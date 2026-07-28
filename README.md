@@ -19,10 +19,10 @@
 watches. **After** it, `slurmpast` tells you what actually happened.
 
 ```bash
-slurmpast              # dashboard over the last 7 days
-slurmpast -S -30days   # ... or a month
-slurmpast 51170455     # one job, in detail
-sp                     # short alias
+slurmpast                # dashboard over the last 7 days
+slurmpast -S now-30days  # ... or a month
+slurmpast 51170455       # one job, in detail
+sp                       # short alias
 ```
 
 `seff` will tell you a job used 92% of its memory. It is often wrong, and it

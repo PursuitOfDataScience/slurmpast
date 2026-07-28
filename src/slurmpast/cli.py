@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import re
 import sys
 
 from . import report
@@ -23,7 +24,7 @@ from .sacct import Sacct, SacctError, live_job_ids
 EPILOG = """\
 examples:
   slurmpast                        dashboard over the last 7 days
-  slurmpast -S -30days             ... over the last 30 days
+  slurmpast -S now-30days         ... over the last 30 days
   slurmpast 51170455               post-mortem for one job
   slurmpast --failed --plain       everything that died, as text
   slurmpast --patterns             what keeps failing, across runs
@@ -43,8 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("job_ids", nargs="*", help="job ids to examine")
     parser.add_argument("-u", "--user", default=None, help="user to query (default: you)")
-    parser.add_argument("-S", "--since", default="-7days",
-                        help="start of the window, sacct syntax (default: -7days)")
+    parser.add_argument("-S", "--since", default="now-7days",
+                        help="start of the window, sacct syntax (default: now-7days). "
+                             "'-7days' is accepted and rewritten for you")
     parser.add_argument("-E", "--until", default=None, help="end of the window")
     parser.add_argument("-p", "--partition", default=None, help="restrict to a partition")
     parser.add_argument("--failed", action="store_true", help="only jobs that failed")
@@ -76,6 +78,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _VALUE_OPTS = ("-S", "--since", "-E", "--until", "-u", "--user", "-p", "--partition")
+
+# sacct's relative time syntax is `now-7days`. A bare `-7days` is REJECTED
+# outright ("Invalid time specification"), but it is the obvious thing to type
+# and what this tool's own help used to advertise -- so accept it and rewrite.
+_RELATIVE_SPEC = re.compile(r"^-\s*\d+\s*(second|minute|hour|day|week|month)s?$", re.IGNORECASE)
+
+
+def normalize_time_spec(value):
+    """``-7days`` -> ``now-7days``. Anything sacct already understands is left alone."""
+    if not value:
+        return value
+    text = value.strip()
+    if _RELATIVE_SPEC.match(text):
+        return "now" + text.replace(" ", "")
+    return value
 
 
 def _glue_negative_values(argv):
@@ -271,6 +288,8 @@ def _job_json(job, log_path, verdict):
 def main(argv=None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(_glue_negative_values(raw))
+    args.since = normalize_time_spec(args.since)
+    args.until = normalize_time_spec(args.until)
     style = report.Style(enabled=False if args.no_color else None)
     sacct = Sacct()
 
