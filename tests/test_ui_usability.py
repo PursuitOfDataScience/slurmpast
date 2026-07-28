@@ -392,7 +392,7 @@ class TestWorkloadBannerSurvivesRefresh:
     """The pattern banner was written into #summary from on_mount, but
     refresh_rows rewrites that widget on every filter and search keystroke -- so
     the banner vanished on the first `f` press. Found by mypy objecting to reading
-    `Static.renderable` back off the widget, which was the smell.
+    a Static widget's rendered content back off the widget, which was the smell.
     """
 
     def _hung_workload(self):
@@ -423,7 +423,9 @@ class TestWorkloadBannerSurvivesRefresh:
             assert "failed repeatedly" in app.screen.summary_text.plain
 
     @pytest.mark.asyncio
-    async def test_a_clean_workload_gets_no_banner(self):
+    async def test_a_clean_workload_gets_no_failure_banner(self):
+        """No findings banner -- though sizing advice may still appear, which is
+        the whole point of the screen."""
         from slurmpast.demo import history as demo
 
         clean = [j for j in demo() if j.name == "midtrain"]
@@ -432,7 +434,9 @@ class TestWorkloadBannerSurvivesRefresh:
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
-            assert app.screen.extra_summary() is None
+            extra = app.screen.extra_summary()
+            text = "" if extra is None else extra.plain
+            assert "failed repeatedly" not in text
 
     @pytest.mark.asyncio
     async def test_flat_job_list_has_no_banner_hook_content(self):

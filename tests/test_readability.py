@@ -93,28 +93,71 @@ class TestGpuHoursAreInterpretable:
         ]
         assert History(cpu_only).gpu_concurrency is None
 
-    def test_plain_report_explains_the_number(self):
+    def test_total_appears_only_as_the_denominator_for_the_idle_figure(self):
+        """The total is not a standalone fact worth a line; it makes "17 of 778"
+        legible, and that ratio is the number worth acting on."""
         from slurmpast.report import Style, render_overview
 
         text = render_overview(History(history()), style=Style(enabled=False))
-        assert "GPU-hours" in text
-        assert "held continuously" in text
+        assert "GPU-hours never computed" in text
         assert "GPU-h (" not in text  # the old abbreviated form
 
-    def test_goodput_jargon_is_gone(self):
+    def test_no_jargon_survives(self):
         from slurmpast.report import Style, render_overview
 
         text = render_overview(History(history()), style=Style(enabled=False))
-        assert "goodput" not in text
-        assert "in jobs that completed" in text
+        for word in ("goodput", "BURNED", "GPU-h ("):
+            assert word not in text
+
+    def test_the_summary_is_brief(self):
+        """It was four lines of derivable detail. Everything above the table
+        should fit in a couple of lines."""
+        from slurmpast.report import Style, render_overview
+
+        text = render_overview(History(history()), style=Style(enabled=False))
+        head = text.split("#    WORKLOAD")[0].strip().splitlines()
+        body = [ln for ln in head if ln.strip() and not set(ln.strip()) <= {"-"}]
+        assert len(body) <= 4, body
+
+    def test_concurrency_still_available_to_callers(self):
+        """Trimmed from the display, not deleted -- it is in the JSON payload."""
+        h = History(history())
+        assert h.gpu_concurrency is not None
 
     @pytest.mark.asyncio
     async def test_dashboard_summary_says_it_in_words(self):
         app = make_app(history(), no_logs=True)
         async with app.run_test() as pilot:
             await pilot.pause()
-            body = app.screen.query_one("#summary")
-            text = body.renderable.plain if hasattr(body.renderable, "plain") else ""
+            text = app.screen.summary_text.plain
             assert "goodput" not in text
             assert "GPU-hours" in text
             assert "never computed" in text
+
+
+class TestNoWidgetInternalsInTests:
+    """Guard against a mistake made twice already.
+
+    A Static widget's rendered-content attribute exists in textual 0.89 and not
+    in 8.x, so a test that reads it passes locally and fails in CI. That was
+    fixed once, then reintroduced in a new file two commits later -- exactly the
+    kind of regression a rule catches and vigilance does not. Assert on data the
+    code composed (``summary_text``, ``extra_summary()``, ``clipboard_view()``)
+    instead.
+    """
+
+    def test_no_test_reads_a_widget_renderable(self):
+        import pathlib
+
+        # Assembled so this file does not trip its own check.
+        needle = "." + "render" + "able"
+        offenders = []
+        for path in sorted(pathlib.Path(__file__).parent.glob("test_*.py")):
+            for number, line in enumerate(path.read_text().splitlines(), start=1):
+                stripped = line.strip()
+                if needle in stripped and not stripped.startswith("#"):
+                    offenders.append("%s:%d" % (path.name, number))
+        assert not offenders, (
+            "these tests read widget internals, which differ across Textual "
+            "versions: %s" % ", ".join(offenders)
+        )

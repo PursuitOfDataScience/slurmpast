@@ -288,6 +288,8 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         super().__init__()
         self._jump = _RowJump()
         self._rows: list[GroupStats] = []
+        # Retained so tests and callers read what was composed, never the widget.
+        self.summary_text = Text()
 
     def compose(self) -> ComposeResult:
         yield _header()
@@ -303,11 +305,11 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
             ("#", 4),
             ("", 2),
             ("WORKLOAD", 26),
-            ("PART", 9),
+            ("PARTITION", 10),
             ("RUNS", 6),
             ("OUTCOMES", 18),
             ("FAILED", 8),
-            ("IDLE", 7),
+            ("NEVER RAN", 10),
             ("USED", 12),
             ("LAST RUN", 12),
             ("VARIANTS", 10),
@@ -335,7 +337,8 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
             filter_groups(history.groups, self.filter_mode, self.search_text), self.sort_mode
         )
         self._rows = groups
-        summary.update(self._summary(history))
+        self.summary_text = self._summary(history)
+        summary.update(self.summary_text)
         table.clear()
         ascii_mode = self.sp.ascii_mode
         for index, group in enumerate(groups, start=1):
@@ -348,7 +351,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
                 Text(str(index), style=theme.FAINT),
                 render.health_dot(group.severity, ascii_mode),
                 Text(group.name[:26], style=theme.INK),
-                Text(group.partition[:9], style=theme.DIM),
+                Text(group.partition[:10], style=theme.DIM),
                 Text(str(group.total), style=theme.DIM),
                 render.outcome_bar(group.completed, group.failed, group.cancelled, 16, ascii_mode),
                 Text(
@@ -381,54 +384,44 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         self.sub_title = "  ·  ".join(parts)
 
     def _summary(self, history: History) -> Text:
-        """The headline numbers, in words rather than jargon.
+        """One line: how much work, how much of it worked, where the waste is.
 
-        "778 GPU-h (96.7% goodput)" told the reader nothing: both the unit and
-        the term are insider shorthand, and neither carries a reference frame. A
-        GPU-hour total only means something next to the period it covers, so it
-        is expressed as the number of GPUs that would have been held
-        continuously to consume it.
+        This was four lines. The GPU-hour total does not deserve a sentence of
+        its own -- it earns its place only as the denominator that makes the idle
+        figure legible ("17 of 778"), which is the number worth acting on. The
+        completed-hours line was redundant with the completion rate, and the
+        concurrency framing was explanation for a number that should not have
+        needed explaining at a glance.
         """
         stats = history.stats
         text = Text()
         text.append("%d jobs" % stats["jobs"], style="bold %s" % theme.INK)
         text.append("  ·  ", style=theme.FAINT)
         text.append("%s completed" % format_percent(stats["completion_rate"]), style=theme.DIM)
-        if stats["excluded_open_records"]:
+
+        if stats["gpu_hours_noop"] and stats["gpu_hours_total"]:
             text.append("  ·  ", style=theme.FAINT)
             text.append(
-                "%d unterminated record%s excluded"
+                "%.0f of %.0f GPU-hours never computed"
+                % (stats["gpu_hours_noop"], stats["gpu_hours_total"]),
+                style=theme.HEALTH_COLOR["warn"],
+            )
+        elif stats["gpu_hours_total"]:
+            text.append("  ·  ", style=theme.FAINT)
+            text.append("%.0f GPU-hours" % stats["gpu_hours_total"], style=theme.GPU_COLOR)
+
+        if stats["excluded_open_records"]:
+            # Terse here on purpose; the workload screen explains it in full,
+            # which is where the "why is a run missing?" question gets asked.
+            text.append("  ·  ", style=theme.FAINT)
+            text.append(
+                "%d record%s excluded"
                 % (
                     stats["excluded_open_records"],
                     "" if stats["excluded_open_records"] == 1 else "s",
                 ),
                 style=theme.FAINT,
             )
-
-        if stats["gpu_hours_total"]:
-            text.append("\n")
-            text.append("%.0f GPU-hours" % stats["gpu_hours_total"], style=theme.GPU_COLOR)
-            concurrency = history.gpu_concurrency
-            span = history.span_hours
-            if concurrency and span:
-                text.append(
-                    " — about %.1f GPU%s held continuously across these %.1f days"
-                    % (concurrency, "" if 0.95 < concurrency < 1.05 else "s", span / 24.0),
-                    style=theme.DIM,
-                )
-            completed = stats["gpu_hours_completed"]
-            text.append(
-                "\n%.0f of them (%s) in jobs that completed"
-                % (completed, format_percent(stats["gpu_goodput"])),
-                style=theme.DIM,
-            )
-            if stats["gpu_hours_noop"]:
-                text.append("\n")
-                text.append(
-                    "%.0f (%s) in jobs that held a GPU and never computed"
-                    % (stats["gpu_hours_noop"], format_percent(stats["gpu_noop_fraction"])),
-                    style=theme.HEALTH_COLOR["warn"],
-                )
 
         if self.search_text:
             text.append("\nsearch: ", style=theme.FAINT)
@@ -793,15 +786,25 @@ class WorkloadScreen(JobListScreen):
         if history is None:
             return None
         findings = history.group_patterns(self._group)
-        if not findings:
-            return None
-        worst = render.sort_findings(findings)[0]
+        worst = render.sort_findings(findings)[0] if findings else None
         banner = Text()
-        banner.append_text(render.severity_chip(worst.severity))
-        banner.append("  ")
-        banner.append(worst.title, style="bold %s" % theme.INK)
-        banner.append("\n  " + " ".join(render.wrap(worst.evidence, 100)), style=theme.DIM)
-        return banner
+        if worst is not None:
+            banner.append_text(render.severity_chip(worst.severity))
+            banner.append("  ")
+            banner.append(worst.title, style="bold %s" % theme.INK)
+            banner.append("\n  " + " ".join(render.wrap(worst.evidence, 100)), style=theme.DIM)
+
+        # The point of reading finished jobs: what the next one should ask for.
+        from .sizing import recommend, sbatch_lines
+
+        lines = sbatch_lines(recommend(self._group.jobs))
+        if lines:
+            if banner.plain:
+                banner.append("\n")
+            banner.append("next run: ", style=theme.FAINT)
+            banner.append("  ".join(lines), style="bold %s" % theme.ACCENT)
+            banner.append("   (slurmpast --sizing for why)", style=theme.FAINT)
+        return banner if banner.plain else None
 
     def action_patterns(self) -> None:
         self.sp.push_screen(PatternsScreen(self._group))

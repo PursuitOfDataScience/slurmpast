@@ -15,6 +15,7 @@ from .index import History, sort_groups
 from .model import severity_rank
 from .nodes import compress_nodelist, dominant_workload, node_table, suggest_exclude
 from .render import job_sections, stamp_short, wrap
+from .sizing import recommend, sbatch_lines
 
 _CODES = {
     "reset": "\033[0m",
@@ -125,38 +126,25 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
         # The window is the commonest explanation for "why are runs missing?",
         # so it belongs on screen rather than in the reader's memory.
         out.append("  window %s" % style(history.window, "bold"))
-    out.append(
-        "  %d jobs · %s completed" % (stats["jobs"], format_percent(stats["completion_rate"]))
+    line = "  %d jobs · %s completed" % (
+        stats["jobs"],
+        format_percent(stats["completion_rate"]),
     )
-    if stats["gpu_hours_total"]:
-        # A GPU-hour total is uninterpretable alone; the concurrency figure is
-        # what makes it mean something.
-        line = "  %.0f GPU-hours" % stats["gpu_hours_total"]
-        concurrency, span = history.gpu_concurrency, history.span_hours
-        if concurrency and span:
-            line += " — about %.1f GPU%s held continuously across these %.1f days" % (
-                concurrency,
-                "" if 0.95 < concurrency < 1.05 else "s",
-                span / 24.0,
-            )
-        out.append(line)
-        out.append(
-            "  %.0f of them (%s) in jobs that completed"
-            % (stats["gpu_hours_completed"], format_percent(stats["gpu_goodput"]))
+    if stats["gpu_hours_noop"] and stats["gpu_hours_total"]:
+        # The total earns its place as the denominator for the idle figure, not as
+        # a standalone fact.
+        line += " · " + style(
+            "%.0f of %.0f GPU-hours never computed"
+            % (stats["gpu_hours_noop"], stats["gpu_hours_total"]),
+            "yellow",
         )
-        if stats["gpu_hours_noop"]:
-            out.append(
-                "  %s"
-                % style(
-                    "%.0f (%s) in jobs that held a GPU and never computed"
-                    % (stats["gpu_hours_noop"], format_percent(stats["gpu_noop_fraction"])),
-                    "yellow",
-                )
-            )
+    elif stats["gpu_hours_total"]:
+        line += " · %.0f GPU-hours" % stats["gpu_hours_total"]
+    out.append(line)
     if stats["excluded_open_records"]:
         out.append(
             style(
-                "  %d unterminated record(s) excluded — their elapsed is now-minus-start"
+                "  %d record(s) excluded as unterminated (elapsed would be now minus start)"
                 % stats["excluded_open_records"],
                 "grey",
             )
@@ -164,7 +152,17 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
     out.append("")
     out.append(
         "  %-4s %-24s %-9s %6s %8s %7s %11s  %-11s %s"
-        % ("#", "WORKLOAD", "PART", "RUNS", "FAILED", "IDLE", "USED", "LAST RUN", "VARIANTS")
+        % (
+            "#",
+            "WORKLOAD",
+            "PARTITION",
+            "RUNS",
+            "FAILED",
+            "NEVER RAN",
+            "USED",
+            "LAST RUN",
+            "VARIANTS",
+        )
     )
     groups = sort_groups(history.groups, sort)
     for index, group in enumerate(groups[:limit], start=1):
@@ -304,4 +302,70 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
     else:
         out.append(style("  no node's interval clears the baseline; nothing to exclude.", "grey"))
     out.append("")
+    return "\n".join(out)
+
+
+def render_sizing(history, style=None, limit=12):
+    """Per-workload guidance for the next submission."""
+    style = style or Style()
+    out = [
+        style("what to request next time", "bold"),
+        style("-" * 92, "grey"),
+        style(
+            "  From how each workload actually ran. Over-requesting narrows which nodes "
+            "can host it;\n  under-requesting kills the run.",
+            "grey",
+        ),
+        "",
+    ]
+    shown = 0
+    for group in history.groups:
+        advice = recommend(group.jobs)
+        if not advice:
+            continue
+        actionable = [a for a in advice if a.actionable]
+        if not actionable:
+            continue
+        shown += 1
+        if shown > limit:
+            break
+        out.append(
+            "  %s  %s"
+            % (
+                style(group.name, "bold"),
+                style("%s · %d runs" % (group.partition, group.total), "grey"),
+            )
+        )
+        for a in advice:
+            if a.verdict == "keep":
+                out.append("    %-17s %s" % (a.flag, style("already about right", "green")))
+                continue
+            if a.verdict == "unknown":
+                out.append("    %-17s %s — %s" % (a.flag, style("no advice", "grey"), a.basis))
+                continue
+            arrow = "raise to" if a.verdict == "raise" else "lower to"
+            out.append(
+                "    %-17s %s %s   %s"
+                % (
+                    a.flag,
+                    arrow,
+                    style(a.suggestion, "bold"),
+                    style("(requested %s, observed %s)" % (a.requested, a.observed), "grey"),
+                )
+            )
+            for line in wrap(a.basis, 84):
+                out.append("        " + style(line, "grey"))
+            if a.caution:
+                for index, line in enumerate(wrap(a.caution, 82)):
+                    out.append(
+                        "        %s%s" % ("! " if index == 0 else "  ", style(line, "yellow"))
+                    )
+        for line in sbatch_lines(advice):
+            out.append("    " + style(line, "bold"))
+        out.append("")
+    if not shown:
+        out.append(
+            style("  every workload is already about right, or lacks the runs to say.", "green")
+        )
+        out.append("")
     return "\n".join(out)

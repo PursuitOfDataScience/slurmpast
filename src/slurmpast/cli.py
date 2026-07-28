@@ -61,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patterns", action="store_true", help="cross-run patterns as text")
     parser.add_argument("--nodes", action="store_true", help="node reliability as text")
     parser.add_argument(
+        "--sizing",
+        action="store_true",
+        help="what to request next time, per workload, from how it actually ran",
+    )
+    parser.add_argument(
         "--metric",
         choices=["failure", "hang"],
         default="hang",
@@ -358,7 +363,13 @@ def main(argv=None) -> int:
     sacct = Sacct()
 
     wants_text = (
-        args.plain or args.json or args.overview or args.patterns or args.nodes or args.job_ids
+        args.plain
+        or args.json
+        or args.overview
+        or args.patterns
+        or args.nodes
+        or args.sizing
+        or args.job_ids
     )
 
     if not wants_text:
@@ -409,6 +420,31 @@ def main(argv=None) -> int:
                     history, metric=args.metric, controlled=not args.all_workloads, style=style
                 )
             )
+        return 0
+
+    if args.sizing:
+        from .sizing import recommend
+
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "slurmpast": __version__,
+                        "workloads": [
+                            {
+                                "name": g.name,
+                                "partition": g.partition,
+                                "runs": g.total,
+                                "advice": [a._asdict() for a in recommend(g.jobs)],
+                            }
+                            for g in history.groups
+                        ],
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(report.render_sizing(history, style=style, limit=args.limit))
         return 0
 
     if args.patterns:
