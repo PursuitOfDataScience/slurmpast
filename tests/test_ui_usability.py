@@ -224,3 +224,124 @@ class TestMouseCapture:
         monkeypatch.setattr(tui, "SlurmpastApp", FakeApp)
         tui.run(lambda: [], window="w", mouse=False)
         assert seen == {"ctor": False, "run": False}
+
+
+class TestWindowIsVisible:
+    """Reported as "why is this job not tracked? many jobs share this name".
+
+    It was not a extraction bug: 19 amd_reserve jobs exist, 2 fall in the default
+    now-7days window, and one of those is RUNNING with End=Unknown so it is
+    correctly excluded from aggregates. The defect was that the UI never showed
+    the window, so a correct 1-job workload looked like data loss.
+    """
+
+    @pytest.mark.asyncio
+    async def test_overview_subtitle_names_the_window(self):
+        app = make_app(history(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert "test" in app.screen.sub_title  # the window string we passed
+
+    @pytest.mark.asyncio
+    async def test_subtitle_is_never_just_a_filter_label(self):
+        """The header used to read "slurmpast — everything", which says nothing."""
+        app = make_app(history(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.screen.sub_title != "everything"
+            await pilot.press("a")
+            await pilot.pause()
+            assert app.screen.sub_title != "everything"
+
+    @pytest.mark.asyncio
+    async def test_filter_named_only_when_filtering(self):
+        app = make_app(history(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert "everything" not in app.screen.sub_title
+            await pilot.press("f")          # -> "problem"
+            await pilot.pause()
+            assert "failed, timed out, or idle" in app.screen.sub_title
+
+    @pytest.mark.asyncio
+    async def test_job_list_subtitle_carries_the_window(self):
+        app = make_app(history(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            assert "test" in app.screen.sub_title
+            assert "jobs" in app.screen.sub_title
+
+
+class TestSingularPlural:
+    @pytest.mark.asyncio
+    async def test_one_job_is_not_reported_as_one_jobs(self):
+        from slurmpast.demo import history as demo
+
+        single = [j for j in demo() if j.name == "soup-merge"]
+        assert len(single) == 1
+        app = make_app(single, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            assert "1 job" in app.screen.sub_title
+            assert "1 jobs" not in app.screen.sub_title
+
+    @pytest.mark.asyncio
+    async def test_one_workload_is_not_one_workloads(self):
+        from slurmpast.demo import history as demo
+
+        single = [j for j in demo() if j.name == "soup-merge"]
+        app = make_app(single, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert "1 workload" in app.screen.sub_title
+            assert "1 workloads" not in app.screen.sub_title
+
+
+class TestExcludedRecordsAreNamed:
+    """A record dropped as unterminated must not just vanish from its workload."""
+
+    def _with_a_running_job(self):
+        from slurmpast.demo import history as demo
+
+        jobs = [j for j in demo() if j.name == "soup-merge"]
+        live = jobs[0]._replace(job_id="9999999", end=None, state="RUNNING", open_ended=True)
+        return jobs + [live]
+
+    def test_group_counts_what_it_lost(self):
+        from slurmpast.index import build_groups
+
+        group = [g for g in build_groups(self._with_a_running_job())
+                 if g.name == "soup-merge"][0]
+        assert group.total == 1
+        assert group.excluded == 1
+
+    def test_group_with_nothing_excluded_reports_zero(self):
+        from slurmpast.demo import history as demo
+        from slurmpast.index import build_groups
+
+        group = [g for g in build_groups(demo()) if g.name == "midtrain"][0]
+        assert group.excluded == 0
+
+    @pytest.mark.asyncio
+    async def test_workload_screen_says_so(self):
+        app = make_app(self._with_a_running_job(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            body = app.screen.query_one("#summary").renderable
+            text = body.plain if hasattr(body, "plain") else str(body)
+            assert "excluded as unterminated" in text
+
+    def test_plain_overview_shows_the_window(self):
+        from slurmpast.demo import history as demo
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_overview
+
+        h = History(demo(), window="now-30days → now")
+        text = render_overview(h, style=Style(enabled=False))
+        assert "window now-30days → now" in text

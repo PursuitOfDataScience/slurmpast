@@ -324,11 +324,18 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
                      style=theme.FAINT),
                 key=str(index),
             )
-        self.sub_title = "%d workloads · %s · %s" % (
-            len(groups),
-            dict(FILTERS).get(self.filter_mode, self.filter_mode),
-            sort_label(self.sort_mode),
-        )
+        # Lead with the WINDOW: it is the single most common explanation for
+        # "why is this workload missing runs?" and it was nowhere on screen.
+        # The filter is named only when it is actually filtering -- a bare
+        # "everything" in the title bar is noise.
+        parts = [
+            self.app.window,  # type: ignore[attr-defined]
+            "%d workload%s" % (len(groups), "" if len(groups) == 1 else "s"),
+            "by %s" % sort_label(self.sort_mode),
+        ]
+        if self.filter_mode != "all":
+            parts.insert(2, dict(FILTERS).get(self.filter_mode, self.filter_mode))
+        self.sub_title = "  ·  ".join(parts)
 
     def _summary(self, history: History, shown: int) -> Text:
         stats = history.stats
@@ -553,15 +560,31 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
 
         summary = Text()
         summary.append(self._title, style="bold %s" % theme.INK)
-        summary.append("  ·  %d jobs" % len(jobs), style=theme.DIM)
+        summary.append("  ·  %d job%s" % (len(jobs), "" if len(jobs) == 1 else "s"),
+                       style=theme.DIM)
         idle = sum(1 for j in jobs if looks_like_noop(j))
         if idle:
             summary.append("  ·  %d never computed" % idle, style=theme.HEALTH_COLOR["warn"])
+        summary.append("  ·  window %s" % self.app.window, style=theme.FAINT)
+        excluded = getattr(self, "_excluded", 0)
+        if excluded:
+            summary.append(
+                "\n%d more record%s in this window excluded as unterminated "
+                "(still running, or never closed — elapsed would be now minus start)"
+                % (excluded, "" if excluded == 1 else "s"),
+                style=theme.FAINT,
+            )
         if self.search_text:
             summary.append("  ·  search: ", style=theme.FAINT)
             summary.append(self.search_text, style=theme.ACCENT)
         self.query_one("#summary", Static).update(summary)
-        self.sub_title = dict(FILTERS).get(self.filter_mode, self.filter_mode)
+        parts = [
+            "%d job%s" % (len(jobs), "" if len(jobs) == 1 else "s"),
+            self.app.window,  # type: ignore[attr-defined]
+        ]
+        if self.filter_mode != "all":
+            parts.insert(1, dict(FILTERS).get(self.filter_mode, self.filter_mode))
+        self.sub_title = "  ·  ".join(parts)
 
     def _selected(self):
         table = self.query_one("#jobs", DataTable)
@@ -642,6 +665,7 @@ class WorkloadScreen(JobListScreen):
     def __init__(self, group: GroupStats) -> None:
         super().__init__(group.jobs, "%s · %s" % (group.name, group.partition))
         self._group = group
+        self._excluded = group.excluded
 
     def on_mount(self) -> None:
         super().on_mount()
@@ -995,6 +1019,7 @@ class SlurmpastApp(App[Any]):
         super().__init__()
         self._loader = loader
         self._window = window
+        self.window = window
         self.history: History | None = None
         self.ascii_mode = ascii_mode
         self.no_logs = no_logs

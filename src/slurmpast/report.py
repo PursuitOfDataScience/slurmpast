@@ -103,6 +103,10 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
     style = style or Style()
     stats = history.stats
     out = [style("workloads — ranked by resources burned", "bold"), style("-" * 96, "grey")]
+    if history.window:
+        # The window is the commonest explanation for "why are runs missing?",
+        # so it belongs on screen rather than in the reader's memory.
+        out.append("  window %s" % style(history.window, "bold"))
     out.append("  %d jobs · %s completed · %.0f GPU-hours (%s goodput)"
                % (stats["jobs"], format_percent(stats["completion_rate"]),
                   stats["gpu_hours_total"], format_percent(stats["gpu_goodput"])))

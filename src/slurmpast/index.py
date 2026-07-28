@@ -39,6 +39,7 @@ class GroupStats(NamedTuple):
     partition: str
     kind: str  # "gpu" | "cpu"
     distinct_names: int  # how many real job names this pattern covers
+    excluded: int  # same-workload records dropped as unterminated (elapsed = now - start)
     jobs: tuple
     total: int
     completed: int
@@ -107,6 +108,14 @@ def build_groups(jobs: Iterable[Job]) -> list[GroupStats]:
     for job in usable(jobs):
         buckets.setdefault(group_key(job), []).append(job)
 
+    # Unterminated records are excluded from every aggregate (their elapsed is
+    # "now minus start"), but silently dropping them makes a workload look like
+    # it lost jobs. Count them per workload so the UI can say so.
+    dropped: dict[tuple, int] = {}
+    for job in jobs:
+        if job.open_ended:
+            dropped[group_key(job)] = dropped.get(group_key(job), 0) + 1
+
     out: list[GroupStats] = []
     for key, members in buckets.items():
         members.sort(key=lambda j: _stamp(j), reverse=True)
@@ -123,6 +132,7 @@ def build_groups(jobs: Iterable[Job]) -> list[GroupStats]:
                 partition=key[1],
                 kind=key[2],
                 distinct_names=len({j.name for j in members}),
+                excluded=dropped.get(key, 0),
                 jobs=tuple(members),
                 total=len(members),
                 completed=sum(1 for j in members if j.completed),

@@ -325,7 +325,7 @@ def main(argv=None) -> int:
         sys.stderr.write("slurmpast: %s\n" % exc)
         return 2
 
-    history = History(jobs, window=args.since)
+    history = History(jobs, window="%s → %s" % (args.since, args.until or "now"))
 
     if args.nodes:
         if args.json:
