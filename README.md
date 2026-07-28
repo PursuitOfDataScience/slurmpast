@@ -8,13 +8,16 @@
   <a href="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
-  <img src="https://img.shields.io/badge/tests-399-brightgreen.svg" alt="399 tests">
+  <img src="https://img.shields.io/badge/tests-416-brightgreen.svg" alt="416 tests">
   <img src="https://img.shields.io/badge/status-beta-orange.svg" alt="Beta">
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmpast/main/assets/demo.gif" width="900" alt="slurmpast dashboard: finished jobs rolled into workloads ranked by resources burned, drilling into one workload and then into a single job's full post-mortem — CPU split by user and kernel, memory peak with the node and task that hit it, disk read and write, each with a gauge — then the cross-run patterns and the workload-controlled node reliability table.">
+  <img src="assets/screenshot-overview.svg" width="900" alt="slurmpast overview: finished jobs rolled into workload groups ranked by resources burned, each with an outcome ribbon, failure rate, idle count and last run.">
 </p>
+
+<p align="center"><em>Finished jobs, rolled into workloads, ranked by resource use.<br>
+An animated walkthrough renders with <code>vhs assets/demo.tape</code>.</em></p>
 
 **Before** the run, `slurmate` builds the request. **During** it, `slurmwatch`
 watches. **After** it, `slurmpast` tells you what actually happened.
@@ -35,19 +38,19 @@ to produce a confidently wrong number.
 <summary><b>Screenshots</b> — exported from the running app (click to expand)</summary>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmpast/main/assets/screenshot-overview.svg" width="860" alt="Overview: workloads ranked by resources burned, with outcome ribbons, failure rate, idle count and last run.">
+  <img src="assets/screenshot-overview.svg" width="860" alt="Overview: workloads ranked by resources burned, with outcome ribbons, failure rate, idle count and last run.">
   <br><em>Overview — 58 jobs rolled into workloads, ranked by cost, not count.</em>
 </p>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmpast/main/assets/screenshot-job.svg" width="860" alt="One job's post-mortem: timing, CPU with the user/system split, memory with peak node and task, filesystem read and write, each with a gauge, then the findings.">
+  <img src="assets/screenshot-job.svg" width="860" alt="One job's post-mortem: timing, CPU with the user/system split, memory with peak node and task, filesystem read and write, each with a gauge, then the findings.">
   <br><em>One job — every field Slurm recorded, with the verdict underneath.</em>
 </p>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmpast/main/assets/screenshot-patterns.svg" width="860" alt="Cross-run patterns: a workload that failed repeatedly at an unchanged time limit, and a memory request being hand-searched.">
+  <img src="assets/screenshot-patterns.svg" width="860" alt="Cross-run patterns: a workload that failed repeatedly at an unchanged time limit, and a memory request being hand-searched.">
   <br><em>Cross-run patterns — what no single job can show you.</em>
 </p>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/PursuitOfDataScience/slurmpast/main/assets/screenshot-nodes.svg" width="860" alt="Node reliability controlled for workload, with Wilson confidence intervals and a ready-to-paste SBATCH exclude line.">
+  <img src="assets/screenshot-nodes.svg" width="860" alt="Node reliability controlled for workload, with Wilson confidence intervals and a ready-to-paste SBATCH exclude line.">
   <br><em>Node reliability — workload-controlled, with confidence intervals.</em>
 </p>
 
@@ -67,7 +70,7 @@ problem back to you. So the landing screen is not a job list — it is a
 **workload rollup**, ranked by resources burned:
 
 ```
-  #    WORKLOAD              PART     RUNS   FAILED   IDLE      BURNED  LAST RUN   VARIANTS
+  #    WORKLOAD              PART     RUNS   FAILED   IDLE        USED  LAST RUN   VARIANTS
   1    node-evaluation       test     1101    14.6%    149  3089 gpu-h  2026-05-30
   2    node-testing          test       62    74.3%     27   785 gpu-h  2026-03-05
   3    midtrain              test      155     9.9%     13  1005 gpu-h  2026-07-03
@@ -325,7 +328,7 @@ log found, the CUDA-OOM and traceback rules stay silent rather than speculate.
 
 ## Status
 
-Beta. 399 tests, 86% coverage. The diagnosis thresholds are heuristics drawn from one
+Beta. 416 tests, 86% coverage. The diagnosis thresholds are heuristics drawn from one
 cluster's measured history — conservative (an allocation must run 5 minutes *and*
 use under 10 CPU-seconds before it is called a hang, ~20× margin over the
 observed median) but not validated elsewhere. `--nodes` is the piece most likely

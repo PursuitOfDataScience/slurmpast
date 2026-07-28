@@ -117,7 +117,7 @@ class TestSorting:
         assert sort_groups(groups, "nonsense") == sort_groups(groups, "cost")
 
     def test_label_exists_for_each_mode(self):
-        assert sort_label("cost") == "resources burned"
+        assert sort_label("cost") == "resource use"
 
 
 class TestFiltering:

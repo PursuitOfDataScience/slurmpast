@@ -117,29 +117,42 @@ def render_job(job, log_path=None, log_text=None, node_note="", style=None, show
 def render_overview(history: History, style=None, limit=25, sort="cost"):
     style = style or Style()
     stats = history.stats
-    out = [style("workloads — ranked by resources burned", "bold"), style("-" * 96, "grey")]
+    out = [
+        style("workloads — ranked by resource use (GPU-hours, else core-hours)", "bold"),
+        style("-" * 96, "grey"),
+    ]
     if history.window:
         # The window is the commonest explanation for "why are runs missing?",
         # so it belongs on screen rather than in the reader's memory.
         out.append("  window %s" % style(history.window, "bold"))
     out.append(
-        "  %d jobs · %s completed · %.0f GPU-hours (%s goodput)"
-        % (
-            stats["jobs"],
-            format_percent(stats["completion_rate"]),
-            stats["gpu_hours_total"],
-            format_percent(stats["gpu_goodput"]),
-        )
+        "  %d jobs · %s completed" % (stats["jobs"], format_percent(stats["completion_rate"]))
     )
-    if stats["gpu_hours_noop"]:
-        out.append(
-            "  %s"
-            % style(
-                "%.0f GPU-hours (%s) went to allocations that never computed"
-                % (stats["gpu_hours_noop"], format_percent(stats["gpu_noop_fraction"])),
-                "yellow",
+    if stats["gpu_hours_total"]:
+        # A GPU-hour total is uninterpretable alone; the concurrency figure is
+        # what makes it mean something.
+        line = "  %.0f GPU-hours" % stats["gpu_hours_total"]
+        concurrency, span = history.gpu_concurrency, history.span_hours
+        if concurrency and span:
+            line += " — about %.1f GPU%s held continuously across these %.1f days" % (
+                concurrency,
+                "" if 0.95 < concurrency < 1.05 else "s",
+                span / 24.0,
             )
+        out.append(line)
+        out.append(
+            "  %.0f of them (%s) in jobs that completed"
+            % (stats["gpu_hours_completed"], format_percent(stats["gpu_goodput"]))
         )
+        if stats["gpu_hours_noop"]:
+            out.append(
+                "  %s"
+                % style(
+                    "%.0f (%s) in jobs that held a GPU and never computed"
+                    % (stats["gpu_hours_noop"], format_percent(stats["gpu_noop_fraction"])),
+                    "yellow",
+                )
+            )
     if stats["excluded_open_records"]:
         out.append(
             style(
@@ -151,7 +164,7 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
     out.append("")
     out.append(
         "  %-4s %-24s %-9s %6s %8s %7s %11s  %-11s %s"
-        % ("#", "WORKLOAD", "PART", "RUNS", "FAILED", "IDLE", "BURNED", "LAST RUN", "VARIANTS")
+        % ("#", "WORKLOAD", "PART", "RUNS", "FAILED", "IDLE", "USED", "LAST RUN", "VARIANTS")
     )
     groups = sort_groups(history.groups, sort)
     for index, group in enumerate(groups[:limit], start=1):

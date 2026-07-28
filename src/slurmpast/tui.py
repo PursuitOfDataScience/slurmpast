@@ -146,6 +146,23 @@ class ClipboardMixin:
         self.sp.notify(message, timeout=6)
 
 
+def _header() -> Header:
+    """A header with no icon.
+
+    Textual's default "⭘" is a clickable shortcut to its command palette. Two
+    reasons it does not belong here: mouse capture is off by default so it cannot
+    be clicked at all, and we expose no customised palette behind it. A
+    non-functional control in the top-left of every screen is worse than none.
+
+    The kwarg is passed defensively -- CI exercises Textual 0.86 through 8.x, and
+    a signature change should degrade to the default rather than crash the app.
+    """
+    try:
+        return Header(show_clock=False, icon="")
+    except TypeError:  # pragma: no cover - only on a Textual without `icon`
+        return Header(show_clock=False)
+
+
 def _digit_bindings(action: str):
     """Type a row number to jump to it, exactly as slurmwatch does for nodes."""
     return [Binding(str(d), f"{action}('{d}')", show=False) for d in range(10)]
@@ -273,7 +290,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         self._rows: list[GroupStats] = []
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
+        yield _header()
         yield Static(id="summary")
         with Horizontal(id="searchbar"):
             yield SearchBar()
@@ -291,7 +308,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
             ("OUTCOMES", 18),
             ("FAILED", 8),
             ("IDLE", 7),
-            ("BURNED", 12),
+            ("USED", 12),
             ("LAST RUN", 12),
             ("VARIANTS", 10),
         ):
@@ -364,29 +381,55 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         self.sub_title = "  ·  ".join(parts)
 
     def _summary(self, history: History) -> Text:
+        """The headline numbers, in words rather than jargon.
+
+        "778 GPU-h (96.7% goodput)" told the reader nothing: both the unit and
+        the term are insider shorthand, and neither carries a reference frame. A
+        GPU-hour total only means something next to the period it covers, so it
+        is expressed as the number of GPUs that would have been held
+        continuously to consume it.
+        """
         stats = history.stats
         text = Text()
         text.append("%d jobs" % stats["jobs"], style="bold %s" % theme.INK)
         text.append("  ·  ", style=theme.FAINT)
         text.append("%s completed" % format_percent(stats["completion_rate"]), style=theme.DIM)
-        if stats["gpu_hours_total"]:
-            text.append("  ·  ", style=theme.FAINT)
-            text.append("%.0f GPU-h" % stats["gpu_hours_total"], style=theme.GPU_COLOR)
-            text.append(" (%s goodput)" % format_percent(stats["gpu_goodput"]), style=theme.DIM)
-        if stats["gpu_hours_noop"]:
-            text.append("  ·  ", style=theme.FAINT)
-            text.append(
-                "%.0f GPU-h idle" % stats["gpu_hours_noop"],
-                style=theme.HEALTH_COLOR["warn"],
-            )
         if stats["excluded_open_records"]:
-            # Never silently drop records: an unterminated row would otherwise
-            # vanish with no trace, and its elapsed is now-minus-start.
             text.append("  ·  ", style=theme.FAINT)
             text.append(
-                "%d unterminated record(s) excluded" % stats["excluded_open_records"],
+                "%d unterminated record%s excluded"
+                % (
+                    stats["excluded_open_records"],
+                    "" if stats["excluded_open_records"] == 1 else "s",
+                ),
                 style=theme.FAINT,
             )
+
+        if stats["gpu_hours_total"]:
+            text.append("\n")
+            text.append("%.0f GPU-hours" % stats["gpu_hours_total"], style=theme.GPU_COLOR)
+            concurrency = history.gpu_concurrency
+            span = history.span_hours
+            if concurrency and span:
+                text.append(
+                    " — about %.1f GPU%s held continuously across these %.1f days"
+                    % (concurrency, "" if 0.95 < concurrency < 1.05 else "s", span / 24.0),
+                    style=theme.DIM,
+                )
+            completed = stats["gpu_hours_completed"]
+            text.append(
+                "\n%.0f of them (%s) in jobs that completed"
+                % (completed, format_percent(stats["gpu_goodput"])),
+                style=theme.DIM,
+            )
+            if stats["gpu_hours_noop"]:
+                text.append("\n")
+                text.append(
+                    "%.0f (%s) in jobs that held a GPU and never computed"
+                    % (stats["gpu_hours_noop"], format_percent(stats["gpu_noop_fraction"])),
+                    style=theme.HEALTH_COLOR["warn"],
+                )
+
         if self.search_text:
             text.append("\nsearch: ", style=theme.FAINT)
             text.append(self.search_text, style=theme.ACCENT)
@@ -527,7 +570,7 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         self._jump = _RowJump()
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
+        yield _header()
         yield Static(id="summary")
         with Horizontal(id="searchbar"):
             yield SearchBar()
@@ -785,7 +828,7 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         self._log_text = None
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
+        yield _header()
         with VerticalScroll(id="detail"):
             yield Static(id="body")
         yield Footer()
@@ -928,7 +971,7 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
     clipboard_view = clipboard_row
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
+        yield _header()
         with VerticalScroll(id="detail"):
             yield Static(id="body")
         yield Footer()
@@ -990,7 +1033,7 @@ class NodesScreen(ClipboardMixin, Screen[Any]):
     controlled: reactive[bool] = reactive(True)
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
+        yield _header()
         yield Static(id="summary")
         yield DataTable(id="nodes", cursor_type="row")
         yield Static(id="exclude")

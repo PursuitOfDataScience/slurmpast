@@ -155,7 +155,7 @@ def build_groups(jobs: Iterable[Job]) -> list[GroupStats]:
 # --- sorting -------------------------------------------------------------
 # Ordered as presented in the UI; `s` cycles through them.
 SORTS: tuple[tuple[str, str], ...] = (
-    ("cost", "resources burned"),
+    ("cost", "resource use"),
     ("failures", "failed runs"),
     ("rate", "failure rate"),
     ("recent", "most recent"),
@@ -312,6 +312,45 @@ class History:
         found = list(find_repeat_failures(group.jobs, limit=3))
         found.extend(find_memory_search(group.jobs))
         return found
+
+    @property
+    def span_hours(self) -> float | None:
+        """Wall-clock hours from the earliest start to the latest end.
+
+        Derived from the records themselves rather than from the requested window,
+        because the window is a string ("now-7days") and what matters is the
+        period the jobs actually cover.
+        """
+        from datetime import datetime
+
+        starts: list[datetime] = []
+        ends: list[datetime] = []
+        for job in self.usable_jobs:
+            for value, bucket in ((job.start, starts), (job.end, ends)):
+                if not value:
+                    continue
+                try:
+                    bucket.append(datetime.fromisoformat(value))
+                except ValueError:
+                    continue
+        if not starts or not ends:
+            return None
+        span = (max(ends) - min(starts)).total_seconds() / 3600.0
+        return span if span > 0 else None
+
+    @property
+    def gpu_concurrency(self) -> float | None:
+        """GPU-hours divided by the span: how many GPUs you held on average.
+
+        This is the number that makes a GPU-hour total mean something. "778
+        GPU-hours" is uninterpretable on its own; "you held about 4.6 GPUs
+        continuously for a week" is a fact someone can act on.
+        """
+        total = self.stats["gpu_hours_total"]
+        span = self.span_hours
+        if not total or not span:
+            return None
+        return total / span
 
     def tail_summary(self, shown: int) -> str:
         """What sits below the fold, so truncation is never silent.
