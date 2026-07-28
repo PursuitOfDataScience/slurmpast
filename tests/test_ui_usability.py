@@ -332,7 +332,7 @@ class TestExcludedRecordsAreNamed:
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
-            assert "excluded as unterminated" in app.screen.summary_text.plain
+            assert "unterminated, excluded" in app.screen.summary_text.plain
 
     def test_plain_overview_shows_the_window(self):
         from slurmpast.demo import history as demo

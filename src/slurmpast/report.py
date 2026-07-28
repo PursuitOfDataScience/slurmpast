@@ -202,7 +202,7 @@ def render_list(jobs, style=None, limit=40):
     # workload with hundreds of identically-named runs is unnavigable without them.
     out = [
         "%-12s %-18s %-12s %-11s %-11s %9s %9s %7s %4s"
-        % ("JOBID", "NAME", "STATE", "STARTED", "ENDED", "ELAPSED", "CPU", "UTIL", "GPU"),
+        % ("JOBID", "NAME", "STATE", "STARTED", "ENDED", "ELAPSED", "CPU TIME", "CPU%", "GPU"),
         style("-" * 106, "grey"),
     ]
     for job in jobs[:limit]:

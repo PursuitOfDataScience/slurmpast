@@ -15,6 +15,7 @@ import sys
 from . import report
 from ._version import __version__
 from .diagnose import diagnose
+from .duration import humanize_window
 from .index import History, filter_jobs
 from .logs import load_for
 from .model import severity_rank
@@ -377,9 +378,7 @@ def main(argv=None) -> int:
         # window paints before the query returns.
         from . import tui
 
-        window = (
-            "SYNTHETIC DEMO DATA" if args.demo else "%s → %s" % (args.since, args.until or "now")
-        )
+        window = "synthetic demo data" if args.demo else humanize_window(args.since, args.until)
         return tui.run(
             lambda: _load(args, sacct),
             window=window,
@@ -395,7 +394,7 @@ def main(argv=None) -> int:
         sys.stderr.write("slurmpast: %s\n" % exc)
         return 2
 
-    window = "SYNTHETIC DEMO DATA" if args.demo else "%s → %s" % (args.since, args.until or "now")
+    window = "synthetic demo data" if args.demo else humanize_window(args.since, args.until)
     history = History(jobs, window=window)
 
     if args.nodes:

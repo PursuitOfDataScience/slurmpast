@@ -198,3 +198,48 @@ def format_cpu_freq(hz):
     if hz >= 1e9:
         return "%.2f GHz" % (hz / 1e9)
     return "%.0f MHz" % (hz / 1e6)
+
+
+_WINDOW_UNITS = {
+    "second": "seconds",
+    "minute": "minutes",
+    "hour": "hours",
+    "day": "days",
+    "week": "weeks",
+    "month": "months",
+}
+
+
+def humanize_window(since, until=None):
+    """A sacct time spec, in English.
+
+    "now-7days → now" is the machine's phrasing showing through; a reader should
+    not have to parse the tool's own arguments back out of its title bar.
+
+        now-7days           -> last 7 days
+        now-1day            -> last 24 hours
+        2026-01-01          -> since 2026-01-01
+        now-30days, 07-15   -> 2026-01-01 to 07-15
+    """
+    import re
+
+    since = (since or "").strip()
+    until = (until or "").strip()
+    ended = until and until.lower() != "now"
+
+    match = re.match(r"^now-\s*(\d+)\s*([a-z]+?)s?$", since, re.IGNORECASE)
+    if match and not ended:
+        count, unit = int(match.group(1)), match.group(2).lower()
+        if unit == "day" and count == 1:
+            return "last 24 hours"
+        plural = _WINDOW_UNITS.get(unit, unit + "s")
+        if count == 1:
+            return "last %s" % unit
+        return "last %d %s" % (count, plural)
+
+    if not since:
+        return "all time" if not ended else "up to %s" % until
+    label = since.split("T")[0]
+    if ended:
+        return "%s to %s" % (label, until.split("T")[0])
+    return "since %s" % label

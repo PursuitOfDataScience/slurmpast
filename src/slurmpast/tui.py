@@ -296,23 +296,28 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         yield Static(id="summary")
         with Horizontal(id="searchbar"):
             yield SearchBar()
-        yield DataTable(id="groups", cursor_type="row", zebra_stripes=False)
+        yield DataTable(
+            id="groups",
+            cursor_type="row",
+            zebra_stripes=False,
+            cell_padding=1,
+            # Without this the cursor's own foreground wins and every coloured
+            # glyph in the highlighted row turns solid white.
+            cursor_foreground_priority="renderable",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#groups", DataTable)
         for label, width in (
-            ("#", 4),
-            ("", 2),
-            ("WORKLOAD", 26),
-            ("PARTITION", 10),
-            ("RUNS", 6),
-            ("OUTCOMES", 18),
-            ("FAILED", 8),
-            ("NEVER RAN", 10),
-            ("USED", 12),
-            ("LAST RUN", 12),
-            ("VARIANTS", 10),
+            ("#", 5),
+            ("WORKLOAD", 24),
+            ("PARTITION", 9),
+            ("RUNS", 5),
+            ("FAILED", 7),
+            ("USED", 11),
+            ("LAST RUN", 10),
+            ("NAMES", 5),
         ):
             table.add_column(label, width=width)
         self.refresh_rows()
@@ -347,25 +352,24 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
                 if group.gpu_hours >= 1
                 else "%.0f core-h" % group.core_hours
             )
+            # The dot rides in the row-number cell: as its own column it paid for
+            # a width plus padding on both sides to show one glyph.
+            marker = Text()
+            marker.append("%-2d " % index, style=theme.FAINT)
+            marker.append_text(render.health_dot(group.severity, ascii_mode))
             table.add_row(
-                Text(str(index), style=theme.FAINT),
-                render.health_dot(group.severity, ascii_mode),
-                Text(group.name[:26], style=theme.INK),
-                Text(group.partition[:10], style=theme.DIM),
+                marker,
+                Text(group.name[:24], style=theme.INK),
+                Text(group.partition[:9], style=theme.DIM),
                 Text(str(group.total), style=theme.DIM),
-                render.outcome_bar(group.completed, group.failed, group.cancelled, 16, ascii_mode),
                 Text(
                     format_percent(group.failure_rate),
                     style=theme.HEALTH_COLOR["crit"] if group.failed else theme.FAINT,
                 ),
-                Text(
-                    str(group.noop) if group.noop else "-",
-                    style=theme.HEALTH_COLOR["warn"] if group.noop else theme.FAINT,
-                ),
                 Text(burned, style=theme.GPU_COLOR if group.gpu_hours else theme.CPU_COLOR),
                 Text((group.last_seen or "")[:10], style=theme.FAINT),
                 Text(
-                    "%d names" % group.distinct_names if group.distinct_names > 1 else "",
+                    str(group.distinct_names) if group.distinct_names > 1 else "",
                     style=theme.FAINT,
                 ),
                 key=str(index),
@@ -567,7 +571,12 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         yield Static(id="summary")
         with Horizontal(id="searchbar"):
             yield SearchBar()
-        yield DataTable(id="jobs", cursor_type="row")
+        yield DataTable(
+            id="jobs",
+            cursor_type="row",
+            cell_padding=1,
+            cursor_foreground_priority="renderable",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -577,17 +586,16 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         # you are looking at.
         for label, width in (
             ("#", 5),
-            ("", 2),
-            ("JOBID", 12),
-            ("NAME", 17),
-            ("STATE", 12),
-            ("STARTED", 12),
-            ("ENDED", 12),
-            ("ELAPSED", 9),
-            ("CPU", 9),
-            ("UTIL", 7),
-            ("GPU", 4),
-            ("NODE", 13),
+            ("JOBID", 11),
+            ("NAME", 14),
+            ("STATE", 11),
+            ("STARTED", 11),
+            ("ENDED", 11),
+            ("ELAPSED", 8),
+            ("CPU TIME", 9),
+            ("CPU%", 6),
+            ("GPU", 3),
+            ("NODE", 12),
         ):
             table.add_column(label, width=width)
         self.refresh_rows()
@@ -608,12 +616,14 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
             if looks_like_noop(job):
                 grade = "crit"
             util = job.cpu_utilization
+            marker = Text()
+            marker.append("%-2d " % index, style=theme.FAINT)
+            marker.append_text(render.health_dot(grade, ascii_mode))
             table.add_row(
-                Text(str(index), style=theme.FAINT),
-                render.health_dot(grade, ascii_mode),
-                Text(job.job_id[:12], style=theme.INK),
-                Text((job.name or "")[:17], style=theme.DIM),
-                Text(job.base_state[:12], style=theme.HEALTH_COLOR.get(grade, theme.DIM)),
+                marker,
+                Text(job.job_id[:11], style=theme.INK),
+                Text((job.name or "")[:14], style=theme.DIM),
+                Text(job.base_state[:11], style=theme.HEALTH_COLOR.get(grade, theme.DIM)),
                 Text(render.stamp_short(job.start) or "-", style=theme.ACCENT),
                 Text(render.stamp_short(job.end) or "-", style=theme.FAINT),
                 Text(format_duration(job.elapsed), style=theme.DIM),
@@ -625,7 +635,7 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
                     else theme.DIM,
                 ),
                 Text(str(job.gpu_count or "-"), style=theme.GPU_COLOR),
-                Text((job.node_list or "")[:13], style=theme.FAINT),
+                Text((job.node_list or "")[:12], style=theme.FAINT),
                 key=str(index),
             )
 
@@ -637,13 +647,12 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         idle = sum(1 for j in jobs if looks_like_noop(j))
         if idle:
             summary.append("  ·  %d never computed" % idle, style=theme.HEALTH_COLOR["warn"])
-        summary.append("  ·  window %s" % self.sp.window, style=theme.FAINT)
         excluded = getattr(self, "_excluded", 0)
         if excluded:
+            # Terse: the window is already in the title bar, and the long
+            # explanation belonged in one place, not on every workload.
             summary.append(
-                "\n%d more record%s in this window excluded as unterminated "
-                "(still running, or never closed — elapsed would be now minus start)"
-                % (excluded, "" if excluded == 1 else "s"),
+                "  ·  %d unterminated, excluded" % excluded,
                 style=theme.FAINT,
             )
         if self.search_text:
@@ -891,8 +900,15 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         # printing both put the name, account and node on screen twice.
         body.append("\n\n")
 
-        # One shared section model with report.py, so the dashboard and the
-        # plain output can never disagree about what a job did.
+        # Lead with slurmwatch's row idiom, so a job you watched running looks
+        # like the same object afterwards.
+        for line in render.resource_rows(job, ascii_mode=ascii_mode):
+            body.append_text(line)
+            body.append("\n")
+        body.append("\n")
+
+        # Then the full detail. One shared section model with report.py, so the
+        # dashboard and the plain output can never disagree about what a job did.
         section_color = {
             "job": theme.INK,
             "timing": theme.ACCENT,

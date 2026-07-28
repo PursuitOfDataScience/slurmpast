@@ -161,3 +161,114 @@ class TestNoWidgetInternalsInTests:
             "these tests read widget internals, which differ across Textual "
             "versions: %s" % ", ".join(offenders)
         )
+
+
+class TestWindowInEnglish:
+    """The title bar read "now-7days → now" -- the tool's own arguments showing
+    through. A reader should not have to parse a sacct time spec back out of it."""
+
+    @pytest.mark.parametrize(
+        "since,expected",
+        [
+            ("now-7days", "last 7 days"),
+            ("now-30days", "last 30 days"),
+            ("now-1day", "last 24 hours"),
+            ("now-1week", "last week"),
+            ("now-6months", "last 6 months"),
+            ("2026-01-01", "since 2026-01-01"),
+        ],
+    )
+    def test_relative_and_absolute(self, since, expected):
+        from slurmpast.duration import humanize_window
+
+        assert humanize_window(since) == expected
+
+    def test_closed_range(self):
+        from slurmpast.duration import humanize_window
+
+        assert humanize_window("2026-01-01", "2026-07-15") == "2026-01-01 to 2026-07-15"
+
+    def test_no_arrow_glyph_leaks_through(self):
+        from slurmpast.duration import humanize_window
+
+        for spec in ("now-7days", "2026-01-01", "now-1day"):
+            assert "→" not in humanize_window(spec)
+            assert "now-" not in humanize_window(spec)
+
+    def test_timestamps_are_trimmed_to_the_date(self):
+        from slurmpast.duration import humanize_window
+
+        assert humanize_window("2026-01-01T08:00:00") == "since 2026-01-01"
+
+
+class TestColumnNamesAreUnambiguous:
+    @pytest.mark.asyncio
+    async def test_cpu_columns_say_which_is_which(self):
+        """A bare "UTIL" beside a "CPU" column does not say whether it is CPU or
+        GPU utilization -- and GPU utilization is not even recorded here."""
+        app = make_app(history(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            from textual.widgets import DataTable
+
+            labels = [str(c.label) for c in app.screen.query_one(DataTable).columns.values()]
+            assert "UTIL" not in labels
+            assert "CPU TIME" in labels
+            assert "CPU%" in labels
+
+    @pytest.mark.asyncio
+    async def test_overview_fits_a_narrow_terminal(self):
+        """It required sideways scrolling; the ribbon and a redundant column went."""
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(84, 20)) as pilot:
+            await pilot.pause()
+            from textual.widgets import DataTable
+
+            columns = list(app.screen.query_one(DataTable).columns.values())
+            assert "OUTCOMES" not in [str(c.label) for c in columns]
+            assert "NEVER RAN" not in [str(c.label) for c in columns]
+            assert sum(c.width for c in columns) <= 80
+
+
+class TestCursorDoesNotRepaintCells:
+    @pytest.mark.asyncio
+    async def test_renderable_keeps_priority_over_the_cursor(self):
+        """With the CSS default the cursor's foreground wins and every coloured
+        glyph in the highlighted row turns solid white."""
+        app = make_app(history(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            from textual.widgets import DataTable
+
+            table = app.screen.query_one(DataTable)
+            assert table.cursor_foreground_priority == "renderable"
+
+
+class TestResourceRowsMatchSlurmwatch:
+    def test_rows_use_the_marker_label_bar_idiom(self):
+        from slurmpast.render import resource_rows
+
+        job = [j for j in history() if j.name == "midtrain"][0]
+        rows = [r.plain for r in resource_rows(job)]
+        assert any(r.lstrip().startswith("●") for r in rows)
+        labels = " ".join(rows)
+        for expected in ("TIME", "CPU", "MEM"):
+            assert expected in labels
+
+    def test_unmeasurable_rows_show_na_and_an_empty_track(self):
+        from slurmpast.render import resource_rows
+
+        job = [j for j in history() if j.gpu_count][0]
+        gpu_row = [r.plain for r in resource_rows(job) if "GPU" in r.plain][0]
+        assert "n/a" in gpu_row
+        assert "░" in gpu_row
+
+    def test_ascii_mode_avoids_block_glyphs(self):
+        from slurmpast.render import resource_rows
+
+        job = [j for j in history() if j.name == "midtrain"][0]
+        rows = " ".join(r.plain for r in resource_rows(job, ascii_mode=True))
+        assert "●" not in rows
+        assert "█" not in rows

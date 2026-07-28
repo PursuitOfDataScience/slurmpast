@@ -102,43 +102,6 @@ def state_text(state: str, ascii_mode: bool = False):
     return text
 
 
-def outcome_bar(completed: int, failed: int, cancelled: int, width: int = 16, ascii_mode=False):
-    """Stacked outcome ribbon: green completed, red failed, grey cancelled.
-
-    Proportions are eyeballed from one row, so each non-zero segment gets at
-    least one cell -- a group with a single failure among 400 runs must still
-    show a red pixel, otherwise the ribbon says "clean" and is a lie.
-    """
-    glyph = "#" if ascii_mode else "█"
-    total = completed + failed + cancelled
-    text = Text()
-    if not total:
-        return Text(("-" if ascii_mode else "░") * width, style=theme.FAINT)
-    parts = [
-        (completed, theme.HEALTH_COLOR["ok"]),
-        (failed, theme.HEALTH_COLOR["crit"]),
-        (cancelled, theme.FAINT),
-    ]
-    widths: list[int] = []
-    colors: list[str] = []
-    for count, color in parts:
-        widths.append(0 if not count else max(1, int(round(width * count / float(total)))))
-        colors.append(color)
-
-    overflow = sum(widths) - width
-    while overflow > 0:  # trim the widest segment first so minorities survive
-        biggest = max(range(len(widths)), key=lambda i: widths[i])
-        if widths[biggest] <= 1:
-            break
-        widths[biggest] -= 1
-        overflow -= 1
-
-    for count, color in zip(widths, colors, strict=True):
-        if count:
-            text.append(glyph * count, style=color)
-    return text
-
-
 def severity_chip(severity: str):
     grade = theme.SEVERITY_HEALTH.get(severity, "none")
     label = {"critical": "FAIL", "warning": "WARN", "info": "INFO"}.get(severity, "----")
@@ -432,3 +395,94 @@ def stamp_short(iso, with_date=True):
     if not with_date:
         return hhmm
     return "%s %s" % (date[5:10], hhmm)
+
+
+# --- slurmwatch-style resource rows ---------------------------------------
+
+_MARKER = "●"
+_MARKER_ASCII = "*"
+
+
+def resource_rows(job, ascii_mode: bool = False, width: int = 18):
+    """The job's resources in slurmwatch's row idiom: ``● LABEL bar value · detail``.
+
+    Deliberately the same shape as the live view. The two tools sit either side of
+    one job, and someone who watched it run should recognise the shape of what they
+    are reading afterwards. As in slurmwatch the marker is decorative -- it carries
+    the resource's identity hue, never a health grade; the bar and the number carry
+    the magnitude, and the verdict lives in the findings below.
+
+    A row whose value could not be measured draws an empty track and prints
+    ``n/a`` rather than a zero.
+    """
+    marker = _MARKER_ASCII if ascii_mode else _MARKER
+    rows = []
+
+    def row(label, color, fraction, value, detail=""):
+        text = Text()
+        text.append("  %s " % marker, style=color)
+        text.append("%-6s " % label, style=color)
+        text.append_text(
+            bar(
+                None if fraction is None else fraction * 100.0,
+                color,
+                width=width,
+                ascii_mode=ascii_mode,
+            )
+        )
+        text.append("  ")
+        text.append("%7s" % value, style=theme.INK)
+        if detail:
+            text.append("   %s %s" % ("-" if ascii_mode else "·", detail), style=theme.DIM)
+        rows.append(text)
+
+    row(
+        "TIME",
+        theme.ACCENT,
+        job.walltime_used,
+        format_percent(job.walltime_used),
+        "%s of %s" % (format_duration(job.elapsed), format_duration(job.timelimit)),
+    )
+    row(
+        "CPU",
+        theme.CPU_COLOR,
+        job.cpu_utilization,
+        format_percent(job.cpu_utilization),
+        "%s of %s over %s cores"
+        % (
+            format_duration(job.total_cpu),
+            format_duration(job.cpu_time),
+            job.cpu_count or "?",
+        ),
+    )
+    if job.system_cpu_fraction is not None:
+        row(
+            "KERNEL",
+            theme.MEM_COLOR,
+            job.system_cpu_fraction,
+            format_percent(job.system_cpu_fraction),
+            "%s of %s in the kernel"
+            % (format_duration(job.system_cpu), format_duration(job.total_cpu)),
+        )
+    detail = "%s of %s" % (format_bytes(job.max_rss), mem_text(job))
+    if job.max_rss_node:
+        detail += ", peak on %s" % job.max_rss_node
+    row("MEM", theme.MEM_COLOR, job.mem_utilization, format_percent(job.mem_utilization), detail)
+    if job.gpu_count:
+        row(
+            "GPU",
+            theme.GPU_COLOR,
+            None,
+            "n/a",
+            "%d device%s, %.1f GPU-hours - utilization is not recorded by Slurm"
+            % (job.gpu_count, "" if job.gpu_count == 1 else "s", job.gpu_hours or 0.0),
+        )
+    if job.io_bytes:
+        row(
+            "DISK",
+            theme.DISK_COLOR,
+            None,
+            format_bytes(job.io_rate) + "/s" if job.io_rate else "n/a",
+            "read %s, wrote %s" % (format_bytes(job.read_bytes), format_bytes(job.write_bytes)),
+        )
+    return rows

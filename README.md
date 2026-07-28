@@ -8,7 +8,7 @@
   <a href="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
-  <img src="https://img.shields.io/badge/tests-442-brightgreen.svg" alt="442 tests">
+  <img src="https://img.shields.io/badge/tests-457-brightgreen.svg" alt="457 tests">
 </p>
 
 <p align="center">
@@ -63,6 +63,23 @@ advice honest:
 - An **OOM kill outranks MaxRSS.** It is an event, not a sample.
 - Below three usable runs it says **"not enough evidence"** rather than guessing.
 
+## One job
+
+Same row idiom as `slurmwatch`, so a job you watched running looks like the same
+object afterwards. The marker carries the resource's identity, the bar and the
+number carry the magnitude, and the verdict lives in the findings below.
+
+```
+  ● TIME   ████████████████▉░    94.0%   · 1h52m49s of 2h00m00s
+  ● CPU    █████████████▎░░░░    73.5%   · 5h31m39s of 7h31m16s over 4 cores
+  ● KERNEL ▉░░░░░░░░░░░░░░░░░     4.7%   · 15m36s of 5h31m39s in the kernel
+  ● MEM    ████████████████▋░    92.3%   · 184.6 GiB of 200.0 GiB, peak on midway3-0600
+  ● GPU    ░░░░░░░░░░░░░░░░░░      n/a   · 3 devices, 5.6 GPU-hours — not recorded by Slurm
+  ● DISK   ░░░░░░░░░░░░░░░░░░  35.5 MiB/s  · read 105.0 GiB, wrote 130.0 GiB
+```
+
+Below that: every field Slurm recorded, then the findings.
+
 ## Why the numbers differ from `seff`
 
 Six traps, each found on a real record, each with a regression test naming the
@@ -88,7 +105,7 @@ that cost 400 GPU-hours outranks 400 two-second probes. The top 20 rows carry
 
 Job names encode parameters, so raw names barely group: 1,624 distinct names roll
 up to 1,687 groups. Collapsing digit runs (`s1e20`, `s2e47` → `s#e#`) folds that
-to 592, and a `VARIANTS` column says when a pattern covers several real names.
+to 592, and a `NAMES` column says how many real names a pattern covers.
 
 No cache: the full seven-month query is 1.54s and the index builds in 0.04s,
 which does not justify a database. Logs are read only when you open a job.
