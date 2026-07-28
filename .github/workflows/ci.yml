@@ -53,6 +53,24 @@ jobs:
           files: ./coverage.xml
           fail_ci_if_error: false
 
+  # The dependency floor is `textual>=0.86,<9`, and CI otherwise resolves the
+  # newest (8.2.8 at time of writing). Without this job that floor is a claim
+  # nobody checks -- and the two are genuinely different: 0.8x has no in-app
+  # text-selection API and still exposes `Static.renderable`, 8.x reverses both.
+  oldest-textual:
+    name: Oldest supported Textual
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - run: |
+          pip install -e ".[dev]"
+          pip install "textual==0.86.*"
+      - run: python -c "import textual; print('textual', textual.__version__)"
+      - run: python -m pytest -q
+
   no-slurm:
     name: Runs with no Slurm installed
     runs-on: ubuntu-latest

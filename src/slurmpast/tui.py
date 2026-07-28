@@ -57,13 +57,16 @@ DataTable > .datatable--cursor { background: $primary 30%; }
 """
 
 
-# Textual 0.89 has copy_to_clipboard (OSC 52) but not the in-app text-selection
-# API that arrived in 1.x, so dragging to select does not work. OSC 52 is
-# actually the better mechanism over SSH -- it reaches the clipboard on the
-# machine you are sitting at -- but it fails silently on some terminals and
-# needs `set -g set-clipboard on` inside tmux. So every copy is ALSO written to
-# a file, and the notification names it; that way the feature never
-# half-works with no way to tell.
+# Explicit copy keys, because selection support depends on the Textual version:
+# 0.89 (what a cluster conda env is likely to have) has no in-app text-selection
+# API at all, while 8.x does. Not capturing the mouse gives terminal-native
+# selection on every version, and these keys work regardless.
+#
+# copy_to_clipboard emits OSC 52, which is the better mechanism over SSH -- it
+# reaches the clipboard on the machine you are sitting at, not the login node --
+# but it fails silently on some terminals and needs `set -g set-clipboard on`
+# inside tmux. So every copy is ALSO written to a file and the notification names
+# it; that way the feature never half-works with no way to tell.
 _COPY_BINDINGS = [
     Binding("y", "copy_row", "Copy row"),
     Binding("Y", "copy_view", "Copy view", show=False),
@@ -519,6 +522,7 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         self._all = list(jobs)
         self._rows: list = []
         self._title = title
+        self.summary_text = Text()
         self.filter_mode = initial_filter
         self._jump = _RowJump()
 
@@ -613,6 +617,10 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         if extra is not None:
             summary.append("\n")
             summary.append_text(extra)
+        # Retained deliberately: reading it back off the Static means depending on
+        # widget internals, and `Static.renderable` exists in textual 0.89 but not
+        # in 8.x -- which is exactly how CI caught this.
+        self.summary_text = summary
         self.query_one("#summary", Static).update(summary)
         parts = [
             "%d job%s" % (len(jobs), "" if len(jobs) == 1 else "s"),

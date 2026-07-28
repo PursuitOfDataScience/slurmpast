@@ -332,9 +332,7 @@ class TestExcludedRecordsAreNamed:
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
-            body = app.screen.query_one("#summary").renderable
-            text = body.plain if hasattr(body, "plain") else str(body)
-            assert "excluded as unterminated" in text
+            assert "excluded as unterminated" in app.screen.summary_text.plain
 
     def test_plain_overview_shows_the_window(self):
         from slurmpast.demo import history as demo
@@ -422,9 +420,7 @@ class TestWorkloadBannerSurvivesRefresh:
             await pilot.pause()
             await pilot.press("f")  # this used to wipe it
             await pilot.pause()
-            body = app.screen.query_one("#summary").renderable
-            text = body.plain if hasattr(body, "plain") else str(body)
-            assert "failed repeatedly" in text
+            assert "failed repeatedly" in app.screen.summary_text.plain
 
     @pytest.mark.asyncio
     async def test_a_clean_workload_gets_no_banner(self):
