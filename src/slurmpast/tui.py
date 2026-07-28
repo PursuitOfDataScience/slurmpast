@@ -198,11 +198,11 @@ class HelpScreen(ModalScreen[None]):
             style=theme.FAINT,
         )
         body.append(
-            "\n  Dragging to select does not work: the terminal's mouse is handed\n"
-            "  to the app. Hold SHIFT (most terminals) or OPTION (macOS) and drag\n"
-            "  to select natively -- or use y / Y, which also drop the text in\n"
-            "  ~/.cache/slurmpast/clip.txt in case your terminal blocks OSC 52.\n"
-            "  For scripting, --plain and --json avoid the question entirely.\n",
+            "\n  Selecting text: just drag. Mouse capture is off by default, so\n"
+            "  your terminal handles selection exactly as it does elsewhere.\n"
+            "  Press M to hand the mouse to the app instead (enables clicking\n"
+            "  and wheel scrolling, disables drag-select), or start --mouse.\n"
+            "  y / Y also copy via OSC 52 and write ~/.cache/slurmpast/clip.txt.\n",
             style=theme.FAINT,
         )
         with Vertical(id="help-box"):
@@ -982,9 +982,16 @@ class SlurmpastApp(App[Any]):
     TITLE = "slurmpast"
     CSS = BASE_CSS
 
-    BINDINGS: ClassVar = [Binding("ctrl+c", "quit", "Quit", show=False)]
+    BINDINGS: ClassVar = [
+        Binding("ctrl+c", "quit", "Quit", show=False),
+        # Mouse capture is OFF by default so the terminal keeps the mouse and
+        # click-drag selection works like it does anywhere else. This toggles it
+        # back on for in-app clicking and wheel scrolling.
+        Binding("M", "toggle_mouse", "Mouse", show=False),
+    ]
 
-    def __init__(self, loader, window: str, ascii_mode=False, no_logs=False, log_dirs=()):
+    def __init__(self, loader, window: str, ascii_mode=False, no_logs=False, log_dirs=(),
+                 mouse=False):
         super().__init__()
         self._loader = loader
         self._window = window
@@ -992,6 +999,7 @@ class SlurmpastApp(App[Any]):
         self.ascii_mode = ascii_mode
         self.no_logs = no_logs
         self.log_dirs = list(log_dirs)
+        self.mouse_enabled = bool(mouse)
         self.load_error: str | None = None
 
     def on_mount(self) -> None:
@@ -1032,6 +1040,41 @@ class SlurmpastApp(App[Any]):
         if isinstance(screen, OverviewScreen):
             screen.refresh_rows()
 
+    def action_toggle_mouse(self) -> None:
+        """Hand the mouse to the terminal, or take it back.
+
+        With capture off, the terminal does its own click-drag selection -- the
+        thing every other program in your terminal does -- at the cost of in-app
+        clicking and wheel scrolling. Keyboard navigation is unaffected, which is
+        why off is the default.
+
+        This reaches into the driver, so it is defensive: a Textual that renames
+        these internals should degrade to a message, not a traceback.
+        """
+        driver = getattr(self, "_driver", None)
+        enable = not self.mouse_enabled
+        try:
+            driver._mouse = True  # the enable/disable methods are gated on this
+            if enable:
+                driver._enable_mouse_support()
+            else:
+                driver._disable_mouse_support()
+                driver._mouse = False
+        except Exception:
+            self.notify(
+                "could not toggle mouse capture on this Textual build; "
+                "restart with --mouse instead",
+                severity="warning",
+                timeout=6,
+            )
+            return
+        self.mouse_enabled = enable
+        if enable:
+            self.notify("mouse capture ON — in-app clicking and wheel scrolling; "
+                        "drag-select is disabled", timeout=5)
+        else:
+            self.notify("mouse capture OFF — drag to select text as normal", timeout=5)
+
     def action_reload(self) -> None:
         """Re-query and return to the overview.
 
@@ -1054,9 +1097,13 @@ def _elide(path: str, keep: int = 46) -> str:
     return "%s/…/%s" % (head, path.rsplit("/", 1)[-1])
 
 
-def run(loader, window: str, ascii_mode=False, no_logs=False, log_dirs=()) -> int:
+def run(loader, window: str, ascii_mode=False, no_logs=False, log_dirs=(), mouse=False) -> int:
     app = SlurmpastApp(
-        loader, window, ascii_mode=ascii_mode, no_logs=no_logs, log_dirs=log_dirs
+        loader, window, ascii_mode=ascii_mode, no_logs=no_logs, log_dirs=log_dirs, mouse=mouse
     )
-    app.run()
+    # mouse=False is what makes text selectable: Textual never emits the
+    # mouse-tracking escape sequences, so the terminal handles the mouse itself
+    # and drag-select behaves normally. Textual 0.89 has no in-app selection
+    # API, so this is the only way to get selection at all.
+    app.run(mouse=mouse)
     return 2 if app.load_error else 0

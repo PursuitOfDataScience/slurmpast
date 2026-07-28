@@ -112,22 +112,31 @@ Same shape as `slurmwatch`: a dashboard you land on, drill-down on single keys,
 | `/` | search name, job id, state or node |
 | `f` `s` | cycle filter / sort |
 | `y` `Y` | copy the selected row · copy the whole view |
+| `M` | toggle mouse capture (off by default, so drag-select works) |
 | `n` `p` `a` | nodes · patterns · flat job list |
 | `?` | help |
 
-**Getting text out.** Dragging to select does not work — a TUI takes the
-terminal's mouse, and Textual's in-app selection API only exists in 1.x. Three
-ways out, in order of convenience:
+### Selecting text just works
 
-- **`y` / `Y`** — copies via OSC 52, which reaches the clipboard on the machine
-  you are *sitting at*, not the login node. On a job screen, `y` copies the
-  entire post-mortem, paste-ready. Every copy is also written to
-  `~/.cache/slurmpast/clip.txt`, because OSC 52 fails silently on some
-  terminals and needs `set -g set-clipboard on` inside tmux — so the feature
-  never half-works with no way to tell.
-- **Hold `Shift`** (most terminals) or `Option` (macOS) and drag, to bypass
-  mouse reporting and select natively.
-- **`--plain` / `--json`** — for anything scripted, skip the question entirely.
+**Mouse capture is off by default**, so your terminal keeps the mouse and
+click-drag selection behaves exactly as it does in any other program — no
+modifier key, no clipboard protocol, no tmux setting.
+
+That is a deliberate trade. A TUI that enables mouse tracking takes drag events
+for itself and the terminal stops selecting; Textual 0.89 has no in-app
+selection API to put back in its place, so capturing the mouse means text simply
+cannot be selected. Since every screen here is fully keyboard-navigable —
+arrows, `enter`, digit-jump, single-letter views — capture buys very little and
+costs the one thing users expect from a terminal.
+
+- Press **`M`** (or start with **`--mouse`**) to hand the mouse to the app when
+  you do want clicking and wheel scrolling. Drag-select stops while it is on.
+- **`y` / `Y`** copy the focused row / whole view via OSC 52, which reaches the
+  clipboard on the machine you are *sitting at* rather than the login node. On a
+  job screen `y` copies the entire post-mortem, paste-ready. Every copy is also
+  written to `~/.cache/slurmpast/clip.txt`, because OSC 52 fails silently on
+  some terminals and needs `set -g set-clipboard on` inside tmux.
+- **`--plain` / `--json`** for anything scripted.
 
 Everything is also plain text, because a post-mortem you cannot paste into a
 ticket is half a tool: `--plain`, `--overview`, `--patterns`, `--nodes`,

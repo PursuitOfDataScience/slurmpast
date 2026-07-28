@@ -69,6 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-logs", action="store_true", help="do not read job logs")
     parser.add_argument("--steps", action="store_true", help="per-step accounting")
     parser.add_argument("--json", action="store_true", help="emit JSON")
+    parser.add_argument("--mouse", action="store_true",
+                        help="let the app capture the mouse (enables clicking and wheel "
+                             "scrolling, but disables your terminal's text selection)")
     parser.add_argument("--demo", action="store_true",
                         help="synthetic history — try it without Slurm, and drive the demo tape")
     parser.add_argument("--ascii", action="store_true", help="ASCII glyphs instead of Unicode")
@@ -313,6 +316,7 @@ def main(argv=None) -> int:
             ascii_mode=args.ascii,
             no_logs=args.no_logs,
             log_dirs=args.log_dir,
+            mouse=args.mouse,
         )
 
     try:
