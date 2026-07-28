@@ -18,7 +18,7 @@ and blocking the first paint on it would feel broken.
 
 from __future__ import annotations
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -88,9 +88,23 @@ class ClipboardMixin:
     Subclasses provide the text; this handles delivery and the notification.
     """
 
-    # Always mixed into a Screen, which supplies `app`. Declared so the type
-    # checker knows that, rather than sprinkling ignores at each use.
-    app: SlurmpastApp
+    @property
+    def sp(self) -> SlurmpastApp:
+        """This screen's app, narrowed to our concrete type.
+
+        Deliberately NOT an ``app: SlurmpastApp`` annotation. That overrides
+        ``MessagePump.app``, and mypy reports the clash once per subclass -- the
+        error lands on the ``class X(ClipboardMixin, Screen)`` line, not on the
+        annotation, so it cannot even be suppressed where it is written. A
+        separate accessor narrows the type with no override and no suppression,
+        and reads explicitly at each use.
+
+        The mixin has no base class, so it cannot know it will be combined with a
+        Screen that supplies ``app``. That single assumption is asserted here --
+        one ignore, on the one line that makes it -- rather than spread across
+        thirty call sites or hidden behind a Protocol shim.
+        """
+        return cast(SlurmpastApp, self.app)  # type: ignore[attr-defined]
 
     def clipboard_row(self) -> str:
         return ""
@@ -106,9 +120,9 @@ class ClipboardMixin:
 
     def _deliver(self, text: str, what: str) -> None:
         if not text:
-            self.app.notify("nothing to copy here", severity="warning", timeout=3)
+            self.sp.notify("nothing to copy here", severity="warning", timeout=3)
             return
-        self.app.copy_to_clipboard(text)
+        self.sp.copy_to_clipboard(text)
         path = _clip_path()
         written = False
         if path:
@@ -126,7 +140,7 @@ class ClipboardMixin:
         )
         if written:
             message += "\nalso written to %s" % path
-        self.app.notify(message, timeout=6)
+        self.sp.notify(message, timeout=6)
 
 
 def _digit_bindings(action: str):
@@ -285,7 +299,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
     # -- data ------------------------------------------------------------
 
     def refresh_rows(self) -> None:
-        history: History | None = self.app.history
+        history: History | None = self.sp.history
         table = self.query_one("#groups", DataTable)
         # The load worker can finish before on_mount has added the columns --
         # with an in-memory loader it reliably does. Populating a zero-column
@@ -303,7 +317,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         self._rows = groups
         summary.update(self._summary(history))
         table.clear()
-        ascii_mode = self.app.ascii_mode
+        ascii_mode = self.sp.ascii_mode
         for index, group in enumerate(groups, start=1):
             burned = (
                 "%.0f gpu-h" % group.gpu_hours
@@ -338,7 +352,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         # The filter is named only when it is actually filtering -- a bare
         # "everything" in the title bar is noise.
         parts = [
-            self.app.window,
+            self.sp.window,
             "%d workload%s" % (len(groups), "" if len(groups) == 1 else "s"),
             "by %s" % sort_label(self.sort_mode),
         ]
@@ -405,7 +419,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         )
 
     def clipboard_view(self) -> str:
-        history: History | None = self.app.history
+        history: History | None = self.sp.history
         if history is None:
             return ""
         from .report import Style, render_overview
@@ -417,7 +431,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
     def action_open(self) -> None:
         group = self._selected()
         if group is not None:
-            self.app.push_screen(WorkloadScreen(group))
+            self.sp.push_screen(WorkloadScreen(group))
 
     def action_digit(self, digit: str) -> None:
         row = self._jump.push(digit, len(self._rows))
@@ -437,18 +451,18 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         self.query_one("#search", Input).focus()
 
     def action_nodes(self) -> None:
-        self.app.push_screen(NodesScreen())
+        self.sp.push_screen(NodesScreen())
 
     def action_patterns(self) -> None:
-        self.app.push_screen(PatternsScreen())
+        self.sp.push_screen(PatternsScreen())
 
     def action_all_jobs(self) -> None:
-        history: History | None = self.app.history
+        history: History | None = self.sp.history
         if history is not None:
-            self.app.push_screen(JobListScreen(history.usable_jobs, "all jobs"))
+            self.sp.push_screen(JobListScreen(history.usable_jobs, "all jobs"))
 
     def action_help(self) -> None:
-        self.app.push_screen(HelpScreen())
+        self.sp.push_screen(HelpScreen())
 
     # Reactive watchers fire when the initial value is set, which happens before
     # on_mount has added the columns; refreshing then writes N values into a
@@ -547,7 +561,7 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         # Newest first: after a failed run you look at the most recent attempt.
         jobs.sort(key=lambda j: (j.start or j.submit or "", j.job_id), reverse=True)
         self._rows = jobs
-        ascii_mode = self.app.ascii_mode
+        ascii_mode = self.sp.ascii_mode
         table.clear()
         for index, job in enumerate(jobs, start=1):
             grade = theme.STATE_HEALTH.get(job.base_state, "none")
@@ -583,7 +597,7 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         idle = sum(1 for j in jobs if looks_like_noop(j))
         if idle:
             summary.append("  ·  %d never computed" % idle, style=theme.HEALTH_COLOR["warn"])
-        summary.append("  ·  window %s" % self.app.window, style=theme.FAINT)
+        summary.append("  ·  window %s" % self.sp.window, style=theme.FAINT)
         excluded = getattr(self, "_excluded", 0)
         if excluded:
             summary.append(
@@ -602,7 +616,7 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         self.query_one("#summary", Static).update(summary)
         parts = [
             "%d job%s" % (len(jobs), "" if len(jobs) == 1 else "s"),
-            self.app.window,
+            self.sp.window,
         ]
         if self.filter_mode != "all":
             parts.insert(1, dict(FILTERS).get(self.filter_mode, self.filter_mode))
@@ -668,7 +682,7 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
     def action_open(self) -> None:
         job = self._selected()
         if job is not None:
-            self.app.push_screen(JobScreen(job))
+            self.sp.push_screen(JobScreen(job))
 
     def action_digit(self, digit: str) -> None:
         row = self._jump.push(digit, len(self._rows))
@@ -684,7 +698,7 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         self.query_one("#search", Input).focus()
 
     def action_help(self) -> None:
-        self.app.push_screen(HelpScreen())
+        self.sp.push_screen(HelpScreen())
 
     def watch_filter_mode(self) -> None:
         if self.is_mounted:
@@ -724,7 +738,7 @@ class WorkloadScreen(JobListScreen):
         The point of the workload screen is that these findings are invisible
         per-job; `p` shows them all.
         """
-        history: History | None = self.app.history
+        history: History | None = self.sp.history
         if history is None:
             return None
         findings = history.group_patterns(self._group)
@@ -739,7 +753,7 @@ class WorkloadScreen(JobListScreen):
         return banner
 
     def action_patterns(self) -> None:
-        self.app.push_screen(PatternsScreen(self._group))
+        self.sp.push_screen(PatternsScreen(self._group))
 
 
 class JobScreen(ClipboardMixin, Screen[Any]):
@@ -792,20 +806,20 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         self.render_body()
 
     def action_help(self) -> None:
-        self.app.push_screen(HelpScreen())
+        self.sp.push_screen(HelpScreen())
 
     def render_body(self) -> None:
         job = self._job
-        ascii_mode = self.app.ascii_mode
+        ascii_mode = self.sp.ascii_mode
         # Logs are read here and only here -- eagerly scanning logs for 6,574
         # jobs at load time would dominate startup for data most of them never
         # need.
         log_path, log_text = (None, None)
-        if not self.app.no_logs:
-            log_path, log_text = load_for(job, extra_dirs=self.app.log_dirs)
+        if not self.sp.no_logs:
+            log_path, log_text = load_for(job, extra_dirs=self.sp.log_dirs)
         self._log_path, self._log_text = log_path, log_text
 
-        history: History | None = self.app.history
+        history: History | None = self.sp.history
         note = ""
         if history is not None and len(history) > 20:
             from .nodes import expand_nodelist, note_for_node
@@ -854,7 +868,7 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         if log_path:
             shown = log_path if self._show_paths else _elide(log_path)
             body.append("  log  %s\n" % shown, style=theme.FAINT)
-        elif not self.app.no_logs:
+        elif not self.sp.no_logs:
             body.append("  log  not found — pass --log-dir to help\n", style=theme.FAINT)
 
         body.append("\n")
@@ -896,7 +910,7 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
         self._group = group
 
     def clipboard_row(self) -> str:
-        history: History | None = self.app.history
+        history: History | None = self.sp.history
         if history is None:
             return ""
         from .report import Style, render_patterns
@@ -912,7 +926,7 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
         yield Footer()
 
     def on_mount(self) -> None:
-        history: History | None = self.app.history
+        history: History | None = self.sp.history
         self.sub_title = "patterns" + (" · %s" % self._group.name if self._group else "")
         body = Text()
         if history is None:
@@ -987,7 +1001,7 @@ class NodesScreen(ClipboardMixin, Screen[Any]):
         self.refresh_rows()
 
     def refresh_rows(self) -> None:
-        history: History | None = self.app.history
+        history: History | None = self.sp.history
         if history is None or not self.query_one("#nodes", DataTable).columns:
             return
         from .nodes import dominant_workload
@@ -1059,7 +1073,7 @@ class NodesScreen(ClipboardMixin, Screen[Any]):
         )
 
     def clipboard_row(self) -> str:
-        history: History | None = self.app.history
+        history: History | None = self.sp.history
         if history is None:
             return ""
         from .report import Style, render_nodes
