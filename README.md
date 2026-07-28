@@ -308,6 +308,7 @@ no third-party package and are usable as a library without a UI:
 
 ```python
 from slurmpast import Sacct, History, diagnose
+
 history = History(Sacct().history(user="you", since="-30days"))
 for group in history.groups[:5]:
     print(group.name, group.failed, group.gpu_hours)

@@ -1,6 +1,5 @@
 import string
 
-
 from slurmpast.index import (
     FILTERS,
     SORTS,

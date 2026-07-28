@@ -81,8 +81,8 @@ class TestWilson:
 
 def _placements(node, bad, total, name="node-evaluation", job_id_base=1000):
     """Synthesize `total` jobs on `node`, `bad` of them FAILED."""
-    from tests.conftest import row
     from slurmpast.sacct import parse
+    from tests.conftest import row
 
     rows = [
         row(

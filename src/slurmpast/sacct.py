@@ -118,7 +118,7 @@ def _run(args):
             args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
         )
     except OSError as exc:
-        raise SacctError("cannot execute %s: %s" % (args[0], exc))
+        raise SacctError("cannot execute %s: %s" % (args[0], exc)) from exc
     out, err = proc.communicate()
     if proc.returncode != 0:
         raise SacctError((err or "").strip() or "%s exited %d" % (args[0], proc.returncode))
@@ -336,7 +336,7 @@ def parse(text, fields=None):
     ]
 
 
-class Sacct(object):
+class Sacct:
     """Queries sacct, dropping fields the local Slurm rejects."""
 
     def __init__(self, runner=None, probe=None):
@@ -409,4 +409,4 @@ def live_job_ids(runner=None):
             out = run(["squeue", "--noheader", "--format=%i"])
         except SacctError:
             return None
-    return set(line.strip() for line in out.splitlines() if line.strip())
+    return {line.strip() for line in out.splitlines() if line.strip()}

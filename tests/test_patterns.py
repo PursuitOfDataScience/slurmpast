@@ -220,8 +220,8 @@ class TestMemorySearchUsesTheRealLimit:
     """
 
     def _series(self, req_mem):
-        from tests.conftest import row
         from slurmpast.sacct import parse
+        from tests.conftest import row
 
         spec = [
             ("48G", "OUT_OF_MEMORY"),

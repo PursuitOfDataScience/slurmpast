@@ -576,7 +576,7 @@ def _paging_rules(job, add):
             "The job was paging",
             "%s major page faults recorded. Memory pressure forced the kernel to "
             "fetch pages from disk, which is orders of magnitude slower than RAM "
-            "and does not show up as a failure." % "{:,}".format(int(pages)),
+            "and does not show up as a failure." % f"{int(pages):,}",
             "Raise --mem, or cut the working set. A job that pages can finish and "
             "still have run many times slower than it needed to.",
         )

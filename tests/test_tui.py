@@ -227,8 +227,8 @@ class TestDemoMode:
         assert all(j.job_id for j in jobs)
 
     def test_demo_contains_the_shapes_the_tool_looks_for(self):
-        from slurmpast.diagnose import diagnose
         from slurmpast.demo import history
+        from slurmpast.diagnose import diagnose
         from slurmpast.index import History
 
         h = History(history())
@@ -249,8 +249,8 @@ class TestDemoMode:
 
     def test_demo_includes_healthy_jobs_that_draw_nothing(self):
         """Restraint must be visible in the demo, not just claimed."""
-        from slurmpast.diagnose import diagnose
         from slurmpast.demo import history
+        from slurmpast.diagnose import diagnose
 
         clean = [j for j in history() if j.name == "midtrain"]
         assert clean

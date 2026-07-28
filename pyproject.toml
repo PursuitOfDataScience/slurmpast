@@ -63,8 +63,16 @@ target-version = "py310"
 # 206 findings the local run never saw. An explicit list makes the gate mean the
 # same thing on every machine.
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "C4", "T20"]
+# UP031 (%-format -> f-string) fires on 206 sites. Ruff auto-converts 113 of them
+# with all tests still passing, so the migration is safe -- but it also introduces
+# 28 line-length violations and leaves 93 sites for hand conversion. That is a
+# refactor, not a lint fix, and a half-migrated file is worse than a consistent
+# one. Recorded here rather than silently dropped.
+ignore = ["UP031"]
 
 [tool.ruff.lint.per-file-ignores]
+# A CLI writes to stdout; that is the point of it.
+"src/slurmpast/cli.py" = ["T201"]
 # Tests deliberately accept arguments they do not use (stub runners that must
 # match a real signature) and build fixtures with sacct's own CamelCase names.
 "tests/*" = ["ARG", "N802", "N803", "N806", "N815"]

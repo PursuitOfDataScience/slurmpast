@@ -80,7 +80,7 @@ def read_tail(path, max_bytes=MAX_TAIL_BYTES):
             if size > max_bytes:
                 handle.seek(size - max_bytes)
             raw = handle.read()
-    except (OSError, IOError):
+    except OSError:
         return None
     text = raw.decode("utf-8", "replace")
     return text.replace("\r\n", "\n").replace("\r", "\n")

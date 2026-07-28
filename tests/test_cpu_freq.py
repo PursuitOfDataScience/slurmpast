@@ -54,8 +54,8 @@ class TestImplausibleValuesAreDropped:
 
 class TestSurfacedOnlyWhenTrustworthy:
     def _job(self, freq):
-        from tests.conftest import row
         from slurmpast.sacct import parse
+        from tests.conftest import row
 
         return parse(
             "\n".join(
@@ -92,11 +92,11 @@ class TestSurfacedOnlyWhenTrustworthy:
     def test_section_shows_a_real_clock(self):
         from slurmpast.render import job_sections
 
-        rows = dict(
-            (label, value)
+        rows = {
+            label: value
             for _, block in job_sections(self._job("3.10M"))
             for label, value, _ in block
-        )
+        }
         assert "avg clock" in rows
         assert "3.10 GHz" in rows["avg clock"]
 
@@ -109,9 +109,9 @@ class TestSurfacedOnlyWhenTrustworthy:
     def test_downclocking_is_called_out(self):
         from slurmpast.render import job_sections
 
-        rows = dict(
-            (label, value)
+        rows = {
+            label: value
             for _, block in job_sections(self._job("800K"))
             for label, value, _ in block
-        )
+        }
         assert "downclocked" in rows["avg clock"]

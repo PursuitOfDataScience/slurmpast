@@ -122,7 +122,7 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
             states[job.base_state] = states.get(job.base_state, 0) + 1
         dominant, count = max(states.items(), key=lambda kv: kv[1])
 
-        limits = set(format_duration(j.timelimit) for j in failures if j.timelimit is not None)
+        limits = {format_duration(j.timelimit) for j in failures if j.timelimit is not None}
         hung = [j for j in failures if looks_like_noop(j)]
         wasted = sum(j.gpu_hours or 0.0 for j in failures)
 
@@ -204,7 +204,9 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
         if len(requests) < min_oom:
             continue
 
-        monotone = all(b >= a for a, b in zip(requests, requests[1:]))
+        # strict=False on purpose: this pairs a list with its own tail, so the
+        # lengths differ by one by construction.
+        monotone = all(b >= a for a, b in zip(requests, requests[1:], strict=False))
         walk = " -> ".join(format_bytes(v) for v in requests)
 
         # Did a later run succeed at a value that had already OOM'd? That proves

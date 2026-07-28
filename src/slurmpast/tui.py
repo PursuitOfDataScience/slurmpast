@@ -90,7 +90,7 @@ class ClipboardMixin:
 
     # Always mixed into a Screen, which supplies `app`. Declared so the type
     # checker knows that, rather than sprinkling ignores at each use.
-    app: "SlurmpastApp"
+    app: SlurmpastApp
 
     def clipboard_row(self) -> str:
         return ""
@@ -301,7 +301,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
             filter_groups(history.groups, self.filter_mode, self.search_text), self.sort_mode
         )
         self._rows = groups
-        summary.update(self._summary(history, len(groups)))
+        summary.update(self._summary(history))
         table.clear()
         ascii_mode = self.app.ascii_mode
         for index, group in enumerate(groups, start=1):
@@ -346,7 +346,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
             parts.insert(2, dict(FILTERS).get(self.filter_mode, self.filter_mode))
         self.sub_title = "  ·  ".join(parts)
 
-    def _summary(self, history: History, shown: int) -> Text:
+    def _summary(self, history: History) -> Text:
         stats = history.stats
         text = Text()
         text.append("%d jobs" % stats["jobs"], style="bold %s" % theme.INK)
@@ -468,11 +468,11 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
     def on_input_changed(self, event: Input.Changed) -> None:
         self.search_text = event.value
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_input_submitted(self, _event: Input.Submitted) -> None:
         self.query_one("#searchbar").remove_class("visible")
         self.query_one("#groups", DataTable).focus()
 
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+    def on_data_table_row_selected(self, _event: DataTable.RowSelected) -> None:
         self.action_open()
 
 
@@ -684,11 +684,11 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
     def on_input_changed(self, event: Input.Changed) -> None:
         self.search_text = event.value
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_input_submitted(self, _event: Input.Submitted) -> None:
         self.query_one("#searchbar").remove_class("visible")
         self.query_one("#jobs", DataTable).focus()
 
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+    def on_data_table_row_selected(self, _event: DataTable.RowSelected) -> None:
         self.action_open()
 
 
@@ -716,7 +716,7 @@ class WorkloadScreen(JobListScreen):
             # point of the workload screen is that these are invisible per-job.
             worst = render.sort_findings(findings)[0]
             banner = Text()
-            banner.append_text(render.severity_chip(worst.severity, self.app.ascii_mode))
+            banner.append_text(render.severity_chip(worst.severity))
             banner.append("  ")
             banner.append(worst.title, style="bold %s" % theme.INK)
             banner.append("\n  " + " ".join(render.wrap(worst.evidence, 100)), style=theme.DIM)
@@ -854,7 +854,7 @@ class JobScreen(ClipboardMixin, Screen[Any]):
             body.append("  nothing to flag.\n", style=theme.HEALTH_COLOR["ok"])
         for finding in findings:
             body.append("  ")
-            body.append_text(render.severity_chip(finding.severity, ascii_mode))
+            body.append_text(render.severity_chip(finding.severity))
             body.append("  %s\n" % finding.title, style="bold %s" % theme.INK)
             for line in render.wrap(finding.evidence, 86):
                 body.append("        %s\n" % line, style=theme.DIM)
@@ -872,7 +872,7 @@ class JobScreen(ClipboardMixin, Screen[Any]):
 class PatternsScreen(ClipboardMixin, Screen[Any]):
     """Cross-run findings: the things no single job can show."""
 
-    app: "SlurmpastApp"
+    app: SlurmpastApp
 
     BINDINGS: ClassVar = [
         Binding("q", "app.pop_screen", "Back"),
@@ -914,7 +914,6 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
         findings = (
             history.group_patterns(self._group) if self._group is not None else history.patterns
         )
-        ascii_mode = self.app.ascii_mode
         if not findings:
             body.append(
                 "  no cross-run pattern met its evidence threshold.\n",
@@ -927,7 +926,7 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
             )
         for finding in render.sort_findings(findings):
             body.append("  ")
-            body.append_text(render.severity_chip(finding.severity, ascii_mode))
+            body.append_text(render.severity_chip(finding.severity))
             body.append("  %s\n" % finding.title, style="bold %s" % theme.INK)
             for line in render.wrap(finding.evidence, 86):
                 body.append("        %s\n" % line, style=theme.DIM)
@@ -944,7 +943,7 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
 class NodesScreen(ClipboardMixin, Screen[Any]):
     """Per-node reliability, workload-controlled."""
 
-    app: "SlurmpastApp"
+    app: SlurmpastApp
 
     BINDINGS: ClassVar = [
         Binding("q", "app.pop_screen", "Back"),

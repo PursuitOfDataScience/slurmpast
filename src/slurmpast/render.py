@@ -133,13 +133,13 @@ def outcome_bar(completed: int, failed: int, cancelled: int, width: int = 16, as
         widths[biggest] -= 1
         overflow -= 1
 
-    for count, color in zip(widths, colors):
+    for count, color in zip(widths, colors, strict=True):
         if count:
             text.append(glyph * count, style=color)
     return text
 
 
-def severity_chip(severity: str, ascii_mode: bool = False):
+def severity_chip(severity: str):
     grade = theme.SEVERITY_HEALTH.get(severity, "none")
     label = {"critical": "FAIL", "warning": "WARN", "info": "INFO"}.get(severity, "----")
     return Text(label, style="bold %s" % theme.HEALTH_COLOR.get(grade, theme.FAINT))
@@ -285,7 +285,7 @@ def job_sections(job):
     if job.scheduled_by:
         timing.append(("scheduled by", job.scheduled_by, None))
     if job.priority is not None:
-        timing.append(("priority", "{:,}".format(job.priority), None))
+        timing.append(("priority", f"{job.priority:,}", None))
     sections.append(("timing", timing))
 
     # -- cpu -----------------------------------------------------------------
@@ -369,7 +369,7 @@ def job_sections(job):
         note = "   (%.0fx resident - address space, not memory used)" % ratio if ratio else ""
         mem.append(("virtual", "%s%s" % (format_bytes(job.max_vmsize), note), None))
     if job.max_pages:
-        mem.append(("page faults", "{:,}".format(int(job.max_pages)), None))
+        mem.append(("page faults", f"{int(job.max_pages):,}", None))
     sections.append(("memory", mem))
 
     # -- io ------------------------------------------------------------------

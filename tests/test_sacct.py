@@ -1,9 +1,9 @@
 import pytest
 
-from tests.conftest import row
 from slurmpast.model import Step
 from slurmpast.sacct import _FIELDS as _FIELDS_FOR_TEST
 from slurmpast.sacct import Sacct, SacctError, parse, supported_fields
+from tests.conftest import row
 
 
 class TestStepReconciliation:

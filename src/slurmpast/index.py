@@ -19,12 +19,12 @@ projections, so the UI never re-queries Slurm to answer a keystroke.
 
 from __future__ import annotations
 
-from typing import Callable, Iterable, NamedTuple, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from typing import NamedTuple
 
 from .diagnose import looks_like_noop
 from .model import Job
 from .patterns import find_memory_search, find_repeat_failures, goodput, group_key, usable
-
 
 # Core-hours one GPU-hour is worth when ranking mixed workloads. See
 # GroupStats.cost for why this number and not a site billing weight.
