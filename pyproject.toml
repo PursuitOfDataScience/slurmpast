@@ -43,7 +43,7 @@ dev = [
   # minor ruff release changing its rule defaults is exactly what broke the
   # first CI run here.
   "ruff>=0.15,<0.17",
-  "mypy>=1.8,<3",
+  "mypy>=2.3,<3",  # >=2.3: 2.2 added the MRO override check CI tripped on
 ]
 
 [tool.setuptools.dynamic]

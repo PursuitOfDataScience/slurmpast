@@ -388,3 +388,61 @@ class TestBarLooksLikeAGauge:
     def test_ascii_mode_has_no_block_glyphs(self):
         text = render.bar(50, "cyan", width=10, ascii_mode=True).plain
         assert set(text) <= set("#-")
+
+
+class TestWorkloadBannerSurvivesRefresh:
+    """The pattern banner was written into #summary from on_mount, but
+    refresh_rows rewrites that widget on every filter and search keystroke -- so
+    the banner vanished on the first `f` press. Found by mypy objecting to reading
+    `Static.renderable` back off the widget, which was the smell.
+    """
+
+    def _hung_workload(self):
+        from slurmpast.demo import history as demo
+
+        return [j for j in demo() if j.name == "cot-exp"]
+
+    @pytest.mark.asyncio
+    async def test_banner_is_present_initially(self):
+        app = make_app(self._hung_workload(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            extra = app.screen.extra_summary()
+            assert extra is not None
+            assert "failed repeatedly" in extra.plain
+
+    @pytest.mark.asyncio
+    async def test_banner_still_there_after_filtering(self):
+        app = make_app(self._hung_workload(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("f")  # this used to wipe it
+            await pilot.pause()
+            body = app.screen.query_one("#summary").renderable
+            text = body.plain if hasattr(body, "plain") else str(body)
+            assert "failed repeatedly" in text
+
+    @pytest.mark.asyncio
+    async def test_a_clean_workload_gets_no_banner(self):
+        from slurmpast.demo import history as demo
+
+        clean = [j for j in demo() if j.name == "midtrain"]
+        app = make_app(clean, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.screen.extra_summary() is None
+
+    @pytest.mark.asyncio
+    async def test_flat_job_list_has_no_banner_hook_content(self):
+        app = make_app(history(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            assert app.screen.extra_summary() is None

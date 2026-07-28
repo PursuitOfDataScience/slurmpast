@@ -595,6 +595,10 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         if self.search_text:
             summary.append("  ·  search: ", style=theme.FAINT)
             summary.append(self.search_text, style=theme.ACCENT)
+        extra = self.extra_summary()
+        if extra is not None:
+            summary.append("\n")
+            summary.append_text(extra)
         self.query_one("#summary", Static).update(summary)
         parts = [
             "%d job%s" % (len(jobs), "" if len(jobs) == 1 else "s"),
@@ -609,6 +613,15 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         if not self._rows or not (0 <= table.cursor_row < len(self._rows)):
             return None
         return self._rows[table.cursor_row]
+
+    def extra_summary(self) -> Text | None:
+        """Extra summary content a subclass wants appended. None by default.
+
+        A hook rather than a post-hoc patch: ``refresh_rows`` rewrites #summary on
+        every filter and search keystroke, so anything written into that widget
+        from ``on_mount`` was destroyed by the first ``f`` press.
+        """
+        return None
 
     def clipboard_row(self) -> str:
         job = self._selected()
@@ -705,29 +718,25 @@ class WorkloadScreen(JobListScreen):
         self._group = group
         self._excluded = group.excluded
 
-    def on_mount(self) -> None:
-        super().on_mount()
+    def extra_summary(self) -> Text | None:
+        """Surface the single worst cross-run pattern for this workload.
+
+        The point of the workload screen is that these findings are invisible
+        per-job; `p` shows them all.
+        """
         history: History | None = self.app.history
         if history is None:
-            return
+            return None
         findings = history.group_patterns(self._group)
-        if findings:
-            # Surface the single worst pattern inline; `p` shows them all. The
-            # point of the workload screen is that these are invisible per-job.
-            worst = render.sort_findings(findings)[0]
-            banner = Text()
-            banner.append_text(render.severity_chip(worst.severity))
-            banner.append("  ")
-            banner.append(worst.title, style="bold %s" % theme.INK)
-            banner.append("\n  " + " ".join(render.wrap(worst.evidence, 100)), style=theme.DIM)
-            existing = self.query_one("#summary", Static)
-            merged = Text()
-            merged.append_text(
-                existing.renderable if isinstance(existing.renderable, Text) else Text()
-            )
-            merged.append("\n")
-            merged.append_text(banner)
-            existing.update(merged)
+        if not findings:
+            return None
+        worst = render.sort_findings(findings)[0]
+        banner = Text()
+        banner.append_text(render.severity_chip(worst.severity))
+        banner.append("  ")
+        banner.append(worst.title, style="bold %s" % theme.INK)
+        banner.append("\n  " + " ".join(render.wrap(worst.evidence, 100)), style=theme.DIM)
+        return banner
 
     def action_patterns(self) -> None:
         self.app.push_screen(PatternsScreen(self._group))
