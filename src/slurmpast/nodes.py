@@ -81,9 +81,7 @@ def wilson_interval(successes, trials, z=Z):
     phat = successes / float(trials)
     denom = 1.0 + z * z / trials
     centre = (phat + z * z / (2.0 * trials)) / denom
-    margin = (
-        z * math.sqrt(phat * (1.0 - phat) / trials + z * z / (4.0 * trials * trials)) / denom
-    )
+    margin = z * math.sqrt(phat * (1.0 - phat) / trials + z * z / (4.0 * trials * trials)) / denom
     return (max(0.0, centre - margin), min(1.0, centre + margin))
 
 

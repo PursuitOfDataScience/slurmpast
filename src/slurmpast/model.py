@@ -229,11 +229,7 @@ class Job(NamedTuple):
     @property
     def cpu_count(self) -> int:
         return (
-            self.alloc_cpus
-            or self.ncpus
-            or _tres_int(self.alloc_tres, "cpu")
-            or self.req_cpus
-            or 0
+            self.alloc_cpus or self.ncpus or _tres_int(self.alloc_tres, "cpu") or self.req_cpus or 0
         )
 
     @property
@@ -323,10 +319,27 @@ class Job(NamedTuple):
 
     @property
     def cpu_freq(self) -> str:
+        """Raw ``AveCPUFreq`` string, kept for the JSON payload."""
         for step in self.work_steps:
             if step.ave_cpu_freq:
                 return step.ave_cpu_freq
         return ""
+
+    @property
+    def cpu_freq_hz(self) -> float | None:
+        """Average clock in hertz, or None when the record is not interpretable.
+
+        See duration.parse_cpu_freq: Slurm reports this field with an ambiguous
+        unit base, so a value that resolves to no plausible clock is dropped
+        rather than displayed.
+        """
+        from .duration import parse_cpu_freq
+
+        for step in self.work_steps:
+            hz = parse_cpu_freq(step.ave_cpu_freq)
+            if hz is not None:
+                return hz
+        return None
 
     @property
     def straggler_spread(self) -> float | None:

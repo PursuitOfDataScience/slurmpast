@@ -55,10 +55,7 @@ class TestNormalizeName:
 
 class TestGroupingUsesPatterns:
     def test_variants_counted(self, cot_exp):
-        jobs = [
-            cot_exp._replace(job_id=str(i), name="att-speed-%d" % (i * 7))
-            for i in range(1, 6)
-        ]
+        jobs = [cot_exp._replace(job_id=str(i), name="att-speed-%d" % (i * 7)) for i in range(1, 6)]
         group = build_groups(jobs)[0]
         assert group.name == "att-speed-#"
         assert group.distinct_names == 5
@@ -78,8 +75,7 @@ class TestTailSummary:
         from slurmpast.index import History
 
         jobs = [
-            cot_exp._replace(job_id=str(i), name="work-" + "abcdefghij"[i % 10])
-            for i in range(100)
+            cot_exp._replace(job_id=str(i), name="work-" + "abcdefghij"[i % 10]) for i in range(100)
         ]
         history = History(jobs)
         tail = history.tail_summary(3)

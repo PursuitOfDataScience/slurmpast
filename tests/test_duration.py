@@ -60,19 +60,19 @@ class TestParseBytes:
         assert parse_bytes("53741792K") == 53741792 * 1024
 
     def test_gibibytes_per_node(self):
-        assert parse_bytes("40Gn") == 40 * 1024 ** 3
+        assert parse_bytes("40Gn") == 40 * 1024**3
 
     def test_mebibytes_per_cpu(self):
-        assert parse_bytes("3810Mc") == 3810 * 1024 ** 2
+        assert parse_bytes("3810Mc") == 3810 * 1024**2
 
     def test_no_suffix(self):
-        assert parse_bytes("80G") == 80 * 1024 ** 3
+        assert parse_bytes("80G") == 80 * 1024**3
 
     def test_bare_number(self):
         assert parse_bytes("1024") == 1024
 
     def test_fractional(self):
-        assert parse_bytes("1.5G") == int(1.5 * 1024 ** 3)
+        assert parse_bytes("1.5G") == int(1.5 * 1024**3)
 
     @pytest.mark.parametrize("text", ["", "Unknown", None, "n/a"])
     def test_missing_is_none(self, text):

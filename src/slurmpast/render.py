@@ -11,7 +11,12 @@ import math
 from rich.text import Text
 
 from . import theme
-from .duration import format_bytes, format_duration, format_percent
+from .duration import (
+    format_bytes,
+    format_cpu_freq,
+    format_duration,
+    format_percent,
+)
 from .model import Job, severity_rank
 
 
@@ -33,13 +38,53 @@ def bar_cells(percent: float | None, width: int) -> int:
     return int(cells)
 
 
+# Partial-cell caps, so a bar lands on its true position instead of snapping to
+# the nearest whole cell. Same glyph set slurmwatch uses.
+_EIGHTHS = "▏▎▍▌▋▊▉"
+
+
 def bar(percent: float | None, color: str, width: int = theme.BAR_WIDTH, ascii_mode: bool = False):
-    """A magnitude bar. ``None`` draws an empty track, never a full or zero bar."""
-    full, empty = ("#", "-") if ascii_mode else ("█", "─")
-    lit = bar_cells(percent, width)
+    """A magnitude bar, matching slurmwatch's.
+
+    The empty track is a shaded block (``░``) in a faint neutral, NOT a line
+    glyph -- ``─`` renders as a string of dashes, which reads as punctuation
+    rather than as the unfilled remainder of a gauge.
+
+    The fill is drawn to one-eighth-of-a-cell precision. Two rules keep the bar
+    honest against the number printed beside it: the last eighth is withheld
+    until the percentage *rounds* to 100, so a visually full bar always means
+    100%; and anything that displays as >=1% keeps at least a sliver, so a bar
+    never reads empty next to a non-zero figure.
+
+    ``None`` draws an empty track -- never a full or a zero bar.
+    """
+    if width <= 0:
+        return Text()
+    if percent is None or math.isnan(percent):
+        return Text(("-" if ascii_mode else "░") * width, style=theme.FAINT)
+
+    percent = min(max(percent, 0.0), 100.0)
     text = Text()
-    text.append(full * lit, style=color)
-    text.append(empty * (width - lit), style=theme.FAINT)
+    if ascii_mode:
+        full = bar_cells(percent, width)
+        text.append("#" * full, style=color)
+        text.append("-" * (width - full), style=theme.FAINT)
+        return text
+
+    eighths = min(width * 8, round(percent / 100.0 * width * 8))
+    # Withhold the last eighth until the value rounds to 100 *at the precision we
+    # print it* -- labels here carry one decimal, so a full bar beside "99.6%"
+    # would contradict itself.
+    if eighths >= width * 8 and round(percent, 1) < 100.0:
+        eighths = width * 8 - 1
+    eighths = 0 if round(percent, 1) < 1.0 else max(1, eighths)
+    full, rem = divmod(int(eighths), 8)
+    fill = "█" * full + (_EIGHTHS[rem - 1] if rem else "")
+    if fill:
+        text.append(fill, style=color)
+    empty = width - full - (1 if rem else 0)
+    if empty > 0:
+        text.append("░" * empty, style=theme.FAINT)
     return text
 
 
@@ -68,24 +113,27 @@ def outcome_bar(completed: int, failed: int, cancelled: int, width: int = 16, as
     total = completed + failed + cancelled
     text = Text()
     if not total:
-        return Text(("-" if ascii_mode else "─") * width, style=theme.FAINT)
+        return Text(("-" if ascii_mode else "░") * width, style=theme.FAINT)
     parts = [
         (completed, theme.HEALTH_COLOR["ok"]),
         (failed, theme.HEALTH_COLOR["crit"]),
         (cancelled, theme.FAINT),
     ]
-    cells = []
+    widths: list[int] = []
+    colors: list[str] = []
     for count, color in parts:
-        n = 0 if not count else max(1, int(round(width * count / float(total))))
-        cells.append([n, color])
-    overflow = sum(c[0] for c in cells) - width
+        widths.append(0 if not count else max(1, int(round(width * count / float(total)))))
+        colors.append(color)
+
+    overflow = sum(widths) - width
     while overflow > 0:  # trim the widest segment first so minorities survive
-        widest = max(cells, key=lambda c: c[0])
-        if widest[0] <= 1:
+        biggest = max(range(len(widths)), key=lambda i: widths[i])
+        if widths[biggest] <= 1:
             break
-        widest[0] -= 1
+        widths[biggest] -= 1
         overflow -= 1
-    for count, color in cells:
+
+    for count, color in zip(widths, colors):
         if count:
             text.append(glyph * count, style=color)
     return text
@@ -166,6 +214,7 @@ def sort_findings(findings):
 # --- the full job detail, shared by the dashboard and the plain renderer ----
 # One source of truth so the two never drift: both consume these sections.
 
+
 def _pct_of(value, whole):
     if value is None or not whole:
         return None
@@ -183,11 +232,22 @@ def job_sections(job):
 
     # -- identity ------------------------------------------------------------
     ident = [("name", job.name or "n/a", None)]
-    ident.append(("account", "%s / %s / %s"
-                  % (job.partition or "?", job.qos or "?", job.account or "?"), None))
+    ident.append(
+        (
+            "account",
+            "%s / %s / %s" % (job.partition or "?", job.qos or "?", job.account or "?"),
+            None,
+        )
+    )
     if job.node_list:
-        ident.append(("nodes", "%s  (%d node%s)"
-                      % (job.node_list, job.node_count, "" if job.node_count == 1 else "s"), None))
+        ident.append(
+            (
+                "nodes",
+                "%s  (%d node%s)"
+                % (job.node_list, job.node_count, "" if job.node_count == 1 else "s"),
+                None,
+            )
+        )
     if job.constraints:
         ident.append(("constraint", job.constraints, None))
     if job.reservation:
@@ -208,10 +268,18 @@ def job_sections(job):
         timing.append(("ended", job.end, None))
     if job.queue_wait is not None:
         timing.append(("queued for", format_duration(job.queue_wait), None))
-    timing.append(("walltime", "%s of %s   (%s)"
-                   % (format_duration(job.elapsed), format_duration(job.timelimit),
-                      format_percent(job.walltime_used)),
-                   _pct_of(job.walltime_used, 1.0)))
+    timing.append(
+        (
+            "walltime",
+            "%s of %s   (%s)"
+            % (
+                format_duration(job.elapsed),
+                format_duration(job.timelimit),
+                format_percent(job.walltime_used),
+            ),
+            _pct_of(job.walltime_used, 1.0),
+        )
+    )
     if job.suspended:
         timing.append(("suspended", format_duration(job.suspended), None))
     if job.scheduled_by:
@@ -221,26 +289,52 @@ def job_sections(job):
     sections.append(("timing", timing))
 
     # -- cpu -----------------------------------------------------------------
-    cpu = [("total", "%s of %s allocated   (%s over %s core%s)"
-            % (format_duration(job.total_cpu), format_duration(job.cpu_time),
-               format_percent(job.cpu_utilization), job.cpu_count or "?",
-               "" if job.cpu_count == 1 else "s"),
-            _pct_of(job.cpu_utilization, 1.0))]
+    cpu = [
+        (
+            "total",
+            "%s of %s allocated   (%s over %s core%s)"
+            % (
+                format_duration(job.total_cpu),
+                format_duration(job.cpu_time),
+                format_percent(job.cpu_utilization),
+                job.cpu_count or "?",
+                "" if job.cpu_count == 1 else "s",
+            ),
+            _pct_of(job.cpu_utilization, 1.0),
+        )
+    ]
     if job.user_cpu is not None or job.system_cpu is not None:
-        cpu.append(("user / system", "%s / %s   (kernel %s)"
-                    % (format_duration(job.user_cpu), format_duration(job.system_cpu),
-                       format_percent(job.system_cpu_fraction)),
-                    _pct_of(job.system_cpu_fraction, 1.0)))
-    if job.cpu_freq:
-        cpu.append(("frequency", job.cpu_freq, None))
+        cpu.append(
+            (
+                "user / system",
+                "%s / %s   (kernel %s)"
+                % (
+                    format_duration(job.user_cpu),
+                    format_duration(job.system_cpu),
+                    format_percent(job.system_cpu_fraction),
+                ),
+                _pct_of(job.system_cpu_fraction, 1.0),
+            )
+        )
+    freq_hz = job.cpu_freq_hz
+    if freq_hz is not None:
+        note = ""
+        if freq_hz < 1.5e9:
+            note = "   (downclocked)"
+        cpu.append(("avg clock", format_cpu_freq(freq_hz) + note, None))
     if job.task_count:
         cpu.append(("tasks", str(job.task_count), None))
     spread = job.straggler_spread
     if spread is not None:
         node, task = job.slowest_task
         where = " (task %s on %s)" % (task or "?", node) if node else ""
-        cpu.append(("slowest task", "%s below average%s" % (format_percent(spread), where),
-                    _pct_of(spread, 1.0)))
+        cpu.append(
+            (
+                "slowest task",
+                "%s below average%s" % (format_percent(spread), where),
+                _pct_of(spread, 1.0),
+            )
+        )
     sections.append(("cpu", cpu))
 
     # -- memory --------------------------------------------------------------
@@ -249,13 +343,23 @@ def job_sections(job):
         note = ""
         if job.mem_limit_bytes and job.max_rss > job.mem_limit_bytes:
             note = "   ABOVE THE LIMIT - not a working set"
-        mem.append(("peak (MaxRSS)", "%s   (%s)%s"
-                    % (format_bytes(job.max_rss), format_percent(job.mem_utilization), note),
-                    _pct_of(job.mem_utilization, 1.0)))
+        mem.append(
+            (
+                "peak (MaxRSS)",
+                "%s   (%s)%s"
+                % (format_bytes(job.max_rss), format_percent(job.mem_utilization), note),
+                _pct_of(job.mem_utilization, 1.0),
+            )
+        )
     if job.max_rss_node:
-        mem.append(("peak on", "%s%s"
-                    % (job.max_rss_node,
-                       " task %s" % job.max_rss_task if job.max_rss_task else ""), None))
+        mem.append(
+            (
+                "peak on",
+                "%s%s"
+                % (job.max_rss_node, " task %s" % job.max_rss_task if job.max_rss_task else ""),
+                None,
+            )
+        )
     if job.ave_rss is not None:
         imbalance = job.rss_task_imbalance
         extra = "   (%.1fx the average)" % imbalance if imbalance and imbalance >= 1.5 else ""
@@ -281,10 +385,15 @@ def job_sections(job):
 
     # -- gpu -----------------------------------------------------------------
     if job.gpu_count:
-        gpu = [("devices", str(job.gpu_count), None),
-               ("gpu-hours", "%.1f" % (job.gpu_hours or 0.0), None),
-               ("utilization", "not recorded - gres/gpuutil is absent from this "
-                               "cluster's accounting", None)]
+        gpu = [
+            ("devices", str(job.gpu_count), None),
+            ("gpu-hours", "%.1f" % (job.gpu_hours or 0.0), None),
+            (
+                "utilization",
+                "not recorded - gres/gpuutil is absent from this cluster's accounting",
+                None,
+            ),
+        ]
         sections.append(("gpu", gpu))
 
     # -- outcome -------------------------------------------------------------

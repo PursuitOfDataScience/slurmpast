@@ -163,7 +163,7 @@ SORTS: tuple[tuple[str, str], ...] = (
     ("name", "name"),
 )
 
-_SORT_KEYS: dict[str, Callable[[GroupStats], object]] = {
+_SORT_KEYS: dict[str, Callable[[GroupStats], tuple]] = {
     "cost": lambda g: (-g.cost, -g.total),
     "failures": lambda g: (-(g.failed + g.noop), -g.cost),
     "rate": lambda g: (-(g.failure_rate or 0.0), -g.total),

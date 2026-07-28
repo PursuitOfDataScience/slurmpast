@@ -5,9 +5,10 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
-  <img src="https://img.shields.io/badge/tests-308-brightgreen.svg" alt="308 tests">
+  <img src="https://img.shields.io/badge/tests-399-brightgreen.svg" alt="399 tests">
   <img src="https://img.shields.io/badge/status-beta-orange.svg" alt="Beta">
 </p>
 
@@ -323,7 +324,7 @@ log found, the CUDA-OOM and traceback rules stay silent rather than speculate.
 
 ## Status
 
-Beta. 308 tests. The diagnosis thresholds are heuristics drawn from one
+Beta. 399 tests, 86% coverage. The diagnosis thresholds are heuristics drawn from one
 cluster's measured history — conservative (an allocation must run 5 minutes *and*
 use under 10 CPU-seconds before it is called a hang, ~20× margin over the
 observed median) but not validated elsewhere. `--nodes` is the piece most likely

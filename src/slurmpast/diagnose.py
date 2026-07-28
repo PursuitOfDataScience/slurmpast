@@ -41,10 +41,10 @@ RSS_SPREAD_SUSPECT = 100.0
 SYSTEM_CPU_HEAVY = 0.30
 # Sustained I/O above this is worth naming: it is the rate at which the shared
 # capacity-tier filesystem, not the GPU, sets the pace.
-IO_RATE_LOUD = 100 * 1024 ** 2  # 100 MiB/s
+IO_RATE_LOUD = 100 * 1024**2  # 100 MiB/s
 # Minimum bytes before commenting on I/O at all -- a short job moving a little
 # data is not interesting.
-IO_VOLUME_FLOOR = 10 * 1024 ** 3  # 10 GiB
+IO_VOLUME_FLOOR = 10 * 1024**3  # 10 GiB
 # Fraction by which the slowest task may lag the average before it is a
 # straggler. In a synchronous collective every other rank waits on this one.
 STRAGGLER_SPREAD = 0.25
@@ -56,7 +56,7 @@ PAGING_FLOOR = 1000
 # Only mention unused memory when a COMPLETED job left this much on the table,
 # and only when the absolute waste is material (see MEM_SLACK_FLOOR).
 MEM_SLACK = 0.35
-MEM_SLACK_FLOOR = 32 * 1024 ** 3  # 32 GiB unused
+MEM_SLACK_FLOOR = 32 * 1024**3  # 32 GiB unused
 
 _CUDA_OOM_MARKERS = (
     "cuda out of memory",
@@ -244,8 +244,7 @@ def _memory_rules(job, add):
                     ),
                     "Trim --mem toward %s (peak plus ~30%% headroom). Memory you "
                     "reserve is memory no one else can use, and it narrows which "
-                    "nodes can host the job."
-                    % format_bytes(int(rss * 1.3)),
+                    "nodes can host the job." % format_bytes(int(rss * 1.3)),
                 )
             )
 

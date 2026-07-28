@@ -41,7 +41,7 @@ class TestTimestampsInJobList:
         app = make_app(history(), no_logs=True)
         async with app.run_test() as pilot:
             await pilot.pause()
-            await pilot.press("a")          # flat job list
+            await pilot.press("a")  # flat job list
             await pilot.pause()
             from textual.widgets import DataTable
 
@@ -259,7 +259,7 @@ class TestWindowIsVisible:
         async with app.run_test() as pilot:
             await pilot.pause()
             assert "everything" not in app.screen.sub_title
-            await pilot.press("f")          # -> "problem"
+            await pilot.press("f")  # -> "problem"
             await pilot.pause()
             assert "failed, timed out, or idle" in app.screen.sub_title
 
@@ -314,8 +314,7 @@ class TestExcludedRecordsAreNamed:
     def test_group_counts_what_it_lost(self):
         from slurmpast.index import build_groups
 
-        group = [g for g in build_groups(self._with_a_running_job())
-                 if g.name == "soup-merge"][0]
+        group = [g for g in build_groups(self._with_a_running_job()) if g.name == "soup-merge"][0]
         assert group.total == 1
         assert group.excluded == 1
 
@@ -345,3 +344,47 @@ class TestExcludedRecordsAreNamed:
         h = History(demo(), window="now-30days → now")
         text = render_overview(h, style=Style(enabled=False))
         assert "window now-30days → now" in text
+
+
+class TestBarLooksLikeAGauge:
+    """The empty track was ``─``, which renders as a string of dashes and reads as
+    punctuation rather than the unfilled remainder of a bar. slurmwatch uses a
+    shaded block; these two tools sit either side of the same job and should not
+    look like different products."""
+
+    def test_empty_track_is_a_shaded_block_not_a_line(self):
+        text = render.bar(40, "cyan", width=10).plain
+        assert "░" in text
+        assert "─" not in text
+
+    def test_partial_cells_are_drawn(self):
+        """Eighth-block caps land the fill on its true position.
+
+        30% of 8 cells is 2.4, so the cap must appear. (37% of 8 lands on exactly
+        3 whole cells -- a value with no remainder correctly draws no cap.)
+        """
+        text = render.bar(30, "cyan", width=8).plain
+        assert any(g in text for g in "▏▎▍▌▋▊▉")
+
+    def test_no_cap_when_the_fill_lands_on_a_whole_cell(self):
+        assert render.bar(37, "cyan", width=8).plain == "███░░░░░"
+
+    def test_zero_is_an_empty_track_not_a_blank(self):
+        assert render.bar(0, "cyan", width=6).plain == "░" * 6
+
+    def test_none_is_an_empty_track(self):
+        assert render.bar(None, "cyan", width=6).plain == "░" * 6
+
+    def test_a_sliver_survives_for_any_visible_percentage(self):
+        """A bar must never read empty beside a non-zero number."""
+        assert render.bar(1, "cyan", width=20).plain[0] != "░"
+
+    def test_full_only_when_it_rounds_to_100_at_our_precision(self):
+        """Labels carry one decimal, so 99.6% must not draw a completely full bar."""
+        assert "░" not in render.bar(100, "cyan", width=10).plain
+        near = render.bar(99.6, "cyan", width=10).plain
+        assert near != "█" * 10
+
+    def test_ascii_mode_has_no_block_glyphs(self):
+        text = render.bar(50, "cyan", width=10, ascii_mode=True).plain
+        assert set(text) <= set("#-")

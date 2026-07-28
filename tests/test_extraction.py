@@ -32,17 +32,32 @@ def build(alloc=None, batch=None):
     by the override it passed, not by the fixture.
     """
     alloc_fields = {
-        "JobID": "900", "JobName": "w", "Partition": "test", "State": "COMPLETED",
-        "ExitCode": "0:0", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T01:00:00",
-        "ElapsedRaw": "3600", "Elapsed": "01:00:00", "TimelimitRaw": "120",
-        "AllocTRES": "billing=8,cpu=8,mem=64G,node=1", "AllocCPUS": "8", "NCPUS": "8",
-        "NNodes": "1", "NodeList": "midway3-0600",
+        "JobID": "900",
+        "JobName": "w",
+        "Partition": "test",
+        "State": "COMPLETED",
+        "ExitCode": "0:0",
+        "Start": "2026-01-01T00:00:00",
+        "End": "2026-01-01T01:00:00",
+        "ElapsedRaw": "3600",
+        "Elapsed": "01:00:00",
+        "TimelimitRaw": "120",
+        "AllocTRES": "billing=8,cpu=8,mem=64G,node=1",
+        "AllocCPUS": "8",
+        "NCPUS": "8",
+        "NNodes": "1",
+        "NodeList": "midway3-0600",
     }
     batch_fields = {
-        "JobID": "900.batch", "JobName": "batch", "State": "COMPLETED",
-        "ElapsedRaw": "3600", "CPUTimeRAW": "28800",
-        "TotalCPU": "04:00:00", "UserCPU": "03:50:00", "SystemCPU": "10:00.000",
-        "MaxRSS": "%dK" % (50 * 1024 ** 2),
+        "JobID": "900.batch",
+        "JobName": "batch",
+        "State": "COMPLETED",
+        "ElapsedRaw": "3600",
+        "CPUTimeRAW": "28800",
+        "TotalCPU": "04:00:00",
+        "UserCPU": "03:50:00",
+        "SystemCPU": "10:00.000",
+        "MaxRSS": "%dK" % (50 * 1024**2),
     }
     alloc_fields.update(alloc or {})
     batch_fields.update(batch or {})
@@ -94,10 +109,12 @@ class TestCpuSplit:
 
 class TestDiskReadWriteSplit:
     def test_read_and_write_are_separate(self):
-        job = build(batch={
-            "TRESUsageInTot": "cpu=04:00:00,fs/disk=112710599158",
-            "TRESUsageOutTot": "fs/disk=139565725797",
-        })
+        job = build(
+            batch={
+                "TRESUsageInTot": "cpu=04:00:00,fs/disk=112710599158",
+                "TRESUsageOutTot": "fs/disk=139565725797",
+            }
+        )
         assert job.read_bytes == 112710599158
         assert job.write_bytes == 139565725797
 
@@ -107,24 +124,26 @@ class TestDiskReadWriteSplit:
         assert job.write_bytes == 139565725797
 
     def test_io_total_and_rate(self):
-        job = build(batch={
-            "TRESUsageInTot": "fs/disk=3600000000",
-            "TRESUsageOutTot": "fs/disk=3600000000",
-        })
+        job = build(
+            batch={
+                "TRESUsageInTot": "fs/disk=3600000000",
+                "TRESUsageOutTot": "fs/disk=3600000000",
+            }
+        )
         assert job.io_bytes == 7200000000
         assert job.io_rate == pytest.approx(2000000.0)
 
     def test_max_disk_fields_used_when_tres_absent(self):
         job = build(batch={"MaxDiskRead": "107489.20M", "MaxDiskWrite": "133100.25M"})
-        assert job.read_bytes == pytest.approx(107489.20 * 1024 ** 2, rel=1e-6)
-        assert job.write_bytes == pytest.approx(133100.25 * 1024 ** 2, rel=1e-6)
+        assert job.read_bytes == pytest.approx(107489.20 * 1024**2, rel=1e-6)
+        assert job.write_bytes == pytest.approx(133100.25 * 1024**2, rel=1e-6)
 
     def test_heavy_io_flagged(self):
-        job = build(batch={"TRESUsageInTot": "fs/disk=%d" % (500 * 1024 ** 3)})
+        job = build(batch={"TRESUsageInTot": "fs/disk=%d" % (500 * 1024**3)})
         assert "io-heavy" in codes(job)
 
     def test_modest_io_is_only_informational(self):
-        job = build(batch={"TRESUsageInTot": "fs/disk=%d" % (20 * 1024 ** 3)})
+        job = build(batch={"TRESUsageInTot": "fs/disk=%d" % (20 * 1024**3)})
         assert "io-volume" in codes(job)
         assert "io-heavy" not in codes(job)
 
@@ -143,8 +162,9 @@ class TestMemoryDetail:
         assert build(batch={"AveRSS": "500000K"}).ave_rss == 500000 * 1024
 
     def test_task_imbalance(self):
-        job = build(batch={"MaxRSS": "1000000K", "AveRSS": "250000K", "NTasks": "4"},
-                    alloc={"NTasks": "4"})
+        job = build(
+            batch={"MaxRSS": "1000000K", "AveRSS": "250000K", "NTasks": "4"}, alloc={"NTasks": "4"}
+        )
         assert job.rss_task_imbalance == pytest.approx(4.0)
         assert "task-memory-imbalance" in codes(job)
 
@@ -166,8 +186,9 @@ class TestMemoryDetail:
         assert "memory-slack" not in codes(job)
 
     def test_mem_utilization(self):
-        job = build(alloc={"AllocTRES": "cpu=8,mem=100G,node=1"},
-                    batch={"MaxRSS": "%dK" % (50 * 1024 ** 2)})
+        job = build(
+            alloc={"AllocTRES": "cpu=8,mem=100G,node=1"}, batch={"MaxRSS": "%dK" % (50 * 1024**2)}
+        )
         assert job.mem_utilization == pytest.approx(0.5, abs=1e-3)
 
 
@@ -181,32 +202,43 @@ class TestPaging:
 
 class TestStragglers:
     def test_straggler_detected(self):
-        job = build(alloc={"NTasks": "8"},
-                    batch={"NTasks": "8", "AveCPU": "01:00:00", "MinCPU": "00:20:00"})
+        job = build(
+            alloc={"NTasks": "8"}, batch={"NTasks": "8", "AveCPU": "01:00:00", "MinCPU": "00:20:00"}
+        )
         assert job.straggler_spread == pytest.approx(2 / 3.0)
         assert "straggler" in codes(job)
 
     def test_balanced_tasks_not_flagged(self):
-        job = build(alloc={"NTasks": "8"},
-                    batch={"NTasks": "8", "AveCPU": "01:00:00", "MinCPU": "00:58:00"})
+        job = build(
+            alloc={"NTasks": "8"}, batch={"NTasks": "8", "AveCPU": "01:00:00", "MinCPU": "00:58:00"}
+        )
         assert "straggler" not in codes(job)
 
     def test_single_task_job_never_a_straggler(self):
-        job = build(alloc={"NTasks": "1"},
-                    batch={"NTasks": "1", "AveCPU": "01:00:00", "MinCPU": "00:01:00"})
+        job = build(
+            alloc={"NTasks": "1"}, batch={"NTasks": "1", "AveCPU": "01:00:00", "MinCPU": "00:01:00"}
+        )
         assert job.straggler_spread is None
         assert "straggler" not in codes(job)
 
     def test_slowest_task_attributed(self):
-        job = build(alloc={"NTasks": "4"},
-                    batch={"NTasks": "4", "AveCPU": "01:00:00", "MinCPU": "00:10:00",
-                           "MinCPUNode": "midway3-0385", "MinCPUTask": "2"})
+        job = build(
+            alloc={"NTasks": "4"},
+            batch={
+                "NTasks": "4",
+                "AveCPU": "01:00:00",
+                "MinCPU": "00:10:00",
+                "MinCPUNode": "midway3-0385",
+                "MinCPUTask": "2",
+            },
+        )
         assert job.slowest_task == ("midway3-0385", "2")
         assert "midway3-0385" in find(job, "straggler").evidence
 
     def test_straggler_advice_warns_about_the_victim(self):
-        job = build(alloc={"NTasks": "4"},
-                    batch={"NTasks": "4", "AveCPU": "01:00:00", "MinCPU": "00:10:00"})
+        job = build(
+            alloc={"NTasks": "4"}, batch={"NTasks": "4", "AveCPU": "01:00:00", "MinCPU": "00:10:00"}
+        )
         assert "victim" in find(job, "straggler").action.lower()
 
 
@@ -230,8 +262,15 @@ class TestSchedulingAndContext:
         assert build(alloc={"DerivedExitCode": "2:0"}).derived_exit_code == 2
 
     def test_identity_fields(self):
-        job = build(alloc={"Cluster": "midway3", "Group": "youzhi", "UID": "94074",
-                           "WCKey": "proj", "Reservation": "rossby"})
+        job = build(
+            alloc={
+                "Cluster": "midway3",
+                "Group": "youzhi",
+                "UID": "94074",
+                "WCKey": "proj",
+                "Reservation": "rossby",
+            }
+        )
         assert job.cluster == "midway3"
         assert job.group == "youzhi"
         assert job.reservation == "rossby"
@@ -271,8 +310,16 @@ class TestJsonCompleteness:
     def test_all_groups_present(self):
         payload = self._payload(build())
         assert set(payload) >= {
-            "identity", "outcome", "timing", "shape", "cpu", "memory",
-            "filesystem", "gpu", "steps", "findings",
+            "identity",
+            "outcome",
+            "timing",
+            "shape",
+            "cpu",
+            "memory",
+            "filesystem",
+            "gpu",
+            "steps",
+            "findings",
         }
 
     def test_cpu_split_exposed(self):
@@ -282,9 +329,12 @@ class TestJsonCompleteness:
         assert cpu["system_fraction"] is not None
 
     def test_read_and_write_both_exposed(self):
-        job = build(batch={
-            "TRESUsageInTot": "fs/disk=100", "TRESUsageOutTot": "fs/disk=200",
-        })
+        job = build(
+            batch={
+                "TRESUsageInTot": "fs/disk=100",
+                "TRESUsageOutTot": "fs/disk=200",
+            }
+        )
         fs = self._payload(job)["filesystem"]
         assert fs["read_bytes"] == 100
         assert fs["write_bytes"] == 200
@@ -327,36 +377,92 @@ class TestFalsePositivesFoundOnRealData:
 
     def test_extern_step_does_not_create_a_spread_finding(self):
         """.extern holds ~2 MB on every job; that spread is structural."""
-        job = parse("\n".join([
-            row(JobID="901", JobName="w", State="COMPLETED", ElapsedRaw="3600",
-                AllocTRES="cpu=8,mem=64G,node=1", End="2026-01-01T01:00:00"),
-            row(JobID="901.batch", JobName="batch", State="COMPLETED",
-                ElapsedRaw="3600", TotalCPU="04:00:00", MaxRSS="60000000K"),
-            row(JobID="901.extern", JobName="extern", State="COMPLETED",
-                ElapsedRaw="3600", TotalCPU="00:00:00", MaxRSS="1956K"),
-        ]))[0]
+        job = parse(
+            "\n".join(
+                [
+                    row(
+                        JobID="901",
+                        JobName="w",
+                        State="COMPLETED",
+                        ElapsedRaw="3600",
+                        AllocTRES="cpu=8,mem=64G,node=1",
+                        End="2026-01-01T01:00:00",
+                    ),
+                    row(
+                        JobID="901.batch",
+                        JobName="batch",
+                        State="COMPLETED",
+                        ElapsedRaw="3600",
+                        TotalCPU="04:00:00",
+                        MaxRSS="60000000K",
+                    ),
+                    row(
+                        JobID="901.extern",
+                        JobName="extern",
+                        State="COMPLETED",
+                        ElapsedRaw="3600",
+                        TotalCPU="00:00:00",
+                        MaxRSS="1956K",
+                    ),
+                ]
+            )
+        )[0]
         assert job.rss_step_spread is None
         assert "rss-step-spread" not in codes(job)
 
     def test_max_rss_still_spans_every_step(self):
         """Excluding extern from the *spread* must not change the *peak*."""
-        job = parse("\n".join([
-            row(JobID="902", JobName="w", State="COMPLETED", ElapsedRaw="3600",
-                AllocTRES="cpu=8,mem=64G,node=1", End="2026-01-01T01:00:00"),
-            row(JobID="902.batch", JobName="batch", State="COMPLETED", MaxRSS="4108K"),
-            row(JobID="902.extern", JobName="extern", State="COMPLETED", MaxRSS="16439052K"),
-        ]))[0]
+        job = parse(
+            "\n".join(
+                [
+                    row(
+                        JobID="902",
+                        JobName="w",
+                        State="COMPLETED",
+                        ElapsedRaw="3600",
+                        AllocTRES="cpu=8,mem=64G,node=1",
+                        End="2026-01-01T01:00:00",
+                    ),
+                    row(JobID="902.batch", JobName="batch", State="COMPLETED", MaxRSS="4108K"),
+                    row(
+                        JobID="902.extern", JobName="extern", State="COMPLETED", MaxRSS="16439052K"
+                    ),
+                ]
+            )
+        )[0]
         assert job.max_rss == 16439052 * 1024
 
     def test_spread_between_real_work_steps_still_reported(self):
-        job = parse("\n".join([
-            row(JobID="903", JobName="w", State="COMPLETED", ElapsedRaw="3600",
-                AllocTRES="cpu=8,mem=64G,node=1", End="2026-01-01T01:00:00"),
-            row(JobID="903.batch", JobName="batch", State="COMPLETED",
-                ElapsedRaw="3600", TotalCPU="04:00:00", MaxRSS="60000000K"),
-            row(JobID="903.0", JobName="srun", State="COMPLETED",
-                ElapsedRaw="3600", TotalCPU="04:00:00", MaxRSS="1000K"),
-        ]))[0]
+        job = parse(
+            "\n".join(
+                [
+                    row(
+                        JobID="903",
+                        JobName="w",
+                        State="COMPLETED",
+                        ElapsedRaw="3600",
+                        AllocTRES="cpu=8,mem=64G,node=1",
+                        End="2026-01-01T01:00:00",
+                    ),
+                    row(
+                        JobID="903.batch",
+                        JobName="batch",
+                        State="COMPLETED",
+                        ElapsedRaw="3600",
+                        TotalCPU="04:00:00",
+                        MaxRSS="60000000K",
+                    ),
+                    row(
+                        JobID="903.0",
+                        JobName="srun",
+                        State="COMPLETED",
+                        ElapsedRaw="3600",
+                        TotalCPU="04:00:00",
+                        MaxRSS="1000K",
+                    ),
+                ]
+            )
+        )[0]
         assert job.rss_step_spread is not None
         assert "rss-step-spread" in codes(job)
 

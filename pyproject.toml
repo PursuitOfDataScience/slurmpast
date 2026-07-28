@@ -35,7 +35,13 @@ slurmpast = "slurmpast.cli:main"
 sp = "slurmpast.cli:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "ruff>=0.5"]
+dev = [
+  "pytest>=7",
+  "pytest-asyncio>=0.23",
+  "pytest-cov>=4",
+  "ruff>=0.5",
+  "mypy>=1.8",
+]
 
 [tool.setuptools.dynamic]
 version = { attr = "slurmpast._version.__version__" }
@@ -47,5 +53,17 @@ where = ["src"]
 line-length = 100
 target-version = "py310"
 
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unreachable = true
+# NOT strict = true, which is what slurmwatch runs. Under --strict this codebase
+# reports 495 findings, almost all missing parameter/return annotations across
+# ~4,700 lines. That is worth doing, but it is an annotation project rather than
+# part of setting up CI, so the gate is set where it currently passes clean and
+# the gap is recorded here rather than silently skipped.
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "strict"

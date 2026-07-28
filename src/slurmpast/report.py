@@ -40,7 +40,9 @@ class Style:
     def __init__(self, enabled=None, stream=None):
         stream = stream or sys.stdout
         if enabled is None:
-            enabled = hasattr(stream, "isatty") and stream.isatty() and not os.environ.get("NO_COLOR")
+            enabled = (
+                hasattr(stream, "isatty") and stream.isatty() and not os.environ.get("NO_COLOR")
+            )
         self.enabled = bool(enabled)
 
     def __call__(self, text, *names):
@@ -56,8 +58,11 @@ def render_job(job, log_path=None, log_text=None, node_note="", style=None, show
     state = job.base_state or "?"
     out.append(
         "%s %s  %s"
-        % (style("job", "grey"), style(job.job_id, "bold"),
-           style(state, _STATE_COLOR.get(state, "bold")))
+        % (
+            style("job", "grey"),
+            style(job.job_id, "bold"),
+            style(state, _STATE_COLOR.get(state, "bold")),
+        )
     )
     for title, rows in job_sections(job):
         out.append("")
@@ -69,18 +74,28 @@ def render_job(job, log_path=None, log_text=None, node_note="", style=None, show
     if show_steps and job.steps:
         out.append("")
         out.append(style("  steps", "bold"))
-        out.append("    %-18s %-11s %8s %9s %9s %9s %9s"
-                   % ("STEP", "STATE", "ELAPSED", "CPU", "MAXRSS", "READ", "WROTE"))
+        out.append(
+            "    %-18s %-11s %8s %9s %9s %9s %9s"
+            % ("STEP", "STATE", "ELAPSED", "CPU", "MAXRSS", "READ", "WROTE")
+        )
         for step in job.steps:
-            out.append("    %-18s %-11s %8s %9s %9s %9s %9s"
-                       % (step.step_id, (step.state or "").split()[0][:11],
-                          format_duration(step.elapsed), format_duration(step.total_cpu),
-                          format_bytes(step.max_rss), format_bytes(step.read_bytes),
-                          format_bytes(step.write_bytes)))
+            out.append(
+                "    %-18s %-11s %8s %9s %9s %9s %9s"
+                % (
+                    step.step_id,
+                    (step.state or "").split()[0][:11],
+                    format_duration(step.elapsed),
+                    format_duration(step.total_cpu),
+                    format_bytes(step.max_rss),
+                    format_bytes(step.read_bytes),
+                    format_bytes(step.write_bytes),
+                )
+            )
 
     out.append("")
-    out.append("  %s %s" % (style("log", "grey"),
-                            log_path or style("not found (pass --log-dir)", "grey")))
+    out.append(
+        "  %s %s" % (style("log", "grey"), log_path or style("not found (pass --log-dir)", "grey"))
+    )
     out.append("")
     findings = sorted(verdict.findings, key=lambda f: severity_rank(f.severity))
     if not findings:
@@ -107,33 +122,62 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
         # The window is the commonest explanation for "why are runs missing?",
         # so it belongs on screen rather than in the reader's memory.
         out.append("  window %s" % style(history.window, "bold"))
-    out.append("  %d jobs · %s completed · %.0f GPU-hours (%s goodput)"
-               % (stats["jobs"], format_percent(stats["completion_rate"]),
-                  stats["gpu_hours_total"], format_percent(stats["gpu_goodput"])))
+    out.append(
+        "  %d jobs · %s completed · %.0f GPU-hours (%s goodput)"
+        % (
+            stats["jobs"],
+            format_percent(stats["completion_rate"]),
+            stats["gpu_hours_total"],
+            format_percent(stats["gpu_goodput"]),
+        )
+    )
     if stats["gpu_hours_noop"]:
-        out.append("  %s"
-                   % style("%.0f GPU-hours (%s) went to allocations that never computed"
-                           % (stats["gpu_hours_noop"], format_percent(stats["gpu_noop_fraction"])),
-                           "yellow"))
+        out.append(
+            "  %s"
+            % style(
+                "%.0f GPU-hours (%s) went to allocations that never computed"
+                % (stats["gpu_hours_noop"], format_percent(stats["gpu_noop_fraction"])),
+                "yellow",
+            )
+        )
     if stats["excluded_open_records"]:
-        out.append(style("  %d unterminated record(s) excluded — their elapsed is now-minus-start"
-                         % stats["excluded_open_records"], "grey"))
+        out.append(
+            style(
+                "  %d unterminated record(s) excluded — their elapsed is now-minus-start"
+                % stats["excluded_open_records"],
+                "grey",
+            )
+        )
     out.append("")
-    out.append("  %-4s %-24s %-9s %6s %8s %7s %11s  %-11s %s"
-               % ("#", "WORKLOAD", "PART", "RUNS", "FAILED", "IDLE", "BURNED", "LAST RUN",
-                  "VARIANTS"))
+    out.append(
+        "  %-4s %-24s %-9s %6s %8s %7s %11s  %-11s %s"
+        % ("#", "WORKLOAD", "PART", "RUNS", "FAILED", "IDLE", "BURNED", "LAST RUN", "VARIANTS")
+    )
     groups = sort_groups(history.groups, sort)
     for index, group in enumerate(groups[:limit], start=1):
-        burned = ("%.0f gpu-h" % group.gpu_hours if group.gpu_hours >= 1
-                  else "%.0f core-h" % group.core_hours)
+        burned = (
+            "%.0f gpu-h" % group.gpu_hours
+            if group.gpu_hours >= 1
+            else "%.0f core-h" % group.core_hours
+        )
         colour = {"crit": "red", "warn": "yellow"}.get(group.severity)
         label = group.name[:24]
         name = style(label, colour) if colour else label
         variants = "%d names" % group.distinct_names if group.distinct_names > 1 else ""
-        out.append("  %-4d %-24s %-9s %6d %8s %7s %11s  %-11s %s"
-                   % (index, name, group.partition[:9], group.total,
-                      format_percent(group.failure_rate), group.noop or "-", burned,
-                      (group.last_seen or "")[:10], style(variants, "grey")))
+        out.append(
+            "  %-4d %-24s %-9s %6d %8s %7s %11s  %-11s %s"
+            % (
+                index,
+                name,
+                group.partition[:9],
+                group.total,
+                format_percent(group.failure_rate),
+                group.noop or "-",
+                burned,
+                (group.last_seen or "")[:10],
+                style(variants, "grey"),
+            )
+        )
     tail = history.tail_summary(limit)
     if tail:
         out.append(style("  … " + tail, "grey"))
@@ -145,17 +189,27 @@ def render_list(jobs, style=None, limit=40):
     style = style or Style()
     # STARTED/ENDED matter here for the same reason they do in the dashboard: a
     # workload with hundreds of identically-named runs is unnavigable without them.
-    out = ["%-12s %-18s %-12s %-11s %-11s %9s %9s %7s %4s"
-           % ("JOBID", "NAME", "STATE", "STARTED", "ENDED", "ELAPSED", "CPU", "UTIL", "GPU"),
-           style("-" * 106, "grey")]
+    out = [
+        "%-12s %-18s %-12s %-11s %-11s %9s %9s %7s %4s"
+        % ("JOBID", "NAME", "STATE", "STARTED", "ENDED", "ELAPSED", "CPU", "UTIL", "GPU"),
+        style("-" * 106, "grey"),
+    ]
     for job in jobs[:limit]:
         state = job.base_state
-        out.append("%-12s %-18s %-12s %-11s %-11s %9s %9s %7s %4s"
-                   % (job.job_id[:12], (job.name or "")[:18],
-                      style("%-12s" % state[:12], _STATE_COLOR.get(state, "bold")),
-                      stamp_short(job.start) or "-", stamp_short(job.end) or "-",
-                      format_duration(job.elapsed), format_duration(job.total_cpu),
-                      format_percent(job.cpu_utilization), job.gpu_count or "-"))
+        out.append(
+            "%-12s %-18s %-12s %-11s %-11s %9s %9s %7s %4s"
+            % (
+                job.job_id[:12],
+                (job.name or "")[:18],
+                style("%-12s" % state[:12], _STATE_COLOR.get(state, "bold")),
+                stamp_short(job.start) or "-",
+                stamp_short(job.end) or "-",
+                format_duration(job.elapsed),
+                format_duration(job.total_cpu),
+                format_percent(job.cpu_utilization),
+                job.gpu_count or "-",
+            )
+        )
     if len(jobs) > limit:
         out.append(style("  … %d more (raise --limit)" % (len(jobs) - limit), "grey"))
     return "\n".join(out)
@@ -187,31 +241,53 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
     table = node_table(jobs, workload=workload, metric=metric)
     out = [style("node reliability (%s rate)" % metric, "bold"), style("-" * 78, "grey")]
     if workload:
-        out.append("  controlled for workload: only %s counted %s"
-                   % (style(workload, "bold"), style("(placement is not random)", "grey")))
+        out.append(
+            "  controlled for workload: only %s counted %s"
+            % (style(workload, "bold"), style("(placement is not random)", "grey"))
+        )
     else:
-        out.append(style("  UNCONTROLLED — mixes workloads; a node that hosted one bad campaign "
-                         "will look cursed", "yellow"))
-    out.append("  baseline %s over %d placements%s"
-               % (format_percent(table["baseline"]), table["trials"],
-                  "; %d nodes below threshold omitted" % table["skipped_nodes"]
-                  if table["skipped_nodes"] else ""))
+        out.append(
+            style(
+                "  UNCONTROLLED — mixes workloads; a node that hosted one bad campaign "
+                "will look cursed",
+                "yellow",
+            )
+        )
+    out.append(
+        "  baseline %s over %d placements%s"
+        % (
+            format_percent(table["baseline"]),
+            table["trials"],
+            "; %d nodes below threshold omitted" % table["skipped_nodes"]
+            if table["skipped_nodes"]
+            else "",
+        )
+    )
     out.append("")
     out.append("  %-16s %9s %10s %20s  %s" % ("NODE", "N", "RATE", "95% CI", "VERDICT"))
     for row in table["rows"]:
         colour = {"worse": "red", "better": "green"}.get(row["verdict"])
-        out.append("  %-16s %9s %10s %20s  %s"
-                   % (row["node"], "%d/%d" % (row["bad"], row["trials"]),
-                      "%.1f%%" % (100 * row["rate"]),
-                      "%.1f - %.1f%%" % (100 * row["ci_low"], 100 * row["ci_high"]),
-                      style(row["verdict"], colour) if colour else row["verdict"]))
+        out.append(
+            "  %-16s %9s %10s %20s  %s"
+            % (
+                row["node"],
+                "%d/%d" % (row["bad"], row["trials"]),
+                "%.1f%%" % (100 * row["rate"]),
+                "%.1f - %.1f%%" % (100 * row["ci_low"], 100 * row["ci_high"]),
+                style(row["verdict"], colour) if colour else row["verdict"],
+            )
+        )
     out.append("")
     excl = compress_nodelist(suggest_exclude(table))
     if excl:
         out.append("  intervals entirely above baseline:")
         out.append("    %s" % style("#SBATCH --exclude=" + excl, "bold"))
-        out.append(style("    not applied for you — excluding nodes trades availability for "
-                         "reliability.", "grey"))
+        out.append(
+            style(
+                "    not applied for you — excluding nodes trades availability for reliability.",
+                "grey",
+            )
+        )
     else:
         out.append(style("  no node's interval clears the baseline; nothing to exclude.", "grey"))
     out.append("")

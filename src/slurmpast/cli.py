@@ -44,9 +44,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("job_ids", nargs="*", help="job ids to examine")
     parser.add_argument("-u", "--user", default=None, help="user to query (default: you)")
-    parser.add_argument("-S", "--since", default="now-7days",
-                        help="start of the window, sacct syntax (default: now-7days). "
-                             "'-7days' is accepted and rewritten for you")
+    parser.add_argument(
+        "-S",
+        "--since",
+        default="now-7days",
+        help="start of the window, sacct syntax (default: now-7days). "
+        "'-7days' is accepted and rewritten for you",
+    )
     parser.add_argument("-E", "--until", default=None, help="end of the window")
     parser.add_argument("-p", "--partition", default=None, help="restrict to a partition")
     parser.add_argument("--failed", action="store_true", help="only jobs that failed")
@@ -56,24 +60,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overview", action="store_true", help="workload rollup as text")
     parser.add_argument("--patterns", action="store_true", help="cross-run patterns as text")
     parser.add_argument("--nodes", action="store_true", help="node reliability as text")
-    parser.add_argument("--metric", choices=["failure", "hang"], default="hang",
-                        help="what --nodes measures (default: hang)")
-    parser.add_argument("--all-workloads", action="store_true",
-                        help="skip the workload control in --nodes (confounded)")
-    parser.add_argument("--sort", default="cost",
-                        choices=["cost", "failures", "rate", "recent", "runs", "name"],
-                        help="workload ordering (default: cost)")
+    parser.add_argument(
+        "--metric",
+        choices=["failure", "hang"],
+        default="hang",
+        help="what --nodes measures (default: hang)",
+    )
+    parser.add_argument(
+        "--all-workloads",
+        action="store_true",
+        help="skip the workload control in --nodes (confounded)",
+    )
+    parser.add_argument(
+        "--sort",
+        default="cost",
+        choices=["cost", "failures", "rate", "recent", "runs", "name"],
+        help="workload ordering (default: cost)",
+    )
 
-    parser.add_argument("--log-dir", action="append", default=[],
-                        help="extra directory to search for job logs")
+    parser.add_argument(
+        "--log-dir", action="append", default=[], help="extra directory to search for job logs"
+    )
     parser.add_argument("--no-logs", action="store_true", help="do not read job logs")
     parser.add_argument("--steps", action="store_true", help="per-step accounting")
     parser.add_argument("--json", action="store_true", help="emit JSON")
-    parser.add_argument("--mouse", action="store_true",
-                        help="let the app capture the mouse (enables clicking and wheel "
-                             "scrolling, but disables your terminal's text selection)")
-    parser.add_argument("--demo", action="store_true",
-                        help="synthetic history — try it without Slurm, and drive the demo tape")
+    parser.add_argument(
+        "--mouse",
+        action="store_true",
+        help="let the app capture the mouse (enables clicking and wheel "
+        "scrolling, but disables your terminal's text selection)",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="synthetic history — try it without Slurm, and drive the demo tape",
+    )
     parser.add_argument("--ascii", action="store_true", help="ASCII glyphs instead of Unicode")
     parser.add_argument("--no-color", action="store_true", help="disable ANSI colour")
     parser.add_argument("--version", action="version", version="slurmpast " + __version__)
@@ -151,11 +172,14 @@ def _load(args, sacct):
 
     user = args.user or getpass.getuser()
     states = ["FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL"] if args.failed else None
-    jobs = sacct.history(user=user, since=args.since, until=args.until,
-                         states=states, partition=args.partition)
+    jobs = sacct.history(
+        user=user, since=args.since, until=args.until, states=states, partition=args.partition
+    )
     if not jobs:
-        raise SacctError("no jobs for %s since %s%s"
-                         % (user, args.since, " matching --failed" if args.failed else ""))
+        raise SacctError(
+            "no jobs for %s since %s%s"
+            % (user, args.since, " matching --failed" if args.failed else "")
+        )
     return _mark_open_records(jobs)
 
 
@@ -183,32 +207,57 @@ def _job_json(job, log_path, verdict):
     """
     return {
         "identity": {
-            "job_id": job.job_id, "job_id_raw": job.job_id_raw, "name": job.name,
-            "user": job.user, "uid": job.uid, "group": job.group,
-            "account": job.account, "cluster": job.cluster, "partition": job.partition,
-            "qos": job.qos, "assoc_id": job.assoc_id, "wckey": job.wckey,
-            "work_dir": job.work_dir, "reservation": job.reservation,
+            "job_id": job.job_id,
+            "job_id_raw": job.job_id_raw,
+            "name": job.name,
+            "user": job.user,
+            "uid": job.uid,
+            "group": job.group,
+            "account": job.account,
+            "cluster": job.cluster,
+            "partition": job.partition,
+            "qos": job.qos,
+            "assoc_id": job.assoc_id,
+            "wckey": job.wckey,
+            "work_dir": job.work_dir,
+            "reservation": job.reservation,
         },
         "outcome": {
-            "state": job.base_state, "state_raw": job.state,
-            "exit_code": job.exit_code, "signal": job.signal,
-            "derived_exit_code": job.derived_exit_code, "reason": job.reason,
-            "failed": job.failed, "completed": job.completed, "cancelled": job.cancelled,
+            "state": job.base_state,
+            "state_raw": job.state,
+            "exit_code": job.exit_code,
+            "signal": job.signal,
+            "derived_exit_code": job.derived_exit_code,
+            "reason": job.reason,
+            "failed": job.failed,
+            "completed": job.completed,
+            "cancelled": job.cancelled,
             "open_ended_record": job.open_ended,
         },
         "timing": {
-            "submit": job.submit, "eligible": job.eligible,
-            "start": job.start, "end": job.end,
-            "elapsed_seconds": job.elapsed, "timelimit_seconds": job.timelimit,
+            "submit": job.submit,
+            "eligible": job.eligible,
+            "start": job.start,
+            "end": job.end,
+            "elapsed_seconds": job.elapsed,
+            "timelimit_seconds": job.timelimit,
             "walltime_used": job.walltime_used,
-            "queue_wait_seconds": job.queue_wait, "suspended_seconds": job.suspended,
-            "scheduled_by": job.scheduled_by, "flags": job.flags, "priority": job.priority,
+            "queue_wait_seconds": job.queue_wait,
+            "suspended_seconds": job.suspended,
+            "scheduled_by": job.scheduled_by,
+            "flags": job.flags,
+            "priority": job.priority,
         },
         "shape": {
-            "nodes": job.node_count, "node_list": job.node_list,
-            "cpus": job.cpu_count, "tasks": job.task_count, "gpus": job.gpu_count,
-            "req_cpus": job.req_cpus, "req_nodes": job.req_nodes,
-            "alloc_tres": job.alloc_tres, "req_tres": job.req_tres,
+            "nodes": job.node_count,
+            "node_list": job.node_list,
+            "cpus": job.cpu_count,
+            "tasks": job.task_count,
+            "gpus": job.gpu_count,
+            "req_cpus": job.req_cpus,
+            "req_nodes": job.req_nodes,
+            "alloc_tres": job.alloc_tres,
+            "req_tres": job.req_tres,
             "constraints": job.constraints,
         },
         "cpu": {
@@ -260,8 +309,10 @@ def _job_json(job, log_path, verdict):
         "log": log_path,
         "steps": [
             {
-                "step_id": s.step_id, "state": s.state,
-                "exit_code": s.exit_code, "signal": s.signal,
+                "step_id": s.step_id,
+                "state": s.state,
+                "exit_code": s.exit_code,
+                "signal": s.signal,
                 "elapsed_seconds": s.elapsed,
                 "total_cpu_seconds": s.total_cpu,
                 "user_cpu_seconds": s.user_cpu,
@@ -271,18 +322,28 @@ def _job_json(job, log_path, verdict):
                 "min_cpu_node": s.min_cpu_node or None,
                 "min_cpu_task": s.min_cpu_task or None,
                 "cpu_frequency": s.ave_cpu_freq or None,
-                "max_rss_bytes": s.max_rss, "max_rss_node": s.max_rss_node or None,
-                "max_rss_task": s.max_rss_task or None, "ave_rss_bytes": s.ave_rss,
+                "max_rss_bytes": s.max_rss,
+                "max_rss_node": s.max_rss_node or None,
+                "max_rss_task": s.max_rss_task or None,
+                "ave_rss_bytes": s.ave_rss,
                 "max_vmsize_bytes": s.max_vmsize,
                 "max_pages": s.max_pages,
-                "read_bytes": s.read_bytes, "write_bytes": s.write_bytes,
-                "ntasks": s.ntasks, "nnodes": s.nnodes, "node_list": s.node_list or None,
+                "read_bytes": s.read_bytes,
+                "write_bytes": s.write_bytes,
+                "ntasks": s.ntasks,
+                "nnodes": s.nnodes,
+                "node_list": s.node_list or None,
             }
             for s in job.steps
         ],
         "findings": [
-            {"severity": f.severity, "code": f.code, "title": f.title,
-             "evidence": f.evidence, "action": f.action}
+            {
+                "severity": f.severity,
+                "code": f.code,
+                "title": f.title,
+                "evidence": f.evidence,
+                "action": f.action,
+            }
             for f in sorted(verdict.findings, key=lambda f: severity_rank(f.severity))
         ],
     }
@@ -306,9 +367,7 @@ def main(argv=None) -> int:
         from . import tui
 
         window = (
-            "SYNTHETIC DEMO DATA"
-            if args.demo
-            else "%s → %s" % (args.since, args.until or "now")
+            "SYNTHETIC DEMO DATA" if args.demo else "%s → %s" % (args.since, args.until or "now")
         )
         return tui.run(
             lambda: _load(args, sacct),
@@ -325,41 +384,76 @@ def main(argv=None) -> int:
         sys.stderr.write("slurmpast: %s\n" % exc)
         return 2
 
-    history = History(jobs, window="%s → %s" % (args.since, args.until or "now"))
+    window = "SYNTHETIC DEMO DATA" if args.demo else "%s → %s" % (args.since, args.until or "now")
+    history = History(jobs, window=window)
 
     if args.nodes:
         if args.json:
             from .nodes import dominant_workload, node_table
 
             workload = None if args.all_workloads else dominant_workload(history.usable_jobs)
-            print(json.dumps(
-                {"slurmpast": __version__,
-                 "nodes": node_table(history.usable_jobs, workload=workload, metric=args.metric)},
-                indent=2))
+            print(
+                json.dumps(
+                    {
+                        "slurmpast": __version__,
+                        "nodes": node_table(
+                            history.usable_jobs, workload=workload, metric=args.metric
+                        ),
+                    },
+                    indent=2,
+                )
+            )
         else:
-            print(report.render_nodes(history, metric=args.metric,
-                                      controlled=not args.all_workloads, style=style))
+            print(
+                report.render_nodes(
+                    history, metric=args.metric, controlled=not args.all_workloads, style=style
+                )
+            )
         return 0
 
     if args.patterns:
         if args.json:
-            print(json.dumps(
-                {"slurmpast": __version__, "summary": history.stats,
-                 "findings": [f._asdict() for f in history.patterns]}, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "slurmpast": __version__,
+                        "summary": history.stats,
+                        "findings": [f._asdict() for f in history.patterns],
+                    },
+                    indent=2,
+                )
+            )
         else:
             print(report.render_patterns(history, style=style))
         return 0
 
     if args.overview:
         if args.json:
-            print(json.dumps(
-                {"slurmpast": __version__, "summary": history.stats,
-                 "workloads": [
-                     {"name": g.name, "partition": g.partition, "runs": g.total,
-                      "completed": g.completed, "failed": g.failed, "cancelled": g.cancelled,
-                      "noop": g.noop, "gpu_hours": g.gpu_hours, "core_hours": g.core_hours,
-                      "severity": g.severity, "last_seen": g.last_seen}
-                     for g in history.groups]}, indent=2))
+            print(
+                json.dumps(
+                    {
+                        "slurmpast": __version__,
+                        "summary": history.stats,
+                        "workloads": [
+                            {
+                                "name": g.name,
+                                "partition": g.partition,
+                                "runs": g.total,
+                                "completed": g.completed,
+                                "failed": g.failed,
+                                "cancelled": g.cancelled,
+                                "noop": g.noop,
+                                "gpu_hours": g.gpu_hours,
+                                "core_hours": g.core_hours,
+                                "severity": g.severity,
+                                "last_seen": g.last_seen,
+                            }
+                            for g in history.groups
+                        ],
+                    },
+                    indent=2,
+                )
+            )
         else:
             print(report.render_overview(history, style=style, limit=args.limit, sort=args.sort))
         return 0
@@ -379,17 +473,27 @@ def main(argv=None) -> int:
             log_path, log_text = _logs_for(job, args)
             verdict = diagnose(job, log_text=log_text, node_note=_node_note(job, history))
             payload.append(_job_json(job, log_path, verdict))
-        print(json.dumps({"slurmpast": __version__, "summary": history.stats, "jobs": payload},
-                         indent=2, default=str))
+        print(
+            json.dumps(
+                {"slurmpast": __version__, "summary": history.stats, "jobs": payload},
+                indent=2,
+                default=str,
+            )
+        )
         return 0
 
     worst_critical = False
     if args.job_ids:
         for job in targets:
             log_path, log_text = _logs_for(job, args)
-            text, verdict = report.render_job(job, log_path=log_path, log_text=log_text,
-                                              node_note=_node_note(job, history), style=style,
-                                              show_steps=args.steps)
+            text, verdict = report.render_job(
+                job,
+                log_path=log_path,
+                log_text=log_text,
+                node_note=_node_note(job, history),
+                style=style,
+                show_steps=args.steps,
+            )
             print(text)
             worst_critical |= any(f.severity == "critical" for f in verdict.findings)
     else:

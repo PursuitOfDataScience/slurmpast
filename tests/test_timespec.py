@@ -36,8 +36,8 @@ class TestNormalizeTimeSpec:
     @pytest.mark.parametrize(
         "given",
         [
-            "now-7days",      # already valid
-            "2026-07-01",     # absolute
+            "now-7days",  # already valid
+            "2026-07-01",  # absolute
             "2026-07-01T08:00:00",
             "today",
             "midnight",

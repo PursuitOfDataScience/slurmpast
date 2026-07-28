@@ -10,7 +10,7 @@ _NOT_A_DURATION = frozenset(
     ["", "unlimited", "invalid", "partition_limit", "unknown", "none", "n/a", "*"]
 )
 
-_UNITS = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3, "t": 1024 ** 4, "p": 1024 ** 5}
+_UNITS = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4, "p": 1024**5}
 
 
 def parse_duration(text):
@@ -129,7 +129,7 @@ def format_bytes(value):
     if value is None:
         return "n/a"
     value = float(value)
-    for unit, scale in (("TiB", 1024 ** 4), ("GiB", 1024 ** 3), ("MiB", 1024 ** 2)):
+    for unit, scale in (("TiB", 1024**4), ("GiB", 1024**3), ("MiB", 1024**2)):
         if value >= scale:
             return "%.1f %s" % (value / scale, unit)
     return "%d B" % int(value)
@@ -144,3 +144,57 @@ def format_percent(value):
     if value is None:
         return "n/a"
     return "%.1f%%" % (100.0 * value)
+
+
+# Plausible sustained CPU clock range. Below the floor a value is not a clock
+# this hardware could have run at; above the ceiling it is a unit error.
+_FREQ_FLOOR_HZ = 400e6
+_FREQ_CEILING_HZ = 6e9
+_FREQ_SUFFIX = {"k": 1e3, "m": 1e6, "g": 1e9, "t": 1e12}
+
+
+def parse_cpu_freq(text):
+    """``AveCPUFreq`` -> hertz, or None when the value cannot be trusted.
+
+    This field is not reliably interpretable as printed. On one cluster the same
+    3.1 GHz part reports ``3.10M`` on 935 records and ``3.10G`` on 342 -- Slurm's
+    magnitude suffix is applied to a kHz base in some code paths and a Hz base in
+    others, so the string alone is ambiguous by a factor of 1000.
+
+    Rather than print an uninterpretable number, both readings are tried and the
+    one that lands in a plausible clock range wins. Values that fit neither (a
+    reported ``14K``, i.e. 14 MHz or 14 kHz) return None and are omitted from the
+    display entirely -- an absent figure is honest, a wrong one is not.
+
+    A genuine low reading survives and is informative: ``800K`` resolves to
+    800 MHz, which is a core that spent its time downclocked.
+    """
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if not raw or raw in ("0", "Unknown", "None", "N/A"):
+        return None
+
+    multiplier = 1.0
+    if raw[-1:].lower() in _FREQ_SUFFIX:
+        multiplier = _FREQ_SUFFIX[raw[-1:].lower()]
+        raw = raw[:-1]
+    try:
+        value = float(raw) * multiplier
+    except ValueError:
+        return None
+
+    # Candidate interpretations: the number is already hertz, or it is kilohertz.
+    for hz in (value, value * 1e3):
+        if _FREQ_FLOOR_HZ <= hz <= _FREQ_CEILING_HZ:
+            return hz
+    return None
+
+
+def format_cpu_freq(hz):
+    """Hertz -> ``3.10 GHz`` / ``800 MHz``. ``None`` renders as ``n/a``."""
+    if hz is None:
+        return "n/a"
+    if hz >= 1e9:
+        return "%.2f GHz" % (hz / 1e9)
+    return "%.0f MHz" % (hz / 1e6)

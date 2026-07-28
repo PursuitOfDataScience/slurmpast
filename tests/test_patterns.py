@@ -95,13 +95,9 @@ class TestMemorySearch:
         makes a walk monotone -- sorting the objects is not enough, the detector
         re-sorts by job id on purpose.
         """
-        ooms = [
-            j for j in oom_series if j.base_state == "OUT_OF_MEMORY" and j.req_mem_bytes
-        ]
+        ooms = [j for j in oom_series if j.base_state == "OUT_OF_MEMORY" and j.req_mem_bytes]
         ooms.sort(key=lambda j: j.req_mem_bytes)
-        monotone = [
-            job._replace(job_id=str(60000000 + index)) for index, job in enumerate(ooms)
-        ]
+        monotone = [job._replace(job_id=str(60000000 + index)) for index, job in enumerate(ooms)]
         finding = find(find_memory_search(monotone), "memory-search")
         assert finding is not None
         assert "Jump well past" in finding.action
@@ -227,18 +223,41 @@ class TestMemorySearchUsesTheRealLimit:
         from tests.conftest import row
         from slurmpast.sacct import parse
 
-        spec = [("48G", "OUT_OF_MEMORY"), ("32G", "OUT_OF_MEMORY"),
-                ("17G", "OUT_OF_MEMORY"), ("12G", "OUT_OF_MEMORY"),
-                ("32G", "COMPLETED")]
+        spec = [
+            ("48G", "OUT_OF_MEMORY"),
+            ("32G", "OUT_OF_MEMORY"),
+            ("17G", "OUT_OF_MEMORY"),
+            ("12G", "OUT_OF_MEMORY"),
+            ("32G", "COMPLETED"),
+        ]
         rows = []
         for index, (mem, state) in enumerate(spec):
             jid = 6000000 + index
-            rows.append(row(JobID=str(jid), JobName="tok", Partition="test", State=state,
-                            ExitCode="0:0", End="2026-07-01T01:00:00", ElapsedRaw="1200",
-                            TimelimitRaw="480", ReqMem=req_mem,
-                            AllocTRES="cpu=16,mem=%s,node=1" % mem, AllocCPUS="16"))
-            rows.append(row(JobID="%d.batch" % jid, JobName="batch", State=state.split()[0],
-                            ElapsedRaw="1200", TotalCPU="00:19:00", MaxRSS="12000000K"))
+            rows.append(
+                row(
+                    JobID=str(jid),
+                    JobName="tok",
+                    Partition="test",
+                    State=state,
+                    ExitCode="0:0",
+                    End="2026-07-01T01:00:00",
+                    ElapsedRaw="1200",
+                    TimelimitRaw="480",
+                    ReqMem=req_mem,
+                    AllocTRES="cpu=16,mem=%s,node=1" % mem,
+                    AllocCPUS="16",
+                )
+            )
+            rows.append(
+                row(
+                    JobID="%d.batch" % jid,
+                    JobName="batch",
+                    State=state.split()[0],
+                    ElapsedRaw="1200",
+                    TotalCPU="00:19:00",
+                    MaxRSS="12000000K",
+                )
+            )
         return parse("\n".join(rows))
 
     def test_detected_when_reqmem_is_zero(self):
@@ -250,7 +269,8 @@ class TestMemorySearchUsesTheRealLimit:
         assert "memory-search" in {f.code for f in findings}
 
     def test_contradiction_reported_from_alloc_tres(self):
-        finding = [f for f in find_memory_search(self._series("0n"))
-                   if f.code == "memory-search"][0]
+        finding = [f for f in find_memory_search(self._series("0n")) if f.code == "memory-search"][
+            0
+        ]
         assert "COMPLETED at" in finding.evidence
         assert "not the deciding variable" in finding.action

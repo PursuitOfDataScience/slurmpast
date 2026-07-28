@@ -122,9 +122,7 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
             states[job.base_state] = states.get(job.base_state, 0) + 1
         dominant, count = max(states.items(), key=lambda kv: kv[1])
 
-        limits = set(
-            format_duration(j.timelimit) for j in failures if j.timelimit is not None
-        )
+        limits = set(format_duration(j.timelimit) for j in failures if j.timelimit is not None)
         hung = [j for j in failures if looks_like_noop(j)]
         wasted = sum(j.gpu_hours or 0.0 for j in failures)
 
@@ -221,9 +219,9 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
 
         evidence = "%d OOM kills for %s with --mem walking %s." % (len(ooms), key[0], walk)
         if contradiction is not None:
-            evidence += (
-                " Job %s then COMPLETED at %s -- a value that had already OOM'd."
-                % (contradiction.job_id, format_bytes(contradiction.mem_limit_bytes))
+            evidence += " Job %s then COMPLETED at %s -- a value that had already OOM'd." % (
+                contradiction.job_id,
+                format_bytes(contradiction.mem_limit_bytes),
             )
 
         if contradiction is not None:
@@ -241,8 +239,7 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
             biggest = max(requests)
             action = (
                 "Stop stepping. Jump well past the largest failed request (%s) to bound the "
-                "requirement, then tighten once from a measurement."
-                % format_bytes(biggest)
+                "requirement, then tighten once from a measurement." % format_bytes(biggest)
             )
 
         findings.append(
@@ -303,9 +300,7 @@ def goodput(jobs):
     total = stats["gpu_hours_total"]
     stats["gpu_goodput"] = (stats["gpu_hours_completed"] / total) if total else None
     stats["gpu_noop_fraction"] = (stats["gpu_hours_noop"] / total) if total else None
-    stats["completion_rate"] = (
-        stats["completed"] / float(stats["jobs"]) if stats["jobs"] else None
-    )
+    stats["completion_rate"] = stats["completed"] / float(stats["jobs"]) if stats["jobs"] else None
     return stats
 
 

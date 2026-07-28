@@ -38,6 +38,7 @@ from .model import Job, Step
 # there is no reason to make a user re-run because the number they wanted was
 # never collected. Pure redundancy (DBIndex, BlockID, McsLabel, duplicate
 # spellings of the same TRES) is omitted.
+# fmt: off
 _FIELDS = [
     # identity
     "JobID", "JobIDRaw", "JobName", "User", "UID", "Group", "Account", "Cluster",
@@ -69,10 +70,12 @@ _FIELDS = [
     # scheduling and context
     "Priority", "Reservation", "WorkDir", "Comment", "AdminComment", "Layout",
 ]
+# fmt: on
 
 # Dropped silently when the local Slurm is too old to know them. Everything not
 # listed is load-bearing and kept even if unrecognised, so a genuinely broken
 # field list fails loudly instead of quietly degrading.
+# fmt: off
 _OPTIONAL = frozenset(
     [
         "WorkDir", "Constraints", "Reason", "MaxRSSNode", "MaxRSSTask", "TRESUsageInTot",
@@ -88,18 +91,21 @@ _OPTIONAL = frozenset(
         "SystemCPU",
     ]
 )
+# fmt: on
 
 _UNSET = frozenset(["", "Unknown", "None", "N/A", "none", "Unlimited"])
 
 # A terminal job is over even if the End timestamp is missing; inferring "still
 # running" from a blank End would suppress every diagnosis on such a record. The
 # stale-record signal is specifically a NON-terminal state with no end.
+# fmt: off
 _TERMINAL_STATES = frozenset(
     [
         "COMPLETED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY", "CANCELLED", "NODE_FAIL",
         "BOOT_FAIL", "DEADLINE", "PREEMPTED", "REVOKED", "SPECIAL_EXIT", "OUT_OF_ME+",
     ]
 )
+# fmt: on
 
 
 class SacctError(RuntimeError):
@@ -326,8 +332,7 @@ def parse(text, fields=None):
         order.append(raw_id)
 
     return [
-        allocations[job_id]._replace(steps=tuple(pending_steps.get(job_id, ())))
-        for job_id in order
+        allocations[job_id]._replace(steps=tuple(pending_steps.get(job_id, ()))) for job_id in order
     ]
 
 

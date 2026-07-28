@@ -47,13 +47,9 @@ class TestRankingByCost:
     """
 
     def test_expensive_group_outranks_numerous_one(self, cot_exp):
-        cheap = [
-            cot_exp._replace(job_id="c%d" % i, name="cheap", elapsed=2.0)
-            for i in range(400)
-        ]
+        cheap = [cot_exp._replace(job_id="c%d" % i, name="cheap", elapsed=2.0) for i in range(400)]
         pricey = [
-            cot_exp._replace(job_id="p%d" % i, name="pricey", elapsed=36000.0)
-            for i in range(5)
+            cot_exp._replace(job_id="p%d" % i, name="pricey", elapsed=36000.0) for i in range(5)
         ]
         assert build_groups(cheap + pricey)[0].name == "pricey"
 
@@ -64,21 +60,25 @@ class TestRankingByCost:
         undefined on all 86 partitions -- so the constant is a stated convention
         and this test pins it.
         """
-        gpu = [cot_exp._replace(job_id="g%d" % i, name="gpu-work", elapsed=3600.0)
-               for i in range(3)]
+        gpu = [
+            cot_exp._replace(job_id="g%d" % i, name="gpu-work", elapsed=3600.0) for i in range(3)
+        ]
         cpu_job = cot_exp._replace(alloc_tres="billing=1,cpu=1,mem=80G,node=1", req_tres="")
-        cpu = [cpu_job._replace(job_id="c%d" % i, name="cpu-work", elapsed=3600.0)
-               for i in range(3)]
+        cpu = [
+            cpu_job._replace(job_id="c%d" % i, name="cpu-work", elapsed=3600.0) for i in range(3)
+        ]
         assert build_groups(gpu + cpu)[0].name == "gpu-work"
 
     def test_enough_cpu_hours_do_outrank_a_little_gpu_work(self, cot_exp):
         """The weighting is a ratio, not a veto: 25,600 core-hours really is more
         compute than 3 GPU-hours, and the ranking must be able to say so."""
-        gpu = [cot_exp._replace(job_id="g%d" % i, name="gpu-work", elapsed=3600.0)
-               for i in range(3)]
+        gpu = [
+            cot_exp._replace(job_id="g%d" % i, name="gpu-work", elapsed=3600.0) for i in range(3)
+        ]
         cpu_job = cot_exp._replace(alloc_tres="billing=64,cpu=64,mem=80G,node=1", req_tres="")
-        cpu = [cpu_job._replace(job_id="c%d" % i, name="cpu-work", elapsed=36000.0)
-               for i in range(40)]
+        cpu = [
+            cpu_job._replace(job_id="c%d" % i, name="cpu-work", elapsed=36000.0) for i in range(40)
+        ]
         assert build_groups(gpu + cpu)[0].name == "cpu-work"
 
 
@@ -202,18 +202,15 @@ class TestScale:
     def test_large_history_builds_quickly(self, cot_exp):
         # Alphabetic names: numeric suffixes would (correctly) normalize into a
         # single family, which is the opposite of what this test measures.
-        names = ["work-" + a + b for a in string.ascii_lowercase[:6]
-                 for b in string.ascii_lowercase[:10]]
-        jobs = [
-            cot_exp._replace(job_id=str(i), name=names[i % len(names)])
-            for i in range(6000)
+        names = [
+            "work-" + a + b for a in string.ascii_lowercase[:6] for b in string.ascii_lowercase[:10]
         ]
+        jobs = [cot_exp._replace(job_id=str(i), name=names[i % len(names)]) for i in range(6000)]
         history = History(jobs)
         assert len(history.groups) == 60
         assert len(history) == 6000
 
     def test_filter_over_large_history(self, cot_exp):
         names = ["work-" + a for a in string.ascii_lowercase]
-        jobs = [cot_exp._replace(job_id=str(i), name=names[i % len(names)])
-                for i in range(6000)]
+        jobs = [cot_exp._replace(job_id=str(i), name=names[i % len(names)]) for i in range(6000)]
         assert len(filter_jobs(jobs, "all", "work-c")) > 0

@@ -79,16 +79,25 @@ class TestDerivedFields:
 
     def test_req_mem_scope(self, oom_job):
         assert oom_job.req_mem_scope == "node"
-        assert oom_job.req_mem_bytes == 40 * 1024 ** 3
+        assert oom_job.req_mem_bytes == 40 * 1024**3
 
 
 class TestArrayAndHetJobs:
     def test_array_task_steps_group_correctly(self):
-        text = "\n".join([
-            row(JobID="123_4", JobName="arr", State="COMPLETED", ExitCode="0:0"),
-            row(JobID="123_4.batch", JobName="batch", State="COMPLETED", ExitCode="0:0",
-                Elapsed="00:10:00", CPUTime="00:40:00", MaxRSS="1024K"),
-        ])
+        text = "\n".join(
+            [
+                row(JobID="123_4", JobName="arr", State="COMPLETED", ExitCode="0:0"),
+                row(
+                    JobID="123_4.batch",
+                    JobName="batch",
+                    State="COMPLETED",
+                    ExitCode="0:0",
+                    Elapsed="00:10:00",
+                    CPUTime="00:40:00",
+                    MaxRSS="1024K",
+                ),
+            ]
+        )
         jobs = parse(text)
         assert len(jobs) == 1
         assert jobs[0].job_id == "123_4"
@@ -187,31 +196,42 @@ class TestMemoryLimitPrecedence:
     """
 
     def _job(self, req_mem="0n", alloc="billing=6,cpu=6,gres/gpu=1,mem=80G,node=1", req_tres=""):
-        return parse(row(
-            JobID="9100", JobName="j", Partition="test", State="TIMEOUT", ExitCode="0:0",
-            End="2026-01-01T00:30:00", Elapsed="00:30:00", Timelimit="00:30:00",
-            ReqMem=req_mem, ReqCPUS="6", AllocTRES=alloc, ReqTRES=req_tres,
-            NodeList="midway3-0385",
-        ))[0]
+        return parse(
+            row(
+                JobID="9100",
+                JobName="j",
+                Partition="test",
+                State="TIMEOUT",
+                ExitCode="0:0",
+                End="2026-01-01T00:30:00",
+                Elapsed="00:30:00",
+                Timelimit="00:30:00",
+                ReqMem=req_mem,
+                ReqCPUS="6",
+                AllocTRES=alloc,
+                ReqTRES=req_tres,
+                NodeList="midway3-0385",
+            )
+        )[0]
 
     def test_zero_reqmem_is_none_not_zero(self):
         assert self._job(req_mem="0n").req_mem_bytes is None
 
     def test_alloc_tres_supplies_the_real_limit(self):
-        assert self._job(req_mem="0n").mem_limit_bytes == 80 * 1024 ** 3
+        assert self._job(req_mem="0n").mem_limit_bytes == 80 * 1024**3
 
     def test_alloc_tres_wins_over_reqtres_default(self):
         """ReqTRES shows DefMemPerCPU x cores (22860M), not the 80G granted."""
         job = self._job(req_mem="0n", req_tres="billing=6,cpu=6,mem=22860M,node=1")
-        assert job.mem_limit_bytes == 80 * 1024 ** 3
+        assert job.mem_limit_bytes == 80 * 1024**3
 
     def test_reqmem_used_when_alloc_tres_has_no_mem(self):
         job = self._job(req_mem="40Gn", alloc="billing=6,cpu=6,node=1")
-        assert job.mem_limit_bytes == 40 * 1024 ** 3
+        assert job.mem_limit_bytes == 40 * 1024**3
 
     def test_reqtres_is_last_resort(self):
         job = self._job(req_mem="0n", alloc="cpu=6", req_tres="cpu=6,mem=22860M")
-        assert job.mem_limit_bytes == 22860 * 1024 ** 2
+        assert job.mem_limit_bytes == 22860 * 1024**2
 
     def test_no_memory_anywhere_is_none(self):
         assert self._job(req_mem="0n", alloc="cpu=6", req_tres="cpu=6").mem_limit_bytes is None
@@ -232,7 +252,7 @@ class TestMemoryLimitPrecedence:
                     elapsed=1800.0,
                     total_cpu=0.5,
                     cpu_time=10800.0,
-                    max_rss=59 * 1024 ** 3,
+                    max_rss=59 * 1024**3,
                 ),
             )
         )
@@ -265,9 +285,7 @@ class TestStateFilterNeedsEndTime:
         assert args[args.index("-E") + 1] == "now"
 
     def test_explicit_until_is_respected(self):
-        args = self._captured(
-            user="u", since="-7days", states=["FAILED"], until="2026-07-28"
-        )
+        args = self._captured(user="u", since="-7days", states=["FAILED"], until="2026-07-28")
         assert args[args.index("-E") + 1] == "2026-07-28"
 
     def test_no_end_time_injected_without_a_state_filter(self):

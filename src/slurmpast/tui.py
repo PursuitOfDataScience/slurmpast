@@ -88,6 +88,10 @@ class ClipboardMixin:
     Subclasses provide the text; this handles delivery and the notification.
     """
 
+    # Always mixed into a Screen, which supplies `app`. Declared so the type
+    # checker knows that, rather than sprinkling ignores at each use.
+    app: "SlurmpastApp"
+
     def clipboard_row(self) -> str:
         return ""
 
@@ -116,7 +120,9 @@ class ClipboardMixin:
                 written = False
         lines = text.count("\n") + 1
         message = "copied %s (%d line%s) to the clipboard" % (
-            what, lines, "" if lines == 1 else "s"
+            what,
+            lines,
+            "" if lines == 1 else "s",
         )
         if written:
             message += "\nalso written to %s" % path
@@ -168,10 +174,13 @@ class HelpScreen(ModalScreen[None]):
         Binding("q", "dismiss", "Back"),
         Binding("question_mark", "dismiss", "Back", show=False),
     ]
-    CSS = BASE_CSS + """
+    CSS = (
+        BASE_CSS
+        + """
     HelpScreen { align: center middle; }
     #help-box { width: 78; height: auto; border: round $primary; background: $panel; padding: 1 2; }
     """
+    )
 
     def compose(self) -> ComposeResult:
         body = Text()
@@ -276,7 +285,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
     # -- data ------------------------------------------------------------
 
     def refresh_rows(self) -> None:
-        history: History | None = self.app.history  # type: ignore[attr-defined]
+        history: History | None = self.app.history
         table = self.query_one("#groups", DataTable)
         # The load worker can finish before on_mount has added the columns --
         # with an in-memory loader it reliably does. Populating a zero-column
@@ -294,7 +303,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         self._rows = groups
         summary.update(self._summary(history, len(groups)))
         table.clear()
-        ascii_mode = self.app.ascii_mode  # type: ignore[attr-defined]
+        ascii_mode = self.app.ascii_mode
         for index, group in enumerate(groups, start=1):
             burned = (
                 "%.0f gpu-h" % group.gpu_hours
@@ -307,9 +316,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
                 Text(group.name[:26], style=theme.INK),
                 Text(group.partition[:9], style=theme.DIM),
                 Text(str(group.total), style=theme.DIM),
-                render.outcome_bar(
-                    group.completed, group.failed, group.cancelled, 16, ascii_mode
-                ),
+                render.outcome_bar(group.completed, group.failed, group.cancelled, 16, ascii_mode),
                 Text(
                     format_percent(group.failure_rate),
                     style=theme.HEALTH_COLOR["crit"] if group.failed else theme.FAINT,
@@ -320,8 +327,10 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
                 ),
                 Text(burned, style=theme.GPU_COLOR if group.gpu_hours else theme.CPU_COLOR),
                 Text((group.last_seen or "")[:10], style=theme.FAINT),
-                Text("%d names" % group.distinct_names if group.distinct_names > 1 else "",
-                     style=theme.FAINT),
+                Text(
+                    "%d names" % group.distinct_names if group.distinct_names > 1 else "",
+                    style=theme.FAINT,
+                ),
                 key=str(index),
             )
         # Lead with the WINDOW: it is the single most common explanation for
@@ -329,7 +338,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         # The filter is named only when it is actually filtering -- a bare
         # "everything" in the title bar is noise.
         parts = [
-            self.app.window,  # type: ignore[attr-defined]
+            self.app.window,
             "%d workload%s" % (len(groups), "" if len(groups) == 1 else "s"),
             "by %s" % sort_label(self.sort_mode),
         ]
@@ -380,22 +389,30 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         group = self._selected()
         if group is None:
             return ""
-        return "\t".join([
-            group.name, group.partition, str(group.total),
-            "%d completed" % group.completed, "%d failed" % group.failed,
-            "%d idle" % group.noop,
-            "%.1f gpu-h" % group.gpu_hours if group.gpu_hours else "%.1f core-h" % group.core_hours,
-            group.last_seen or "",
-        ])
+        return "\t".join(
+            [
+                group.name,
+                group.partition,
+                str(group.total),
+                "%d completed" % group.completed,
+                "%d failed" % group.failed,
+                "%d idle" % group.noop,
+                "%.1f gpu-h" % group.gpu_hours
+                if group.gpu_hours
+                else "%.1f core-h" % group.core_hours,
+                group.last_seen or "",
+            ]
+        )
 
     def clipboard_view(self) -> str:
-        history: History | None = self.app.history  # type: ignore[attr-defined]
+        history: History | None = self.app.history
         if history is None:
             return ""
         from .report import Style, render_overview
 
-        return render_overview(history, style=Style(enabled=False), limit=len(self._rows),
-                               sort=self.sort_mode)
+        return render_overview(
+            history, style=Style(enabled=False), limit=len(self._rows), sort=self.sort_mode
+        )
 
     def action_open(self) -> None:
         group = self._selected()
@@ -426,7 +443,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         self.app.push_screen(PatternsScreen())
 
     def action_all_jobs(self) -> None:
-        history: History | None = self.app.history  # type: ignore[attr-defined]
+        history: History | None = self.app.history
         if history is not None:
             self.app.push_screen(JobListScreen(history.usable_jobs, "all jobs"))
 
@@ -530,7 +547,7 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         # Newest first: after a failed run you look at the most recent attempt.
         jobs.sort(key=lambda j: (j.start or j.submit or "", j.job_id), reverse=True)
         self._rows = jobs
-        ascii_mode = self.app.ascii_mode  # type: ignore[attr-defined]
+        ascii_mode = self.app.ascii_mode
         table.clear()
         for index, job in enumerate(jobs, start=1):
             grade = theme.STATE_HEALTH.get(job.base_state, "none")
@@ -560,8 +577,9 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
 
         summary = Text()
         summary.append(self._title, style="bold %s" % theme.INK)
-        summary.append("  ·  %d job%s" % (len(jobs), "" if len(jobs) == 1 else "s"),
-                       style=theme.DIM)
+        summary.append(
+            "  ·  %d job%s" % (len(jobs), "" if len(jobs) == 1 else "s"), style=theme.DIM
+        )
         idle = sum(1 for j in jobs if looks_like_noop(j))
         if idle:
             summary.append("  ·  %d never computed" % idle, style=theme.HEALTH_COLOR["warn"])
@@ -580,7 +598,7 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         self.query_one("#summary", Static).update(summary)
         parts = [
             "%d job%s" % (len(jobs), "" if len(jobs) == 1 else "s"),
-            self.app.window,  # type: ignore[attr-defined]
+            self.app.window,
         ]
         if self.filter_mode != "all":
             parts.insert(1, dict(FILTERS).get(self.filter_mode, self.filter_mode))
@@ -596,22 +614,42 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         job = self._selected()
         if job is None:
             return ""
-        return "\t".join([
-            job.job_id, job.name or "", job.base_state,
-            job.start or "", job.end or "",
-            format_duration(job.elapsed), format_duration(job.total_cpu),
-            format_percent(job.cpu_utilization), str(job.gpu_count or 0),
-            job.node_list or "",
-        ])
+        return "\t".join(
+            [
+                job.job_id,
+                job.name or "",
+                job.base_state,
+                job.start or "",
+                job.end or "",
+                format_duration(job.elapsed),
+                format_duration(job.total_cpu),
+                format_percent(job.cpu_utilization),
+                str(job.gpu_count or 0),
+                job.node_list or "",
+            ]
+        )
 
     def clipboard_view(self) -> str:
-        header = "\t".join(["JOBID", "NAME", "STATE", "STARTED", "ENDED",
-                            "ELAPSED", "CPU", "UTIL", "GPU", "NODE"])
-        rows = ["\t".join([
-            j.job_id, j.name or "", j.base_state, j.start or "", j.end or "",
-            format_duration(j.elapsed), format_duration(j.total_cpu),
-            format_percent(j.cpu_utilization), str(j.gpu_count or 0), j.node_list or "",
-        ]) for j in self._rows]
+        header = "\t".join(
+            ["JOBID", "NAME", "STATE", "STARTED", "ENDED", "ELAPSED", "CPU", "UTIL", "GPU", "NODE"]
+        )
+        rows = [
+            "\t".join(
+                [
+                    j.job_id,
+                    j.name or "",
+                    j.base_state,
+                    j.start or "",
+                    j.end or "",
+                    format_duration(j.elapsed),
+                    format_duration(j.total_cpu),
+                    format_percent(j.cpu_utilization),
+                    str(j.gpu_count or 0),
+                    j.node_list or "",
+                ]
+            )
+            for j in self._rows
+        ]
         return "\n".join([header] + rows)
 
     def action_open(self) -> None:
@@ -669,7 +707,7 @@ class WorkloadScreen(JobListScreen):
 
     def on_mount(self) -> None:
         super().on_mount()
-        history: History | None = self.app.history  # type: ignore[attr-defined]
+        history: History | None = self.app.history
         if history is None:
             return
         findings = history.group_patterns(self._group)
@@ -684,7 +722,9 @@ class WorkloadScreen(JobListScreen):
             banner.append("\n  " + " ".join(render.wrap(worst.evidence, 100)), style=theme.DIM)
             existing = self.query_one("#summary", Static)
             merged = Text()
-            merged.append_text(existing.renderable if isinstance(existing.renderable, Text) else Text())
+            merged.append_text(
+                existing.renderable if isinstance(existing.renderable, Text) else Text()
+            )
             merged.append("\n")
             merged.append_text(banner)
             existing.update(merged)
@@ -727,8 +767,13 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         """The whole post-mortem, rendered plain -- the paste-ready artefact."""
         from .report import Style, render_job
 
-        text, _ = render_job(self._job, log_path=self._log_path, log_text=self._log_text,
-                             style=Style(enabled=False), show_steps=True)
+        text, _ = render_job(
+            self._job,
+            log_path=self._log_path,
+            log_text=self._log_text,
+            style=Style(enabled=False),
+            show_steps=True,
+        )
         return text
 
     clipboard_view = clipboard_row
@@ -742,16 +787,16 @@ class JobScreen(ClipboardMixin, Screen[Any]):
 
     def render_body(self) -> None:
         job = self._job
-        ascii_mode = self.app.ascii_mode  # type: ignore[attr-defined]
+        ascii_mode = self.app.ascii_mode
         # Logs are read here and only here -- eagerly scanning logs for 6,574
         # jobs at load time would dominate startup for data most of them never
         # need.
         log_path, log_text = (None, None)
-        if not self.app.no_logs:  # type: ignore[attr-defined]
-            log_path, log_text = load_for(job, extra_dirs=self.app.log_dirs)  # type: ignore
+        if not self.app.no_logs:
+            log_path, log_text = load_for(job, extra_dirs=self.app.log_dirs)
         self._log_path, self._log_text = log_path, log_text
 
-        history: History | None = self.app.history  # type: ignore[attr-defined]
+        history: History | None = self.app.history
         note = ""
         if history is not None and len(history) > 20:
             from .nodes import expand_nodelist, note_for_node
@@ -772,9 +817,13 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         # One shared section model with report.py, so the dashboard and the
         # plain output can never disagree about what a job did.
         section_color = {
-            "job": theme.INK, "timing": theme.ACCENT, "cpu": theme.CPU_COLOR,
-            "memory": theme.MEM_COLOR, "filesystem": theme.DISK_COLOR,
-            "gpu": theme.GPU_COLOR, "outcome": theme.INK,
+            "job": theme.INK,
+            "timing": theme.ACCENT,
+            "cpu": theme.CPU_COLOR,
+            "memory": theme.MEM_COLOR,
+            "filesystem": theme.DISK_COLOR,
+            "gpu": theme.GPU_COLOR,
+            "outcome": theme.INK,
         }
         for title, rows in render.job_sections(job):
             colour = section_color.get(title, theme.INK)
@@ -796,7 +845,7 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         if log_path:
             shown = log_path if self._show_paths else _elide(log_path)
             body.append("  log  %s\n" % shown, style=theme.FAINT)
-        elif not self.app.no_logs:  # type: ignore[attr-defined]
+        elif not self.app.no_logs:
             body.append("  log  not found — pass --log-dir to help\n", style=theme.FAINT)
 
         body.append("\n")
@@ -811,8 +860,10 @@ class JobScreen(ClipboardMixin, Screen[Any]):
                 body.append("        %s\n" % line, style=theme.DIM)
             if finding.action:
                 for index, line in enumerate(render.wrap(finding.action, 82)):
-                    body.append("        %s%s\n" % ("→ " if index == 0 else "  ", line),
-                                style=theme.ACCENT if index == 0 else theme.DIM)
+                    body.append(
+                        "        %s%s\n" % ("→ " if index == 0 else "  ", line),
+                        style=theme.ACCENT if index == 0 else theme.DIM,
+                    )
             body.append("\n")
 
         self.query_one("#body", Static).update(body)
@@ -820,6 +871,8 @@ class JobScreen(ClipboardMixin, Screen[Any]):
 
 class PatternsScreen(ClipboardMixin, Screen[Any]):
     """Cross-run findings: the things no single job can show."""
+
+    app: "SlurmpastApp"
 
     BINDINGS: ClassVar = [
         Binding("q", "app.pop_screen", "Back"),
@@ -834,7 +887,7 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
         self._group = group
 
     def clipboard_row(self) -> str:
-        history: History | None = self.app.history  # type: ignore[attr-defined]
+        history: History | None = self.app.history
         if history is None:
             return ""
         from .report import Style, render_patterns
@@ -850,7 +903,7 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
         yield Footer()
 
     def on_mount(self) -> None:
-        history: History | None = self.app.history  # type: ignore[attr-defined]
+        history: History | None = self.app.history
         self.sub_title = "patterns" + (" · %s" % self._group.name if self._group else "")
         body = Text()
         if history is None:
@@ -861,10 +914,12 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
         findings = (
             history.group_patterns(self._group) if self._group is not None else history.patterns
         )
-        ascii_mode = self.app.ascii_mode  # type: ignore[attr-defined]
+        ascii_mode = self.app.ascii_mode
         if not findings:
-            body.append("  no cross-run pattern met its evidence threshold.\n",
-                        style=theme.HEALTH_COLOR["ok"])
+            body.append(
+                "  no cross-run pattern met its evidence threshold.\n",
+                style=theme.HEALTH_COLOR["ok"],
+            )
             body.append(
                 "\n  That is a real answer, not an empty screen: these detectors\n"
                 "  stay silent rather than manufacture a finding.\n",
@@ -878,14 +933,18 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
                 body.append("        %s\n" % line, style=theme.DIM)
             if finding.action:
                 for index, line in enumerate(render.wrap(finding.action, 82)):
-                    body.append("        %s%s\n" % ("→ " if index == 0 else "  ", line),
-                                style=theme.ACCENT if index == 0 else theme.DIM)
+                    body.append(
+                        "        %s%s\n" % ("→ " if index == 0 else "  ", line),
+                        style=theme.ACCENT if index == 0 else theme.DIM,
+                    )
             body.append("\n")
         self.query_one("#body", Static).update(body)
 
 
 class NodesScreen(ClipboardMixin, Screen[Any]):
     """Per-node reliability, workload-controlled."""
+
+    app: "SlurmpastApp"
 
     BINDINGS: ClassVar = [
         Binding("q", "app.pop_screen", "Back"),
@@ -920,7 +979,7 @@ class NodesScreen(ClipboardMixin, Screen[Any]):
         self.refresh_rows()
 
     def refresh_rows(self) -> None:
-        history: History | None = self.app.history  # type: ignore[attr-defined]
+        history: History | None = self.app.history
         if history is None or not self.query_one("#nodes", DataTable).columns:
             return
         from .nodes import dominant_workload
@@ -931,12 +990,16 @@ class NodesScreen(ClipboardMixin, Screen[Any]):
         summary = Text()
         summary.append("node reliability — %s rate\n" % self.metric, style="bold %s" % theme.INK)
         if workload:
-            summary.append("  controlled for workload: only %s counted " % workload,
-                           style=theme.DIM)
+            summary.append(
+                "  controlled for workload: only %s counted " % workload, style=theme.DIM
+            )
             summary.append("(placement is not random)\n", style=theme.FAINT)
         else:
-            summary.append("  UNCONTROLLED — mixes workloads, so a node that hosted one bad "
-                           "campaign looks cursed\n", style=theme.HEALTH_COLOR["warn"])
+            summary.append(
+                "  UNCONTROLLED — mixes workloads, so a node that hosted one bad "
+                "campaign looks cursed\n",
+                style=theme.HEALTH_COLOR["warn"],
+            )
         summary.append(
             "  baseline %s over %d placements%s\n"
             % (
@@ -957,9 +1020,12 @@ class NodesScreen(ClipboardMixin, Screen[Any]):
             table.add_row(
                 Text(row["node"], style=theme.INK),
                 Text("%d/%d" % (row["bad"], row["trials"]), style=theme.DIM),
-                Text("%.1f%%" % (100 * row["rate"]), style=theme.HEALTH_COLOR.get(grade, theme.DIM)),
-                Text("%.1f – %.1f%%" % (100 * row["ci_low"], 100 * row["ci_high"]),
-                     style=theme.FAINT),
+                Text(
+                    "%.1f%%" % (100 * row["rate"]), style=theme.HEALTH_COLOR.get(grade, theme.DIM)
+                ),
+                Text(
+                    "%.1f – %.1f%%" % (100 * row["ci_low"], 100 * row["ci_high"]), style=theme.FAINT
+                ),
                 Text(row["verdict"], style=theme.HEALTH_COLOR.get(grade, theme.FAINT)),
             )
 
@@ -968,22 +1034,31 @@ class NodesScreen(ClipboardMixin, Screen[Any]):
         if excl:
             note.append("\n  intervals entirely above baseline:\n", style=theme.DIM)
             note.append("    #SBATCH --exclude=%s\n" % excl, style="bold %s" % theme.ACCENT)
-            note.append("    not applied for you — excluding nodes trades availability for "
-                        "reliability, and that is your call.\n", style=theme.FAINT)
+            note.append(
+                "    not applied for you — excluding nodes trades availability for "
+                "reliability, and that is your call.\n",
+                style=theme.FAINT,
+            )
         else:
-            note.append("\n  no node's interval clears the baseline; nothing to exclude.\n",
-                        style=theme.FAINT)
+            note.append(
+                "\n  no node's interval clears the baseline; nothing to exclude.\n",
+                style=theme.FAINT,
+            )
         self.query_one("#exclude", Static).update(note)
-        self.sub_title = "nodes · %s%s" % (self.metric, "" if self.controlled else " · uncontrolled")
+        self.sub_title = "nodes · %s%s" % (
+            self.metric,
+            "" if self.controlled else " · uncontrolled",
+        )
 
     def clipboard_row(self) -> str:
-        history: History | None = self.app.history  # type: ignore[attr-defined]
+        history: History | None = self.app.history
         if history is None:
             return ""
         from .report import Style, render_nodes
 
-        return render_nodes(history, metric=self.metric, controlled=self.controlled,
-                            style=Style(enabled=False))
+        return render_nodes(
+            history, metric=self.metric, controlled=self.controlled, style=Style(enabled=False)
+        )
 
     clipboard_view = clipboard_row
 
@@ -1014,8 +1089,9 @@ class SlurmpastApp(App[Any]):
         Binding("M", "toggle_mouse", "Mouse", show=False),
     ]
 
-    def __init__(self, loader, window: str, ascii_mode=False, no_logs=False, log_dirs=(),
-                 mouse=False):
+    def __init__(
+        self, loader, window: str, ascii_mode=False, no_logs=False, log_dirs=(), mouse=False
+    ):
         super().__init__()
         self._loader = loader
         self._window = window
@@ -1076,9 +1152,11 @@ class SlurmpastApp(App[Any]):
         This reaches into the driver, so it is defensive: a Textual that renames
         these internals should degrade to a message, not a traceback.
         """
-        driver = getattr(self, "_driver", None)
+        driver: Any = getattr(self, "_driver", None)
         enable = not self.mouse_enabled
         try:
+            if driver is None:
+                raise RuntimeError("no driver")
             driver._mouse = True  # the enable/disable methods are gated on this
             if enable:
                 driver._enable_mouse_support()
@@ -1095,8 +1173,10 @@ class SlurmpastApp(App[Any]):
             return
         self.mouse_enabled = enable
         if enable:
-            self.notify("mouse capture ON — in-app clicking and wheel scrolling; "
-                        "drag-select is disabled", timeout=5)
+            self.notify(
+                "mouse capture ON — in-app clicking and wheel scrolling; drag-select is disabled",
+                timeout=5,
+            )
         else:
             self.notify("mouse capture OFF — drag to select text as normal", timeout=5)
 

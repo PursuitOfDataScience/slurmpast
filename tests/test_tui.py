@@ -184,7 +184,7 @@ class TestRowJump:
         assert jump.push("3", 50) == 3
 
     def test_two_digits_accumulate(self):
-        """"12" must reach row 12, not row 1 then row 2."""
+        """ "12" must reach row 12, not row 1 then row 2."""
         jump = tui._RowJump()
         assert jump.push("1", 50) == 1
         assert jump.push("2", 50) == 12
@@ -238,8 +238,14 @@ class TestDemoMode:
         per_job = set()
         for job in h.usable_jobs:
             per_job |= {f.code for f in diagnose(job).findings}
-        assert {"timeout-hang", "host-oom", "system-cpu-heavy", "straggler",
-                "paging", "noop-allocation"} <= per_job
+        assert {
+            "timeout-hang",
+            "host-oom",
+            "system-cpu-heavy",
+            "straggler",
+            "paging",
+            "noop-allocation",
+        } <= per_job
 
     def test_demo_includes_healthy_jobs_that_draw_nothing(self):
         """Restraint must be visible in the demo, not just claimed."""
