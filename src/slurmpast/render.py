@@ -108,29 +108,6 @@ def severity_chip(severity: str):
     return Text(label, style="bold %s" % theme.HEALTH_COLOR.get(grade, theme.FAINT))
 
 
-def job_headline(job: Job, ascii_mode: bool = False):
-    """``<state> · <elapsed> · <cpu util>`` -- the three facts that classify a job."""
-    text = state_text(job.base_state, ascii_mode)
-    text.append("  ")
-    text.append(format_duration(job.elapsed), style=theme.DIM)
-    text.append("  cpu ", style=theme.FAINT)
-    util = job.cpu_utilization
-    style = theme.CPU_COLOR
-    if util is not None and util < 0.02:
-        style = theme.HEALTH_COLOR["crit"]
-    text.append(format_percent(util), style=style)
-    return text
-
-
-def finding_lines(finding, width: int = 74) -> list[str]:
-    out = [finding.title]
-    out.extend("    " + line for line in wrap(finding.evidence, width - 4))
-    if finding.action:
-        for index, line in enumerate(wrap(finding.action, width - 7)):
-            out.append(("    -> " if index == 0 else "       ") + line)
-    return out
-
-
 def wrap(text: str, width: int) -> list[str]:
     """Word wrap that preserves explicit newlines."""
     lines: list[str] = []
@@ -149,15 +126,6 @@ def wrap(text: str, width: int) -> list[str]:
         if current:
             lines.append(current)
     return lines
-
-
-def resource_line(label: str, value: str, color: str, percent: float | None, ascii_mode=False):
-    text = Text()
-    text.append("  %-9s " % label, style=color)
-    text.append_text(bar(percent, color, ascii_mode=ascii_mode))
-    text.append("  ")
-    text.append(value, style=theme.INK)
-    return text
 
 
 def mem_text(job: Job) -> str:

@@ -22,7 +22,10 @@ from .patterns import usable
 MIN_SAMPLES = 10
 Z = 1.96  # 95%
 
-_RANGE = re.compile(r"^([A-Za-z0-9\-]*?)\[(.+)\]$")
+# Tolerates a suffix after the bracket (``node[1-2]-ib``), which some
+# site naming schemes produce; without it the whole string was treated as
+# a single node name.
+_RANGE = re.compile(r"^([A-Za-z0-9\-]*?)\[(.+?)\](.*)$")
 
 
 def expand_nodelist(nodelist):
@@ -39,7 +42,7 @@ def expand_nodelist(nodelist):
         if not match:
             out.append(chunk)
             continue
-        prefix, body = match.group(1), match.group(2)
+        prefix, body, suffix = match.group(1), match.group(2), match.group(3)
         for part in body.split(","):
             part = part.strip()
             if "-" in part:
@@ -47,11 +50,11 @@ def expand_nodelist(nodelist):
                 width = len(low)
                 try:
                     for value in range(int(low), int(high) + 1):
-                        out.append("%s%0*d" % (prefix, width, value))
+                        out.append("%s%0*d%s" % (prefix, width, value, suffix))
                 except ValueError:
-                    out.append(prefix + part)
+                    out.append(prefix + part + suffix)
             elif part:
-                out.append(prefix + part)
+                out.append(prefix + part + suffix)
     return out
 
 

@@ -212,6 +212,9 @@ def _job_json(job, log_path, verdict):
     not be read are ``null``, never 0.
     """
     return {
+        # Deliberately exhaustive. If the reader was captured, it is emitted --
+        # a field extracted but never surfaced is dead weight, and the point of
+        # the wide query was that nobody should have to re-run sacct.
         "identity": {
             "job_id": job.job_id,
             "job_id_raw": job.job_id_raw,
@@ -227,6 +230,9 @@ def _job_json(job, log_path, verdict):
             "wckey": job.wckey,
             "work_dir": job.work_dir,
             "reservation": job.reservation,
+            "comment": job.comment or None,
+            "admin_comment": job.admin_comment or None,
+            "layout": job.layout or None,
         },
         "outcome": {
             "state": job.base_state,
@@ -265,6 +271,10 @@ def _job_json(job, log_path, verdict):
             "alloc_tres": job.alloc_tres,
             "req_tres": job.req_tres,
             "constraints": job.constraints,
+            "req_mem_scope": job.req_mem_scope,
+            "req_cpu_freq_min": job.req_cpu_freq_min or None,
+            "req_cpu_freq_max": job.req_cpu_freq_max or None,
+            "req_cpu_freq_governor": job.req_cpu_freq_gov or None,
         },
         "cpu": {
             "total_seconds": job.total_cpu,
@@ -333,9 +343,22 @@ def _job_json(job, log_path, verdict):
                 "max_rss_task": s.max_rss_task or None,
                 "ave_rss_bytes": s.ave_rss,
                 "max_vmsize_bytes": s.max_vmsize,
+                "max_vmsize_node": s.max_vmsize_node or None,
+                "ave_vmsize_bytes": s.ave_vmsize,
                 "max_pages": s.max_pages,
+                "max_pages_node": s.max_pages_node or None,
+                "ave_pages": s.ave_pages,
                 "read_bytes": s.read_bytes,
                 "write_bytes": s.write_bytes,
+                "max_disk_read_bytes": s.max_disk_read,
+                "max_disk_read_node": s.max_disk_read_node or None,
+                "ave_disk_read_bytes": s.ave_disk_read,
+                "max_disk_write_bytes": s.max_disk_write,
+                "max_disk_write_node": s.max_disk_write_node or None,
+                "ave_disk_write_bytes": s.ave_disk_write,
+                "tres_usage_in_max": s.tres_in_max or None,
+                "tres_usage_in_max_node": s.tres_in_max_node or None,
+                "consumed_energy": s.consumed_energy,
                 "ntasks": s.ntasks,
                 "nnodes": s.nnodes,
                 "node_list": s.node_list or None,

@@ -111,7 +111,7 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
         if len(members) < min_runs:
             continue
         failures = [j for j in members if j.failed]
-        if not failures or len(failures) < min_runs:
+        if len(failures) < min_runs:
             continue
         fraction = len(failures) / float(len(members))
         if fraction < REPEAT_FAIL_FRACTION:

@@ -8,7 +8,7 @@
   <a href="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
-  <img src="https://img.shields.io/badge/tests-457-brightgreen.svg" alt="457 tests">
+  <img src="https://img.shields.io/badge/tests-473-brightgreen.svg" alt="473 tests">
 </p>
 
 <p align="center">
@@ -128,7 +128,7 @@ Two were entirely invisible with a narrow `--format`: **disk writes** (one run
 read 112 GB and wrote 139 GB) and the **user/kernel CPU split** (791 of 6,582
 jobs exceed 30% kernel time — syscall overhead no other tool surfaces).
 
-`--json` emits all of it, 137 values per job.
+`--json` emits all of it — 165 values per job. Nothing is captured and then hidden; a test fails if a field is read but never surfaced.
 
 ## Also finds
 

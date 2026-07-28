@@ -54,6 +54,15 @@ class GroupStats(NamedTuple):
 
     @property
     def failure_rate(self) -> float | None:
+        """Failures as a share of *judged* runs -- cancellations excluded.
+
+        Cancellation is ambiguous (a deliberate kill and an abandoned run are
+        identical in accounting), so counting it as neither success nor failure is
+        the honest denominator. That makes this rate NOT comparable to the RUNS
+        column, which counts everything -- which is why the table shows a failure
+        *count* and this rate is reserved for sorting and severity, where a
+        size-independent measure is what is wanted.
+        """
         judged = self.completed + self.failed
         return (self.failed / judged) if judged else None
 

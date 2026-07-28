@@ -239,6 +239,18 @@ def humanize_window(since, until=None):
 
     if not since:
         return "all time" if not ended else "up to %s" % until
+
+    # Slurm accepts these bare keywords; "since today" reads worse than "today".
+    keyword = {
+        "today": "today",
+        "yesterday": "since yesterday",
+        "midnight": "since midnight",
+        "noon": "since noon",
+        "now": "just now",
+    }.get(since.lower())
+    if keyword and not ended:
+        return keyword
+
     label = since.split("T")[0]
     if ended:
         return "%s to %s" % (label, until.split("T")[0])

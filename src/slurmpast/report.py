@@ -151,17 +151,16 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
         )
     out.append("")
     out.append(
-        "  %-4s %-24s %-9s %6s %8s %7s %11s  %-11s %s"
+        "  %-4s %-24s %-9s %6s %8s %13s  %-11s %s"
         % (
             "#",
             "WORKLOAD",
             "PARTITION",
             "RUNS",
             "FAILED",
-            "NEVER RAN",
             "USED",
             "LAST RUN",
-            "VARIANTS",
+            "NAMES",
         )
     )
     groups = sort_groups(history.groups, sort)
@@ -176,14 +175,13 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
         name = style(label, colour) if colour else label
         variants = "%d names" % group.distinct_names if group.distinct_names > 1 else ""
         out.append(
-            "  %-4d %-24s %-9s %6d %8s %7s %11s  %-11s %s"
+            "  %-4d %-24s %-9s %6d %8s %13s  %-11s %s"
             % (
                 index,
                 name,
                 group.partition[:9],
                 group.total,
-                format_percent(group.failure_rate),
-                group.noop or "-",
+                group.failed or "-",
                 burned,
                 (group.last_seen or "")[:10],
                 style(variants, "grey"),

@@ -315,7 +315,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
             ("PARTITION", 9),
             ("RUNS", 5),
             ("FAILED", 7),
-            ("USED", 11),
+            ("USED", 13),
             ("LAST RUN", 10),
             ("NAMES", 5),
         ):
@@ -362,8 +362,11 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
                 Text(group.name[:24], style=theme.INK),
                 Text(group.partition[:9], style=theme.DIM),
                 Text(str(group.total), style=theme.DIM),
+                # A count, not a rate: the rate's denominator excludes
+                # cancellations while RUNS counts them, so "RUNS 20 / FAILED 20%"
+                # invited the reader to compute 4 failures where there were 2.
                 Text(
-                    format_percent(group.failure_rate),
+                    str(group.failed) if group.failed else "-",
                     style=theme.HEALTH_COLOR["crit"] if group.failed else theme.FAINT,
                 ),
                 Text(burned, style=theme.GPU_COLOR if group.gpu_hours else theme.CPU_COLOR),
