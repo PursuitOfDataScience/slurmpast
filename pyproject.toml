@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slurmpast"
+dynamic = ["version"]
+description = "Why did your Slurm jobs fail? A post-mortem dashboard for finished jobs."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Youzhi Yu" }]
+keywords = ["slurm", "hpc", "sacct", "postmortem", "job-failure", "tui", "seff"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: System :: Distributed Computing",
+]
+dependencies = [
+  # Same floor as slurmwatch: >=0.86 is where the theme system landed, which the
+  # dashboard uses to register its own theme, and it covers DataTable/Header/
+  # Footer/Input. Matching the floor means the two tools resolve to one Textual
+  # in a shared environment instead of fighting over it.
+  "textual>=0.86,<9",
+]
+
+[project.scripts]
+slurmpast = "slurmpast.cli:main"
+# "sp" is a short alias for the same entry point -- same behaviour, less typing.
+# Parallels slurmwatch's "sw"; verified free on PATH.
+sp = "slurmpast.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff>=0.5"]
+
+[tool.setuptools.dynamic]
+version = { attr = "slurmpast._version.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
