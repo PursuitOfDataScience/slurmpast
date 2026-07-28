@@ -305,3 +305,21 @@ def job_sections(job):
     sections.append(("outcome", outcome))
 
     return sections
+
+
+def stamp_short(iso, with_date=True):
+    """``2026-06-27T08:12:50`` -> ``06-27 08:12``, for dense table columns.
+
+    Returns ``""`` for a missing timestamp rather than a placeholder date, so an
+    absent value never looks like a real one.
+    """
+    if not iso:
+        return ""
+    text = str(iso)
+    if "T" not in text:
+        return text[:11]
+    date, _, clock = text.partition("T")
+    hhmm = clock[:5]
+    if not with_date:
+        return hhmm
+    return "%s %s" % (date[5:10], hhmm)

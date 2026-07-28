@@ -111,8 +111,23 @@ Same shape as `slurmwatch`: a dashboard you land on, drill-down on single keys,
 | `1`-`9`… | jump to a row by number (multi-digit) |
 | `/` | search name, job id, state or node |
 | `f` `s` | cycle filter / sort |
+| `y` `Y` | copy the selected row · copy the whole view |
 | `n` `p` `a` | nodes · patterns · flat job list |
 | `?` | help |
+
+**Getting text out.** Dragging to select does not work — a TUI takes the
+terminal's mouse, and Textual's in-app selection API only exists in 1.x. Three
+ways out, in order of convenience:
+
+- **`y` / `Y`** — copies via OSC 52, which reaches the clipboard on the machine
+  you are *sitting at*, not the login node. On a job screen, `y` copies the
+  entire post-mortem, paste-ready. Every copy is also written to
+  `~/.cache/slurmpast/clip.txt`, because OSC 52 fails silently on some
+  terminals and needs `set -g set-clipboard on` inside tmux — so the feature
+  never half-works with no way to tell.
+- **Hold `Shift`** (most terminals) or `Option` (macOS) and drag, to bypass
+  mouse reporting and select natively.
+- **`--plain` / `--json`** — for anything scripted, skip the question entirely.
 
 Everything is also plain text, because a post-mortem you cannot paste into a
 ticket is half a tool: `--plain`, `--overview`, `--patterns`, `--nodes`,

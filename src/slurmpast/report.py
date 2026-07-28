@@ -14,7 +14,7 @@ from .duration import format_bytes, format_duration, format_percent
 from .index import History, sort_groups
 from .model import severity_rank
 from .nodes import compress_nodelist, dominant_workload, node_table, suggest_exclude
-from .render import job_sections, wrap
+from .render import job_sections, stamp_short, wrap
 
 _CODES = {
     "reset": "\033[0m",
@@ -139,14 +139,17 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
 
 def render_list(jobs, style=None, limit=40):
     style = style or Style()
-    out = ["%-13s %-22s %-15s %9s %9s %7s %5s"
-           % ("JOBID", "NAME", "STATE", "ELAPSED", "CPU", "UTIL", "GPU"),
-           style("-" * 88, "grey")]
+    # STARTED/ENDED matter here for the same reason they do in the dashboard: a
+    # workload with hundreds of identically-named runs is unnavigable without them.
+    out = ["%-12s %-18s %-12s %-11s %-11s %9s %9s %7s %4s"
+           % ("JOBID", "NAME", "STATE", "STARTED", "ENDED", "ELAPSED", "CPU", "UTIL", "GPU"),
+           style("-" * 106, "grey")]
     for job in jobs[:limit]:
         state = job.base_state
-        out.append("%-13s %-22s %-15s %9s %9s %7s %5s"
-                   % (job.job_id[:13], (job.name or "")[:22],
-                      style("%-15s" % state[:15], _STATE_COLOR.get(state, "bold")),
+        out.append("%-12s %-18s %-12s %-11s %-11s %9s %9s %7s %4s"
+                   % (job.job_id[:12], (job.name or "")[:18],
+                      style("%-12s" % state[:12], _STATE_COLOR.get(state, "bold")),
+                      stamp_short(job.start) or "-", stamp_short(job.end) or "-",
                       format_duration(job.elapsed), format_duration(job.total_cpu),
                       format_percent(job.cpu_utilization), job.gpu_count or "-"))
     if len(jobs) > limit:

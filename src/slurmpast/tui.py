@@ -57,6 +57,72 @@ DataTable > .datatable--cursor { background: $primary 30%; }
 """
 
 
+# Textual 0.89 has copy_to_clipboard (OSC 52) but not the in-app text-selection
+# API that arrived in 1.x, so dragging to select does not work. OSC 52 is
+# actually the better mechanism over SSH -- it reaches the clipboard on the
+# machine you are sitting at -- but it fails silently on some terminals and
+# needs `set -g set-clipboard on` inside tmux. So every copy is ALSO written to
+# a file, and the notification names it; that way the feature never
+# half-works with no way to tell.
+_COPY_BINDINGS = [
+    Binding("y", "copy_row", "Copy row"),
+    Binding("Y", "copy_view", "Copy view", show=False),
+]
+
+
+def _clip_path() -> str:
+    import os
+
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    directory = os.path.join(base, "slurmpast")
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return ""
+    return os.path.join(directory, "clip.txt")
+
+
+class ClipboardMixin:
+    """``y`` copies the focused row, ``Y`` the whole view.
+
+    Subclasses provide the text; this handles delivery and the notification.
+    """
+
+    def clipboard_row(self) -> str:
+        return ""
+
+    def clipboard_view(self) -> str:
+        return ""
+
+    def action_copy_row(self) -> None:
+        self._deliver(self.clipboard_row(), "row")
+
+    def action_copy_view(self) -> None:
+        self._deliver(self.clipboard_view(), "view")
+
+    def _deliver(self, text: str, what: str) -> None:
+        if not text:
+            self.app.notify("nothing to copy here", severity="warning", timeout=3)
+            return
+        self.app.copy_to_clipboard(text)
+        path = _clip_path()
+        written = False
+        if path:
+            try:
+                with open(path, "w") as handle:
+                    handle.write(text if text.endswith("\n") else text + "\n")
+                written = True
+            except OSError:
+                written = False
+        lines = text.count("\n") + 1
+        message = "copied %s (%d line%s) to the clipboard" % (
+            what, lines, "" if lines == 1 else "s"
+        )
+        if written:
+            message += "\nalso written to %s" % path
+        self.app.notify(message, timeout=6)
+
+
 def _digit_bindings(action: str):
     """Type a row number to jump to it, exactly as slurmwatch does for nodes."""
     return [Binding(str(d), f"{action}('{d}')", show=False) for d in range(10)]
@@ -119,6 +185,8 @@ class HelpScreen(ModalScreen[None]):
             ("n", "node reliability, controlled for workload"),
             ("p", "cross-job patterns"),
             ("a", "flat job list, skipping the grouping"),
+            ("y", "copy the selected row to the clipboard"),
+            ("Y", "copy the whole view (a job screen copies the full report)"),
             ("r", "reload from sacct"),
             ("?", "this help"),
         ):
@@ -129,15 +197,24 @@ class HelpScreen(ModalScreen[None]):
             "  group that cost 400 GPU-hours outranks 400 two-second probes.\n",
             style=theme.FAINT,
         )
+        body.append(
+            "\n  Dragging to select does not work: the terminal's mouse is handed\n"
+            "  to the app. Hold SHIFT (most terminals) or OPTION (macOS) and drag\n"
+            "  to select natively -- or use y / Y, which also drop the text in\n"
+            "  ~/.cache/slurmpast/clip.txt in case your terminal blocks OSC 52.\n"
+            "  For scripting, --plain and --json avoid the question entirely.\n",
+            style=theme.FAINT,
+        )
         with Vertical(id="help-box"):
             yield Static(Text("slurmpast — keys", style="bold %s" % theme.ACCENT))
             yield Static(body)
 
 
-class OverviewScreen(Screen[Any]):
+class OverviewScreen(ClipboardMixin, Screen[Any]):
     """Workload groups, ranked. The landing screen."""
 
     BINDINGS: ClassVar = [
+        *_COPY_BINDINGS,
         Binding("q", "app.quit", "Quit"),
         Binding("escape", "app.quit", "Quit", show=False),
         Binding("enter", "open", "Open"),
@@ -292,6 +369,27 @@ class OverviewScreen(Screen[Any]):
             return None
         return self._rows[table.cursor_row]
 
+    def clipboard_row(self) -> str:
+        group = self._selected()
+        if group is None:
+            return ""
+        return "\t".join([
+            group.name, group.partition, str(group.total),
+            "%d completed" % group.completed, "%d failed" % group.failed,
+            "%d idle" % group.noop,
+            "%.1f gpu-h" % group.gpu_hours if group.gpu_hours else "%.1f core-h" % group.core_hours,
+            group.last_seen or "",
+        ])
+
+    def clipboard_view(self) -> str:
+        history: History | None = self.app.history  # type: ignore[attr-defined]
+        if history is None:
+            return ""
+        from .report import Style, render_overview
+
+        return render_overview(history, style=Style(enabled=False), limit=len(self._rows),
+                               sort=self.sort_mode)
+
     def action_open(self) -> None:
         group = self._selected()
         if group is not None:
@@ -354,10 +452,11 @@ class OverviewScreen(Screen[Any]):
         self.action_open()
 
 
-class JobListScreen(Screen[Any]):
+class JobListScreen(ClipboardMixin, Screen[Any]):
     """A list of jobs -- inside one workload, or flat across everything."""
 
     BINDINGS: ClassVar = [
+        *_COPY_BINDINGS,
         Binding("q", "app.pop_screen", "Back"),
         Binding("escape", "app.pop_screen", "Back", show=False),
         Binding("left", "app.pop_screen", "Back", show=False),
@@ -395,17 +494,22 @@ class JobListScreen(Screen[Any]):
 
     def on_mount(self) -> None:
         table = self.query_one("#jobs", DataTable)
+        # STARTED/ENDED are load-bearing, not decoration: inside a workload with
+        # 1,101 same-named runs the job id alone does not tell you which attempt
+        # you are looking at.
         for label, width in (
             ("#", 5),
             ("", 2),
-            ("JOBID", 13),
-            ("NAME", 22),
-            ("STATE", 15),
-            ("ELAPSED", 10),
-            ("CPU", 10),
+            ("JOBID", 12),
+            ("NAME", 17),
+            ("STATE", 12),
+            ("STARTED", 12),
+            ("ENDED", 12),
+            ("ELAPSED", 9),
+            ("CPU", 9),
             ("UTIL", 7),
-            ("GPU", 5),
-            ("NODE", 15),
+            ("GPU", 4),
+            ("NODE", 13),
         ):
             table.add_column(label, width=width)
         self.refresh_rows()
@@ -429,9 +533,11 @@ class JobListScreen(Screen[Any]):
             table.add_row(
                 Text(str(index), style=theme.FAINT),
                 render.health_dot(grade, ascii_mode),
-                Text(job.job_id[:13], style=theme.INK),
-                Text((job.name or "")[:22], style=theme.DIM),
-                Text(job.base_state[:15], style=theme.HEALTH_COLOR.get(grade, theme.DIM)),
+                Text(job.job_id[:12], style=theme.INK),
+                Text((job.name or "")[:17], style=theme.DIM),
+                Text(job.base_state[:12], style=theme.HEALTH_COLOR.get(grade, theme.DIM)),
+                Text(render.stamp_short(job.start) or "-", style=theme.ACCENT),
+                Text(render.stamp_short(job.end) or "-", style=theme.FAINT),
                 Text(format_duration(job.elapsed), style=theme.DIM),
                 Text(format_duration(job.total_cpu), style=theme.CPU_COLOR),
                 Text(
@@ -441,7 +547,7 @@ class JobListScreen(Screen[Any]):
                     else theme.DIM,
                 ),
                 Text(str(job.gpu_count or "-"), style=theme.GPU_COLOR),
-                Text((job.node_list or "")[:15], style=theme.FAINT),
+                Text((job.node_list or "")[:13], style=theme.FAINT),
                 key=str(index),
             )
 
@@ -462,6 +568,28 @@ class JobListScreen(Screen[Any]):
         if not self._rows or not (0 <= table.cursor_row < len(self._rows)):
             return None
         return self._rows[table.cursor_row]
+
+    def clipboard_row(self) -> str:
+        job = self._selected()
+        if job is None:
+            return ""
+        return "\t".join([
+            job.job_id, job.name or "", job.base_state,
+            job.start or "", job.end or "",
+            format_duration(job.elapsed), format_duration(job.total_cpu),
+            format_percent(job.cpu_utilization), str(job.gpu_count or 0),
+            job.node_list or "",
+        ])
+
+    def clipboard_view(self) -> str:
+        header = "\t".join(["JOBID", "NAME", "STATE", "STARTED", "ENDED",
+                            "ELAPSED", "CPU", "UTIL", "GPU", "NODE"])
+        rows = ["\t".join([
+            j.job_id, j.name or "", j.base_state, j.start or "", j.end or "",
+            format_duration(j.elapsed), format_duration(j.total_cpu),
+            format_percent(j.cpu_utilization), str(j.gpu_count or 0), j.node_list or "",
+        ]) for j in self._rows]
+        return "\n".join([header] + rows)
 
     def action_open(self) -> None:
         job = self._selected()
@@ -541,10 +669,11 @@ class WorkloadScreen(JobListScreen):
         self.app.push_screen(PatternsScreen(self._group))
 
 
-class JobScreen(Screen[Any]):
+class JobScreen(ClipboardMixin, Screen[Any]):
     """The post-mortem for one job."""
 
     BINDINGS: ClassVar = [
+        *_COPY_BINDINGS,
         Binding("q", "app.pop_screen", "Back"),
         Binding("escape", "app.pop_screen", "Back", show=False),
         Binding("left", "app.pop_screen", "Back", show=False),
@@ -557,6 +686,8 @@ class JobScreen(Screen[Any]):
         super().__init__()
         self._job = job
         self._show_paths = False
+        self._log_path = None
+        self._log_text = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -567,6 +698,16 @@ class JobScreen(Screen[Any]):
     def on_mount(self) -> None:
         self.sub_title = "job %s" % self._job.job_id
         self.render_body()
+
+    def clipboard_row(self) -> str:
+        """The whole post-mortem, rendered plain -- the paste-ready artefact."""
+        from .report import Style, render_job
+
+        text, _ = render_job(self._job, log_path=self._log_path, log_text=self._log_text,
+                             style=Style(enabled=False), show_steps=True)
+        return text
+
+    clipboard_view = clipboard_row
 
     def action_toggle_paths(self) -> None:
         self._show_paths = not self._show_paths
@@ -584,6 +725,7 @@ class JobScreen(Screen[Any]):
         log_path, log_text = (None, None)
         if not self.app.no_logs:  # type: ignore[attr-defined]
             log_path, log_text = load_for(job, extra_dirs=self.app.log_dirs)  # type: ignore
+        self._log_path, self._log_text = log_path, log_text
 
         history: History | None = self.app.history  # type: ignore[attr-defined]
         note = ""
@@ -652,19 +794,30 @@ class JobScreen(Screen[Any]):
         self.query_one("#body", Static).update(body)
 
 
-class PatternsScreen(Screen[Any]):
+class PatternsScreen(ClipboardMixin, Screen[Any]):
     """Cross-run findings: the things no single job can show."""
 
     BINDINGS: ClassVar = [
         Binding("q", "app.pop_screen", "Back"),
         Binding("escape", "app.pop_screen", "Back", show=False),
         Binding("left", "app.pop_screen", "Back", show=False),
+        *_COPY_BINDINGS,
     ]
     CSS = BASE_CSS
 
     def __init__(self, group: GroupStats | None = None) -> None:
         super().__init__()
         self._group = group
+
+    def clipboard_row(self) -> str:
+        history: History | None = self.app.history  # type: ignore[attr-defined]
+        if history is None:
+            return ""
+        from .report import Style, render_patterns
+
+        return render_patterns(history, style=Style(enabled=False))
+
+    clipboard_view = clipboard_row
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -707,13 +860,14 @@ class PatternsScreen(Screen[Any]):
         self.query_one("#body", Static).update(body)
 
 
-class NodesScreen(Screen[Any]):
+class NodesScreen(ClipboardMixin, Screen[Any]):
     """Per-node reliability, workload-controlled."""
 
     BINDINGS: ClassVar = [
         Binding("q", "app.pop_screen", "Back"),
         Binding("escape", "app.pop_screen", "Back", show=False),
         Binding("left", "app.pop_screen", "Back", show=False),
+        *_COPY_BINDINGS,
         Binding("m", "cycle_metric", "Metric"),
         Binding("c", "toggle_control", "Control"),
     ]
@@ -797,6 +951,17 @@ class NodesScreen(Screen[Any]):
                         style=theme.FAINT)
         self.query_one("#exclude", Static).update(note)
         self.sub_title = "nodes · %s%s" % (self.metric, "" if self.controlled else " · uncontrolled")
+
+    def clipboard_row(self) -> str:
+        history: History | None = self.app.history  # type: ignore[attr-defined]
+        if history is None:
+            return ""
+        from .report import Style, render_nodes
+
+        return render_nodes(history, metric=self.metric, controlled=self.controlled,
+                            style=Style(enabled=False))
+
+    clipboard_view = clipboard_row
 
     def action_cycle_metric(self) -> None:
         self.metric = "failure" if self.metric == "hang" else "hang"
