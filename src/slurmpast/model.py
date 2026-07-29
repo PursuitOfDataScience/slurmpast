@@ -429,11 +429,13 @@ class Job(NamedTuple):
         held for the step's longer span, so the widest allocated span any work row
         reports is the honest denominator. Extern is excluded, as in the numerator.
         """
-        spans = [self.cpu_time_alloc]
+        # Filtered into a NEW name: reassigning `candidates` would leave its
+        # declared type as `float | None` and `max` cannot order that.
+        candidates = [self.cpu_time_alloc]
         if self.elapsed is not None and self.cpu_count:
-            spans.append(self.elapsed * self.cpu_count)
-        spans.extend(s.cpu_time for s in self.work_steps)
-        spans = [s for s in spans if s is not None]
+            candidates.append(self.elapsed * self.cpu_count)
+        candidates.extend(s.cpu_time for s in self.work_steps)
+        spans = [value for value in candidates if value is not None]
         return max(spans) if spans else None
 
     @property
