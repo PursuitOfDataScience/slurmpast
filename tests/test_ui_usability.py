@@ -252,6 +252,30 @@ class TestClipboard:
         assert clip.read_text().strip()
 
     @pytest.mark.asyncio
+    async def test_the_fallback_file_is_utf8_whatever_the_locale_says(self, tmp_path, monkeypatch):
+        """What gets copied always holds ``●``, ``·`` and box drawing. Writing it
+        with the locale's encoding meant that on a Python whose preferred encoding
+        resolves to ASCII, `y` raised UnicodeEncodeError -- a ValueError, so the
+        OSError handler beside it would not have caught it, and the exception left
+        a UI action handler."""
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        app = make_app(history(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("Y")
+            await pilot.pause()
+        clip = tmp_path / "slurmpast" / "clip.txt"
+        # Decodes as UTF-8 regardless of the ambient locale, and round-trips.
+        raw = clip.read_bytes()
+        assert raw.decode("utf-8").strip()
+
+    def test_the_help_text_names_the_path_it_actually_writes(self, tmp_path, monkeypatch):
+        """It advertised ~/.cache/slurmpast/clip.txt, which is wrong wherever
+        XDG_CACHE_HOME is set -- and the code has always honoured that."""
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        assert tui._clip_path().startswith(str(tmp_path))
+
+    @pytest.mark.asyncio
     async def test_copy_is_offered_in_the_footer(self):
         app = make_app(history(), no_logs=True)
         async with app.run_test() as pilot:

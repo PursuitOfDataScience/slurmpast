@@ -31,6 +31,11 @@ _RANGE = re.compile(r"^([^\[\]]*)\[([^\[\]]+)\](.*)$")
 # Guard against a pathological expression eating memory. A real allocation is
 # thousands of nodes at the very top end; this is far above any of them and only
 # exists so a malformed `[0-999999999]` cannot hang the tool.
+#
+# Enforced *while* expanding, not afterwards. Truncating the finished list left
+# the guard doing nothing about the case that needs it: two ranges multiply, so
+# `u[1-2000]r[1-2000]` built four million strings and 325 MiB before anything
+# trimmed it to this bound, and a third range would not have returned at all.
 MAX_EXPANSION = 65536
 
 
@@ -58,14 +63,21 @@ def expand_nodelist(nodelist):
         return []
     out = []
     for chunk in _split_top_level(nodelist):
-        out.extend(_expand_one(chunk))
-        if len(out) > MAX_EXPANSION:
+        out.extend(_expand_one(chunk, MAX_EXPANSION - len(out)))
+        if len(out) >= MAX_EXPANSION:
             return out[:MAX_EXPANSION]
     return out
 
 
-def _expand_one(name):
-    """Expand every bracketed range in one host expression, left to right."""
+def _expand_one(name, limit=MAX_EXPANSION):
+    """Expand every bracketed range in one host expression, left to right.
+
+    ``limit`` bounds what this may return, and is applied at every stage rather
+    than to the finished list -- ranges multiply, so a list built first and trimmed
+    second is not bounded at all.
+    """
+    if limit <= 0:
+        return []
     match = _RANGE.match(name)
     if not match:
         return [name] if name else []
@@ -73,6 +85,8 @@ def _expand_one(name):
 
     heads = []
     for part in body.split(","):
+        if len(heads) >= limit:
+            break
         part = part.strip()
         if not part:
             continue
@@ -88,14 +102,21 @@ def _expand_one(name):
             # names, so an unfamiliar expression degrades to one unmatched node.
             heads.append(prefix + part)
             continue
-        if last < first or last - first > MAX_EXPANSION:
+        if last < first:
             heads.append(prefix + part)
             continue
-        heads.extend("%s%0*d" % (prefix, width, value) for value in range(first, last + 1))
+        stop = min(last, first + (limit - len(heads)) - 1)
+        heads.extend("%s%0*d" % (prefix, width, value) for value in range(first, stop + 1))
 
     # `rest` may hold further ranges (`unit[0-3]rack[0-2]`) or a plain suffix.
-    tails = _expand_one(rest) if rest else [""]
-    return [head + tail for head in heads for tail in tails]
+    tails = _expand_one(rest, limit) if rest else [""]
+    out = []
+    for head in heads:
+        for tail in tails:
+            if len(out) >= limit:
+                return out
+            out.append(head + tail)
+    return out
 
 
 def _split_top_level(text):

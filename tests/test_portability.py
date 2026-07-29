@@ -235,6 +235,34 @@ class TestHostlistExpansion:
     def test_expansion_is_bounded(self):
         assert len(expand_nodelist("n[1-99999999]")) <= 65536
 
+    def test_the_bound_holds_where_ranges_multiply(self):
+        """The bound has to be applied *while* expanding, not to the finished list.
+        Trimming afterwards left `u[1-2000]r[1-2000]` building four million strings
+        and 325 MiB first, and a third range never returned at all."""
+        import resource
+        import time
+
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        started = time.time()
+        for expression in (
+            "u[1-2000]r[1-2000]",
+            "x[1-300]y[1-300]z[1-300]",
+            "n[1-99999999]m[1-99999999]",
+        ):
+            assert len(expand_nodelist(expression)) <= 65536
+        assert time.time() - started < 5.0
+        # Peak RSS is a high-water mark, so this only rises if the run above
+        # allocated more than everything before it -- 4M strings would.
+        grew_mib = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before) / 1024.0
+        assert grew_mib < 200, "expansion allocated %.0f MiB" % grew_mib
+
+    def test_a_truncated_range_yields_real_names_not_one_fabricated_one(self):
+        """The names kept are the first N actual nodes. The old over-limit branch
+        fell back to the bracket expression itself, which is not a node at all."""
+        names = expand_nodelist("n[1-99999999]")
+        assert names[0] == "n1" and names[1] == "n2"
+        assert not any("[" in name or "-" in name for name in names)
+
     @pytest.mark.skipif(
         subprocess.run(["which", "scontrol"], capture_output=True).returncode != 0,
         reason="no Slurm on this machine",
@@ -715,6 +743,24 @@ class TestRecordedLogPaths:
         candidates = logs.candidate_paths(job)
         assert candidates[0] == "/work/real-60.err"
         assert "/work/slurm-60.out" in candidates
+
+    def test_a_miss_names_the_recorded_path_where_there_is_one(self):
+        """Knowing Slurm recorded /scratch/x.err and that it is not there is a
+        different, actionable fact from "no log found anywhere"."""
+        from slurmpast.report import Style, render_job
+
+        text, _ = render_job(
+            self._job(StdErr="/nowhere/real-%j.err"), style=Style(enabled=False), log_text=None
+        )
+        assert "none at /nowhere/real-60.err" in text
+        assert "moved or deleted" in text
+
+    def test_a_miss_on_a_cluster_recording_nothing_stays_vague(self):
+        from slurmpast.report import Style, render_job
+
+        text, _ = render_job(self._job(), style=Style(enabled=False), log_text=None)
+        assert "none found" in text
+        assert "moved or deleted" not in text
 
     def test_it_is_still_confirmed_to_exist_rather_than_trusted(self, tmp_path):
         real = tmp_path / "out-60.err"

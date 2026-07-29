@@ -160,10 +160,15 @@ class ClipboardMixin:
         written = False
         if path:
             try:
-                with open(path, "w") as handle:
+                # Explicit UTF-8, not the locale's encoding. What gets copied always
+                # contains ``●``, ``·`` and box drawing, so on a Python whose
+                # preferred encoding resolves to ASCII this raised UnicodeEncodeError
+                # -- which is a ValueError, so the OSError handler below would not
+                # have caught it and `y` would have thrown out of a UI action.
+                with open(path, "w", encoding="utf-8") as handle:
                     handle.write(text if text.endswith("\n") else text + "\n")
                 written = True
-            except OSError:
+            except (OSError, UnicodeError):
                 written = False
         lines = text.count("\n") + 1
         message = "copied %s (%d line%s) to the clipboard" % (
@@ -380,7 +385,9 @@ class HelpScreen(ModalScreen[None]):
             "  your terminal handles selection exactly as it does elsewhere.\n"
             "  Press M to hand the mouse to the app instead (enables clicking\n"
             "  and wheel scrolling, disables drag-select), or start --mouse.\n"
-            "  y / Y also copy via OSC 52 and write ~/.cache/slurmpast/clip.txt.\n",
+            # The real path, not a hardcoded ~/.cache: it follows XDG_CACHE_HOME,
+            # so naming the default was wrong wherever that is set.
+            "  y / Y also copy via OSC 52 and write %s.\n" % (_clip_path() or "a cache file"),
             style=theme.FAINT,
         )
         with Vertical(id="help-box"):

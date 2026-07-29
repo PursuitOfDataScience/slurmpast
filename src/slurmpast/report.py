@@ -237,15 +237,20 @@ def render_job(
         )
         out.append("  %s %s%s" % (style("log", "grey"), log_path, style(note, "grey")))
     else:
-        # One line. Slurm keeps StdOut/StdErr only in slurmctld, and MinJobAge is
-        # 120s on this cluster -- `scontrol show job` returns "Invalid job id" for
-        # anything a post-mortem would look at, and sacct has no such field at all.
-        # So the path is unknowable here, and spelling that out over three lines
-        # was explaining a limitation the reader cannot act on.
-        out.append(
-            "  %s %s"
-            % (style("log", "grey"), style("none found — --log-dir points at one", "grey"))
-        )
+        # One line, but which line depends on whether the cluster recorded a path.
+        # From Slurm 21.08 sacct has StdOut/StdErr, so the miss is "the file has
+        # moved or been deleted" and naming the expected path is actionable. Before
+        # that there is no such field anywhere a post-mortem can reach -- slurmctld
+        # forgets a job after MinJobAge -- so the path is genuinely unknowable and
+        # saying more would explain a limitation the reader cannot act on.
+        from .logs import recorded_paths
+
+        expected = recorded_paths(job)
+        if expected:
+            detail = "none at %s — moved or deleted; --log-dir points at it" % expected[0]
+        else:
+            detail = "none found — --log-dir points at one"
+        out.append("  %s %s" % (style("log", "grey"), style(detail, "grey")))
     out.append("")
     findings = sorted(verdict.findings, key=lambda f: severity_rank(f.severity))
     if not findings:
