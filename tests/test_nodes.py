@@ -188,3 +188,60 @@ class TestDominantWorkload:
 
     def test_empty_history(self):
         assert dominant_workload([]) is None
+
+    def test_prefers_a_workload_that_exhibits_the_metric(self, repeat_timeouts, healthy_job):
+        """Measured on a real 30-day history: the most-common workload was 200
+        runs of `sw-arr100` with ZERO hangs, so every row of the table read
+        "0/10, 0.0%, inconclusive" against a 0.0% baseline -- eight rows of
+        nothing. The comparison has to be held over work that actually hangs.
+        """
+        # More runs of the healthy workload than of the hanging one.
+        bulk = [healthy_job._replace(job_id=str(9000 + i), name="bulk-healthy") for i in range(40)]
+        jobs = bulk + list(repeat_timeouts)
+        assert dominant_workload(jobs) == "bulk-healthy"  # by count alone
+        assert dominant_workload(jobs, metric="hang") == "cot-exp"
+
+    def test_falls_back_to_the_count_when_nothing_exhibits_it(self, healthy_job):
+        jobs = [healthy_job._replace(job_id=str(9000 + i)) for i in range(5)]
+        assert dominant_workload(jobs, metric="hang") == healthy_job.name
+
+
+class TestEmptyTablesSayWhyNotNothing:
+    """An empty grid, or a grid of zeros, is not an answer. Reported as "some of
+    these options ... are useless"."""
+
+    def test_no_events_reports_in_words(self, healthy_job):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_nodes
+
+        jobs = [
+            healthy_job._replace(job_id=str(9000 + i), node_list="midway3-0600") for i in range(20)
+        ]
+        text = render_nodes(History(jobs), metric="hang", style=Style(enabled=False))
+        assert "nothing to attribute to a node" in text
+        assert "VERDICT" not in text  # no column header over an empty table
+
+    def test_too_few_placements_reports_in_words(self, repeat_timeouts):
+        """Every node fell below the sample threshold, so the table had a
+        baseline line and then a bare column header with no rows."""
+        from slurmpast.index import History
+        from slurmpast.nodes import MIN_SAMPLES
+        from slurmpast.report import Style, render_nodes
+
+        few = list(repeat_timeouts)[:4]
+        assert len(few) < MIN_SAMPLES
+        text = render_nodes(History(few), metric="hang", style=Style(enabled=False))
+        assert "placements a comparison needs" in text
+        assert "VERDICT" not in text
+
+    def test_a_real_signal_still_produces_a_table(self):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_nodes
+
+        # _placements produces FAILED runs, so `failure` is the metric it carries.
+        jobs = _placements("midway3-0385", 19, 36) + _placements(
+            "midway3-0600", 12, 218, job_id_base=5000
+        )
+        text = render_nodes(History(jobs), metric="failure", style=Style(enabled=False))
+        assert "VERDICT" in text
+        assert "midway3-0385" in text

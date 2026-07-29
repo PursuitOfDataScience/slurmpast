@@ -30,6 +30,21 @@ from .patterns import find_memory_search, find_repeat_failures, goodput, group_k
 # GroupStats.cost for why this number and not a site billing weight.
 GPU_CORE_EQUIVALENT = 16.0
 
+# When idle GPU-hours are worth putting in the summary at all.
+#
+# They are this tool's central finding, and printing them at every magnitude is
+# exactly how a headline turns into noise: "18 of 783 GPU-hours never computed"
+# beside a count of 234 jobs is a 2.3% loss demanding the same attention as a
+# 50% one, and it reads as a non-sequitur. The same sentence at 50% is the most
+# important thing on the screen.
+#
+# Either gate is sufficient. A large share means most of what you paid for was
+# wasted; a large absolute figure means that even a small share of a very big
+# history is real money. Same restraint the diagnosis rules apply -- stay quiet
+# when there is nothing to act on.
+IDLE_SHARE_WORTH_NAMING = 0.10
+IDLE_HOURS_WORTH_NAMING = 100.0
+
 
 class GroupStats(NamedTuple):
     """One workload rolled up. The unit the overview is built from."""
@@ -46,6 +61,13 @@ class GroupStats(NamedTuple):
     failed: int
     cancelled: int
     noop: int
+    # Runs that failed OR held the allocation without computing -- a UNION, not
+    # failed + noop. The two overlap heavily: a hung TIMEOUT is both, so on a real
+    # workload of 20 runs the sum reads 36 problems. This is the one number the
+    # overview shows; `failed` and `noop` remain for severity, the JSON and the
+    # drill-down, where the distinction between "ran out of time" and "never
+    # started" is the whole point.
+    problems: int
     gpu_hours: float
     core_hours: float
     wasted_gpu_hours: float
@@ -148,6 +170,12 @@ def build_groups(jobs: Iterable[Job]) -> list[GroupStats]:
                 failed=sum(1 for j in members if j.failed),
                 cancelled=sum(1 for j in members if j.cancelled),
                 noop=len(dead),
+                # Cancellations are deliberately NOT problems: a deliberate kill
+                # and an abandoned run are identical in accounting, so counting
+                # them would report `total - completed` and brand every
+                # exploratory run you stopped on purpose. That is why this is not
+                # simply the arithmetic gap between RUNS and COMPLETED.
+                problems=sum(1 for j in members if j.failed or looks_like_noop(j)),
                 gpu_hours=gpu_hours,
                 core_hours=core_hours,
                 wasted_gpu_hours=sum(
@@ -226,9 +254,14 @@ def match_job(job: Job, mode: str) -> bool:
 def filter_jobs(jobs: Iterable[Job], mode: str = "all", query: str = "") -> list[Job]:
     """Filter and free-text search, in memory.
 
-    Search matches job id, name, state, partition and node list so one box
-    serves "what happened to 51170455", "show me cot-exp", and "what died on
-    midway3-0385" without a query language.
+    Search matches job id, name, state, partition, node list and timestamps so
+    one box serves "what happened to 51170455", "show me cot-exp", "what died on
+    midway3-0385" and "07-28" without a query language.
+
+    The timestamps are load-bearing: STARTED and ENDED are columns on screen, and
+    searching "07-28" against a table full of visible "07-28 15:00" returned
+    nothing at all. Typing what you can plainly see and getting an empty list is
+    the worst kind of empty result -- it reads as missing data.
     """
     needle = (query or "").strip().lower()
     out = []
@@ -243,6 +276,18 @@ def filter_jobs(jobs: Iterable[Job], mode: str = "all", query: str = "") -> list
                     job.base_state,
                     job.partition or "",
                     job.node_list or "",
+                    # START ONLY, deliberately. Indexing the end time too made a
+                    # run that began 07-24 23:02 and finished 07-25 06:58 match
+                    # "07-25" while its row displayed 07-24 -- a hit the reader
+                    # cannot see, reported as a bug. STARTED is the column that is
+                    # always shown and the key the list is sorted by, so matching
+                    # it alone keeps every result visibly explained.
+                    #
+                    # "T" -> " " so ONE spelling covers what sacct stores and what
+                    # the table shows: "2026-07-28 15:00:00" contains the raw
+                    # "2026-07-28", the bare "07-28", and the "07-28 15:00" a
+                    # reader copies straight off the screen.
+                    (job.start or "").replace("T", " "),
                 )
             ).lower()
             if needle not in haystack:
@@ -263,7 +308,17 @@ def filter_groups(
             continue
         if mode == "problem" and not (group.failed or group.noop):
             continue
-        if needle and needle not in ("%s %s" % (group.name, group.partition)).lower():
+        # Same as filter_jobs: LAST RUN is a column here, so its date has to be
+        # searchable. first_seen too -- it bounds the same range and costs nothing.
+        haystack = " ".join(
+            (
+                group.name,
+                group.partition,
+                (group.last_seen or "").replace("T", " "),
+                (group.first_seen or "").replace("T", " "),
+            )
+        ).lower()
+        if needle and needle not in haystack:
             continue
         out.append(group)
     return out
@@ -361,6 +416,20 @@ class History:
             return None
         return total / span
 
+    @property
+    def idle_gpu_hours(self) -> tuple[float, float] | None:
+        """``(idle, total)`` GPU-hours, but only when the loss earns the space.
+
+        None means "do not mention it" -- not "there was none". Callers report the
+        plain total instead. See IDLE_SHARE_WORTH_NAMING.
+        """
+        idle, total = self.stats["gpu_hours_noop"], self.stats["gpu_hours_total"]
+        if not idle or not total:
+            return None
+        if idle / total >= IDLE_SHARE_WORTH_NAMING or idle >= IDLE_HOURS_WORTH_NAMING:
+            return (idle, total)
+        return None
+
     def tail_summary(self, shown: int) -> str:
         """What sits below the fold, so truncation is never silent.
 
@@ -374,7 +443,9 @@ class History:
         total = sum(g.cost for g in self.groups) or 1.0
         share = sum(g.cost for g in hidden) / total
         runs = sum(g.total for g in hidden)
-        return "%d more workloads (%d runs) holding %.1f%% of the resource" % (
+        # "of the resource" matched nothing the reader had been told; the ordering
+        # note above the table calls the same quantity "compute used".
+        return "%d more workloads (%d runs) holding %.1f%% of the compute" % (
             len(hidden),
             runs,
             100.0 * share,
@@ -383,10 +454,11 @@ class History:
     def headline(self) -> str:
         """One line for the footer: the number that should bother you most."""
         stats = self.stats
-        if stats["gpu_hours_noop"] and stats["gpu_hours_total"]:
-            return "%.0f of %.0f GPU-hours went to allocations that never computed" % (
-                stats["gpu_hours_noop"],
-                stats["gpu_hours_total"],
+        idle = self.idle_gpu_hours
+        if idle is not None:
+            return "%.0f GPU-hours, %.0f of them in allocations that never computed" % (
+                idle[1],
+                idle[0],
             )
         if stats["failed"]:
             return "%d of %d jobs failed" % (stats["failed"], stats["jobs"])

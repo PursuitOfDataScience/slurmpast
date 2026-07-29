@@ -80,7 +80,9 @@ class TestTailSummary:
         history = History(jobs)
         tail = history.tail_summary(3)
         assert "7 more workloads" in tail
-        assert "% of the resource" in tail
+        # "of the compute", matching the ordering note above the table. "Of the
+        # resource" named a quantity the reader had never been given.
+        assert "% of the compute" in tail
 
     def test_no_tail_when_everything_shown(self, repeat_timeouts):
         from slurmpast.index import History

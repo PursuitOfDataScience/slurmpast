@@ -131,8 +131,26 @@ class TestGoodput:
         stats = goodput([stale_job, healthy_job])
         assert stats["jobs"] == 1
         assert stats["excluded_open_records"] == 1
+        assert stats["excluded_no_elapsed"] == 0
         # the phantom 62-day, 3-GPU record would have dominated this
         assert stats["gpu_hours_total"] < 10
+
+    def test_a_closed_record_with_no_elapsed_is_not_called_unterminated(self, healthy_job):
+        """Both kinds are excluded, but the UI names one of them: "elapsed would
+        be now minus start" is simply false about a COMPLETED record that carries
+        no Elapsed at all, so the two are counted apart."""
+        blank = healthy_job._replace(job_id="9", state="COMPLETED", elapsed=None, steps=())
+        stats = goodput([blank, healthy_job])
+        assert stats["jobs"] == 1
+        assert stats["excluded_open_records"] == 0
+        assert stats["excluded_no_elapsed"] == 1
+
+    def test_every_dropped_record_is_accounted_for(self, healthy_job, stale_job):
+        blank = healthy_job._replace(job_id="9", state="COMPLETED", elapsed=None, steps=())
+        jobs = [blank, stale_job, healthy_job]
+        stats = goodput(jobs)
+        dropped = stats["excluded_open_records"] + stats["excluded_no_elapsed"]
+        assert stats["jobs"] + dropped == len(jobs)
 
     def test_gpu_goodput_ratio(self, healthy_job, cot_exp):
         stats = goodput([healthy_job, cot_exp])

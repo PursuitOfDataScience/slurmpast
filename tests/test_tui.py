@@ -204,6 +204,287 @@ class TestRowJump:
         jump.clear()
         assert jump.push("2", 50) == 2
 
+    def test_a_non_digit_key_ends_the_pending_jump(self):
+        """The buffer used to outlive the jump: press 3 to reach row 3, navigate
+        away, press 7 later and the accumulated "37" landed on a row neither key
+        asked for. `clear` existed and nothing called it."""
+        jump = tui._RowJump()
+        assert jump.push("3", 60) == 3
+        jump.on_key_pressed("down")
+        assert jump.push("7", 60) == 7
+
+    def test_consecutive_digits_still_accumulate(self):
+        jump = tui._RowJump()
+        assert jump.push("1", 60) == 1
+        jump.on_key_pressed("2")  # a digit must NOT reset the buffer
+        assert jump.push("2", 60) == 12
+
+    @pytest.mark.asyncio
+    async def test_an_arrow_between_digits_does_not_accumulate_in_the_app(self, history_jobs):
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            screen = app.screen
+            await pilot.press("1")
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            assert screen._jump._buffer == ""
+
+
+class TestEscapeCancelsSearch:
+    """Escape is the universal "cancel this". On the overview it was bound to
+    Quit and the search Input does not consume it, so cancelling a search ENDED
+    THE SESSION; on a job list it popped the screen. Enter commits the filter,
+    escape discards it -- and neither should lose your place."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("open_keys,table", [([], "#groups"), (["a"], "#jobs")])
+    async def test_escape_clears_the_search_and_keeps_the_app(self, history_jobs, open_keys, table):
+        from textual.widgets import DataTable
+
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for key in open_keys:
+                await pilot.press(key)
+                await pilot.pause()
+            before = app.screen.query_one(table, DataTable).row_count
+            await pilot.press("slash")
+            await pilot.pause()
+            for char in "cot":
+                await pilot.press(char)
+            await pilot.pause()
+            assert app.screen.query_one(table, DataTable).row_count < before
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.is_running, "escape cancelled the search by killing the app"
+            assert app.screen.query_one(table, DataTable).row_count == before
+            assert app.screen.search_text == ""
+            assert isinstance(app.screen.focused, DataTable)
+
+    @pytest.mark.asyncio
+    async def test_escape_with_no_search_still_backs_out(self, history_jobs):
+        """Cancelling a search must not cost escape its normal job."""
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            assert isinstance(app.screen, tui.JobListScreen)
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, tui.OverviewScreen)
+
+    @pytest.mark.asyncio
+    async def test_enter_commits_the_search_instead(self, history_jobs):
+        from textual.widgets import DataTable
+
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            for char in "cot":
+                await pilot.press(char)
+            await pilot.pause()
+            narrowed = app.screen.query_one("#groups", DataTable).row_count
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app.screen.query_one("#groups", DataTable).row_count == narrowed
+            assert app.screen.search_text == "cot"
+
+
+class TestRequeryKeepsTheAppAlive:
+    """`r` popped screens "while deeper than one", but the overview is itself a
+    pushed screen sitting on the App's own default Screen -- so it popped the
+    overview too and left a blank screen that swallowed every later key. Reported
+    as "some of these options can crash the program and are useless"."""
+
+    def _app(self, jobs, **kwargs):
+        return tui.SlurmpastApp(
+            lambda since=None: list(jobs), window="last 7 days", no_logs=True, **kwargs
+        )
+
+    @pytest.mark.asyncio
+    async def test_reload_lands_back_on_the_overview(self, history_jobs):
+        app = self._app(history_jobs, since="now-7days")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("r")
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, tui.OverviewScreen)
+            assert app.history is not None
+
+    @pytest.mark.asyncio
+    async def test_the_app_still_responds_after_a_reload(self, history_jobs):
+        """The blank screen was not just empty -- it had no bindings, so the app
+        was unusable from that point on."""
+        app = self._app(history_jobs, since="now-7days")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("r")
+            await pilot.pause()
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            assert isinstance(app.screen, tui.JobListScreen)
+
+    @pytest.mark.asyncio
+    async def test_a_drilled_in_screen_is_popped_but_not_the_overview(self, history_jobs):
+        app = self._app(history_jobs, since="now-7days")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("n")  # NodesScreen on top
+            await pilot.pause()
+            assert isinstance(app.screen, tui.NodesScreen)
+            await pilot.press("w")  # app-level binding, works from any screen
+            await pilot.pause()
+            await pilot.pause()
+            assert isinstance(app.screen, tui.OverviewScreen)
+            assert app.history is not None
+
+    @pytest.mark.asyncio
+    async def test_cycling_the_window_leaves_a_usable_overview(self, history_jobs):
+        app = self._app(history_jobs, since="now-7days")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for _ in range(3):
+                await pilot.press("w")
+                await pilot.pause()
+                await pilot.pause()
+                assert isinstance(app.screen, tui.OverviewScreen)
+                assert app.screen.query_one("#groups").row_count > 0
+
+
+class TestWindowCycling:
+    """The window was fixed by -S at launch, so "what about last month?" meant
+    quitting and starting again."""
+
+    def _spy_app(self, jobs):
+        """An app whose loader takes a window, and records which it was asked for."""
+        seen = []
+
+        def load(since=None):
+            seen.append(since)
+            return list(jobs)
+
+        app = tui.SlurmpastApp(load, window="last 7 days", no_logs=True, since="now-7days")
+        return app, seen
+
+    def test_only_specs_sacct_accepts_are_offered(self):
+        """Verified against Slurm 20.11.8: `-S now-6months` is "Invalid time
+        specification". Only days and weeks survive."""
+        for spec in tui.WINDOWS:
+            assert spec.startswith("now-")
+            assert spec.endswith(("days", "day", "weeks", "week", "hours"))
+
+    def test_the_labels_come_from_the_shared_humanizer(self):
+        from slurmpast.duration import humanize_window
+
+        for spec in tui.WINDOWS:
+            assert "now-" not in humanize_window(spec)
+
+    @pytest.mark.asyncio
+    async def test_w_requeries_with_the_next_window(self, history_jobs):
+        app, seen = self._spy_app(history_jobs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert seen == ["now-7days"]
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.pause()
+            assert seen[-1] == "now-30days"
+            assert app.window == "last 30 days"
+
+    @pytest.mark.asyncio
+    async def test_the_cycle_comes_back_round(self, history_jobs):
+        app, _seen = self._spy_app(history_jobs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for _ in range(len(tui.WINDOWS)):
+                await pilot.press("w")
+                await pilot.pause()
+            assert app.window == "last 7 days"
+
+    @pytest.mark.asyncio
+    async def test_a_launch_window_outside_the_presets_stays_in_the_cycle(self, history_jobs):
+        app = tui.SlurmpastApp(
+            lambda since=None: list(history_jobs),
+            window="since 2026-01-01",
+            no_logs=True,
+            since="2026-01-01",
+        )
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for _ in range(len(tui.WINDOWS) + 1):
+                await pilot.press("w")
+                await pilot.pause()
+            assert app._since == "2026-01-01"
+
+    @pytest.mark.asyncio
+    async def test_an_empty_window_is_backed_out_of_not_fatal(self, history_jobs):
+        """Cycling into a window with no jobs must not exit the app -- the reader
+        still has the data they had a keypress ago."""
+        calls = []
+
+        def load(since=None):
+            calls.append(since)
+            if len(calls) > 1:
+                raise RuntimeError("no jobs for youzhi since %s" % since)
+            return list(history_jobs)
+
+        app = tui.SlurmpastApp(load, window="last 7 days", no_logs=True, since="now-7days")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = app.history
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.pause()
+            assert app.load_error is None
+            assert app.history is before
+            assert app.window == "last 7 days"
+            assert app._since == "now-7days"
+
+    @pytest.mark.asyncio
+    async def test_a_zero_argument_loader_disables_cycling(self, history_jobs):
+        """--demo and the tests pass one; there is no window over synthetic data."""
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._can_requery is False
+            await pilot.press("w")
+            await pilot.pause()
+            assert app.window == "test window"
+            assert app.load_error is None
+
+
+class TestPathElision:
+    """A log path is shown so the reader knows WHICH log was read."""
+
+    def test_a_short_path_is_untouched(self):
+        assert tui._elide("/home/y/slurm-1.out") == "/home/y/slurm-1.out"
+
+    def test_the_leading_directory_survives(self):
+        """`"/a/b".partition("/")` yields an empty head, so every absolute path
+        collapsed to a bare "/…/slurm-123.out" -- the directory, which was the
+        only reason to print a path at all, was thrown away."""
+        long_path = "/scratch/midway3/youzhi/runs/cot-exp/logs/slurm-51170455.out"
+        elided = tui._elide(long_path)
+        assert elided.startswith("/scratch/")
+        assert elided.endswith("slurm-51170455.out")
+        assert elided != "/…/slurm-51170455.out"
+
+    def test_a_relative_path_keeps_its_first_component(self):
+        elided = tui._elide("runs/deep/deeper/evenmore/andmore/slurm-1.out")
+        assert elided.startswith("runs/")
+        assert elided.endswith("slurm-1.out")
+
+    def test_a_single_long_component_is_left_alone(self):
+        name = "s" * 80
+        assert tui._elide(name) == name
+
 
 class TestAsciiMode:
     @pytest.mark.asyncio
@@ -273,3 +554,150 @@ class TestDemoMode:
             await pilot.pause()
             assert isinstance(app.screen, tui.OverviewScreen)
             assert len(app.screen._rows) > 5
+
+
+class TestLongPathsDoNotBreakTheLayout:
+    """A 118-character workdir wrapped to column 0, leaving the label looking
+    empty with an orphaned line of path beneath it."""
+
+    def _job_with_a_long_workdir(self, history_jobs):
+        long_dir = "/project/rcc/youzhi/.cache/tmp/claude-940740146/-home-youzhi-ArgonneAI/deep/er"
+        assert len(long_dir) > tui._MAX_PATH_WIDTH
+        return history_jobs[0]._replace(work_dir=long_dir), long_dir
+
+    @pytest.mark.asyncio
+    async def test_a_long_path_is_elided_inline(self, history_jobs):
+        job, long_dir = self._job_with_a_long_workdir(history_jobs)
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test(size=(118, 44)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(job))
+            await pilot.pause()
+            body = "\n".join(
+                "".join(s.text for s in strip) for strip in app.screen._compositor.render_strips()
+            )
+            row = [ln for ln in body.splitlines() if "workdir" in ln][0]
+            assert "…" in row, row
+            assert long_dir not in row
+            # Elided, not emptied: both ends of the path survive.
+            assert "/project" in row and "er" in row
+
+    @pytest.mark.asyncio
+    async def test_p_reveals_the_whole_path(self, history_jobs):
+        job, long_dir = self._job_with_a_long_workdir(history_jobs)
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test(size=(118, 44)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(job))
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            body = "\n".join(
+                "".join(s.text for s in strip) for strip in app.screen._compositor.render_strips()
+            )
+            assert long_dir.split("/")[-1] in body
+
+    def test_plain_output_never_elides_a_path(self, history_jobs):
+        """A path you cannot copy whole is no use in a ticket."""
+        from slurmpast.report import Style, render_job
+
+        job, long_dir = self._job_with_a_long_workdir(history_jobs)
+        text, _ = render_job(job, style=Style(enabled=False))
+        assert long_dir in text
+
+
+class TestNavigatingWhileSearching:
+    """Reported as "i can never move the highlightor up or down at all". An Input
+    swallows the arrows -- left/right move its caret, up/down do nothing -- so once
+    a query was typed the highlight was stuck until enter, with nothing saying so.
+    Type to filter, arrow to choose, enter to commit."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("open_keys,table", [([], "#groups"), (["a"], "#jobs")])
+    async def test_arrows_move_the_cursor_from_the_search_box(self, history_jobs, open_keys, table):
+        from textual.widgets import DataTable, Input
+
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            for key in open_keys:
+                await pilot.press(key)
+                await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            assert isinstance(app.screen.focused, Input), "search box should have focus"
+            grid = app.screen.query_one(table, DataTable)
+            assert grid.row_count > 2, "need rows to move between"
+            await pilot.press("down")
+            await pilot.pause()
+            assert grid.cursor_row == 1
+            await pilot.press("down")
+            await pilot.pause()
+            assert grid.cursor_row == 2
+            await pilot.press("up")
+            await pilot.pause()
+            assert grid.cursor_row == 1
+            # And focus never left the box, so typing continues to filter.
+            assert isinstance(app.screen.focused, Input)
+
+    @pytest.mark.asyncio
+    async def test_home_and_end_reach_both_ends(self, history_jobs):
+        from textual.widgets import DataTable
+
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("slash")
+            await pilot.pause()
+            grid = app.screen.query_one("#groups", DataTable)
+            await pilot.press("end")
+            await pilot.pause()
+            assert grid.cursor_row == grid.row_count - 1
+            await pilot.press("home")
+            await pilot.pause()
+            assert grid.cursor_row == 0
+
+    @pytest.mark.asyncio
+    async def test_typing_still_filters(self, history_jobs):
+        """The steering must not eat the printable keys."""
+        from textual.widgets import DataTable
+
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = app.screen.query_one("#groups", DataTable).row_count
+            await pilot.press("slash")
+            await pilot.pause()
+            for char in "cot":
+                await pilot.press(char)
+            await pilot.pause()
+            assert app.screen.search_text == "cot"
+            assert app.screen.query_one("#groups", DataTable).row_count < before
+
+
+class TestJobRowsHaveNoSelectionLookalike:
+    @pytest.mark.asyncio
+    async def test_no_dot_leads_a_job_row(self, history_jobs):
+        """A filled circle on every row was read as "all the entries are
+        selected", and it duplicated the STATE column beside it."""
+        from textual.widgets import DataTable
+
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            grid = app.screen.query_one("#jobs", DataTable)
+            for r in range(min(5, grid.row_count)):
+                assert "●" not in str(grid.get_row_at(r)[0])
+
+    @pytest.mark.asyncio
+    async def test_the_overview_keeps_its_dot(self, history_jobs):
+        """There it carries group severity, which has no column of its own."""
+        from textual.widgets import DataTable
+
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            grid = app.screen.query_one("#groups", DataTable)
+            assert any("●" in str(grid.get_row_at(r)[0]) for r in range(grid.row_count))

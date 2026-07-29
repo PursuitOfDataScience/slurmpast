@@ -107,6 +107,29 @@ class TestCpuSplit:
         assert build(batch={"AveCPUFreq": "2.17M"}).cpu_freq == "2.17M"
 
 
+class TestCoresBusy:
+    """Reported as "what is cpu%? is it memory usage or cpu core usage?" -- a
+    percentage with no named denominator does not say what it measures."""
+
+    def test_cores_busy_is_utilization_times_the_allocation(self):
+        job = build()
+        assert job.cores_busy == pytest.approx(job.cpu_utilization * job.cpu_count)
+
+    def test_it_reads_as_cores_of_cores(self):
+        from slurmpast.render import cores_text
+
+        text = cores_text(build())
+        assert " of " in text
+        assert text.split(" of ")[1] == str(build().cpu_count)
+
+    def test_unmeasurable_is_n_a_never_zero(self):
+        from slurmpast.model import Job
+        from slurmpast.render import cores_text
+
+        assert Job(job_id="1").cores_busy is None
+        assert cores_text(Job(job_id="1")) == "n/a"
+
+
 class TestDiskReadWriteSplit:
     def test_read_and_write_are_separate(self):
         job = build(
@@ -142,14 +165,25 @@ class TestDiskReadWriteSplit:
         job = build(batch={"TRESUsageInTot": "fs/disk=%d" % (500 * 1024**3)})
         assert "io-heavy" in codes(job)
 
-    def test_modest_io_is_only_informational(self):
+    def test_modest_io_says_nothing_at_all(self):
+        """There used to be an INFO here restating the DISK gauge row verbatim --
+        same bytes, same rate, no action. Two lines of the findings list telling
+        the reader what they had just read one screen above."""
         job = build(batch={"TRESUsageInTot": "fs/disk=%d" % (20 * 1024**3)})
-        assert "io-volume" in codes(job)
+        assert "io-volume" not in codes(job)
         assert "io-heavy" not in codes(job)
 
     def test_small_io_says_nothing(self):
         job = build(batch={"TRESUsageInTot": "fs/disk=1048576"})
         assert "io-volume" not in codes(job)
+
+    def test_the_bytes_are_still_reported_in_the_filesystem_section(self):
+        """Dropping the io-volume finding must not drop the measurement."""
+        from slurmpast.render import job_sections
+
+        job = build(batch={"TRESUsageInTot": "fs/disk=%d" % (20 * 1024**3)})
+        rows = dict(job_sections(job, summarized=True))["filesystem"]
+        assert ("read", "20.0 GiB", None) in rows, rows
 
 
 class TestMemoryDetail:
@@ -432,7 +466,7 @@ class TestFalsePositivesFoundOnRealData:
         )[0]
         assert job.max_rss == 16439052 * 1024
 
-    def test_spread_between_real_work_steps_still_reported(self):
+    def test_spread_between_real_work_steps_is_still_measured(self):
         job = parse(
             "\n".join(
                 [
@@ -464,7 +498,8 @@ class TestFalsePositivesFoundOnRealData:
             )
         )[0]
         assert job.rss_step_spread is not None
-        assert "rss-step-spread" in codes(job)
+        assert job.rss_step_spread and job.rss_step_spread > 100
+        assert "rss-step-spread" not in codes(job)
 
     def test_handful_of_page_faults_is_not_thrashing(self):
         assert "paging" not in codes(build(batch={"MaxPages": "15"}))

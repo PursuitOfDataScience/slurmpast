@@ -26,6 +26,13 @@ dependencies = [
   # Footer/Input. Matching the floor means the two tools resolve to one Textual
   # in a shared environment instead of fighting over it.
   "textual>=0.86,<9",
+  # Imported directly by render.py and tui.py (`rich.text.Text`), and render.py
+  # is on the plain-text path too, so `--plain` needs it as much as the
+  # dashboard does. It resolved anyway as a transitive dependency of textual,
+  # which is exactly why it was easy to miss -- a package you import belongs in
+  # your own dependency list, not borrowed from someone else's. Floor matches
+  # what textual itself requires.
+  "rich>=13.3.3",
 ]
 
 [project.scripts]

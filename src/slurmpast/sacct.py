@@ -190,6 +190,11 @@ def parse(text, fields=None):
     """Parse ``sacct --parsable2`` output into Jobs with their steps attached."""
     fields = list(fields or _FIELDS)
     index = {name.lower(): pos for pos, name in enumerate(fields)}
+    job_id_at = index.get("jobid")
+    if job_id_at is None:
+        # Every row is keyed by JobID, so without it there is nothing to build.
+        # This used to surface as a bare KeyError from inside the row loop.
+        raise SacctError("JobID must be among the requested fields; got: %s" % ", ".join(fields))
 
     def get(row, name):
         pos = index.get(name.lower())
@@ -205,7 +210,7 @@ def parse(text, fields=None):
         if not line.strip():
             continue
         row = line.split("|")
-        raw_id = (row[index["jobid"]] if index.get("jobid", 0) < len(row) else "").strip()
+        raw_id = (row[job_id_at] if job_id_at < len(row) else "").strip()
         if not raw_id or raw_id.lower() == "jobid":
             continue
 

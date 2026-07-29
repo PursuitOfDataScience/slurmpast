@@ -175,6 +175,13 @@ class TestParserRobustness:
     def test_short_rows_do_not_crash(self):
         assert parse("79|z|COMPLETED") == parse("79|z|COMPLETED")
 
+    def test_a_field_list_without_jobid_reports_rather_than_crashing(self):
+        """Every row is keyed by JobID. Without it this raised a bare KeyError
+        from inside the row loop, which reads as a parser bug rather than as the
+        caller's mistake it is."""
+        with pytest.raises(SacctError, match="JobID"):
+            parse("a|b", fields=["JobName", "State"])
+
     def test_orphan_step_without_allocation_is_dropped(self):
         """A step whose allocation row is absent must not invent a job."""
         text = row(JobID="999.batch", JobName="batch", State="COMPLETED")

@@ -136,12 +136,10 @@ def _walltime_rules(job, add):
                     CRITICAL,
                     "timeout-hang",
                     "Hit the wall clock without ever running",
-                    "Held the allocation for %s but consumed only %s of CPU. A process that "
-                    "never accumulates CPU time is blocked, not slow."
+                    "Held the allocation %s but used only %s of CPU — blocked, not slow."
                     % (format_duration(job.elapsed), format_duration(job.total_cpu)),
-                    "Do NOT raise --time; a longer limit buys a longer hang. Look for a "
-                    "blocking wait: dataset/model read, a lock, a rendezvous, an interactive "
-                    "prompt. Run with a startup timeout so it fails in seconds.",
+                    "Do NOT raise --time; a longer limit buys a longer hang. Find the "
+                    "blocking wait — a dataset read, a lock, a rendezvous, a prompt.",
                 )
             )
         else:
@@ -151,16 +149,14 @@ def _walltime_rules(job, add):
                     CRITICAL,
                     "timeout-real",
                     "Ran out of wall clock while working",
-                    "Limit %s reached; CPU consumed %s (utilization %s), so it was making "
-                    "progress when killed."
+                    "Hit the %s limit having used %s of CPU (%s) — it was making progress."
                     % (
                         format_duration(job.timelimit),
                         format_duration(used),
                         format_percent(job.cpu_utilization),
                     ),
-                    "Raise --time. Elapsed is truncated at the limit, so it only bounds the "
-                    "true runtime from below -- add real headroom, do not fit to %s."
-                    % format_duration(job.elapsed),
+                    "Raise --time with real headroom: Elapsed is truncated at the limit, "
+                    "so it bounds the true runtime only from below.",
                 )
             )
         return
@@ -204,8 +200,8 @@ def _memory_rules(job, add):
                 "host-oom",
                 "Host memory exhausted",
                 detail,
-                "Raise --mem, or cut whatever multiplies per-worker footprint "
-                "(dataloader workers, prefetch depth, cache size).",
+                "Raise --mem, or cut what multiplies per-worker footprint — workers, "
+                "prefetch depth, cache size.",
             )
         )
         return
@@ -215,10 +211,11 @@ def _memory_rules(job, add):
             Finding(
                 WARNING,
                 "rss-above-limit",
-                "MaxRSS exceeds the memory limit but the job was not OOM-killed",
-                "MaxRSS %s vs limit %s. The metric is summing shared pages across processes; "
-                "it is not this job's footprint." % (format_bytes(rss), format_bytes(limit)),
-                "Treat MaxRSS as unusable here. Measure the cgroup working set live instead.",
+                "Peak memory reads above the limit, yet nothing was OOM-killed",
+                "%s against a %s limit: MaxRSS sums shared pages across the process "
+                "tree, so it is not this job's footprint."
+                % (format_bytes(rss), format_bytes(limit)),
+                "Measure the cgroup working set live (slurmwatch) before sizing --mem.",
             )
         )
 
@@ -233,33 +230,24 @@ def _memory_rules(job, add):
                     INFO,
                     "memory-slack",
                     "Reserved far more memory than it touched",
-                    "Peak %s against a %s limit (%s) -- %s reserved and never used. "
-                    "Note MaxRSS over-reports for multi-process jobs, so the real "
-                    "footprint is at most this."
+                    "Peak %s of a %s limit (%s) — %s never used."
                     % (
                         format_bytes(rss),
                         format_bytes(limit),
                         format_percent(used),
                         format_bytes(unused),
                     ),
-                    "Trim --mem toward %s (peak plus ~30%% headroom). Memory you "
-                    "reserve is memory no one else can use, and it narrows which "
-                    "nodes can host the job." % format_bytes(int(rss * 1.3)),
+                    "Try --mem=%s (peak plus ~30%%). MaxRSS over-reports "
+                    "multi-process jobs, so treat it as an upper bound."
+                    % format_bytes(int(rss * 1.3)),
                 )
             )
 
-    spread = job.rss_step_spread
-    if spread is not None and spread > RSS_SPREAD_SUSPECT:
-        add(
-            Finding(
-                INFO,
-                "rss-step-spread",
-                "MaxRSS disagrees wildly between steps",
-                "Largest/smallest step MaxRSS ratio is %.0fx. Any tool reading a single step "
-                "is wrong by that factor." % spread,
-                "",
-            )
-        )
+    # No finding for a wide MaxRSS spread between steps. It said "Any tool reading
+    # a single step is wrong by that factor" -- a remark about other tools, with no
+    # action, about a hazard this one already avoids: Job.max_rss takes the maximum
+    # across steps, and the MEM gauge shows that against the limit. Reported as
+    # "what does this message mean here?", fairly.
 
 
 def _cpu_rules(job, add):
@@ -298,8 +286,7 @@ def _cpu_rules(job, add):
                 "Most allocated cores were idle",
                 "Utilization %s of %d cores, i.e. about %.1f cores of real work."
                 % (format_percent(util), cores, effective),
-                "Reduce --cpus-per-task toward %d, unless the cores are there to feed "
-                "dataloader workers that were not actually running."
+                "Try --cpus-per-task=%d, unless those cores feed dataloader workers."
                 % max(1, int(effective + 0.999)),
             )
         )
@@ -316,8 +303,8 @@ def _exit_rules(job, log_text, add):
                 INFO,
                 "cancelled",
                 "Cancelled, not failed",
-                "Cancellation is ambiguous -- a deliberate kill and an abandoned run look "
-                "identical in accounting. Excluded from failure statistics.",
+                "A deliberate kill and an abandoned run are identical in accounting, so this "
+                "is excluded from failure statistics.",
                 "",
             )
         )
@@ -347,15 +334,27 @@ def _exit_rules(job, log_text, add):
 
     if not lowered:
         if code not in (None, 0) and state == "FAILED":
+            # Named for the code actually recorded. Hardcoding "Exit 1" put a
+            # finding on screen whose title said "Exited 3" and whose evidence
+            # discussed exit 1 -- self-contradictory in the same paragraph.
+            if code == 1:
+                detail = (
+                    "Exit 1 is the generic Python-exception status and is "
+                    "indistinguishable from a CUDA OOM without the stderr text."
+                )
+            else:
+                detail = (
+                    "An exit status does not name a cause: exit %d is indistinguishable "
+                    "from a CUDA OOM, a killed worker or a bad argument without the "
+                    "stderr text." % code
+                )
             add(
                 Finding(
                     WARNING,
                     "exit-nonzero-nolog",
                     "Exited %d, but no log was found to explain it" % code,
-                    "Exit 1 is the generic Python-exception code and is indistinguishable "
-                    "from a CUDA OOM without the stderr text.",
-                    "Point slurmpast at the log with --log-dir, or set a predictable "
-                    "--error= path so post-mortems can find it.",
+                    detail,
+                    "Pass --log-dir, or set a predictable --error= path.",
                 )
             )
         return
@@ -433,11 +432,11 @@ def _gpu_rules(job, add):
                 WARNING,
                 "gpu-suspect-idle",
                 "GPUs allocated but host CPU barely moved",
-                "%d GPU(s) held for %s at %s CPU utilization. Kernel launches consume host "
+                "%d GPU(s) held for %s at %s CPU utilization; kernel launches consume host "
                 "CPU, so this suggests the GPUs were mostly unused."
                 % (job.gpu_count, format_duration(job.elapsed), format_percent(util)),
-                "Confirm with live telemetry (slurmwatch) before trusting this; post-hoc GPU "
-                "utilization is not recorded by this cluster's accounting.",
+                "Confirm with live telemetry (slurmwatch): post-hoc GPU utilization is not "
+                "recorded here.",
             )
         )
 
@@ -462,16 +461,12 @@ def _kernel_time_rules(job, add):
             WARNING,
             "system-cpu-heavy",
             "Most CPU time went to the kernel, not your code",
-            "%s of %s CPU time was system time (%s). A healthy run here measures "
-            "around 5%%. That is syscall overhead: many small reads, heavy metadata "
-            "traffic, or process churn."
-            % (
-                format_duration(job.system_cpu),
-                format_duration(job.total_cpu),
-                format_percent(fraction),
-            ),
-            "Batch your I/O into larger reads, cut per-file overhead (pack many "
-            "small files into shards), or stage the dataset onto a faster tier.",
+            # The percentage leads. "1h05m21s of 2h54m17s" is a duration divided by
+            # a duration, and the denominator is core-time -- a synthetic figure the
+            # reader has to reconstruct. The raw split is in the cpu section.
+            "%s of CPU time went to the kernel; a healthy run here is ~5%%."
+            % format_percent(fraction),
+            "That is syscall overhead: batch small reads, or pack many small files into shards.",
         )
     )
 
@@ -500,24 +495,15 @@ def _io_rules(job, add):
             Finding(
                 WARNING,
                 "io-heavy",
-                "Sustained heavy filesystem traffic",
-                detail + ". At this rate the filesystem, not the GPU, may be setting the pace.",
-                "Check whether the input sits on the capacity tier. Staging to a "
-                "performance filesystem is worth it once the data is reused enough "
-                "to repay the copy.",
+                "Filesystem may be setting the pace, not the GPU",
+                detail + ".",
+                "Check whether the input sits on the capacity tier; stage it to a "
+                "performance tier once it is reused enough to repay the copy.",
             )
         )
-        return
-
-    add(
-        Finding(
-            INFO,
-            "io-volume",
-            "Moved a substantial amount of data",
-            detail + ".",
-            "",
-        )
-    )
+    # No INFO for merely moving a lot of data. It restated the DISK row above it
+    # verbatim -- same bytes, same rate -- and carried no action, so it was two
+    # lines of a finding list saying what the reader had just read.
 
 
 def _parallel_rules(job, add):

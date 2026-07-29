@@ -97,7 +97,11 @@ def _job(
         CPUTimeRAW=str(int(elapsed * cpus)),
         TotalCPU=cpu,
         UserCPU=cpu,
-        SystemCPU=system_cpu or "00:00:01",
+        # Blank when not given, rather than a flat "00:00:01". A fabricated one
+        # second exceeded TotalCPU on the hung runs (0.5s), and SystemCPU can
+        # never exceed it -- the job screen showed "KERNEL 200.0%". Not every step
+        # reports SystemCPU anyway, so absent is also the more faithful default.
+        SystemCPU=system_cpu or "",
         MaxRSS=rss,
         MaxRSSNode=node,
         MaxRSSTask="0",

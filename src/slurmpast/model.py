@@ -25,6 +25,11 @@ WARNING = "warning"
 INFO = "info"
 _SEVERITY_RANK = {CRITICAL: 0, WARNING: 1, INFO: 2}
 
+# Below this much total CPU, the user/system split is not a ratio worth reporting.
+# One second: interpreter startup alone spends more than that, so anything under it
+# is a job that did not run rather than one that ran badly.
+MIN_CPU_FOR_A_SHARE = 1.0
+
 
 def severity_rank(severity: str) -> int:
     return _SEVERITY_RANK.get(severity, 99)
@@ -296,6 +301,21 @@ class Job(NamedTuple):
         total, system = self.total_cpu, self.system_cpu
         if not total or system is None:
             return None
+        if system > total:
+            # TotalCPU is user + system by definition, so this cannot happen from
+            # one measurement -- it means the two figures came from different
+            # steps (each is resolved independently: batch if present, else the
+            # largest work step). The ratio is then meaningless, and it rendered
+            # as "KERNEL 200.0%" -- a share of CPU time exceeding all of it.
+            # Unmeasurable is the honest answer.
+            return None
+        if total < MIN_CPU_FOR_A_SHARE:
+            # A ratio needs a denominator worth dividing by. Observed on real
+            # records: TotalCPU 0.01s, all of it system, rendered as "kernel share
+            # 100.0%" beside "user / system  0.00s / 0.01s" -- a headline
+            # percentage computed from one hundredth of a second, which reads as a
+            # syscall-bound job when it is a job that barely ran.
+            return None
         return system / total
 
     @property
@@ -316,6 +336,19 @@ class Job(NamedTuple):
         if total is None or not allocated:
             return None
         return total / allocated
+
+    @property
+    def cores_busy(self) -> float | None:
+        """Average number of cores actually working.
+
+        A bare "74.7%" does not say what it is a percentage of -- it was read as
+        memory. "3.0 of 4 cores" names the quantity and is also the number you
+        act on when choosing ``--cpus-per-task``.
+        """
+        util = self.cpu_utilization
+        if util is None or not self.cpu_count:
+            return None
+        return util * self.cpu_count
 
     @property
     def cpu_freq(self) -> str:

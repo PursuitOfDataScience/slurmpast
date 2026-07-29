@@ -7,6 +7,7 @@ targets one thing, and every view is also reachable as plain text for pipes.
 from __future__ import annotations
 
 import argparse
+import copy
 import getpass
 import json
 import re
@@ -169,7 +170,16 @@ def _load(args, sacct):
         # Clearly synthetic; see demo.py. Never mixed with real records.
         from .demo import history
 
-        return history()
+        jobs = history()
+        if args.job_ids:
+            # Honour the id rather than silently ignoring it and printing all 58
+            # synthetic post-mortems, which is what `--demo <jobid>` used to do.
+            wanted = {str(j) for j in args.job_ids}
+            picked = [j for j in jobs if j.job_id in wanted]
+            if not picked:
+                raise SacctError("no demo job matches: %s" % ", ".join(args.job_ids))
+            return picked
+        return jobs
     if args.job_ids:
         jobs = sacct.jobs(args.job_ids)
         if not jobs:
@@ -191,7 +201,7 @@ def _load(args, sacct):
 
 def _logs_for(job, args):
     if args.no_logs:
-        return None, None
+        return None, None, False
     return load_for(job, extra_dirs=args.log_dir)
 
 
@@ -402,13 +412,31 @@ def main(argv=None) -> int:
         from . import tui
 
         window = "synthetic demo data" if args.demo else humanize_window(args.since, args.until)
+
+        def load(since=None):
+            """Query for one window. ``w`` in the app calls back with a new one.
+
+            A copy of the parsed arguments rather than a mutation of them, so a
+            re-query cannot leave the namespace describing a window other than
+            the one on screen.
+            """
+            if since is None:
+                return _load(args, sacct)
+            scoped = copy.copy(args)
+            scoped.since = since
+            return _load(scoped, sacct)
+
         return tui.run(
-            lambda: _load(args, sacct),
+            load,
             window=window,
             ascii_mode=args.ascii,
             no_logs=args.no_logs,
             log_dirs=args.log_dir,
             mouse=args.mouse,
+            # No window to cycle over synthetic data, and an explicit -E pins the
+            # range the user asked for -- overwriting it from a preset would
+            # silently discard half of their request.
+            since=None if (args.demo or args.until) else args.since,
         )
 
     try:
@@ -424,7 +452,11 @@ def main(argv=None) -> int:
         if args.json:
             from .nodes import dominant_workload, node_table
 
-            workload = None if args.all_workloads else dominant_workload(history.usable_jobs)
+            workload = (
+                None
+                if args.all_workloads
+                else dominant_workload(history.usable_jobs, metric=args.metric)
+            )
             print(
                 json.dumps(
                     {
@@ -496,8 +528,16 @@ def main(argv=None) -> int:
                             {
                                 "name": g.name,
                                 "partition": g.partition,
+                                # How many real job names the folded pattern
+                                # covers. Off the table on purpose -- it read as
+                                # clutter beside the name -- but it is a real
+                                # measurement, so it is emitted rather than lost.
+                                "distinct_names": g.distinct_names,
                                 "runs": g.total,
                                 "completed": g.completed,
+                                # The overview shows only the union; the breakdown
+                                # stays here so nothing measured is lost.
+                                "problems": g.problems,
                                 "failed": g.failed,
                                 "cancelled": g.cancelled,
                                 "noop": g.noop,
@@ -528,7 +568,7 @@ def main(argv=None) -> int:
     if args.json:
         payload = []
         for job in targets:
-            log_path, log_text = _logs_for(job, args)
+            log_path, log_text, _inferred = _logs_for(job, args)
             verdict = diagnose(job, log_text=log_text, node_note=_node_note(job, history))
             payload.append(_job_json(job, log_path, verdict))
         print(
@@ -543,7 +583,7 @@ def main(argv=None) -> int:
     worst_critical = False
     if args.job_ids:
         for job in targets:
-            log_path, log_text = _logs_for(job, args)
+            log_path, log_text, inferred = _logs_for(job, args)
             text, verdict = report.render_job(
                 job,
                 log_path=log_path,
@@ -551,6 +591,8 @@ def main(argv=None) -> int:
                 node_note=_node_note(job, history),
                 style=style,
                 show_steps=args.steps,
+                ascii_mode=args.ascii,
+                log_inferred=inferred,
             )
             print(text)
             worst_critical |= any(f.severity == "critical" for f in verdict.findings)

@@ -105,7 +105,20 @@ def mem_scope(text):
 
 
 def format_duration(seconds):
-    """Seconds -> compact human duration. ``None`` renders as ``n/a``."""
+    """Seconds -> a Slurm-shaped duration. ``None`` renders as ``n/a``.
+
+    ``HH:MM:SS``, or ``D-HH:MM:SS`` past a day -- the notation sacct prints and
+    ``--time=`` accepts. "57m54s" was this tool's own invention, so a reader had
+    to translate it back into the format they actually type; the sizing advice was
+    already emitting ``--time=09:45:00`` while the display said ``9h45m00s``.
+
+    Fixed width is a second benefit: ``00:57:54`` right-aligns in a column where
+    ``57m54s`` / ``2h53m27s`` / ``1d18h00m`` do not.
+
+    Under a minute the value stays in seconds, deliberately. A hung job's evidence
+    is "0.52s of CPU", and ``00:00:00`` would erase the single number this whole
+    tool exists to surface.
+    """
     if seconds is None:
         return "n/a"
     seconds = float(seconds)
@@ -118,10 +131,8 @@ def format_duration(seconds):
     hours, rem = divmod(rem, 3600)
     minutes, secs = divmod(rem, 60)
     if days:
-        return "%dd%02dh%02dm" % (days, hours, minutes)
-    if hours:
-        return "%dh%02dm%02ds" % (hours, minutes, secs)
-    return "%dm%02ds" % (minutes, secs)
+        return "%d-%02d:%02d:%02d" % (days, hours, minutes, secs)
+    return "%02d:%02d:%02d" % (hours, minutes, secs)
 
 
 def format_bytes(value):
@@ -219,7 +230,7 @@ def humanize_window(since, until=None):
         now-7days           -> last 7 days
         now-1day            -> last 24 hours
         2026-01-01          -> since 2026-01-01
-        now-30days, 07-15   -> 2026-01-01 to 07-15
+        now-30days, 07-15   -> 30 days ago to 07-15
     """
     import re
 
@@ -228,11 +239,21 @@ def humanize_window(since, until=None):
     ended = until and until.lower() != "now"
 
     match = re.match(r"^now-\s*(\d+)\s*([a-z]+?)s?$", since, re.IGNORECASE)
-    if match and not ended:
+    if match:
         count, unit = int(match.group(1)), match.group(2).lower()
+        plural = _WINDOW_UNITS.get(unit, unit + "s")
+        if ended:
+            # "last N days" would claim the range reaches now, and an explicit
+            # -E says it does not. Without this branch the raw "now-30days" fell
+            # through to the display -- the machine's own argument syntax, which
+            # is the one thing this function exists to keep off the screen.
+            if unit == "day" and count == 1:
+                span = "24 hours"
+            else:
+                span = "1 %s" % unit if count == 1 else "%d %s" % (count, plural)
+            return "%s ago to %s" % (span, until.split("T")[0])
         if unit == "day" and count == 1:
             return "last 24 hours"
-        plural = _WINDOW_UNITS.get(unit, unit + "s")
         if count == 1:
             return "last %s" % unit
         return "last %d %s" % (count, plural)

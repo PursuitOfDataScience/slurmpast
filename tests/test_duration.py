@@ -101,13 +101,33 @@ class TestFormatting:
         assert format_duration(0.539) == "0.54s"
 
     def test_minutes(self):
-        assert format_duration(1826) == "30m26s"
+        """Slurm's own notation, not this tool's: sacct prints "01:52:49" and
+        --time= accepts it, so "30m26s" made the reader translate."""
+        assert format_duration(1826) == "00:30:26"
 
     def test_hours(self):
-        assert format_duration(6769) == "1h52m49s"
+        assert format_duration(6769) == "01:52:49"
 
     def test_days(self):
-        assert format_duration(129600).startswith("1d")
+        assert format_duration(129600) == "1-12:00:00"
+
+    def test_it_round_trips_through_the_parser(self):
+        """The strongest check that the format really is Slurm's: our own parser,
+        written against sacct output, reads back what we print."""
+        from slurmpast.duration import parse_duration
+
+        for seconds in (60, 1826, 6769, 129600, 3600, 86399):
+            assert parse_duration(format_duration(seconds)) == seconds
+
+    def test_a_walltime_suggestion_matches_the_display(self):
+        """--sizing emitted "--time=09:45:00" while the display said "9h45m00s"."""
+        from slurmpast.sizing import _fmt_walltime
+
+        assert _fmt_walltime(35100) == format_duration(35100)
+
+    def test_fixed_width_so_columns_align(self):
+        widths = {len(format_duration(s)) for s in (60, 1826, 6769, 86399)}
+        assert widths == {8}
 
     def test_bytes(self):
         assert format_bytes(53741792 * 1024) == "51.3 GiB"

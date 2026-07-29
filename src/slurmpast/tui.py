@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Any, ClassVar, cast
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -30,9 +31,10 @@ from textual.widgets import DataTable, Footer, Header, Input, Static
 
 from . import render, theme
 from .diagnose import diagnose, looks_like_noop
-from .duration import format_duration, format_percent
+from .duration import format_bytes, format_duration, format_percent, humanize_window
 from .index import (
     FILTERS,
+    SORTS,
     GroupStats,
     History,
     filter_groups,
@@ -42,12 +44,14 @@ from .index import (
     sort_label,
 )
 from .logs import load_for
-from .nodes import compress_nodelist, node_table, suggest_exclude
+from .nodes import MIN_SAMPLES, compress_nodelist, node_table, suggest_exclude
 
 BASE_CSS = """
 Screen { background: $surface; }
 #banner { height: auto; padding: 0 1; color: $text-muted; }
-#summary { height: auto; padding: 0 1 1 1; }
+/* A blank line above and below. Header bar, stats and column headings on three
+   consecutive rows read as one squeezed block. */
+#summary { height: auto; padding: 1 1 1 1; }
 DataTable { height: 1fr; }
 DataTable > .datatable--cursor { background: $primary 30%; }
 #detail { padding: 0 1; height: 1fr; }
@@ -71,6 +75,32 @@ _COPY_BINDINGS = [
     Binding("y", "copy_row", "Copy row"),
     Binding("Y", "copy_view", "Copy view", show=False),
 ]
+
+
+# Windows `w` cycles through, shortest first. Only day and week specs appear
+# because sacct rejects anything coarser -- verified against Slurm 20.11.8:
+# `-S now-6months` and `-S now-1year` both fail with "Invalid time specification
+# (pos=4)", while every spec below returns rows. The labels are not written out
+# here: humanize_window derives them, so the cycle and the title bar cannot drift.
+WINDOWS = ("now-1day", "now-7days", "now-30days", "now-12weeks", "now-52weeks")
+
+
+def _loader_accepts_since(loader) -> bool:
+    """Whether this loader can be re-run for a different window.
+
+    The CLI passes a loader taking a sacct time spec; ``--demo`` and the tests
+    pass a zero-argument one, and there is no window to cycle in those cases.
+    Decided by signature rather than by catching TypeError from the call, which
+    would swallow a TypeError raised *inside* the loader and misreport it as
+    "cannot change the window".
+    """
+    import inspect
+
+    try:
+        inspect.signature(loader).bind("now-7days")
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _clip_path() -> str:
@@ -163,6 +193,38 @@ def _header() -> Header:
         return Header(show_clock=False)
 
 
+# Width of the table before the first layout pass has run, and the floor below
+# which shrinking columns stops helping. A vertical scrollbar takes a couple of
+# cells once the rows overflow, so the layout leaves room for one rather than
+# spilling into a horizontal scrollbar.
+# Longest path shown inline on a job screen before it is elided. `p` toggles the
+# full value; --plain never elides, so a pasted report keeps the whole path.
+_MAX_PATH_WIDTH = 62
+_DEFAULT_TABLE_WIDTH = 96
+_MIN_TABLE_WIDTH = 40
+_SCROLLBAR = 2
+
+
+def _sync_columns(table: DataTable, spec, current, content=None):
+    """Give ``table`` exactly the columns its current width calls for.
+
+    Rebuilding is the only way to resize a DataTable's columns, and it drops the
+    rows along with them, so it happens only when the layout actually changed --
+    not on every search keystroke.
+
+    ``content`` is the longest real cell per column, so a flexible column stops
+    growing once its content fits instead of stretching into empty space.
+    """
+    # `size` is zero until the first layout pass; on_resize calls back after it.
+    width = table.size.width or _DEFAULT_TABLE_WIDTH
+    layout = render.fit_columns(spec, max(_MIN_TABLE_WIDTH, width - _SCROLLBAR), content=content)
+    if layout != current or not table.columns:
+        table.clear(columns=True)
+        for label, column_width in layout:
+            table.add_column(label, width=column_width)
+    return layout
+
+
 def _digit_bindings(action: str):
     """Type a row number to jump to it, exactly as slurmwatch does for nodes."""
     return [Binding(str(d), f"{action}('{d}')", show=False) for d in range(10)]
@@ -178,6 +240,16 @@ class _RowJump:
 
     def __init__(self) -> None:
         self._buffer = ""
+
+    def on_key_pressed(self, key: str) -> None:
+        """End a pending jump on anything that is not a digit.
+
+        Without this the buffer outlives the jump: press ``3`` to reach row 3,
+        navigate elsewhere, press ``7`` later and the accumulated "37" lands on a
+        row neither key asked for. Nothing was calling ``clear``.
+        """
+        if not (len(key) == 1 and key.isdigit()):
+            self.clear()
 
     def push(self, digit: str, limit: int) -> int | None:
         self._buffer += digit
@@ -197,9 +269,57 @@ class _RowJump:
         self._buffer = ""
 
 
+# Keys that should still drive the table while the search box has focus. An Input
+# swallows the arrows (left/right move its caret, up/down do nothing at all), so
+# once you had typed a query the highlight could not be moved AT ALL until you
+# pressed enter -- and nothing on screen said so.
+_TABLE_KEYS = frozenset(["up", "down", "pageup", "pagedown", "home", "end"])
+
+
+def _steer_table(screen, table_id: str, key: str) -> bool:
+    """Send a navigation key to the table even when the search box has focus.
+
+    Type to filter, arrow to choose, enter to commit -- the behaviour of every
+    other filter box. Returns whether the key was handled.
+    """
+    if key not in _TABLE_KEYS:
+        return False
+    if not screen.query_one("#search", Input).has_focus:
+        return False
+    table = screen.query_one(table_id, DataTable)
+    if not table.row_count:
+        return True
+    if key in ("up", "down"):
+        table.move_cursor(row=table.cursor_row + (1 if key == "down" else -1))
+    elif key in ("pageup", "pagedown"):
+        step = max(1, table.size.height - 2)
+        table.move_cursor(row=table.cursor_row + (step if key == "pagedown" else -step))
+    else:
+        table.move_cursor(row=0 if key == "home" else table.row_count - 1)
+    return True
+
+
+def _dismiss_search(screen, table_id: str) -> bool:
+    """Cancel an open search: clear it, hide the box, hand focus back.
+
+    Returns whether there was a search to cancel, so the caller knows to stop the
+    key event. Without this, `escape` reached the screen binding while the input
+    had focus -- which on the overview is Quit, so cancelling a search ended the
+    session, and on a job list popped the screen. Escape is the universal "cancel
+    this"; enter commits the filter and closes the box, escape discards it.
+    """
+    if not screen.query_one("#search", Input).has_focus:
+        return False
+    screen.query_one("#searchbar").remove_class("visible")
+    screen.query_one("#search", Input).value = ""
+    screen.search_text = ""
+    screen.query_one(table_id, DataTable).focus()
+    return True
+
+
 class SearchBar(Input):
     def __init__(self) -> None:
-        super().__init__(placeholder="filter by name, job id, state or node…", id="search")
+        super().__init__(placeholder="filter by name, job id, state, node or date…", id="search")
 
 
 class HelpScreen(ModalScreen[None]):
@@ -230,11 +350,26 @@ class HelpScreen(ModalScreen[None]):
             ("a", "flat job list, skipping the grouping"),
             ("y", "copy the selected row to the clipboard"),
             ("Y", "copy the whole view (a job screen copies the full report)"),
-            ("r", "reload from sacct"),
+            ("w", "cycle the time window: 1 day → 7 → 30 → 12 weeks → 52"),
+            ("r", "reload the same window from sacct"),
             ("?", "this help"),
         ):
             body.append("  %-14s " % key, style="bold %s" % theme.ACCENT)
             body.append(description + "\n", style=theme.INK)
+        body.append(
+            "\n  A row on the overview is one workload: every run whose job name\n"
+            '  matches once digits are folded to "#", so cot-exp1 and cot-exp2\n'
+            "  share a row. Its counts and hour totals cover all of those runs.\n"
+            "  Open a row to see the real job names.\n"
+            "\n  FLAGGED counts runs this tool marks for a look: they failed, or\n"
+            "  they held the allocation without computing. One number, because\n"
+            "  those two overlap — open the row to see which. It says what was\n"
+            "  flagged, not that it was your mistake; a failure can be expected.\n"
+            "  COMPLETED plus FLAGGED can be less than RUNS: a cancelled run is\n"
+            "  neither, since a deliberate kill and an abandoned one are\n"
+            "  identical in accounting.\n",
+            style=theme.FAINT,
+        )
         body.append(
             "\n  Groups are ranked by resources burned, not run count: a 5-run\n"
             "  group that cost 400 GPU-hours outranks 400 two-second probes.\n",
@@ -251,6 +386,13 @@ class HelpScreen(ModalScreen[None]):
         with Vertical(id="help-box"):
             yield Static(Text("slurmpast — keys", style="bold %s" % theme.ACCENT))
             yield Static(body)
+
+
+# Both table specs live in render.py, because --plain draws these same two tables
+# and a spec kept next to only one renderer drifted: the dashboard's overview had
+# already lost its NEVER RAN column and its "(2 names)" suffix while --plain was
+# still printing both.
+_OVERVIEW_COLUMNS = render.OVERVIEW_COLUMNS
 
 
 class OverviewScreen(ClipboardMixin, Screen[Any]):
@@ -288,6 +430,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         super().__init__()
         self._jump = _RowJump()
         self._rows: list[GroupStats] = []
+        self._layout: list[tuple[str, int]] = []
         # Retained so tests and callers read what was composed, never the widget.
         self.summary_text = Text()
 
@@ -308,32 +451,37 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         yield Footer()
 
     def on_mount(self) -> None:
-        table = self.query_one("#groups", DataTable)
-        for label, width in (
-            ("#", 5),
-            ("WORKLOAD", 24),
-            ("PARTITION", 9),
-            ("RUNS", 5),
-            ("FAILED", 7),
-            ("USED", 13),
-            ("LAST RUN", 10),
-            ("NAMES", 5),
-        ):
-            table.add_column(label, width=width)
         self.refresh_rows()
-        table.focus()
+        self.query_one("#groups", DataTable).focus()
+
+    def on_resize(self) -> None:
+        """Columns are sized to the terminal, so a resize is a relayout.
+
+        The row set is unchanged, so the selection is carried across it -- a
+        relayout that silently returned you to row 1 would be its own annoyance.
+        """
+        if self.is_mounted:
+            self.refresh_rows(keep_cursor=True)
 
     # -- data ------------------------------------------------------------
 
-    def refresh_rows(self) -> None:
+    def refresh_rows(self, keep_cursor: bool = False) -> None:
         history: History | None = self.sp.history
         table = self.query_one("#groups", DataTable)
-        # The load worker can finish before on_mount has added the columns --
-        # with an in-memory loader it reliably does. Populating a zero-column
-        # table raises, so bail; on_mount calls this again once set up.
-        if not table.columns:
-            return
         summary = self.query_one("#summary", Static)
+        cursor = table.cursor_row if keep_cursor else 0
+        # A CPU-only history should not carry a GPU half that is "-" on every row:
+        # the paired cell collapses to a plain CPU-HOURS column instead.
+        spec = _OVERVIEW_COLUMNS
+        if history is not None and not any(g.gpu_hours for g in history.groups):
+            spec = render.cpu_only_columns(spec)
+        # The longest real name, so JOB NAME stops growing once it fits rather
+        # than stretching to a cap over empty space.
+        names = [g.name for g in history.groups] if history is not None else []
+        layout = _sync_columns(
+            table, spec, self._layout, content={"JOB NAME": max(map(len, names), default=0)}
+        )
+        self._layout = layout
         if history is None:
             summary.update(Text("loading…", style=theme.DIM))
             return
@@ -342,55 +490,64 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
             filter_groups(history.groups, self.filter_mode, self.search_text), self.sort_mode
         )
         self._rows = groups
-        self.summary_text = self._summary(history)
+        self.summary_text = self._summary(history, shown=len(groups))
         summary.update(self.summary_text)
         table.clear()
         ascii_mode = self.sp.ascii_mode
         for index, group in enumerate(groups, start=1):
-            burned = (
-                "%.0f gpu-h" % group.gpu_hours
-                if group.gpu_hours >= 1
-                else "%.0f core-h" % group.core_hours
-            )
             # The dot rides in the row-number cell: as its own column it paid for
             # a width plus padding on both sides to show one glyph.
             marker = Text()
             marker.append("%-2d " % index, style=theme.FAINT)
             marker.append_text(render.health_dot(group.severity, ascii_mode))
-            table.add_row(
-                marker,
-                Text(group.name[:24], style=theme.INK),
-                Text(group.partition[:9], style=theme.DIM),
-                Text(str(group.total), style=theme.DIM),
+            cells = {
+                "#": marker,
+                # Just the name. The count of distinct spellings folded into it was
+                # here as a "NAMES" column and then as a "(2 names)" suffix, and
+                # both read as clutter hanging off an identifier: the "#" already
+                # says digits were folded, and the real names are one keypress away
+                # in this workload's own NAME column. It stays in the JSON payload.
+                "JOB NAME": Text(group.name, style=theme.INK),
+                "PARTITION": Text(group.partition, style=theme.DIM),
+                "RUNS": Text(str(group.total), style=theme.DIM),
+                "COMPLETED": Text(
+                    str(group.completed) if group.completed else "-",
+                    style=theme.HEALTH_COLOR["ok"] if group.completed else theme.FAINT,
+                ),
                 # A count, not a rate: the rate's denominator excludes
                 # cancellations while RUNS counts them, so "RUNS 20 / FAILED 20%"
                 # invited the reader to compute 4 failures where there were 2.
-                Text(
-                    str(group.failed) if group.failed else "-",
-                    style=theme.HEALTH_COLOR["crit"] if group.failed else theme.FAINT,
+                "FLAGGED": Text(
+                    str(group.problems) if group.problems else "-",
+                    style=theme.HEALTH_COLOR["crit"] if group.problems else theme.FAINT,
                 ),
-                Text(burned, style=theme.GPU_COLOR if group.gpu_hours else theme.CPU_COLOR),
-                Text((group.last_seen or "")[:10], style=theme.FAINT),
-                Text(
-                    str(group.distinct_names) if group.distinct_names > 1 else "",
-                    style=theme.FAINT,
+                render.HOURS_PAIR_LABEL: render.hours_pair(group),
+                "CPU-HOURS": Text(
+                    render.hours_text(group.core_hours),
+                    style=theme.CPU_COLOR if group.core_hours else theme.FAINT,
+                    justify="right",
                 ),
-                key=str(index),
-            )
-        # Lead with the WINDOW: it is the single most common explanation for
-        # "why is this workload missing runs?" and it was nowhere on screen.
-        # The filter is named only when it is actually filtering -- a bare
-        # "everything" in the title bar is noise.
-        parts = [
-            self.sp.window,
-            "%d workload%s" % (len(groups), "" if len(groups) == 1 else "s"),
-            "by %s" % sort_label(self.sort_mode),
-        ]
+                "LAST RUN": Text((group.last_seen or "")[:10], style=theme.FAINT),
+            }
+            table.add_row(*(cells[label] for label, _ in layout), key=str(index))
+        if cursor and cursor < len(groups):
+            table.move_cursor(row=cursor)
+        # The WINDOW, and nothing that belongs next to a number. Counts live on
+        # the summary line: "41 workloads" up here with "233 jobs" down there split
+        # one fact across two rows, and the job list said "58 jobs" in both places.
+        #
+        # The filter and the sort are named only when they are actually doing
+        # something. A bare "everything" is noise, and so is "by resource use" on
+        # the default ordering -- it named the sort without saying what it meant,
+        # and the reader has not chosen anything yet. Press `s` and it appears.
+        parts = [self.sp.window]
         if self.filter_mode != "all":
-            parts.insert(2, dict(FILTERS).get(self.filter_mode, self.filter_mode))
+            parts.append(dict(FILTERS).get(self.filter_mode, self.filter_mode))
+        if self.sort_mode != SORTS[0][0]:
+            parts.append("by %s" % sort_label(self.sort_mode))
         self.sub_title = "  ·  ".join(parts)
 
-    def _summary(self, history: History) -> Text:
+    def _summary(self, history: History, shown: int = 0) -> Text:
         """One line: how much work, how much of it worked, where the waste is.
 
         This was four lines. The GPU-hour total does not deserve a sentence of
@@ -399,36 +556,53 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         completed-hours line was redundant with the completion rate, and the
         concurrency framing was explanation for a number that should not have
         needed explaining at a glance.
+
+        ``shown`` is the row count after filtering, named only when it differs
+        from the total -- the two counts belong together on one line, but the
+        header count has to stay honest when a filter narrows the table.
         """
         stats = history.stats
+        total_groups = len(history.groups)
         text = Text()
+        # "233 jobs rolled up into 41 workloads" is one fact and was split between
+        # the header bar and this line, so neither read as a whole thought.
         text.append("%d jobs" % stats["jobs"], style="bold %s" % theme.INK)
+        text.append(
+            " in %d workload%s" % (total_groups, "" if total_groups == 1 else "s"),
+            style=theme.DIM,
+        )
         text.append("  ·  ", style=theme.FAINT)
         text.append("%s completed" % format_percent(stats["completion_rate"]), style=theme.DIM)
 
-        if stats["gpu_hours_noop"] and stats["gpu_hours_total"]:
+        # The total appears ONLY as the denominator for the idle figure, and only
+        # when that loss is material. On its own "783 GPU-hours" is a magnitude
+        # with nothing to compare it against and nothing to do about it -- the
+        # per-workload columns are where the resource numbers are comparable. So
+        # there is no `elif` printing a bare total: no numerator, no line.
+        #
+        # Deliberately NOT here either: the excluded-record count and an
+        # explanation of the "#" name folding. Both were true and both were
+        # clutter -- three dense lines stacked under the header bar with no air
+        # between them. The exclusion count is on the workload screen, which is
+        # where "why is a run missing?" gets asked, and in --plain; the "#" is
+        # explained under `?`.
+        idle = history.idle_gpu_hours
+        if idle is not None:
             text.append("  ·  ", style=theme.FAINT)
+            # "total" and "of them" are both load-bearing: "783 GPU-hours" alone
+            # was read as a per-job figure, and a bare "18 never computed" did not
+            # say 18 of what.
+            text.append("%.0f GPU-hours total" % idle[1], style=theme.GPU_COLOR)
             text.append(
-                "%.0f of %.0f GPU-hours never computed"
-                % (stats["gpu_hours_noop"], stats["gpu_hours_total"]),
+                ", %.0f of them never used" % idle[0],
                 style=theme.HEALTH_COLOR["warn"],
             )
-        elif stats["gpu_hours_total"]:
-            text.append("  ·  ", style=theme.FAINT)
-            text.append("%.0f GPU-hours" % stats["gpu_hours_total"], style=theme.GPU_COLOR)
 
-        if stats["excluded_open_records"]:
-            # Terse here on purpose; the workload screen explains it in full,
-            # which is where the "why is a run missing?" question gets asked.
+        # Last: the facts about the history come first, then what the view is
+        # currently doing to them.
+        if shown and shown != total_groups:
             text.append("  ·  ", style=theme.FAINT)
-            text.append(
-                "%d record%s excluded"
-                % (
-                    stats["excluded_open_records"],
-                    "" if stats["excluded_open_records"] == 1 else "s",
-                ),
-                style=theme.FAINT,
-            )
+            text.append("showing %d" % shown, style=theme.ACCENT)
 
         if self.search_text:
             text.append("\nsearch: ", style=theme.FAINT)
@@ -455,11 +629,14 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
                 group.partition,
                 str(group.total),
                 "%d completed" % group.completed,
+                # The breakdown too: a pasted row has no width limit and no
+                # drill-down, so it carries what the table sends you elsewhere for.
+                "%d problems" % group.problems,
                 "%d failed" % group.failed,
-                "%d idle" % group.noop,
-                "%.1f gpu-h" % group.gpu_hours
-                if group.gpu_hours
-                else "%.1f core-h" % group.core_hours,
+                "%d never ran" % group.noop,
+                # Units named here: a pasted row has no column header above it.
+                "%s CPU-hours" % render.hours_text(group.core_hours),
+                "%s GPU-hours" % render.hours_text(group.gpu_hours),
                 group.last_seen or "",
             ]
         )
@@ -483,6 +660,15 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         row = self._jump.push(digit, len(self._rows))
         if row is not None:
             self.query_one("#groups", DataTable).move_cursor(row=row - 1)
+
+    def on_key(self, event: events.Key) -> None:
+        self._jump.on_key_pressed(event.key)
+        handled = (event.key == "escape" and _dismiss_search(self, "#groups")) or _steer_table(
+            self, "#groups", event.key
+        )
+        if handled:
+            event.stop()
+            event.prevent_default()
 
     def action_cycle_filter(self) -> None:
         names = [name for name, _ in FILTERS]
@@ -536,6 +722,43 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         self.action_open()
 
 
+_JOB_COLUMNS = render.JOB_COLUMNS
+
+# A copy is a paste-ready artefact, so it carries every column regardless of how
+# narrow the terminal was when the rows were drawn, and uses the same labels.
+_JOB_CLIPBOARD_HEADER = (
+    "JOBID",
+    "NAME",
+    "STATE",
+    "STARTED",
+    "ENDED",
+    "WALL TIME",
+    "CPU TIME",
+    "CPUS BUSY",
+    "PEAK MEM",
+    "MEM%",
+    "GPU",
+    "NODE",
+)
+
+
+def _job_clipboard_cells(job) -> list[str]:
+    return [
+        job.job_id,
+        job.name or "",
+        job.base_state,
+        job.start or "",
+        job.end or "",
+        format_duration(job.elapsed),
+        format_duration(job.total_cpu),
+        render.cores_text(job),
+        format_bytes(job.max_rss),
+        format_percent(job.mem_utilization),
+        str(job.gpu_count or 0),
+        job.node_list or "",
+    ]
+
+
 class JobListScreen(ClipboardMixin, Screen[Any]):
     """A list of jobs -- inside one workload, or flat across everything."""
 
@@ -564,6 +787,7 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         super().__init__()
         self._all = list(jobs)
         self._rows: list = []
+        self._layout: list[tuple[str, int]] = []
         self._title = title
         self.summary_text = Text()
         self.filter_mode = initial_filter
@@ -583,64 +807,77 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         yield Footer()
 
     def on_mount(self) -> None:
-        table = self.query_one("#jobs", DataTable)
-        # STARTED/ENDED are load-bearing, not decoration: inside a workload with
-        # 1,101 same-named runs the job id alone does not tell you which attempt
-        # you are looking at.
-        for label, width in (
-            ("#", 5),
-            ("JOBID", 11),
-            ("NAME", 14),
-            ("STATE", 11),
-            ("STARTED", 11),
-            ("ENDED", 11),
-            ("ELAPSED", 8),
-            ("CPU TIME", 9),
-            ("CPU%", 6),
-            ("GPU", 3),
-            ("NODE", 12),
-        ):
-            table.add_column(label, width=width)
         self.refresh_rows()
-        table.focus()
+        self.query_one("#jobs", DataTable).focus()
 
-    def refresh_rows(self) -> None:
+    def on_resize(self) -> None:
+        """Columns are sized to the terminal, so a resize is a relayout.
+
+        The row set is unchanged, so the selection is carried across it -- a
+        relayout that silently returned you to row 1 would be its own annoyance.
+        """
+        if self.is_mounted:
+            self.refresh_rows(keep_cursor=True)
+
+    def refresh_rows(self, keep_cursor: bool = False) -> None:
         table = self.query_one("#jobs", DataTable)
-        if not table.columns:  # see OverviewScreen.refresh_rows
-            return
+        cursor = table.cursor_row if keep_cursor else 0
         jobs = filter_jobs(self._all, self.filter_mode, self.search_text)
+        layout = _sync_columns(
+            table,
+            _JOB_COLUMNS,
+            self._layout,
+            content={
+                "NAME": max((len(j.name or "") for j in jobs), default=0),
+                "NODE": max((len(j.node_list or "") for j in jobs), default=0),
+            },
+        )
+        self._layout = layout
         # Newest first: after a failed run you look at the most recent attempt.
         jobs.sort(key=lambda j: (j.start or j.submit or "", j.job_id), reverse=True)
         self._rows = jobs
-        ascii_mode = self.sp.ascii_mode
         table.clear()
         for index, job in enumerate(jobs, start=1):
             grade = theme.STATE_HEALTH.get(job.base_state, "none")
             if looks_like_noop(job):
                 grade = "crit"
             util = job.cpu_utilization
-            marker = Text()
-            marker.append("%-2d " % index, style=theme.FAINT)
-            marker.append_text(render.health_dot(grade, ascii_mode))
-            table.add_row(
-                marker,
-                Text(job.job_id[:11], style=theme.INK),
-                Text((job.name or "")[:14], style=theme.DIM),
-                Text(job.base_state[:11], style=theme.HEALTH_COLOR.get(grade, theme.DIM)),
-                Text(render.stamp_short(job.start) or "-", style=theme.ACCENT),
-                Text(render.stamp_short(job.end) or "-", style=theme.FAINT),
-                Text(format_duration(job.elapsed), style=theme.DIM),
-                Text(format_duration(job.total_cpu), style=theme.CPU_COLOR),
-                Text(
-                    format_percent(util),
+            # Row number only. A health dot on every row duplicated the STATE
+            # column beside it, and a filled circle leading each line was read as
+            # "all the entries are selected". The overview keeps its dot: group
+            # severity has no column of its own there.
+            marker = Text("%-2d" % index, style=theme.FAINT)
+            # MaxRSS above the ceiling is not a working set (it sums shared pages
+            # across the process tree), so it is flagged rather than read as 103%.
+            over_limit = bool(
+                job.mem_limit_bytes and job.max_rss and job.max_rss > job.mem_limit_bytes
+            )
+            cells = {
+                "#": marker,
+                "JOBID": Text(job.job_id, style=theme.INK),
+                "NAME": Text(job.name or "", style=theme.DIM),
+                "STATE": Text(job.base_state, style=theme.HEALTH_COLOR.get(grade, theme.DIM)),
+                "STARTED": Text(render.stamp_short(job.start) or "-", style=theme.ACCENT),
+                "ENDED": Text(render.stamp_short(job.end) or "-", style=theme.FAINT),
+                "WALL TIME": Text(format_duration(job.elapsed), style=theme.DIM),
+                "CPU TIME": Text(format_duration(job.total_cpu), style=theme.CPU_COLOR),
+                "CPUS BUSY": Text(
+                    render.cores_text(job),
                     style=theme.HEALTH_COLOR["crit"]
                     if (util is not None and util < 0.02)
-                    else theme.DIM,
+                    else theme.CPU_COLOR,
                 ),
-                Text(str(job.gpu_count or "-"), style=theme.GPU_COLOR),
-                Text((job.node_list or "")[:12], style=theme.FAINT),
-                key=str(index),
-            )
+                "PEAK MEM": Text(format_bytes(job.max_rss), style=theme.MEM_COLOR),
+                "MEM%": Text(
+                    format_percent(job.mem_utilization),
+                    style=theme.HEALTH_COLOR["crit"] if over_limit else theme.DIM,
+                ),
+                "GPU": Text(str(job.gpu_count or "-"), style=theme.GPU_COLOR),
+                "NODE": Text(job.node_list or "", style=theme.FAINT),
+            }
+            table.add_row(*(cells[label] for label, _ in layout), key=str(index))
+        if cursor and cursor < len(jobs):
+            table.move_cursor(row=cursor)
 
         summary = Text()
         summary.append(self._title, style="bold %s" % theme.INK)
@@ -649,7 +886,11 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         )
         idle = sum(1 for j in jobs if looks_like_noop(j))
         if idle:
-            summary.append("  ·  %d never computed" % idle, style=theme.HEALTH_COLOR["warn"])
+            # "of them" ties the count to the job count beside it. A bare "3 never
+            # computed" next to a GPU-hours figure elsewhere read as hours.
+            summary.append(
+                "  ·  %d of them never computed" % idle, style=theme.HEALTH_COLOR["warn"]
+            )
         excluded = getattr(self, "_excluded", 0)
         if excluded:
             # Terse: the window is already in the title bar, and the long
@@ -670,12 +911,12 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         # in 8.x -- which is exactly how CI caught this.
         self.summary_text = summary
         self.query_one("#summary", Static).update(summary)
-        parts = [
-            "%d job%s" % (len(jobs), "" if len(jobs) == 1 else "s"),
-            self.sp.window,
-        ]
+        # No count here -- the summary line above already carries it, and printing
+        # "58 jobs" in both places was the same duplication as the overview's split
+        # workload/job counts.
+        parts = [self.sp.window]
         if self.filter_mode != "all":
-            parts.insert(1, dict(FILTERS).get(self.filter_mode, self.filter_mode))
+            parts.append(dict(FILTERS).get(self.filter_mode, self.filter_mode))
         self.sub_title = "  ·  ".join(parts)
 
     def _selected(self):
@@ -697,43 +938,11 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         job = self._selected()
         if job is None:
             return ""
-        return "\t".join(
-            [
-                job.job_id,
-                job.name or "",
-                job.base_state,
-                job.start or "",
-                job.end or "",
-                format_duration(job.elapsed),
-                format_duration(job.total_cpu),
-                format_percent(job.cpu_utilization),
-                str(job.gpu_count or 0),
-                job.node_list or "",
-            ]
-        )
+        return "\t".join(_job_clipboard_cells(job))
 
     def clipboard_view(self) -> str:
-        header = "\t".join(
-            ["JOBID", "NAME", "STATE", "STARTED", "ENDED", "ELAPSED", "CPU", "UTIL", "GPU", "NODE"]
-        )
-        rows = [
-            "\t".join(
-                [
-                    j.job_id,
-                    j.name or "",
-                    j.base_state,
-                    j.start or "",
-                    j.end or "",
-                    format_duration(j.elapsed),
-                    format_duration(j.total_cpu),
-                    format_percent(j.cpu_utilization),
-                    str(j.gpu_count or 0),
-                    j.node_list or "",
-                ]
-            )
-            for j in self._rows
-        ]
-        return "\n".join([header] + rows)
+        header = "\t".join(_JOB_CLIPBOARD_HEADER)
+        return "\n".join([header] + ["\t".join(_job_clipboard_cells(j)) for j in self._rows])
 
     def action_open(self) -> None:
         job = self._selected()
@@ -744,6 +953,15 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
         row = self._jump.push(digit, len(self._rows))
         if row is not None:
             self.query_one("#jobs", DataTable).move_cursor(row=row - 1)
+
+    def on_key(self, event: events.Key) -> None:
+        self._jump.on_key_pressed(event.key)
+        handled = (event.key == "escape" and _dismiss_search(self, "#jobs")) or _steer_table(
+            self, "#jobs", event.key
+        )
+        if handled:
+            event.stop()
+            event.prevent_default()
 
     def action_cycle_filter(self) -> None:
         names = [name for name, _ in FILTERS]
@@ -807,15 +1025,18 @@ class WorkloadScreen(JobListScreen):
             banner.append("\n  " + " ".join(render.wrap(worst.evidence, 100)), style=theme.DIM)
 
         # The point of reading finished jobs: what the next one should ask for.
-        from .sizing import recommend, sbatch_lines
+        from .sizing import recommend
 
-        lines = sbatch_lines(recommend(self._group.jobs))
-        if lines:
-            if banner.plain:
-                banner.append("\n")
-            banner.append("next run: ", style=theme.FAINT)
-            banner.append("  ".join(lines), style="bold %s" % theme.ACCENT)
-            banner.append("   (slurmpast --sizing for why)", style=theme.FAINT)
+        # Each directive with the evidence behind it, on screen. It used to assert
+        # "--time=09:45:00  --mem=72G" and point at `slurmpast --sizing for why` --
+        # a bare number with no basis, and for the reason a different command in a
+        # different program. The reason belongs where the number is.
+        advice = [a for a in recommend(self._group.jobs) if a.actionable]
+        for index, item in enumerate(advice):
+            banner.append("\n" if banner.plain else "")
+            banner.append("next run  " if index == 0 else "          ", style=theme.FAINT)
+            banner.append("%-22s" % ("%s=%s" % (item.flag, item.suggestion)), style=theme.ACCENT)
+            banner.append("  ".join(render.wrap(item.basis, 84)[:1]), style=theme.DIM)
         return banner if banner.plain else None
 
     def action_patterns(self) -> None:
@@ -880,9 +1101,9 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         # Logs are read here and only here -- eagerly scanning logs for 6,574
         # jobs at load time would dominate startup for data most of them never
         # need.
-        log_path, log_text = (None, None)
+        log_path, log_text, inferred = (None, None, False)
         if not self.sp.no_logs:
-            log_path, log_text = load_for(job, extra_dirs=self.sp.log_dirs)
+            log_path, log_text, inferred = load_for(job, extra_dirs=self.sp.log_dirs)
         self._log_path, self._log_text = log_path, log_text
 
         history: History | None = self.sp.history
@@ -921,28 +1142,68 @@ class JobScreen(ClipboardMixin, Screen[Any]):
             "gpu": theme.GPU_COLOR,
             "outcome": theme.INK,
         }
-        for title, rows in render.job_sections(job):
+        # summarized: the gauge block above already carries walltime, CPU, kernel
+        # share, memory, GPU and disk. Printing both put every headline number on
+        # screen twice, each with its own differently-sized bar.
+        for title, rows in render.job_sections(job, summarized=True):
             colour = section_color.get(title, theme.INK)
             body.append("  %s\n" % title, style="bold %s" % colour)
-            for label, value, gauge in rows:
-                body.append("    %-16s " % label, style=theme.FAINT)
+
+            def cell(label, value, gauge, pad, colour=colour):
+                """One label/value pair. ``pad`` right-fills for a paired line."""
+                # A 118-character workdir wrapped to column 0, leaving the label
+                # looking empty with an orphaned line of path beneath it. Elided
+                # here only -- `p` shows it in full, and --plain always does,
+                # because a path you cannot copy whole is no use in a ticket.
+                if not self._show_paths and "/" in value and len(value) > _MAX_PATH_WIDTH:
+                    value = _elide(value, keep=_MAX_PATH_WIDTH)
+                body.append("    %-*s " % (render.PAIR_LABEL_WIDTH, label), style=theme.FAINT)
                 if gauge is not None:
                     body.append_text(render.bar(gauge, colour, width=14, ascii_mode=ascii_mode))
                     body.append("  ")
-                style = theme.INK
+                # Values carry their section's hue. The palette already spreads
+                # these across the wheel so no two read alike even under
+                # red-green colour blindness; printing every value in one ink
+                # threw that away and left the eye nothing to group by.
+                style = colour
                 if "ABOVE THE LIMIT" in value:
                     style = theme.HEALTH_COLOR["crit"]
                 elif "not recorded" in value:
                     style = theme.FAINT
-                body.append(value + "\n", style=style)
+                body.append("%-*s" % (pad, value) if pad else value, style=style)
+
+            # Two pairs per line where both values are short: one row per line
+            # used about 40 of 120 columns and ran the screen off the bottom.
+            for group in render.pair_rows(rows):
+                first = group[0]
+                if len(group) == 2:
+                    second = group[1]
+                    cell(first[0], first[1], first[2], render.PAIR_VALUE_WIDTH)
+                    body.append("  ")
+                    cell(second[0], second[1], second[2], 0)
+                else:
+                    cell(first[0], first[1], first[2], 0)
+                body.append("\n")
             body.append("\n")
 
         body.append("\n")
         if log_path:
             shown = log_path if self._show_paths else _elide(log_path)
             body.append("  log  %s\n" % shown, style=theme.FAINT)
+            if inferred:
+                # Matched by when it was written, not by its name. Say so: a wrong
+                # log invents a cause, which is worse than no log at all.
+                body.append(
+                    "       matched by timing, not by name — verify before trusting it\n",
+                    style=theme.HEALTH_COLOR["warn"],
+                )
         elif not self.sp.no_logs:
-            body.append("  log  not found — pass --log-dir to help\n", style=theme.FAINT)
+            # One line. Slurm keeps StdOut/StdErr only in slurmctld and MinJobAge
+            # is 120s here, so `scontrol show job` answers "Invalid job id" for
+            # anything a post-mortem looks at and sacct has no such field at all.
+            # The path is unknowable, and saying so over three lines was explaining
+            # a limitation the reader cannot act on.
+            body.append("  log  none found — --log-dir points at one\n", style=theme.FAINT)
 
         body.append("\n")
         findings = render.sort_findings(verdict.findings)
@@ -967,8 +1228,6 @@ class JobScreen(ClipboardMixin, Screen[Any]):
 
 class PatternsScreen(ClipboardMixin, Screen[Any]):
     """Cross-run findings: the things no single job can show."""
-
-    app: SlurmpastApp
 
     BINDINGS: ClassVar = [
         Binding("q", "app.pop_screen", "Back"),
@@ -1039,8 +1298,6 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
 class NodesScreen(ClipboardMixin, Screen[Any]):
     """Per-node reliability, workload-controlled."""
 
-    app: SlurmpastApp
-
     BINDINGS: ClassVar = [
         Binding("q", "app.pop_screen", "Back"),
         Binding("escape", "app.pop_screen", "Back", show=False),
@@ -1079,7 +1336,9 @@ class NodesScreen(ClipboardMixin, Screen[Any]):
             return
         from .nodes import dominant_workload
 
-        workload = dominant_workload(history.usable_jobs) if self.controlled else None
+        workload = (
+            dominant_workload(history.usable_jobs, metric=self.metric) if self.controlled else None
+        )
         table_data = node_table(history.usable_jobs, workload=workload, metric=self.metric)
 
         summary = Text()
@@ -1110,7 +1369,26 @@ class NodesScreen(ClipboardMixin, Screen[Any]):
 
         table = self.query_one("#nodes", DataTable)
         table.clear()
-        for row in table_data["rows"]:
+        # Two ways this table has nothing to say, and an empty grid says neither.
+        rows = table_data["rows"]
+        empty_reason = ""
+        if not table_data["hits"]:
+            empty_reason = (
+                "\n  No %s recorded%s in this window, so there is nothing\n"
+                "  to attribute to a node.\n"
+                % (self.metric + "s", " for %s" % workload if workload else "")
+            )
+        elif not rows:
+            empty_reason = (
+                "\n  No node reached the %d placements a comparison needs — %d seen,\n"
+                "  all below it. A wider window (w) is what fixes this.\n"
+                % (MIN_SAMPLES, table_data["skipped_nodes"])
+            )
+        if empty_reason:
+            rows = []
+            summary.append(empty_reason, style=theme.HEALTH_COLOR["ok"])
+            self.query_one("#summary", Static).update(summary)
+        for row in rows:
             grade = {"worse": "crit", "better": "ok"}.get(row["verdict"], "none")
             table.add_row(
                 Text(row["node"], style=theme.INK),
@@ -1182,14 +1460,24 @@ class SlurmpastApp(App[Any]):
         # click-drag selection works like it does anywhere else. This toggles it
         # back on for in-app clicking and wheel scrolling.
         Binding("M", "toggle_mouse", "Mouse", show=False),
+        # `w` rather than `r`, which is already Reload -- and the two are
+        # different operations: reload re-runs the same window to pick up jobs
+        # that have finished since, `w` changes which window that is.
+        Binding("w", "cycle_window", "Window"),
     ]
 
     def __init__(
-        self, loader, window: str, ascii_mode=False, no_logs=False, log_dirs=(), mouse=False
+        self,
+        loader,
+        window: str,
+        ascii_mode=False,
+        no_logs=False,
+        log_dirs=(),
+        mouse=False,
+        since=None,
     ):
         super().__init__()
         self._loader = loader
-        self._window = window
         self.window = window
         self.history: History | None = None
         self.ascii_mode = ascii_mode
@@ -1197,6 +1485,20 @@ class SlurmpastApp(App[Any]):
         self.log_dirs = list(log_dirs)
         self.mouse_enabled = bool(mouse)
         self.load_error: str | None = None
+
+        # The window was fixed at launch by -S, so answering "what about last
+        # month?" meant quitting and re-running. `w` cycles it in place.
+        self._since = since
+        self._windows = list(WINDOWS)
+        if since and since not in self._windows:
+            # Whatever was asked for on the command line stays in the cycle, so
+            # `w` comes back round to it instead of stranding it.
+            self._windows.insert(0, since)
+        self._window_at = self._windows.index(since) if since in self._windows else 0
+        self._can_requery = bool(since) and _loader_accepts_since(loader)
+        # Saved before a re-query so a window with no jobs can be backed out of
+        # rather than emptying the screen or, worse, exiting the app.
+        self._previous: tuple | None = None
 
     def on_mount(self) -> None:
         self.register_theme(theme.theme())  # type: ignore[arg-type]
@@ -1219,22 +1521,41 @@ class SlurmpastApp(App[Any]):
 
     def _load(self) -> None:
         try:
-            jobs = self._loader()
+            jobs = self._loader(self._since) if self._can_requery else self._loader()
         except Exception as exc:  # surfaced in the UI, never swallowed
             self.call_from_thread(self._loaded, None, str(exc))
             return
-        history = History(jobs, window=self._window)
+        history = History(jobs, window=self.window)
         self.call_from_thread(self._loaded, history, None)
 
     def _loaded(self, history: History | None, error: str | None) -> None:
         if error is not None or history is None:
+            if self._previous is not None:
+                # A window the user cycled into has no jobs, or sacct refused it.
+                # Backing out beats exiting: they still have the data they had.
+                self._restore(error)
+                return
             self.load_error = error
             self.exit(message="slurmpast: %s" % (error or "no data"))
             return
+        self._previous = None
         self.history = history
         screen = self.screen
         if isinstance(screen, OverviewScreen):
             screen.refresh_rows()
+
+    def _restore(self, error: str | None) -> None:
+        """Undo a re-query that came back with nothing."""
+        assert self._previous is not None
+        self._window_at, self._since, self.window, self.history = self._previous
+        self._previous = None
+        self.notify(
+            "nothing found there — staying on %s\n%s" % (self.window, error or ""),
+            severity="warning",
+            timeout=6,
+        )
+        if isinstance(self.screen, OverviewScreen):
+            self.screen.refresh_rows()
 
     def action_toggle_mouse(self) -> None:
         """Hand the mouse to the terminal, or take it back.
@@ -1282,8 +1603,40 @@ class SlurmpastApp(App[Any]):
         finishes, so incremental merging would risk showing a stale outcome for
         no measurable gain against a 1.3 s query.
         """
+        self._requery()
+
+    def action_cycle_window(self) -> None:
+        """Move to the next time window and re-query.
+
+        The window used to be settable only by ``-S`` at launch, so "what about
+        last month?" meant quitting and starting again. Only day and week specs
+        are offered because sacct rejects everything coarser -- verified:
+        ``-S now-6months`` is "Invalid time specification".
+        """
+        if not self._can_requery:
+            self.notify(
+                "the window is fixed in this mode — pass -S to choose one",
+                severity="warning",
+                timeout=4,
+            )
+            return
+        self._previous = (self._window_at, self._since, self.window, self.history)
+        self._window_at = (self._window_at + 1) % len(self._windows)
+        self._since = self._windows[self._window_at]
+        self.window = humanize_window(self._since)
+        self._requery()
+
+    def _requery(self) -> None:
+        """Drop back to the overview and load again.
+
+        Pop down to the OverviewScreen, NOT to a stack depth. The overview is
+        itself a pushed screen sitting on the App's own default Screen, so
+        "pop while deeper than one" popped the overview too and left a blank,
+        dead screen that swallowed every subsequent key -- `r` had always done
+        this, and `w` inherited it.
+        """
         self.history = None
-        while len(self.screen_stack) > 1:
+        while len(self.screen_stack) > 1 and not isinstance(self.screen, OverviewScreen):
             self.pop_screen()
         if isinstance(self.screen, OverviewScreen):
             self.screen.refresh_rows()
@@ -1291,15 +1644,33 @@ class SlurmpastApp(App[Any]):
 
 
 def _elide(path: str, keep: int = 46) -> str:
+    """Shorten a long path to ``first/…/filename``, keeping both ends readable.
+
+    ``"/a/b/c".partition("/")`` yields an empty head, so taking the first
+    component before stripping the leading slash collapsed every absolute path to
+    a bare ``/…/slurm-123.out`` -- throwing away the directory that was the only
+    reason to print the path rather than just the file name.
+    """
     if len(path) <= keep:
         return path
-    head, _, tail = path.partition("/")
-    return "%s/…/%s" % (head, path.rsplit("/", 1)[-1])
+    lead = "/" if path.startswith("/") else ""
+    head, separator, _ = path.lstrip("/").partition("/")
+    if not separator:
+        return path  # a single long component; eliding it would hide the name
+    return "%s%s/…/%s" % (lead, head, path.rsplit("/", 1)[-1])
 
 
-def run(loader, window: str, ascii_mode=False, no_logs=False, log_dirs=(), mouse=False) -> int:
+def run(
+    loader, window: str, ascii_mode=False, no_logs=False, log_dirs=(), mouse=False, since=None
+) -> int:
     app = SlurmpastApp(
-        loader, window, ascii_mode=ascii_mode, no_logs=no_logs, log_dirs=log_dirs, mouse=mouse
+        loader,
+        window,
+        ascii_mode=ascii_mode,
+        no_logs=no_logs,
+        log_dirs=log_dirs,
+        mouse=mouse,
+        since=since,
     )
     # mouse=False is what makes text selectable: Textual never emits the
     # mouse-tracking escape sequences, so the terminal handles the mouse itself

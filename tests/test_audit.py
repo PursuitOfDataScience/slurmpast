@@ -70,6 +70,50 @@ class TestFailureCountAgreesWithRuns:
         group = self._group()
         assert group.failure_rate == pytest.approx(2 / 10)
 
+    def test_problems_is_a_union_not_a_sum(self):
+        """A hung TIMEOUT is both failed and never-ran. Summing the two columns
+        reported 36 problems out of 20 runs on a real workload, which is what made
+        showing them side by side a trap."""
+        from slurmpast.demo import history as demo
+        from slurmpast.index import History
+
+        group = [g for g in History(demo()).groups if g.name == "cot-exp"][0]
+        assert group.failed == 18
+        assert group.noop == 18
+        assert group.problems == 18  # NOT 36
+        assert group.problems <= group.total
+
+    def test_problems_excludes_deliberate_cancellations(self):
+        """ "total minus completed" is the obvious single number and it is wrong:
+        it brands every run you stopped on purpose. This workload has 10 runs, 1
+        completed, 8 failed and 1 cancelled -- 8 problems, not 9."""
+        from slurmpast.demo import history as demo
+        from slurmpast.index import History
+
+        group = [g for g in History(demo()).groups if g.name == "rc-tok-github_code"][0]
+        assert (group.total, group.completed, group.cancelled) == (10, 1, 1)
+        assert group.problems == 8
+        assert group.problems < group.total - group.completed
+
+    def test_a_clean_workload_reports_no_problems(self):
+        from slurmpast.demo import history as demo
+        from slurmpast.index import History
+
+        group = [g for g in History(demo()).groups if g.name == "midtrain"][0]
+        assert group.completed == group.total
+        assert group.problems == 0
+
+    def test_a_cancelled_hang_still_counts(self):
+        """Cancelled is not a free pass: a run that held GPUs for two days and
+        computed nothing is a problem however it ended."""
+        from slurmpast.demo import history as demo
+        from slurmpast.index import History
+
+        group = [g for g in History(demo()).groups if g.name == "node-evaluation"][0]
+        assert group.cancelled == 1
+        assert group.failed == 0
+        assert group.problems == 1
+
     def test_table_shows_a_count_not_that_rate(self):
         group = self._group()
         assert group.failed == 2
@@ -87,10 +131,14 @@ class TestFailureCountAgreesWithRuns:
             ),
             style=Style(enabled=False),
         )
-        header = [ln for ln in text.splitlines() if "WORKLOAD" in ln][0]
+        header = [ln for ln in text.splitlines() if "JOB NAME" in ln][0]
         body = [ln for ln in text.splitlines() if ln.strip().startswith("1 ")][0]
-        assert "FAILED" in header
-        assert "%" not in body.split()[4] if len(body.split()) > 4 else True
+        # One outcome column now: FAILED and NEVER RAN overlapped, so two adjacent
+        # integers invited adding them into more problems than there were runs.
+        assert "FLAGGED" in header
+        assert "FAILED" not in header and "NEVER RAN" not in header
+        # Still a count, not a rate -- no percentage anywhere in the data row.
+        assert "%" not in body
 
 
 class TestNoDeadCode:
@@ -257,18 +305,83 @@ class TestWindowKeywords:
         assert humanize_window(spec) == expected
 
 
-class TestUsedColumnFits:
-    def test_wide_core_hour_values_do_not_bleed(self):
-        """ "12246 core-h" is 12 characters and overran an 11-wide column."""
+class TestHourColumnsFit:
+    def _rows_and_header(self, jobs):
+        """Data rows only -- taken from below the header line.
+
+        A bare "starts with a number" match also catches the summary line above
+        the table ("  58 jobs · ..."), which silently made this assert nothing.
+        """
         from slurmpast.index import History
 
+        lines = render_overview(History(jobs), style=Style(enabled=False)).splitlines()
+        at = next(i for i, ln in enumerate(lines) if "JOB NAME" in ln)
+        rows = [ln for ln in lines[at + 1 :] if re.match(r"^  \d", ln)]
+        assert rows, "expected data rows in the fixture"
+        return lines[at], rows
+
+    def test_wide_core_hour_values_do_not_bleed(self):
+        """A five-figure core-hour total overran a narrower column, shifting
+        every column to its right."""
         cpu_heavy = [
             j._replace(alloc_tres="billing=90,cpu=90,mem=50G,node=1", req_tres="")
             for j in history()
         ]
-        text = render_overview(History(cpu_heavy), style=Style(enabled=False))
-        # Data rows only -- the section title also contains the words "core-hours".
-        rows = [ln for ln in text.splitlines() if re.match(r"^  \d+ ", ln) and "core-h" in ln]
-        assert rows, "expected core-hour rows in the fixture"
+        header, rows = self._rows_and_header(cpu_heavy)
+        # The date is the last column. If an hour value overran its field, the
+        # date would no longer begin where the header says the column begins.
+        at = header.index("LAST RUN")
         for line in rows:
-            assert line.split("core-h", 1)[1].startswith(" "), line
+            assert re.match(r"\d{4}-\d{2}-\d{2}", line[at : at + 10]), (line[at:], line)
+
+    def test_the_header_carries_the_unit_and_the_cells_do_not_abbreviate(self):
+        """ "497 gpu-h" made a reader ask what "gpu-h" was. The header names both
+        units once and the cells are plain numbers."""
+        from slurmpast.render import HOURS_PAIR_LABEL
+
+        header, rows = self._rows_and_header(history())
+        assert HOURS_PAIR_LABEL in header
+        for line in rows:
+            for abbreviation in ("gpu-h ", "core-h ", "GPU-h "):
+                assert abbreviation not in line, line
+
+    def test_cpu_comes_before_gpu_in_the_paired_cell(self):
+        """Every job consumes CPU; only some hold a GPU, so CPU leads. The order
+        is what makes the cell readable with no colour at all."""
+        from slurmpast.render import HOURS_PAIR_LABEL
+
+        assert HOURS_PAIR_LABEL.index("CPU") < HOURS_PAIR_LABEL.index("GPU")
+        header, rows = self._rows_and_header(history())
+        assert HOURS_PAIR_LABEL in header
+        for line in rows:
+            assert "/" in line, line
+
+    def test_the_pair_is_readable_without_colour(self):
+        """Colour reinforces which side is which but is never the only signal --
+        this output gets piped, and --no-color exists."""
+        from slurmpast.index import History
+        from slurmpast.render import hours_pair_text
+
+        for group in History(history()).groups:
+            cell = hours_pair_text(group)
+            cpu, _, gpu = cell.partition("/")
+            assert cpu.strip(), cell
+            assert gpu.strip(), cell
+
+    def test_a_gpu_workload_has_cpu_hours_too(self):
+        """A GPU job burns CPU-hours as well; the single merged column hid them.
+
+        Asserted on the rolled-up data and the formatted cell rather than by
+        slicing the rendered row: the labels sit inside wider fields, so a label
+        offset is not a field offset and any such slice is brittle.
+        """
+        from slurmpast.index import History
+        from slurmpast.render import hours_pair_text
+
+        with_gpu = [g for g in History(history()).groups if g.gpu_hours]
+        assert with_gpu, "expected GPU workloads in the fixture"
+        for group in with_gpu:
+            assert group.core_hours > 0, group.name
+            cpu, _, gpu = hours_pair_text(group).partition("/")
+            assert cpu.strip() != "-", group.name
+            assert gpu.strip() != "-", group.name

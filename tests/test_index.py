@@ -1,5 +1,7 @@
 import string
 
+import pytest
+
 from slurmpast.index import (
     FILTERS,
     SORTS,
@@ -193,6 +195,80 @@ class TestHistory:
         history = History([stale_job, healthy_job])
         assert history.stats["excluded_open_records"] == 1
         assert history.stats["gpu_hours_total"] < 10
+
+
+class TestSearchMatchesWhatIsOnScreen:
+    """Reported: searching "07-28" returned nothing against a table full of
+    visible "07-28 15:00". Typing what you can plainly see and getting an empty
+    list reads as missing data, not as a narrow search box."""
+
+    def _jobs(self):
+        from slurmpast.demo import history
+
+        return history()
+
+    @pytest.mark.parametrize("query", ["07-01", "2026-07-01", "07-01 07:00", "07:00", "2026-07"])
+    def test_a_date_from_the_started_column_matches(self, query):
+        assert filter_jobs(self._jobs(), "all", query), query
+
+    def test_only_the_started_column_is_matched(self):
+        """A run that began 07-24 23:02 and finished 07-25 06:58 matched "07-25"
+        while its row displayed 07-24 -- a hit the reader cannot see. STARTED is
+        the always-visible column and the sort key, so it alone is indexed."""
+        from slurmpast.model import Job
+
+        overnight = Job(
+            job_id="1",
+            name="w",
+            state="COMPLETED",
+            start="2026-07-24T23:02:00",
+            end="2026-07-25T06:58:00",
+            elapsed=28680.0,
+        )
+        assert filter_jobs([overnight], "all", "07-24") == [overnight]
+        assert filter_jobs([overnight], "all", "07-25") == []
+
+    def test_every_hit_is_visibly_explained(self):
+        """After the fix, each returned row displays the date that was typed."""
+        jobs = self._jobs()
+        for stamp in ("07-01", "07-05", "07-20"):
+            for job in filter_jobs(jobs, "all", stamp):
+                assert stamp in (job.start or ""), (stamp, job.start)
+
+    def test_the_display_spelling_and_the_raw_spelling_both_match(self):
+        """The table shows "07-01 07:00"; sacct stores "2026-07-01T07:00:00". One
+        normalised haystack covers both, so a query copied off the screen works."""
+        jobs = self._jobs()
+        assert filter_jobs(jobs, "all", "2026-07-01T07:00:00".replace("T", " "))
+        assert filter_jobs(jobs, "all", "07-01 07:00")
+
+    def test_the_existing_fields_still_match(self):
+        jobs = self._jobs()
+        assert filter_jobs(jobs, "all", "cot-exp")
+        assert filter_jobs(jobs, "all", "TIMEOUT")
+        assert filter_jobs(jobs, "all", "midway3-0602")
+        assert filter_jobs(jobs, "all", "5100001")
+
+    def test_a_miss_is_still_a_miss(self):
+        assert filter_jobs(self._jobs(), "all", "no-such-thing") == []
+
+    def test_the_overview_last_run_date_is_searchable(self):
+        """LAST RUN is a column there for the same reason."""
+        from slurmpast.index import filter_groups
+
+        groups = History(self._jobs()).groups
+        stamp = groups[0].last_seen[:10]
+        assert filter_groups(groups, "all", stamp)
+        assert filter_groups(groups, "all", stamp[5:])  # the "07-26" form
+        assert filter_groups(groups, "all", "no-such-thing") == []
+
+    @pytest.mark.asyncio
+    async def test_the_placeholder_advertises_dates(self):
+        """A box that silently cannot match a whole visible column is a trap."""
+        pytest.importorskip("textual")
+        from slurmpast import tui
+
+        assert "date" in tui.SearchBar().placeholder
 
 
 class TestScale:

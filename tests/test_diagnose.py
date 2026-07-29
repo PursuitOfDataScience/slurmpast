@@ -87,8 +87,13 @@ class TestMemory:
         )
         assert "rss-above-limit" in codes(diagnose(inflated))
 
-    def test_step_spread_reported(self, step_spread_job):
-        assert "rss-step-spread" in codes(diagnose(step_spread_job))
+    def test_step_spread_is_measured_but_not_reported(self, step_spread_job):
+        """The finding said "any tool reading a single step is wrong by that
+        factor" -- a remark about other tools, with no action, about a hazard this
+        one already avoids: max_rss takes the maximum across steps. The
+        measurement stays; the noise goes."""
+        assert step_spread_job.rss_step_spread > 100
+        assert "rss-step-spread" not in codes(diagnose(step_spread_job))
 
     def test_cuda_oom_separated_from_host_oom(self, healthy_job):
         failed = healthy_job._replace(state="FAILED", exit_code=1)
@@ -161,6 +166,26 @@ class TestExitCodes:
     def test_cancelled_marked_ambiguous(self, healthy_job):
         job = healthy_job._replace(state="CANCELLED by 940740146")
         assert "cancelled" in codes(diagnose(job))
+
+    def test_the_evidence_names_the_code_the_title_names(self):
+        """The evidence hardcoded "Exit 1", so a job that exited 3 produced a
+        finding titled "Exited 3" whose evidence discussed exit 1 -- two
+        different claims in one paragraph."""
+        from slurmpast.model import Job
+
+        finding = find(diagnose(Job(job_id="1", state="FAILED", exit_code=3)), "exit-nonzero-nolog")
+        assert "Exited 3" in finding.title
+        assert "exit 3" in finding.evidence
+        assert "Exit 1" not in finding.evidence
+
+    def test_exit_one_keeps_the_python_exception_note(self):
+        """Exit 1 really is the generic Python status; that insight survives for
+        the code it is actually about."""
+        from slurmpast.model import Job
+
+        finding = find(diagnose(Job(job_id="1", state="FAILED", exit_code=1)), "exit-nonzero-nolog")
+        assert "Exit 1" in finding.evidence
+        assert "Python" in finding.evidence
 
 
 class TestOpenEndedRecords:

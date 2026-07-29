@@ -35,11 +35,83 @@ class TestStampShort:
         assert render.stamp_short("Unknown") == "Unknown"
 
 
+class TestResizeRelayout:
+    """Columns are fitted to the terminal, so the table has to be rebuilt when
+    the terminal changes -- without losing the reader's place."""
+
+    @pytest.mark.asyncio
+    async def test_columns_follow_the_terminal_width(self):
+        from textual.widgets import DataTable
+
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(84, 24)) as pilot:
+            await pilot.pause()
+            table = app.screen.query_one(DataTable)
+            narrow = sum(c.width for c in table.columns.values())
+            await pilot.resize_terminal(150, 24)
+            await pilot.pause()
+            table = app.screen.query_one(DataTable)
+            wide = sum(c.width for c in table.columns.values())
+            assert wide > narrow
+
+    @pytest.mark.asyncio
+    async def test_the_table_fits_its_content_without_a_canyon(self):
+        """Two reported defects, and the fix for the first caused the second:
+        a hard stop at 94 columns leaving a wide terminal blank, then a JOB NAME
+        column stretched to 44 cells around 18-character names.
+
+        The contract is now: wide enough for the content, never wider than the
+        terminal, and no further.
+        """
+        from textual.widgets import DataTable
+
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(140, 24)) as pilot:
+            await pilot.pause()
+            table = app.screen.query_one(DataTable)
+            used = sum(c.width for c in table.columns.values()) + 2 * len(table.columns)
+            assert used <= table.size.width, (used, table.size.width)
+
+            longest = max(len(g.name) for g in app.history.groups)
+            columns = {str(c.label): c.width for c in table.columns.values()}
+            assert columns["JOB NAME"] >= longest, "names would be truncated"
+            # Snug: the minimum floor is 22, so allow that but not a 44-wide canyon.
+            assert columns["JOB NAME"] <= max(longest, 22), columns["JOB NAME"]
+
+    @pytest.mark.asyncio
+    async def test_a_long_name_still_gets_the_room_it_needs(self):
+        """Content-aware sizing must not become a new truncation bug."""
+        from textual.widgets import DataTable
+
+        jobs = [j._replace(name="a-really-quite-long-workload-name-here") for j in history()]
+        app = make_app(jobs, no_logs=True)
+        async with app.run_test(size=(140, 24)) as pilot:
+            await pilot.pause()
+            table = app.screen.query_one(DataTable)
+            columns = {str(c.label): c.width for c in table.columns.values()}
+            assert columns["JOB NAME"] >= len("a-really-quite-long-workload-name-here")
+
+    @pytest.mark.asyncio
+    async def test_the_selected_row_survives_a_resize(self):
+        from textual.widgets import DataTable
+
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(100, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            before = app.screen.query_one(DataTable).cursor_row
+            assert before > 0
+            await pilot.resize_terminal(150, 24)
+            await pilot.pause()
+            assert app.screen.query_one(DataTable).cursor_row == before
+
+
 class TestTimestampsInJobList:
     @pytest.mark.asyncio
     async def test_job_table_has_started_and_ended_columns(self):
         app = make_app(history(), no_logs=True)
-        async with app.run_test() as pilot:
+        async with app.run_test(size=(160, 24)) as pilot:
             await pilot.pause()
             await pilot.press("a")  # flat job list
             await pilot.pause()
@@ -48,6 +120,25 @@ class TestTimestampsInJobList:
             labels = [str(c.label) for c in app.screen.query_one(DataTable).columns.values()]
             assert "STARTED" in labels
             assert "ENDED" in labels
+
+    @pytest.mark.asyncio
+    async def test_started_outlives_ended_on_a_narrow_terminal(self):
+        """Columns are fitted to the width, so something has to yield at 80
+        columns. ENDED goes first because STARTED plus WALL TIME imply it;
+        STARTED itself is what tells two same-named attempts apart."""
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            from textual.widgets import DataTable
+
+            labels = [str(c.label) for c in app.screen.query_one(DataTable).columns.values()]
+            assert "STARTED" in labels
+            assert "ENDED" not in labels
+            # The measurements survive the squeeze; the derivable column does not.
+            assert "PEAK MEM" in labels
+            assert "CPUS BUSY" in labels
 
     @pytest.mark.asyncio
     async def test_rows_actually_carry_a_timestamp(self):
@@ -61,19 +152,38 @@ class TestTimestampsInJobList:
             assert "STARTED" in header and "ENDED" in header
             assert "2026-07" in first
 
-    def test_plain_renderer_shows_them_too(self):
+    def test_plain_renderer_shows_them_too(self, monkeypatch):
         """The dashboard and the text output must not disagree.
 
         The table uses the compact ``MM-DD HH:MM`` form, not full ISO -- the
         clipboard payload carries the full timestamps instead.
+
+        Given room for every column, both front ends show both stamps: they now
+        share one column spec, so they cannot label or order them differently.
         """
         import re
 
         from slurmpast.report import Style, render_list
 
+        monkeypatch.setenv("COLUMNS", "150")
         text = render_list(history()[:5], style=Style(enabled=False))
         assert "STARTED" in text and "ENDED" in text
         assert re.search(r"\d\d-\d\d \d\d:\d\d", text)
+
+    def test_started_outlives_ended_when_the_terminal_is_narrow(self, monkeypatch):
+        """ENDED is the first column dropped, deliberately: STARTED plus WALL TIME
+        recover it, whereas nothing else on the row recovers a node name or a peak
+        memory figure. Pinned because the alternative -- keeping all 13 columns at
+        135 cells wide -- wrapped every row on a 100-column terminal, and a
+        wrapped table is worse than a narrow one."""
+        from slurmpast.report import Style, render_list
+
+        monkeypatch.setenv("COLUMNS", "100")
+        text = render_list(history()[:5], style=Style(enabled=False))
+        assert "STARTED" in text
+        assert "ENDED" not in text
+        assert "PEAK MEM" in text and "NODE" in text
+        assert max(len(line) for line in text.splitlines()) <= 100
 
 
 class TestClipboard:
@@ -106,7 +216,10 @@ class TestClipboard:
             await pilot.pause()
             assert isinstance(app.screen, tui.JobScreen)
             text = app.screen.clipboard_row()
-            for section in ("timing", "cpu", "memory", "outcome"):
+            # "outcome" is not listed: it holds only a non-zero exit code and the
+            # like, so a clean run has no such section rather than a heading over
+            # one line repeating the state from the title.
+            for section in ("job", "timing", "memory"):
                 assert section in text
             assert "\033[" not in text
 
@@ -271,10 +384,16 @@ class TestWindowIsVisible:
             await pilot.press("a")
             await pilot.pause()
             assert "test" in app.screen.sub_title
-            assert "jobs" in app.screen.sub_title
+            # The count is on the summary line, not repeated up here: the job list
+            # printed "58 jobs" in both places.
+            assert "jobs" not in app.screen.sub_title
+            assert "jobs" in app.screen.summary_text.plain
 
 
 class TestSingularPlural:
+    """Counts live on the summary line, not the title bar -- the title bar carries
+    the window and any active filter or sort, and nothing else."""
+
     @pytest.mark.asyncio
     async def test_one_job_is_not_reported_as_one_jobs(self):
         from slurmpast.demo import history as demo
@@ -286,8 +405,9 @@ class TestSingularPlural:
             await pilot.pause()
             await pilot.press("a")
             await pilot.pause()
-            assert "1 job" in app.screen.sub_title
-            assert "1 jobs" not in app.screen.sub_title
+            summary = app.screen.summary_text.plain
+            assert "1 job" in summary
+            assert "1 jobs" not in summary
 
     @pytest.mark.asyncio
     async def test_one_workload_is_not_one_workloads(self):
@@ -297,8 +417,35 @@ class TestSingularPlural:
         app = make_app(single, no_logs=True)
         async with app.run_test() as pilot:
             await pilot.pause()
-            assert "1 workload" in app.screen.sub_title
-            assert "1 workloads" not in app.screen.sub_title
+            summary = app.screen.summary_text.plain
+            assert "1 workload" in summary
+            assert "1 workloads" not in summary
+
+    @pytest.mark.asyncio
+    async def test_both_counts_share_one_line(self):
+        """Reported as "why not putting workloads at the same line as jobs?" --
+        "233 jobs rolled up into 41 workloads" is one fact and it was split
+        between the title bar and the summary."""
+        app = make_app(history(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            first = app.screen.summary_text.plain.splitlines()[0]
+            assert "jobs in" in first and "workloads" in first
+            # And not repeated in the title bar.
+            assert "workload" not in app.screen.sub_title
+
+    @pytest.mark.asyncio
+    async def test_a_narrowed_table_still_reports_the_true_total(self):
+        """The header count has to stay honest when a filter hides rows."""
+        app = make_app(history(), no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            total = app.screen.summary_text.plain.splitlines()[0]
+            await pilot.press("f")  # -> problems only
+            await pilot.pause()
+            narrowed = app.screen.summary_text.plain.splitlines()[0]
+            assert narrowed.startswith(total.split("  ·  ")[0])
+            assert "showing" in narrowed
 
 
 class TestExcludedRecordsAreNamed:
@@ -386,6 +533,23 @@ class TestBarLooksLikeAGauge:
     def test_ascii_mode_has_no_block_glyphs(self):
         text = render.bar(50, "cyan", width=10, ascii_mode=True).plain
         assert set(text) <= set("#-")
+
+    @pytest.mark.parametrize("percent", [0.0, 0.4, 0.6, 0.94, 0.95, 1.0, 4.0, 50.0, 99.6, 100.0])
+    def test_ascii_and_unicode_agree_on_whether_anything_is_lit(self, percent):
+        """Both docstrings promise a lit cell for anything that *prints* as >=1%,
+        but one tested `>= 0.5` and the other `round(x, 1) >= 1.0`, so over
+        0.5-0.94% the ASCII bar lit a cell beside a label reading "0.7%" and the
+        Unicode bar did not."""
+        unicode_lit = render.bar(percent, "cyan", width=10).plain[0] != "░"
+        ascii_lit = render.bar(percent, "cyan", width=10, ascii_mode=True).plain[0] != "-"
+        assert unicode_lit == ascii_lit, percent
+
+    @pytest.mark.parametrize("percent", [0.4, 0.94])
+    def test_a_value_printing_below_one_percent_lights_nothing(self, percent):
+        from slurmpast.duration import format_percent
+
+        assert format_percent(percent / 100.0) in ("0.4%", "0.9%")
+        assert render.bar_cells(percent, 10) == 0
 
 
 class TestWorkloadBannerSurvivesRefresh:

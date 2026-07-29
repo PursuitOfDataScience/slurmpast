@@ -271,6 +271,12 @@ def goodput(jobs):
     are indistinguishable in accounting.
     """
     records = usable(jobs)
+    # Two different reasons a record is dropped, reported separately because the
+    # UI names one of them: an unterminated record has an Elapsed measured to
+    # *now*, while a closed record with no Elapsed at all was simply never
+    # accounted. Counting both as "unterminated" made the report state something
+    # false about the second kind.
+    open_ended = sum(1 for job in jobs if job.open_ended)
     stats = {
         "jobs": len(records),
         "completed": 0,
@@ -281,7 +287,8 @@ def goodput(jobs):
         "gpu_hours_noop": 0.0,
         "core_hours_total": 0.0,
         "noop_jobs": 0,
-        "excluded_open_records": len(jobs) - len(records),
+        "excluded_open_records": open_ended,
+        "excluded_no_elapsed": len(jobs) - len(records) - open_ended,
     }
     for job in records:
         gpu_h = job.gpu_hours or 0.0

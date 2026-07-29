@@ -154,13 +154,42 @@ def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
     }
 
 
-def dominant_workload(jobs):
-    """The job name with the most usable records -- the natural control group."""
-    counts = {}
-    for job in usable(jobs):
-        counts[job.name] = counts.get(job.name, 0) + 1
-    if not counts:
+def dominant_workload(jobs, metric=None):
+    """The job name to hold fixed when comparing nodes.
+
+    Not simply the most common name. Controlling on a workload that never
+    exhibits the metric leaves the table structurally unable to say anything: on
+    a real 30-day history the most-common workload was 200 runs of ``sw-arr100``
+    with **zero** hangs, so every row read ``0/10, 0.0%, inconclusive`` against a
+    0.0% baseline -- eight rows of nothing, which is what made this screen read as
+    useless. Controlling instead on a workload that does hang (``test``, 19 in 75)
+    gives a 25.7% baseline and an actual verdict.
+
+    This picks a sample where the question is answerable rather than selecting on
+    the outcome: the confound being held fixed is still the workload, and the
+    comparison is still strictly between nodes inside it.
+
+    ``metric`` mirrors :func:`node_table`. Without it the choice is by run count,
+    which is all that can be said when no metric is named.
+    """
+    records = usable(jobs)
+    if not records:
         return None
+    predicate = None
+    if metric == "hang":
+        predicate = looks_like_noop
+    elif metric:
+        predicate = _bad
+
+    counts, events = {}, {}
+    for job in records:
+        counts[job.name] = counts.get(job.name, 0) + 1
+        if predicate is not None and predicate(job):
+            events[job.name] = events.get(job.name, 0) + 1
+    if events:
+        # Most events first, then most runs -- both feed the statistical power to
+        # tell one node apart from another.
+        return max(events, key=lambda name: (events[name], counts[name]))
     return max(counts.items(), key=lambda kv: kv[1])[0]
 
 
