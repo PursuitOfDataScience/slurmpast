@@ -1,179 +1,138 @@
-# slurmpast — problems found
+# slurmpast — audit and resolution
 
-**Date:** 2026-07-29 · **Version audited:** `d656765` (main, CI green) · **No code changed.**
+**Audited:** 2026-07-29 at `d656765`. **Resolved:** 2026-07-29 at `7b7da8c`.
 
-**Audit scope, stated up front so this isn't read as a clean bill of health.** I read
-`nodes.py` and `sizing.py` closely and ran simulations against the real code; I skimmed
-`patterns.py`, `diagnose.py`, `index.py`, `model.py`. I did **not** audit `tui.py` (1,868 lines),
-`render.py`, `sacct.py`, `logs.py`, or `cli.py` in any depth. The sacct/data layer appears
-well-covered already — `docs/details.md` documents seven parsing traps, each with a named
-regression test.
+Two defects were found by measurement and both are fixed. One item flagged as a
+possible third was measured afterwards and is not a defect. One is a documented
+design choice, left alone.
 
-Two problems are confirmed by measurement. One is a design tension I flagged but did not
-quantify. One is a characteristic worth knowing rather than a defect.
+**Audit scope, stated up front so this is not read as a clean bill of health.**
+`nodes.py` and `sizing.py` were read closely and simulated against the real code;
+`patterns.py`, `diagnose.py`, `index.py` and `model.py` were skimmed. `tui.py`,
+`render.py`, `sacct.py`, `logs.py` and `cli.py` were **not** audited in any depth.
+The sacct/data layer appears well covered already — `docs/details.md` documents
+seven parsing traps, each with a named regression test.
+
+| # | Problem | Status |
+|---|---|---|
+| 1 | The node table ran a test per node and corrected for none of them | **fixed** |
+| 2 | `requested` was the largest limit in the window, not the next run's | **fixed** |
+| 3 | `dominant_workload` selects on the outcome | measured, not a defect |
+| 4 | Walltime sized from the longest completed run | by design, unchanged |
 
 ---
 
-## 1. The node table runs many tests and corrects for none of them
+## 1. The node table ran many tests and corrected for none of them
 
-**Severity: the only item here that hands a user a wrong answer they will act on.**
+`node_table()` asked, for each node with ≥ `MIN_SAMPLES` placements, whether its
+Wilson interval sat above the rate on every *other* node, at `Z = 1.96`. Each test
+was right in isolation. Twenty run together and about one trips by chance — and
+`suggest_exclude()` passed whatever tripped to the user as a paste-ready
+`--exclude` string. This was the one output a user acts on directly.
 
-`nodes.py:node_table()` walks every node with ≥ `MIN_SAMPLES` (10) jobs and independently asks
-whether that node's Wilson interval sits above the rate on every *other* node, at `Z = 1.96`
-(`nodes.py:23`). Each test in isolation is correct. Twenty of them run together and roughly one
-should trip by chance — and `suggest_exclude()` passes whatever tripped to the user as a
-paste-ready `--exclude` string.
+**Measured, not estimated.** Null simulation against the real `node_table` /
+`suggest_exclude`, every node given the identical true failure rate so any flag is
+a false positive by construction. 30 jobs/node, p = 0.20:
 
-### Measured, not estimated
-
-Null simulation against the real `node_table` / `suggest_exclude`: **every node given the
-identical true failure rate**, so any flag is a false positive by construction. 30 jobs/node,
-p = 0.20, 400 tables per row.
-
-| nodes in the table | tables flagging ≥1 innocent node | mean nodes flagged |
+| nodes in the table | before | after |
 |---|---|---|
-| 10 | 31.8% | 0.45 |
-| 20 | **58.8%** | 0.78 |
-| 40 | **76.8%** | 1.41 |
+| 10 | 36.5% | 2.7% |
+| 20 | **54.8%** | 2.8% |
+| 40 | **77.8%** | 2.4% |
 
-For a user whose history spans 20 nodes, **more than half the time** the tool offers at least one
-node to exclude that is not actually worse than the rest. The error rate climbs with the size of
-the table, which is the signature of the defect: it is a function of how many tests were run, not
-of the evidence.
+The error rate climbing with the size of the table is the signature of the defect:
+it was a function of how many tests were run, not of the evidence. What matters
+about the corrected column is not that it is smaller but that it is **flat**.
 
-### Which fix, with the cost of each
+**Fix.** One-sided Fisher exact p-value per row against the existing leave-one-out
+comparison, Benjamini–Hochberg adjusted across the rows of the table, in
+`nodes.py:node_p_value` / `_bh_reject`. Raising `Z` to 2.576 was rejected as an
+alternative: it only slows the growth (13.5% / 21.3% / 33.8% across the same three
+sizes), because a wider interval treats the symptom and the cause is the number of
+tests.
 
-Same simulation for false positives; power measured with node 0 truly bad (0.55 vs 0.20
-elsewhere), 20 nodes.
+Fisher rather than a binomial tail against the leave-one-out rate, because that
+rate is *estimated*. Against an estimated 0% a binomial test scores one bad run at
+exactly p = 0, which no correction can ever withhold; Fisher conditions on the
+margins and leaves it borderline, so the size of the table still gets a say. The
+implementation agrees with `scipy.stats.fisher_exact` to 1.4e-12 relative error
+over 4,000 random tables in both tails.
 
-| | FP rate (10 / 20 / 40 nodes) | power (20 / 30 / 50 jobs per node) |
-|---|---|---|
-| `Z = 1.96` (today) | 31.8% / 58.8% / 76.8% | 95.5% / 98.5% / 100% |
-| `Z = 2.576` | 11.2% / 25.5% / 29.5% | 87.5% / 95.2% / 100% |
-| **Benjamini–Hochberg** | **5.8% / 6.0% / 1.8%** | 65.2% / 88.5% / 98.8% |
+**Cost.** Power against one truly bad node (0.55 against 0.20 elsewhere, 20
+nodes): 63% at 20 placements per node, 87% at 30, 98% at 50. Concentrated where
+evidence is thin, which is where the module already said it wanted to hold back.
+The recorded headline signal — `midway3-0385` at 19/36 against 12/218 — is
+untouched, and still lands buried among 39 innocent nodes.
 
-**Benjamini–Hochberg is the right fix.** It is the only option whose error rate stays flat as the
-table grows — raising `Z` to 2.576 still leaves 29.5% at 40 nodes, because it treats the symptom
-rather than the cause. BH's power cost is concentrated where evidence is thin (20 jobs/node),
-which is precisely where the module's own stated philosophy says it should hold back:
+**Consequence for the display.** The table shows the interval the verdict no
+longer rests on alone, so a row can read `inconclusive` beside a CI clear of the
+baseline. Both front ends now say why (`render.held_back_note`), phrased as "an
+interval alone is not enough when this many nodes were tested" rather than as a
+claim that those particular intervals are chance — one of them may be the
+genuinely bad node the correction cost us.
 
-> *"A node is only called out when its interval excludes the baseline; otherwise the honest
-> answer is 'not enough evidence', which is what it says."*
+## 2. "Requested" was the largest limit in the window
 
-### Where it would go
+`walltime_advice()` took `max()` over every `Timelimit` in the window as both the
+`requested` figure shown and the `current` value the raise/lower/keep verdict was
+measured against. `memory_advice()` and `cpu_advice()` did the same. It is rendered
+as "raise to X (from Y)", so Y has to be the value the script currently holds.
 
-One helper computing one-sided binomial p-values against the existing leave-one-out `comparison`,
-BH-adjusted across the rows of a table, applied where `verdict` is assigned. `wilson_interval`
-stays for the displayed interval. Regression test: the null simulation above, asserting the
-flag rate stays near 5% as the node count grows.
+This collided with a deliberate decision. `patterns.group_key()` excludes resource
+magnitudes — *"raising `--mem` must not fork the history you are trying to learn
+from"* — which is the right call and guarantees a group spans every limit the user
+has tried. `max()` reached back across exactly the history the grouping exists to
+unify.
 
-### What is explicitly *not* wrong here
-
-Worth recording, because I previously claimed this module was broken and had to retract it. The
-module already handles the hard part correctly:
-
-- **It controls for workload by default** — `node_table(jobs, workload=…)` restricts to one job
-  name, and `tests/test_nodes.py` has 34 tests including one named *"the confound is real: a node
-  hosting one bad campaign looks cursed."*
-- **It compares leave-one-out**, against every *other* node rather than a pooled rate that
-  includes the node under test. This is better than the cluster-wide `sacct -a` analysis I
-  originally proposed to "correct" it with, which used the pooled baseline.
-- Thin evidence renders `inconclusive`, not an accusation.
-
-The multiple-comparison gap is the residual after all of that, not evidence of a careless module.
-
----
-
-## 2. "Requested" is the largest limit in the window, not the one the next job will use
-
-**Severity: misleading display, and a spurious verdict on an already-correct setup. Not dangerous.**
-
-`sizing.py:walltime_advice()` builds `limits = sorted({j.timelimit …})` and then takes
-`limits[-1]` — the **maximum** over the whole window — as both the `requested` figure shown to the
-user and the `current` value the raise/lower/keep verdict is measured against.
-`memory_advice()` does the same with `max(limits)`.
-
-This interacts with a deliberate design decision. `patterns.py:group_key()` folds in name,
-partition and GPU-or-CPU but **deliberately excludes resource magnitudes**:
-
-> *"Resource magnitudes are deliberately excluded: raising --mem must not fork the history you are
-> trying to learn from."*
-
-That is the right call — but it guarantees a group spans every limit the user has tried, so
-`max()` is reaching across exactly the history the grouping was designed to unify.
-
-### Demonstrated against the real code
+**Worse than first reported.** The original note called this "misleading display,
+not dangerous", on the grounds that `target` never derives from `current`. The
+*number* is indeed sound, but the verdict computed against `current` is not:
 
 ```
-2 old runs at --time=08:00:00, then 20 recent at 00:40:00; every run takes 25m
-   → requested=08:00:00   verdict=lower   suggestion=00:35:00
+midtrain, longest run 01:52:49, so the right answer is "raise to 02:30:00"
 
-20 runs at 08:00:00, then 2 recent at 00:30:00 (user just tightened it); runs take 25m
-   → requested=08:00:00   verdict=lower   suggestion=00:35:00
-
-control — all 20 runs at 00:40:00, runs take 25m
-   → requested=00:40:00   verdict=keep    suggestion=—
+ 2 stale runs @08:00:00 + 20 recent @00:40:00   before: requested 08:00:00, LOWER
+ 1 stale run  @02:30:00 + 13 recent @00:40:00   before: requested 02:30:00, KEEP
+                                                        → and keep suppresses the
+                                                          suggestion, so the tool
+                                                          emitted nothing at all
 ```
 
-The control is the same workload without the stale rows, and it correctly says **keep**. So a user
-who already fixed their walltime is told they are over-requesting by eight hours, above a
-`requested` figure that does not match their script.
+The first inverts the instruction. The second silences it: a single stale run near
+the target made the verdict `keep`, and `keep` withholds the suggestion, so the
+tool said nothing about a 40-minute limit that every recent run needed 01:52:49 to
+finish. Both now report `requested 00:40:00` and `raise to 02:30:00`.
 
-### Why it is not dangerous
+On the recorded `rc-tok-github_code` history the memory figure was **48.0 GiB** —
+a *cancelled* run five submissions back — against the 17 GiB the script actually
+asked for.
 
-`target` is derived from observed runtimes plus the timeout floor, never from `current` — so the
-*number suggested* stays sound. Only the framing is wrong: the stated current request, and the
-raise/lower/keep verdict computed against it. Impact is bounded by the window (7 days by default)
-and grows with longer `--since`.
+**Fix.** `sizing._latest` takes the limit from the most recent run, ordered by
+`start or submit` to match `index._stamp`. Timeout and OOM **floors** still use
+`max()`, and that is still right: a floor is a claim about the requirement, which
+no later, smaller request retracts.
 
-**Fix direction:** use the limit from the most recent run in the group rather than the maximum,
-and say so in the basis text. Keeping `max()` for the *floor* logic is still correct.
+## 3. `dominant_workload` selects on the outcome — measured, not a defect
 
----
+`dominant_workload()` picks the job name with the most failure *events* rather than
+the most runs, so the node screen has something to say. Choosing the densest-failure
+stratum and then testing every node in it reads like it should push the same way as
+problem 1. Measured once problem 1 was fixed, it does not, and the reason is
+structural: the Fisher test **conditions on** the total number of failures in the
+table, and that total is precisely what this function selects on. Selecting on a
+statistic the test conditions away cannot bias it.
 
-## 3. `dominant_workload` selects on the outcome — flagged, not quantified
+Paired against a workload chosen at random on the same 3,000 simulated histories,
+all nodes null within each workload: 3.73% against 3.03% at 10 nodes, 3.17% against
+2.97% at 20 (SE ~0.35%). At most a fraction of a point, and under the 5% target
+either way. No change made.
 
-`nodes.py:dominant_workload()` deliberately picks the job name with the most failure *events*
-rather than the most runs, so the node screen has something to say. The docstring is candid about
-this and argues the case: the confound being held fixed is still the workload, and the comparison
-is still strictly between nodes inside it.
+## 4. Sizing from the longest completed run — by design
 
-That argument is largely right for the *confound* question. It remains true that choosing the
-densest-failure stratum before testing pushes in the same direction as problem 1 — you are
-selecting the slice most likely to contain an extreme node, then testing every node in it without
-correction.
-
-**I did not measure this separately**, and the numbers in problem 1 do not include it. If BH is
-implemented, this is worth re-measuring on top of it before deciding whether it needs anything.
-
----
-
-## 4. Sizing from the longest completed run — a characteristic, not a defect
-
-`walltime_advice` sizes from `max(elapsed)` × 1.25, not from p95, and the code explains why at
-length: p95 told the `software` workload to "lower to 03:00:00" on the same screen that showed
-"longest 07:57:12", which would have timed out its slowest runs by design.
-
-That reasoning is sound and the choice is right. Two consequences to be aware of rather than fix:
-
-- One atypically long run inflates the recommendation for the rest of the window. The no-CPU hang
-  branch catches pathological hangs before they reach here, but a genuinely slow-but-real outlier
-  is included by design.
-- A workload whose runtime is *growing* run over run gets a lagging estimate, since the basis is
-  the longest run already observed.
-
-Neither is worth changing without evidence that it bites in practice.
-
----
-
-## Summary
-
-| # | Problem | Confirmed | User-facing wrong answer? |
-|---|---|---|---|
-| 1 | No multiple-comparison correction in the node table | measured | **Yes** — spurious nodes in `--exclude` |
-| 2 | `requested` / `current` is max-over-window, not current | measured | Misleading display + spurious verdict |
-| 3 | `dominant_workload` selects on the outcome | flagged, unquantified | Compounds #1 |
-| 4 | Sizing from the longest run | by design | No |
-
-Only **#1** produces advice a user would act on and be wrong to. It is also the most contained
-change.
+`walltime_advice` sizes from `max(elapsed) × 1.25`, not p95, and the code explains
+why at length: p95 told the `software` workload to "lower to 03:00:00" on the same
+screen that showed "longest 07:57:12", which would have timed out its slowest runs
+by design. That reasoning is sound and the choice is right. Two consequences to be
+aware of rather than fix — one atypically long run inflates the recommendation for
+the rest of the window, and a workload whose runtime is *growing* gets a lagging
+estimate. Neither is worth changing without evidence that it bites in practice.

@@ -45,8 +45,8 @@ run. Your own history settles both.
 
 ```
 argonne35-pretrain   test · 101 runs
-  --time            raise to 10:00:00   (requested 8h05m, observed 7h58m03s at p95)
-      p95 of 90 completed runs is 7h58m03s (longest 7h58m23s); +25% headroom.
+  --time            raise to 10:00:00   (from 08:05:00)
+      longest of 90 completed runs took 07:58:23.
   --mem             already about right
   --cpus-per-task   already about right
   #SBATCH --time=10:00:00
@@ -54,6 +54,12 @@ argonne35-pretrain   test · 101 runs
 
 That workload was running on a seven-minute margin. With fewer than three usable
 runs it says *not enough evidence* instead of guessing.
+
+The figure it measures you against — `08:05:00` above — is the limit your **last**
+run asked for, not the largest in the window. Those differ the moment you tune a
+request, and the window is deliberately built to span that tuning: grouping ignores
+resource magnitudes, so that raising `--mem` does not fork the history you are
+trying to learn from.
 
 ## One job
 
@@ -74,6 +80,12 @@ recorded, the log excerpts if the files are still on disk, and the findings.
 submitted this 115 times and it died 99 times."* Runs group into workloads, so a
 repeated failure — and the node it keeps landing on — is visible at a glance, with
 a ready-to-paste `--exclude`.
+
+That `--exclude` is offered only when a node is worse than the rest *after*
+accounting for every other node the table tested. Without that correction a large
+enough history always produces a culprit: given twenty nodes with one identical
+true failure rate, testing each interval on its own named an innocent node more
+than half the time.
 
 ## Correct on any cluster
 
