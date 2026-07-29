@@ -10,7 +10,7 @@ import pytest
 
 pytest.importorskip("textual")
 
-from slurmpast import tui  # noqa: E402
+from slurmpast import theme, tui  # noqa: E402
 
 
 def make_app(jobs, **kwargs):
@@ -983,3 +983,81 @@ class TestTheFooterSaysWhatThingsAre:
             assert "what keeps failing" in text
             assert "how far back to look" in text
             assert "every job in one flat list" in text
+
+
+class TestChangingTheTimeRangeIsNoticeable:
+    """Reported: "when pressing `w` to switch the time frames, the only update is
+    'slurmpast — last 12 weeks'. users have a hard time noticing that."
+
+    The row you were looking at usually survives the requery and the counts move by
+    a few, so the one phrase that changed sat in the title bar where nobody looks.
+    """
+
+    def _loader(self, jobs):
+        def load(since=None):
+            return jobs if since == "now-7days" else jobs[:20]
+
+        return load
+
+    def _app(self, jobs):
+        return tui.SlurmpastApp(
+            self._loader(jobs), window="last 7 days", no_logs=True, since="now-7days"
+        )
+
+    @pytest.mark.asyncio
+    async def test_it_announces_the_new_range(self, history_jobs):
+        app = self._app(history_jobs)
+        async with app.run_test(size=(120, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("w")
+            await pilot.pause()
+            messages = [n.message for n in app._notifications]
+            assert any("time range: last 30 days" in m for m in messages), messages
+
+    @pytest.mark.asyncio
+    async def test_the_toast_names_the_whole_cycle(self, history_jobs):
+        """So `w` is discoverable as a cycle rather than a mystery step."""
+        app = self._app(history_jobs)
+        async with app.run_test(size=(120, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("w")
+            await pilot.pause()
+            message = next(n.message for n in app._notifications)
+            assert "last 24 hours" in message and "last 52 weeks" in message
+
+    @pytest.mark.asyncio
+    async def test_the_range_is_on_screen_after_the_toast_goes(self, history_jobs):
+        """A toast is transient. The body has to carry it too, or the screen stops
+        saying what it is showing."""
+        app = self._app(history_jobs)
+        async with app.run_test(size=(120, 24)) as pilot:
+            await pilot.pause()
+            before = app.screen.summary_text.plain
+            assert before.startswith("last 7 days")
+            await pilot.press("w")
+            await pilot.pause()
+            await pilot.pause()
+            after = app.screen.summary_text.plain
+            assert after.startswith("last 30 days"), after
+            assert after != before
+
+    @pytest.mark.asyncio
+    async def test_the_range_is_styled_apart_from_the_counts(self, history_jobs):
+        """Asked for: "you might need to have different colors to denote the changed
+        parts." The range carries the accent; the counts stay ink."""
+        app = self._app(history_jobs)
+        async with app.run_test(size=(120, 24)) as pilot:
+            await pilot.pause()
+            summary = app.screen.summary_text
+            first = summary.spans[0]
+            assert summary.plain[first.start : first.end] == "last 7 days"
+            assert theme.ACCENT in str(first.style)
+
+    @pytest.mark.asyncio
+    async def test_a_fixed_window_still_says_why_nothing_happened(self, history_jobs):
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test(size=(120, 24)) as pilot:
+            await pilot.pause()
+            await pilot.press("w")
+            await pilot.pause()
+            assert any("window is fixed" in n.message for n in app._notifications)

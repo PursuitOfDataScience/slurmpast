@@ -638,6 +638,10 @@ class OverviewScreen(ClipboardMixin, CentredContent, Screen[Any]):
         text = Text()
         # "233 jobs rolled up into 41 workloads" is one fact and was split between
         # the header bar and this line, so neither read as a whole thought.
+        # The range leads, in the accent: after the toast fades the only other place
+        # it appears is the title bar, which is exactly where a change goes unseen.
+        text.append(self.sp.window, style="bold %s" % theme.ACCENT)
+        text.append("  ·  ", style=theme.FAINT)
         text.append("%d jobs" % stats["jobs"], style="bold %s" % theme.INK)
         text.append(
             " in %d workload%s" % (total_groups, "" if total_groups == 1 else "s"),
@@ -1777,6 +1781,16 @@ class SlurmpastApp(App[Any]):
         self._window_at = (self._window_at + 1) % len(self._windows)
         self._since = self._windows[self._window_at]
         self.window = humanize_window(self._since)
+        # Say so out loud. The only thing `w` changed was one phrase in the title
+        # bar -- the row you were looking at usually stays, the counts move by a few
+        # -- so pressing it read as nothing happening: "users have a hard time
+        # noticing that". A toast is the one element that cannot be mistaken for
+        # part of the layout, and it names where the cycle has got to.
+        self.notify(
+            "time range: %s  (w cycles: %s)"
+            % (self.window, " → ".join(humanize_window(w) for w in self._windows)),
+            timeout=4,
+        )
         self._requery()
 
     def _requery(self) -> None:

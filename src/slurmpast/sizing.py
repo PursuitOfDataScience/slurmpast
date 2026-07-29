@@ -86,11 +86,6 @@ def _round_walltime(seconds):
     return int(math.ceil(seconds / step) * step)
 
 
-def _walltime_step(seconds):
-    """How the rounding above is worded, so a reader can reproduce the figure."""
-    return "5 minutes" if seconds < 3600 else "15 minutes"
-
-
 def _fmt_walltime(seconds):
     total = int(seconds)
     hours, rem = divmod(total, 3600)
@@ -187,16 +182,16 @@ def walltime_advice(jobs) -> Advice:
     spread = ""
     if abs(longest - p95) > max(1.0, 0.01 * longest):
         spread = " (p95 %s)" % format_duration(p95)
-    # Every step, so the reader can reproduce the number to the left. "+25%
-    # headroom" said neither what the 25% was of nor that it was already applied --
-    # and it did not get you there: 00:30:18 plus 25% is 00:37:52, and the figure
-    # printed is 00:40:00. The rounding was doing work nobody was told about.
-    basis = "longest of %d completed runs %s%s, +%d%%, rounded up to the next %s." % (
+    # What the figure MEANS, not how it was computed. "+25% headroom" was asked
+    # about because "headroom" says nothing; spelling the recipe out instead --
+    # "+25%, rounded up to the next 15 minutes" -- was worse, and got asked about
+    # twice: a reader wants to know where 00:40:00 came from and why it is not
+    # 00:30:18, and neither the multiplier nor the rounding step is that. The gap
+    # between the two numbers on screen IS the answer, so the text names it.
+    basis = "longest of %d completed runs took %s%s; the rest is room to spare." % (
         len(completed),
         format_duration(longest),
         spread,
-        round((WALLTIME_MARGIN - 1) * 100),
-        _walltime_step(target),
     )
     caution = ""
     if timeouts:
@@ -320,8 +315,7 @@ def memory_advice(jobs) -> Advice:
         requested=requested,
         observed="%s peak across %d runs" % (format_bytes(peak), len(usable)),
         suggestion="%dG" % target if verdict != "keep" else "",
-        basis="highest observed peak %s, +%d%%, rounded up to whole GiB."
-        % (format_bytes(peak), round((MEMORY_MARGIN - 1) * 100)),
+        basis="the most any run used was %s; the rest is room to spare." % format_bytes(peak),
         caution=caution,
     )
 
@@ -357,12 +351,7 @@ def cpu_advice(jobs) -> Advice:
 
     effective = [j.cpu_utilization * j.cpus_per_task for j in usable]
     peak = max(effective)
-    rounded = int(math.ceil(peak * CPU_MARGIN))
-    target = max(1, rounded)
-    # Named only when it did something. A workload that used 0.0 cores per task
-    # rounds up to 0, and "rounded up to a whole core" would then not reach the 1
-    # printed beside it -- the same defect as the "+20% headroom" it replaced.
-    floor_note = "" if rounded >= 1 else ", and never below one core"
+    target = max(1, int(math.ceil(peak * CPU_MARGIN)))
     current = per_task[-1] if per_task else None
 
     if current is None:
@@ -397,13 +386,8 @@ def cpu_advice(jobs) -> Advice:
         observed="%.1f %s busy per task at peak across %d runs"
         % (peak, per_task_label, len(usable)),
         suggestion=str(target) if verdict != "keep" else "",
-        basis="busiest run used %s of %s cores per task, +%d%%, rounded up to a whole core%s."
-        % (
-            _cores_text(peak),
-            requested,
-            round((CPU_MARGIN - 1) * 100),
-            floor_note,
-        ),
+        basis="the busiest run used %s of %s cores per task; the rest is room to spare."
+        % (_cores_text(peak), requested),
         caution=caution,
     )
 

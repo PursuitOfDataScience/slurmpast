@@ -918,25 +918,37 @@ def resource_rows(job, ascii_mode: bool = False, width: int = 18, flat: bool = F
     marker = _MARKER_ASCII if ascii_mode else _MARKER
     rows = []
 
-    def row(label, color, fraction, value, detail=""):
+    def row(label, color, fraction, value, detail="", instead=""):
+        """One gauge row. ``instead`` replaces the bar with a phrase.
+
+        Three renderings, and the third exists because the other two both lie when
+        there is no fraction to draw. Blanking the cells left a hole where the rows
+        above had bars -- "why does mem sometimes have the progress bar and
+        sometimes not? it looks very inconsistent". Drawing an empty track instead
+        was worse: a track IS the picture of 0%, so the row then read as no memory
+        used beside a figure of 58.5 GiB -- "which one should users trust?".
+
+        Neither. So the gauge column says, in words, that it has nothing to show.
+        The row keeps its shape and claims no magnitude at all.
+        """
         text = Text()
         text.append("  %s " % marker, style=color)
         text.append("%-6s " % label, style=color)
-        # Always a gauge, even with nothing to plot. ``bar(None)`` is an empty
-        # track, which is this module's established way of saying "no measurement"
-        # -- TIME already draws it on a job submitted without a limit. Blanking the
-        # cells instead left a hole where the two rows above had bars, and the three
-        # rows stopped reading as one block: reported as "why does mem sometimes
-        # have the progress bar and sometimes not? it looks very inconsistent".
-        text.append_text(
-            bar(
-                None if fraction is None else fraction * 100.0,
-                color,
-                width=width,
-                ascii_mode=ascii_mode,
-                flat=flat,
+        if instead:
+            # Sliced before centring: a phrase wider than the gauge would push the
+            # value column out of line with every row above it, which is the
+            # alignment the marker/label/gauge/value shape depends on.
+            text.append(instead[:width].center(width), style=theme.FAINT)
+        else:
+            text.append_text(
+                bar(
+                    None if fraction is None else fraction * 100.0,
+                    color,
+                    width=width,
+                    ascii_mode=ascii_mode,
+                    flat=flat,
+                )
             )
-        )
         text.append("  ")
         # 11 is the widest cell measured over 1,342 real jobs ("123.4 MiB/s");
         # anything narrower lets the DISK rate overrun and shifts its "·" one cell
@@ -963,17 +975,22 @@ def resource_rows(job, ascii_mode: bool = False, width: int = 18, flat: bool = F
         "%s cores busy" % cores_text(job),
     )
     if job.mem_limit_bytes and job.max_rss and job.max_rss > job.mem_limit_bytes:
-        # An empty track, not a 101%-full bar: the findings below say this number is
-        # not a working set, and a full bar would have the summary asserting a
-        # magnitude the diagnosis has just disowned. The value beside it reads
-        # "58.5 GiB · over the 56.0 GiB limit, so not a real footprint", so there is
-        # no reading it as low usage.
+        # A figure above the limit cannot be a working set -- the job would have been
+        # killed -- so there is no fraction of the limit to draw and no bar that
+        # would not misstate it. "so not a real footprint" was asked what it meant;
+        # what it means is that the number bounds the truth from above rather than
+        # measuring it, which is what the reader has to know before acting on it.
         row(
             "MEM",
             theme.MEM_COLOR,
             None,
             format_bytes(job.max_rss),
-            "over the %s limit, so not a real footprint" % format_bytes(job.mem_limit_bytes),
+            # Short enough that the row still fits 100 cells: a wrapped gauge row
+            # loses its marker and its alignment and stops reading as part of the
+            # block. Interpretation first, evidence second -- what the reader needs
+            # is that the figure is a ceiling, not that it is 2.5 GiB over one.
+            "an upper bound, over the %s limit" % format_bytes(job.mem_limit_bytes),
+            instead="no percentage",
         )
     else:
         row(

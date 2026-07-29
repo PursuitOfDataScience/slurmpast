@@ -463,7 +463,7 @@ class TestResourceRowsMatchSlurmwatch:
             # for, so each draws a gauge -- the one documented exception being a
             # MaxRSS above its own limit, covered by its own test below.
             for row in resource_rows(job):
-                gauged = "█" in row.plain or "░" in row.plain
+                gauged = "█" in row.plain or "░" in row.plain or "no percentage" in row.plain
                 over_limit = "not a real footprint" in row.plain
                 assert gauged or over_limit, row.plain
 
@@ -607,24 +607,37 @@ class TestResourceRowsMatchSlurmwatch:
         diagnosis on the same screen. So: no fill."""
         row = self._over_limit_mem_row()
         assert "█" not in row, row
-        assert "over the" in row and "not a real footprint" in row
+        assert "upper bound" in row and "limit" in row
 
-    def test_an_unusable_peak_still_draws_its_track(self):
-        """Blanking the cells left a hole where the two rows above had bars, and the
-        three stopped reading as one block -- reported as "why does mem sometimes
-        have the progress bar and sometimes not? it looks very inconsistent". An
-        empty track is already how this module says "no measurement": TIME draws one
-        on a job submitted without a limit."""
+    def test_an_unusable_peak_says_so_where_the_gauge_would_be(self):
+        """Three renderings were tried and two of them lie. Blank cells left a hole
+        where the rows above had bars -- "why does mem sometimes have the progress
+        bar and sometimes not?". An empty track was worse, because a track IS the
+        picture of 0% and the row then read as no memory used beside 58.5 GiB --
+        "which one should users trust?". Neither: the column says it has nothing."""
         row = self._over_limit_mem_row()
-        assert row.count("░") == 18, row
+        assert "no percentage" in row, row
+        assert "░" not in row and "█" not in row, row
 
-    def test_the_two_unmeasurable_cases_look_alike(self):
-        """Whatever the reason there is nothing to plot, the row keeps its shape."""
-        from slurmpast.model import Job
+    def test_it_says_what_the_number_is_rather_than_what_it_is_not(self):
+        """ "so not a real footprint" was asked what it meant. What it means is that
+        the figure bounds the truth from above instead of measuring it."""
+        row = self._over_limit_mem_row()
+        assert "upper bound" in row, row
+
+    def test_the_row_keeps_its_shape(self):
+        """Which is the point of a phrase rather than blank cells: the value column
+        has to stay in line with every row above it."""
         from slurmpast.render import resource_rows
 
-        no_limit = [r.plain for r in resource_rows(Job(job_id="1")) if " TIME " in r.plain][0]
-        assert no_limit.count("░") == 18, no_limit
+        job = [
+            j
+            for j in history()
+            if j.mem_limit_bytes and j.max_rss and j.max_rss > j.mem_limit_bytes
+        ][0]
+        rows = [r.plain for r in resource_rows(job)]
+        ends = {r.index("   " + ("·" if "·" in r else "-")) for r in rows if len(r) > 40}
+        assert len(ends) == 1, [r[:48] for r in rows]
 
     def test_no_row_overflows_a_normal_terminal(self):
         """Two rows wrapped in practice -- the memory limit's provenance note and
