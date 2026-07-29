@@ -924,3 +924,62 @@ class TestTheBlockIsCentred:
         wide = await self._probe(history_jobs, 150, keys=("n",))
         narrow = await self._probe(history_jobs, 55, keys=("n",))
         assert narrow["columns"] < wide["columns"], (narrow["columns"], wide["columns"])
+
+
+class TestTheFooterSaysWhatThingsAre:
+    """Asked of the footer: "what is patterns and what is window? why all jobs
+    deserves a button?" Two labels named the implementation rather than the answer,
+    and one action was taking a slot it had not earned.
+    """
+
+    async def _footer(self, jobs, width):
+        app = make_app(jobs, no_logs=True)
+        async with app.run_test(size=(width, 20)) as pilot:
+            await pilot.pause()
+            strips = app.screen._compositor.render_strips()
+            return "".join(s.text for s in strips[-1])
+
+    @pytest.mark.asyncio
+    async def test_the_labels_name_the_answer_not_the_screen(self, history_jobs):
+        text = await self._footer(history_jobs, 150)
+        assert "Repeat failures" in text, "'Patterns' named the code, not the finding"
+        assert "Time range" in text, "'Window' is sacct's word, not a reader's"
+        assert "Patterns" not in text and "Window" not in text
+
+    @pytest.mark.asyncio
+    async def test_every_shown_binding_actually_fits(self, history_jobs):
+        """Textual truncates the tail, so a label that grows costs a later one its
+        place silently: "Copy row" being shown pushed `r Reload` and `w Time range`
+        off the end at 100 columns. 100 is the width to hold, being the narrowest
+        anyone reads a 13-column table in."""
+        text = await self._footer(history_jobs, 100)
+        for label in ("Quit", "Search", "Filter", "Sort", "Nodes", "Repeat failures", "Reload"):
+            assert label in text, label
+
+    @pytest.mark.asyncio
+    async def test_the_niche_views_keep_their_keys_without_a_slot(self, history_jobs):
+        """`a` and `y` are off the footer, not gone: the overview groups by workload
+        because a flat list of thousands of jobs is not an interface, so the flat
+        list is an escape hatch rather than a headline action."""
+        text = await self._footer(history_jobs, 150)
+        assert "All jobs" not in text and "Copy row" not in text
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test(size=(150, 20)) as pilot:
+            await pilot.pause()
+            await pilot.press("a")
+            await pilot.pause()
+            assert isinstance(app.screen, tui.JobListScreen)
+
+    @pytest.mark.asyncio
+    async def test_help_explains_the_ones_the_footer_cannot(self, history_jobs):
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            await pilot.press("question_mark")
+            await pilot.pause()
+            text = "".join(
+                "".join(s.text for s in st) for st in app.screen._compositor.render_strips()
+            )
+            assert "what keeps failing" in text
+            assert "how far back to look" in text
+            assert "every job in one flat list" in text

@@ -39,8 +39,10 @@ from .site import maxrss_caveat
 
 # Below this many usable observations there is no distribution to reason about.
 MIN_RUNS = 3
-# Headroom over the observed peak. Enough to absorb run-to-run variation without
-# drifting back into over-request.
+# Added on top of the observed peak, to absorb run-to-run variation without
+# drifting back into over-request. Called "headroom" here and nowhere a reader
+# sees: on screen it was "+30% headroom", which said neither what the 30% was of
+# nor that it had already been applied to the figure beside it.
 WALLTIME_MARGIN = 1.25
 MEMORY_MARGIN = 1.30
 CPU_MARGIN = 1.20
@@ -84,6 +86,11 @@ def _round_walltime(seconds):
     return int(math.ceil(seconds / step) * step)
 
 
+def _walltime_step(seconds):
+    """How the rounding above is worded, so a reader can reproduce the figure."""
+    return "5 minutes" if seconds < 3600 else "15 minutes"
+
+
 def _fmt_walltime(seconds):
     total = int(seconds)
     hours, rem = divmod(total, 3600)
@@ -92,6 +99,21 @@ def _fmt_walltime(seconds):
         days, hours = divmod(hours, 24)
         return "%d-%02d:%02d:%02d" % (days, hours, minutes, secs)
     return "%02d:%02d:%02d" % (hours, minutes, secs)
+
+
+def _cores_text(cores):
+    """A core count a reader can put back into the sum beside it.
+
+    "%.1f" turned 0.04 into "0.0" and two decimals turn 0.003 into "0.00", and both
+    read as zero -- from which the advice of 1 core cannot be derived, since
+    rounding zero up is still zero. What is true of any nonzero fraction of a core
+    is that rounding it up gives exactly one, so that is what it says.
+    """
+    if cores <= 0:
+        return "0"
+    if cores < 0.05:
+        return "under 0.05"
+    return ("%.2f" if cores < 0.1 else "%.1f") % cores
 
 
 def _round_gib(byte_count):
@@ -165,11 +187,16 @@ def walltime_advice(jobs) -> Advice:
     spread = ""
     if abs(longest - p95) > max(1.0, 0.01 * longest):
         spread = " (p95 %s)" % format_duration(p95)
-    basis = "longest of %d completed runs %s%s, +%d%% headroom." % (
+    # Every step, so the reader can reproduce the number to the left. "+25%
+    # headroom" said neither what the 25% was of nor that it was already applied --
+    # and it did not get you there: 00:30:18 plus 25% is 00:37:52, and the figure
+    # printed is 00:40:00. The rounding was doing work nobody was told about.
+    basis = "longest of %d completed runs %s%s, +%d%%, rounded up to the next %s." % (
         len(completed),
         format_duration(longest),
         spread,
         round((WALLTIME_MARGIN - 1) * 100),
+        _walltime_step(target),
     )
     caution = ""
     if timeouts:
@@ -293,7 +320,7 @@ def memory_advice(jobs) -> Advice:
         requested=requested,
         observed="%s peak across %d runs" % (format_bytes(peak), len(usable)),
         suggestion="%dG" % target if verdict != "keep" else "",
-        basis="Highest observed peak %s, +%d%% headroom."
+        basis="highest observed peak %s, +%d%%, rounded up to whole GiB."
         % (format_bytes(peak), round((MEMORY_MARGIN - 1) * 100)),
         caution=caution,
     )
@@ -330,7 +357,12 @@ def cpu_advice(jobs) -> Advice:
 
     effective = [j.cpu_utilization * j.cpus_per_task for j in usable]
     peak = max(effective)
-    target = max(1, int(math.ceil(peak * CPU_MARGIN)))
+    rounded = int(math.ceil(peak * CPU_MARGIN))
+    target = max(1, rounded)
+    # Named only when it did something. A workload that used 0.0 cores per task
+    # rounds up to 0, and "rounded up to a whole core" would then not reach the 1
+    # printed beside it -- the same defect as the "+20% headroom" it replaced.
+    floor_note = "" if rounded >= 1 else ", and never below one core"
     current = per_task[-1] if per_task else None
 
     if current is None:
@@ -365,8 +397,13 @@ def cpu_advice(jobs) -> Advice:
         observed="%.1f %s busy per task at peak across %d runs"
         % (peak, per_task_label, len(usable)),
         suggestion=str(target) if verdict != "keep" else "",
-        basis="Busiest run used %.1f of %s cores per task; +%d%% headroom."
-        % (peak, requested, round((CPU_MARGIN - 1) * 100)),
+        basis="busiest run used %s of %s cores per task, +%d%%, rounded up to a whole core%s."
+        % (
+            _cores_text(peak),
+            requested,
+            round((CPU_MARGIN - 1) * 100),
+            floor_note,
+        ),
         caution=caution,
     )
 

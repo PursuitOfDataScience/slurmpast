@@ -76,7 +76,12 @@ DataTable > .datatable--cursor { background: $primary 30%; }
 # inside tmux. So every copy is ALSO written to a file and the notification names
 # it; that way the feature never half-works with no way to tell.
 _COPY_BINDINGS = [
-    Binding("y", "copy_row", "Copy row"),
+    # Both hidden from the footer, listed under `?`. Ten entries do not fit an
+    # 80-column footer and Textual truncates the tail, so every label that earns a
+    # slot costs a later one its place: with "Copy row" shown, `r Reload` and
+    # `w Time range` fell off the end at 100 columns entirely. Copying is a power
+    # move you go looking for; a time range is something you need told.
+    Binding("y", "copy_row", "Copy row", show=False),
     Binding("Y", "copy_view", "Copy view", show=False),
 ]
 
@@ -399,12 +404,12 @@ class HelpScreen(ModalScreen[None]):
             ("/", "search — name, job id, state or node"),
             ("f", "cycle filter: all → problems → failed → idle"),
             ("s", "cycle sort"),
-            ("n", "node reliability, controlled for workload"),
-            ("p", "cross-job patterns"),
-            ("a", "flat job list, skipping the grouping"),
+            ("n", "which nodes your jobs fail on, controlled for workload"),
+            ("p", "what keeps failing the same way, across runs"),
+            ("a", "every job in one flat list, ignoring the workload grouping"),
             ("y", "copy the selected row to the clipboard"),
             ("Y", "copy the whole view (a job screen copies the full report)"),
-            ("w", "cycle the time window: 1 day → 7 → 30 → 12 weeks → 52"),
+            ("w", "how far back to look: 1 day → 7 → 30 → 12 weeks → 52"),
             ("r", "reload the same window from sacct"),
             ("?", "this help"),
         ):
@@ -464,8 +469,13 @@ class OverviewScreen(ClipboardMixin, CentredContent, Screen[Any]):
         Binding("f", "cycle_filter", "Filter"),
         Binding("s", "cycle_sort", "Sort"),
         Binding("n", "nodes", "Nodes"),
-        Binding("p", "patterns", "Patterns"),
-        Binding("a", "all_jobs", "All jobs"),
+        Binding("p", "patterns", "Repeat failures"),
+        # Off the footer, still bound and still under `?`. The overview groups by
+        # workload because a flat list of 6,600 jobs is not an interface; the flat
+        # list is the deliberate escape hatch from that, not a headline action --
+        # asked directly, "why does all jobs deserve a button?". Its slot is what
+        # let `w Time range` fall off the end at 100 columns.
+        Binding("a", "all_jobs", "All jobs", show=False),
         Binding("r", "app.reload", "Reload"),
         Binding("question_mark", "help", "Help", show=False),
         *_digit_bindings("digit"),
@@ -1072,7 +1082,7 @@ class WorkloadScreen(JobListScreen):
 
     BINDINGS: ClassVar = [
         *JobListScreen.BINDINGS,
-        Binding("p", "patterns", "Patterns"),
+        Binding("p", "patterns", "Repeat failures"),
     ]
 
     def __init__(self, group: GroupStats) -> None:
@@ -1570,7 +1580,7 @@ class SlurmpastApp(App[Any]):
         # `w` rather than `r`, which is already Reload -- and the two are
         # different operations: reload re-runs the same window to pick up jobs
         # that have finished since, `w` changes which window that is.
-        Binding("w", "cycle_window", "Window"),
+        Binding("w", "cycle_window", "Time range"),
     ]
 
     def __init__(

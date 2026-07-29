@@ -145,7 +145,9 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
                 "of time. Raising the limit will not help; fix the blocking call." % len(hung)
             )
         elif dominant == "TIMEOUT":
-            action = "Raise --time with headroom; timeout Elapsed only bounds runtime from below."
+            action = (
+                "Raise --time above that limit; a timeout's Elapsed only bounds runtime from below."
+            )
         elif dominant == "OUT_OF_MEMORY":
             action = "See the memory-search check -- the next increment is probably not the fix."
         else:

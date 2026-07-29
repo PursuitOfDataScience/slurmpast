@@ -574,17 +574,37 @@ class TestBarLooksLikeAGauge:
         assert set(text) <= set("#-")
 
     def test_the_tip_has_track_behind_it(self):
-        """Reported: "there is nothing at the end of the final tip". At 95.9% of 18
-        cells the fill lands IN the last cell, so there is no "░" left to follow it
-        -- and an eighth-block paints only its own fraction. The remaining 6/8 of
-        that cell was bare background, so the same gauge looked finished at 94.4%
-        and at 100% but notched in between."""
-        text = render.bar(95.9, "cyan", width=18)
-        assert text.plain == "█" * 17 + "▎", text.plain
-        tip = [sp for sp in text.spans if sp.start == 17]
+        """An eighth-block paints only its own fraction of a cell, so without a
+        background the rest of that cell is bare terminal and the tip reads as a
+        notch rather than as a position."""
+        text = render.bar(74.8, "cyan", width=18)
+        assert "▌" in text.plain, text.plain
+        tip = [sp for sp in text.spans if text.plain[sp.start] in "▏▎▍▌▋▊▉"]
         assert tip, "the tip must carry a style of its own"
-        assert "on " in str(tip[0].style), str(tip[0].style)
-        assert theme.TRACK_BG in str(tip[0].style)
+        assert theme.TRACK_BG in str(tip[0].style), str(tip[0].style)
+
+    def test_anything_short_of_full_keeps_a_whole_cell_of_track(self):
+        """Reported twice: "there is nothing at the end of the final tip", then
+        "the tip is still not obvious at all" after the background was added.
+
+        At 96.6% of 18 cells the fill took 3/8 of the last cell and left 5/8 of dark
+        behind it, which is not a gap a reader can see. Withholding one eighth was
+        never enough; the whole final cell has to stay track."""
+        for pct in (94.4, 96.6, 99.6, 99.9):
+            drawn = render.bar(pct, "cyan", width=18).plain
+            assert drawn.endswith("░"), (pct, drawn)
+            assert drawn.count("░") >= 1
+
+    def test_a_full_bar_is_the_only_one_that_reaches_the_end(self):
+        """Which is what makes the reserved cell worth its cost: "at the limit" and
+        "nearly at the limit" are now different pictures."""
+        assert render.bar(100.0, "cyan", width=18).plain == "█" * 18
+        assert render.bar(99.9, "cyan", width=18).plain != "█" * 18
+
+    def test_the_reserved_cell_costs_the_top_of_the_range_and_that_is_accepted(self):
+        """94.5% and 99.9% draw alike now. The figure is printed beside the bar, and
+        a gauge whose last 5% was invisible distinguished nothing anyway."""
+        assert render.bar(94.5, "cyan", width=18).plain == render.bar(99.9, "cyan", width=18).plain
 
     @pytest.mark.parametrize("pct", [0.0, 1.0, 30.0, 50.0, 94.4, 95.9, 99.6, 100.0])
     def test_every_cell_of_every_bar_is_painted(self, pct):

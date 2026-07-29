@@ -95,11 +95,20 @@ def bar(
         return text
 
     eighths = min(width * 8, round(percent / 100.0 * width * 8))
-    # Withhold the last eighth until the value rounds to 100 *at the precision we
-    # print it* -- labels here carry one decimal, so a full bar beside "99.6%"
-    # would contradict itself.
-    if eighths >= width * 8 and round(percent, 1) < 100.0:
-        eighths = width * 8 - 1
+    if round(percent, 1) < 100.0:
+        # Reserve the whole final cell, not merely its last eighth. Withholding an
+        # eighth was not a gap anyone could see: at 96.6% of 18 cells the fill took
+        # 3/8 of the last cell and left 5/8 of dark behind it, and the tip read as
+        # the bar simply stopping -- reported twice, the second time after the tip
+        # was given a track background, which was not enough on its own.
+        #
+        # So anything short of 100% now ends against a FULL cell of track, and a
+        # bar reaching the end means full and nothing else. The cost is real and
+        # accepted: 94.5% and 99.9% draw alike. What that range has to distinguish
+        # is "at the limit" from "not at the limit", the exact figure is printed
+        # beside the bar, and a gauge whose last 5% is invisible was distinguishing
+        # nothing at all.
+        eighths = min((width - 1) * 8, eighths)
     eighths = 0 if round(percent, 1) < 1.0 else max(1, eighths)
     full, rem = divmod(int(eighths), 8)
     if full:

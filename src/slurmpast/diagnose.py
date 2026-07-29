@@ -163,8 +163,8 @@ def _walltime_rules(job, add):
                         format_duration(used),
                         format_percent(job.cpu_utilization),
                     ),
-                    "Raise --time with real headroom: Elapsed is truncated at the limit, "
-                    "so it bounds the true runtime only from below.",
+                    "Raise --time well above the limit that cut it off: Elapsed is "
+                    "truncated at the limit, so it bounds the true runtime only from below.",
                 )
             )
         return

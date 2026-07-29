@@ -238,3 +238,70 @@ class TestRulePrecedence:
             for j in workload("midtrain")
         ]
         assert memory_advice(jobs).verdict == "unknown"
+
+
+class TestTheBasisCanBeReproduced:
+    """Asked of "+30% headroom": "what does headroom mean in this context? it's so
+    confusing." It said neither what the 30% was a percentage OF nor that it had
+    already been applied to the figure beside it -- and it did not get you there.
+    Every basis now states each step, and the steps reach the printed number.
+    """
+
+    def test_no_surface_still_says_headroom(self):
+        import pathlib
+
+        src = pathlib.Path(__file__).resolve().parent.parent / "src" / "slurmpast"
+        for module in ("sizing.py", "diagnose.py", "patterns.py"):
+            text = (src / module).read_text()
+            # Comments may explain the word; no string a reader sees may use it.
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#") or "headroom" not in line:
+                    continue
+                assert '"' not in line and "'" not in line, (module, line)
+
+    def test_memory_names_the_rounding_that_produces_the_figure(self):
+        advice = memory_advice(workload("midtrain"))
+        assert "rounded up to whole GiB" in advice.basis
+        assert "headroom" not in advice.basis
+
+    def test_cpu_names_the_rounding_that_produces_the_figure(self):
+        """The worst of the three: 1.0 core plus 20% is 1.2, and the advice is 2.
+        The ceiling to a whole core was doing the work and went unmentioned."""
+        advice = cpu_advice(workload("tokenize-shards"))
+        assert "rounded up to a whole core" in advice.basis
+        assert "headroom" not in advice.basis
+
+    def test_walltime_names_the_step_it_rounded_to(self):
+        advice = walltime_advice(workload("midtrain"))
+        assert "rounded up to the next" in advice.basis
+        assert "minutes" in advice.basis
+        assert "headroom" not in advice.basis
+
+    def test_the_walltime_step_matches_the_magnitude(self):
+        from slurmpast.sizing import _walltime_step
+
+        assert _walltime_step(1800) == "5 minutes"
+        assert _walltime_step(7200) == "15 minutes"
+
+    def test_a_core_count_that_displays_as_zero_says_so_honestly(self):
+        """ "0.00 of 8 cores, rounded up to a whole core" cannot yield the 1 printed
+        beside it -- rounding zero up is zero. Any nonzero fraction of a core rounds
+        up to exactly one, so that is what it claims."""
+        from slurmpast.sizing import _cores_text
+
+        assert _cores_text(0.003) == "under 0.05"
+        assert _cores_text(0.04) == "under 0.05"
+        assert _cores_text(0.0) == "0"
+        assert _cores_text(1.1) == "1.1"
+
+    def test_an_exactly_idle_workload_names_the_floor(self):
+        """There the ceiling really does give zero, and a floor supplies the 1."""
+        # total_cpu is derived from the steps, so the steps are what to zero.
+        jobs = [
+            j._replace(steps=tuple(st._replace(total_cpu=0.0) for st in j.steps))
+            for j in workload("midtrain")
+        ]
+        advice = cpu_advice(jobs)
+        if advice.suggestion == "1":
+            assert "never below one core" in advice.basis, advice.basis
