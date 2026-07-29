@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,18 +7,26 @@ name = "slurmpast"
 dynamic = ["version"]
 description = "Why did your Slurm jobs fail? A post-mortem dashboard for finished jobs."
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
 requires-python = ">=3.10"
-authors = [{ name = "Youzhi Yu" }]
+authors = [{ name = "Youzhi Yu", email = "yuyouzhi666@icloud.com" }]
 keywords = ["slurm", "hpc", "sacct", "postmortem", "job-failure", "tui", "seff"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Environment :: Console",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: MIT License",
+  "Natural Language :: English",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering",
   "Topic :: System :: Distributed Computing",
+  "Topic :: System :: Monitoring",
+  "Topic :: Utilities",
+  "Typing :: Typed",
 ]
 dependencies = [
   # Same floor as slurmwatch: >=0.86 is where the theme system landed, which the
@@ -34,6 +42,12 @@ dependencies = [
   # what textual itself requires.
   "rich>=13.3.3",
 ]
+
+[project.urls]
+Homepage = "https://github.com/PursuitOfDataScience/slurmpast"
+Repository = "https://github.com/PursuitOfDataScience/slurmpast.git"
+Documentation = "https://github.com/PursuitOfDataScience/slurmpast#readme"
+Issues = "https://github.com/PursuitOfDataScience/slurmpast/issues"
 
 [project.scripts]
 slurmpast = "slurmpast.cli:main"
@@ -51,6 +65,8 @@ dev = [
   # first CI run here.
   "ruff>=0.15,<0.17",
   "mypy>=2.3,<3",  # >=2.3: 2.2 added the MRO override check CI tripped on
+  "build>=1.0",
+  "twine>=5.0",
 ]
 
 [tool.setuptools.dynamic]
@@ -58,6 +74,10 @@ version = { attr = "slurmpast._version.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["slurmpast*"]
+
+[tool.setuptools.package-data]
+slurmpast = ["py.typed"]
 
 [tool.ruff]
 line-length = 100

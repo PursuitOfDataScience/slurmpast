@@ -484,13 +484,27 @@ def wrap(text: str, width: int) -> list[str]:
 
 
 def mem_text(job: Job) -> str:
-    """Memory ceiling, saying where the figure came from when ReqMem was unusable."""
+    """Memory ceiling per node, saying where the figure came from and over how many.
+
+    Two notes, each only when it has something to say. The provenance quotes the
+    ReqMem value actually seen rather than the literal ``0n`` -- that is the Slurm
+    20.11 spelling of "not recorded", and 21.08 onwards writes something else, so
+    hardcoding it printed a value the record did not contain.
+
+    The per-node note appears only on a multi-node job, where the figure here and
+    the ``mem=`` in AllocTRES differ by the node count and a reader comparing them
+    would otherwise think one of the two was wrong.
+    """
     limit = job.mem_limit_bytes
     if limit is None:
         return "n/a"
-    if job.req_mem_bytes:
-        return format_bytes(limit)
-    return "%s (AllocTRES; ReqMem was 0n)" % format_bytes(limit)
+    text = format_bytes(limit)
+    nodes = job.node_count
+    if nodes > 1:
+        text += " per node (%s over %d)" % (format_bytes(job.mem_limit_total_bytes), nodes)
+    if not job.req_mem_bytes:
+        text += " (from AllocTRES; ReqMem read %s)" % (job.req_mem_raw or "empty")
+    return text
 
 
 def sort_findings(findings):
@@ -571,6 +585,10 @@ def job_sections(job, summarized: bool = False):
         ident.append(("reservation", job.reservation, None))
     if job.work_dir:
         ident.append(("workdir", job.work_dir, None))
+    if job.submit_line:
+        # Recorded from Slurm 21.08. The one row that answers "what did I actually
+        # ask for" without the reader reconstructing it from the numbers below.
+        ident.append(("submitted as", job.submit_line, None))
     sections.append(("job", ident))
 
     # -- timing --------------------------------------------------------------
@@ -657,9 +675,12 @@ def job_sections(job, summarized: bool = False):
 
     # -- memory --------------------------------------------------------------
     mem = []
-    if job.mem_limit_bytes and not job.req_mem_bytes:
-        # Only when there is something to explain: ReqMem was unusable and the
-        # ceiling came from AllocTRES. Otherwise the MEM gauge row already said it.
+    if job.mem_limit_bytes and (not job.req_mem_bytes or job.node_count > 1):
+        # Only when there is something to explain. Either ReqMem was unusable and
+        # the ceiling came from AllocTRES, or the job spans several nodes -- where
+        # the gauge shows the per-node ceiling and AllocTRES shows the total, so
+        # without this row the two figures look like a contradiction. On an
+        # ordinary single-node job the MEM gauge already said it.
         mem.append(("limit", mem_text(job), None))
     if job.max_rss is not None:
         note = ""
@@ -712,17 +733,23 @@ def job_sections(job, summarized: bool = False):
 
     # -- gpu -----------------------------------------------------------------
     if job.gpu_count:
+        util = job.gpu_utilization
+        if util is None:
+            # Why it is missing is a property of the cluster, not of the job: a
+            # site running AutoDetect=nvml records gres/gpuutil and this row shows
+            # a real number. Saying "not recorded by Slurm" everywhere was true
+            # here and wrong there.
+            from .site import gpu_utilization_note
+
+            util_cell = (gpu_utilization_note(), None)
+        else:
+            util_cell = (format_percent(util), _pct_of(util, 1.0))
         gpu = [
             ("devices", str(job.gpu_count), None),
-            (
-                "utilization",
-                # Short enough to pair. The full explanation (gres/gpuutil is
-                # absent from AccountingStorageTRES here) is in the module docs;
-                # on screen the fact is that Slurm did not record it.
-                "not recorded by Slurm",
-                None,
-            ),
+            ("utilization", util_cell[0], util_cell[1]),
         ]
+        if job.gpu_mem_peak_bytes:
+            gpu.append(("device memory", "%s peak" % format_bytes(job.gpu_mem_peak_bytes), None))
         # gpu-hours is devices x elapsed, so on an unterminated record it is
         # devices x (now - start): job 50108238 read "gpu-hours 4615.9" from a
         # RUNNING record 64 days old. Every other consumer already suppresses
@@ -798,11 +825,13 @@ def resource_rows(job, ascii_mode: bool = False, width: int = 18):
 
     A row whose value could not be measured prints ``n/a`` rather than a zero.
 
-    Rows with no ceiling to be a fraction of -- GPU, whose utilization this
-    cluster's accounting does not record, and DISK, where there is no quota to
-    divide by -- get blank space where the gauge would be, not an empty track.
-    They can never fill, and an unfillable ``░░░░`` reads as a measured zero.
-    Blank keeps the value column aligned without making a claim.
+    Three rows only -- TIME, CPU, MEM -- because a gauge needs a ceiling to be a
+    fraction of. Kernel share, disk rate and GPU count have none, and drawing them
+    as bars that can never fill made an unfillable ``░░░░`` read as a measured
+    zero; they live in :func:`job_sections` instead, where they are numbers rather
+    than proportions. The one case here that still drops its gauge is a MaxRSS
+    above the limit: the findings below say that figure is not a working set, so a
+    101%-full bar would have the summary contradicting the diagnosis.
     """
     marker = _MARKER_ASCII if ascii_mode else _MARKER
     rows = []

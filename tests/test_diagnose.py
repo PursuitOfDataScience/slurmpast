@@ -78,7 +78,7 @@ class TestMemory:
         assert "above the hard limit" in evidence
 
     def test_oom_action_does_not_tell_you_to_trust_maxrss(self, oom_job):
-        assert "do not size --mem from it" in find(diagnose(oom_job), "host-oom").evidence
+        assert "Do not size --mem from it" in find(diagnose(oom_job), "host-oom").evidence
 
     def test_rss_above_limit_without_oom_is_its_own_finding(self, healthy_job):
         # The limit must be lowered where the tool actually reads it: AllocTRES.

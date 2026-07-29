@@ -100,3 +100,27 @@ jobs:
           slurmpast --demo --overview --plain --no-color
           slurmpast --demo --patterns --no-color
           slurmpast --demo --nodes --no-color
+          slurmpast --demo --sizing --no-color
+          slurmpast --demo --overview --json
+
+      # `site` reads `scontrol show config` to word what a measurement means on
+      # this cluster. With no scontrol it must return "cannot say" and every
+      # caller must cope -- not raise, and not assert the Midway3 answer.
+      - name: A missing scontrol degrades to "cannot say"
+        run: |
+          python - <<'PY'
+          from slurmpast.site import gpu_utilization_note, maxrss_caveat, site
+          found = site(refresh=True)
+          assert not found.known, found
+          assert found.rss_from_cgroup is None
+          assert "depending on this cluster" in maxrss_caveat()
+          assert gpu_utilization_note() == "not recorded by Slurm"
+          print("unknown site handled:", maxrss_caveat())
+          PY
+
+      # The demo is meant to look the same everywhere. It pins its own synthetic
+      # site config for exactly that reason, so this output must match what a
+      # login node prints.
+      - name: The demo does not vary with the host cluster
+        run: |
+          slurmpast --demo --sizing --no-color | grep -q "jobacct_gather/linux"

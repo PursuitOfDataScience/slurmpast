@@ -154,7 +154,12 @@ class TestNoDeadCode:
 
     def test_no_unreferenced_module_level_definitions(self):
         text = "\n".join(p.read_text() for p in SRC.glob("*.py"))
-        text += "\n".join(p.read_text() for p in (SRC.parent.parent / "tests").glob("test_*.py"))
+        # conftest.py counts: a helper the fixtures use is referenced, and leaving
+        # it out of this sweep reported a live function as dead code.
+        tests = SRC.parent.parent / "tests"
+        text += "\n".join(
+            p.read_text() for p in list(tests.glob("test_*.py")) + [tests / "conftest.py"]
+        )
         orphans = [
             "%s (%s)" % (name, where)
             for name, where in self._module_names().items()

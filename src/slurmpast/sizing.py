@@ -17,9 +17,15 @@ Four rules keep the advice honest, each from something measured on real records:
   43742638 reports 51.25 GiB against a 40 GiB limit that OOM-killed;
   ``jobacct_gather/linux`` sums RSS across the process tree and double-counts
   shared pages, so the figure is an upper bound at best and nonsense at worst.
+  How far to distrust it is a property of the *cluster*, so the caution attached
+  to this advice is worded from ``JobAcctGatherType`` -- see :mod:`slurmpast.site`.
 * **Say "not enough evidence" rather than guess.** Below MIN_RUNS successful
   observations there is no distribution to reason about, and a confident wrong
   number is worse than an admission.
+
+Both quantities are stated in the unit the flag takes, which is not the unit
+sacct reports: ``--mem`` is per node while ``AllocTRES`` totals the allocation,
+and ``--cpus-per-task`` is per task while every CPU counter totals it too.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from typing import NamedTuple
 
 from .diagnose import looks_like_noop
 from .duration import format_bytes, format_duration
+from .site import maxrss_caveat
 
 # Below this many usable observations there is no distribution to reason about.
 MIN_RUNS = 3
@@ -172,7 +179,13 @@ def walltime_advice(jobs) -> Advice:
 
 
 def memory_advice(jobs) -> Advice:
-    """How much memory the next run should ask for."""
+    """How much memory the next run should ask for, per node.
+
+    ``--mem`` is per node, and so is :attr:`Job.mem_limit_bytes` -- ``AllocTRES``
+    reports the allocation total, which on a multi-node job is the ceiling
+    multiplied by the node count. Comparing MaxRSS (one task's peak) against the
+    total understated use by exactly that factor.
+    """
     limits = [j.mem_limit_bytes for j in jobs if j.mem_limit_bytes]
     requested = format_bytes(max(limits)) if limits else "n/a"
     ooms = [j for j in jobs if j.base_state == "OUT_OF_MEMORY"]
@@ -213,8 +226,8 @@ def memory_advice(jobs) -> Advice:
             % (len(untrustworthy), len(measured)),
             suggestion="",
             basis=(
-                "MaxRSS sums RSS across the process tree and double-counts shared "
-                "pages, so on this workload it is not a footprint at all."
+                "MaxRSS reads above the ceiling that was enforced, so on this workload "
+                "it is not a footprint at all (%s)." % maxrss_caveat()
             ),
             caution="Measure the cgroup working set live (slurmwatch) to size this.",
         )
@@ -245,6 +258,16 @@ def memory_advice(jobs) -> Advice:
     else:
         verdict = "keep"
 
+    caution = maxrss_caveat() + "."
+    if untrustworthy:
+        caution += "  %d run%s excluded: MaxRSS above the limit there, which cannot be a " % (
+            len(untrustworthy),
+            "" if len(untrustworthy) == 1 else "s",
+        )
+        caution += "working set."
+    if any((j.node_count or 1) > 1 for j in usable):
+        caution += "  Per node, which is what --mem sets; the allocation total is larger."
+
     return Advice(
         flag="--mem",
         verdict=verdict,
@@ -253,26 +276,27 @@ def memory_advice(jobs) -> Advice:
         suggestion="%dG" % target if verdict != "keep" else "",
         basis="Highest observed peak %s, +%d%% headroom."
         % (format_bytes(peak), round((MEMORY_MARGIN - 1) * 100)),
-        caution=(
-            "MaxRSS over-reports for multi-process jobs, so treat this as an "
-            "upper bound rather than the true footprint."
-            + (
-                "  %d run%s excluded: MaxRSS above the limit there, which cannot "
-                "be a working set." % (len(untrustworthy), "" if len(untrustworthy) == 1 else "s")
-                if untrustworthy
-                else ""
-            )
-        ),
+        caution=caution,
     )
 
 
 def cpu_advice(jobs) -> Advice:
-    """How many cores the next run should ask for."""
-    allocated = sorted({j.cpu_count for j in jobs if j.cpu_count})
-    requested = str(allocated[-1]) if allocated else "n/a"
+    """How many cores the next run should ask for, per task.
+
+    ``--cpus-per-task`` is per task; every CPU number sacct reports is a total
+    over the allocation. Comparing the two directly is right for the single-task
+    job that dominates most histories and badly wrong otherwise -- it told a
+    15-node, 90-core job to request 90 cores for each of its tasks.
+    """
+    # Cores per task, which is the quantity the flag sets. Identical to cpu_count
+    # whenever there is one task, so single-task advice is unchanged.
+    per_task = sorted({j.cpus_per_task for j in jobs if j.cpus_per_task})
+    requested = ("%g" % per_task[-1]) if per_task else "n/a"
 
     usable = [
-        j for j in jobs if j.cpu_utilization is not None and j.cpu_count and not looks_like_noop(j)
+        j
+        for j in jobs
+        if j.cpu_utilization is not None and j.cpus_per_task and not looks_like_noop(j)
     ]
     if len(usable) < MIN_RUNS:
         return Advice(
@@ -285,10 +309,10 @@ def cpu_advice(jobs) -> Advice:
             basis="Needs at least %d before core use can be inferred." % MIN_RUNS,
         )
 
-    effective = [j.cpu_utilization * j.cpu_count for j in usable]
+    effective = [j.cpu_utilization * j.cpus_per_task for j in usable]
     peak = max(effective)
     target = max(1, int(math.ceil(peak * CPU_MARGIN)))
-    current = allocated[-1] if allocated else None
+    current = per_task[-1] if per_task else None
 
     if current is None:
         verdict = "unknown"
@@ -306,14 +330,23 @@ def cpu_advice(jobs) -> Advice:
             "This is a GPU workload: cores may be there to feed dataloader "
             "workers, and cutting them can starve the GPU even though they look idle."
         )
+    tasks = max((j.task_count for j in usable), default=1)
+    if tasks > 1:
+        caution = (
+            (caution + "  " if caution else "")
+            + "Per task: this workload runs %d, so the allocation total is that many times larger."
+            % (tasks)
+        )
 
+    per_task_label = "core" if peak < 2 else "cores"
     return Advice(
         flag="--cpus-per-task",
         verdict=verdict,
         requested=requested,
-        observed="%.1f cores busy at peak across %d runs" % (peak, len(usable)),
+        observed="%.1f %s busy per task at peak across %d runs"
+        % (peak, per_task_label, len(usable)),
         suggestion=str(target) if verdict != "keep" else "",
-        basis="Busiest run used %.1f of %s cores; +%d%% headroom."
+        basis="Busiest run used %.1f of %s cores per task; +%d%% headroom."
         % (peak, requested, round((CPU_MARGIN - 1) * 100)),
         caution=caution,
     )

@@ -1,0 +1,821 @@
+"""Every assumption about "the cluster" that turned out to be about *one* cluster.
+
+This tool was written against Slurm 20.11.8 on Midway3, and each case below is a
+place where that showed through -- verified against the Slurm documentation, the
+release notes that changed the behaviour, or `scontrol show hostnames` itself.
+None of them fail on Midway3, which is exactly why they need pinning.
+"""
+
+import pathlib
+import subprocess
+
+import pytest
+
+from slurmpast import logs, model
+from slurmpast.duration import parse_bytes
+from slurmpast.nodes import expand_nodelist
+from slurmpast.sacct import (
+    _ALIASES,
+    _FIELDS,
+    _OPTIONAL,
+    SAFE_DELIMITER,
+    Sacct,
+    SacctError,
+    child_env,
+    live_job_ids,
+    parse,
+    resolve_fields,
+)
+from slurmpast.site import Site, gpu_utilization_note, maxrss_caveat, site
+
+from .conftest import row
+
+_SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "slurmpast"
+
+
+def _fields_lower(names):
+    return {n.lower() for n in names}
+
+
+class TestFieldNamesAcrossReleases:
+    """Slurm renames fields. A rename is not the same as a removal.
+
+    `Reserved` became `Planned` in 23.02 (release notes: "sacct - Rename
+    'Reserved' field to 'Planned'"). Treating it as merely optional means every
+    cluster from 23.02 onward drops queue wait with no error at all.
+    """
+
+    def test_reserved_is_asked_for_on_an_older_slurm(self):
+        chosen = resolve_fields(_fields_lower(_FIELDS))
+        assert "Reserved" in chosen
+        assert "Planned" not in chosen
+
+    def test_planned_is_asked_for_when_reserved_is_gone(self):
+        available = _fields_lower(_FIELDS) - {"reserved"}
+        available.add("planned")
+        chosen = resolve_fields(available)
+        assert "Planned" in chosen
+        assert "Reserved" not in chosen
+
+    def test_queue_wait_is_read_back_under_one_name(self):
+        """The rest of the codebase must not learn that the field moved."""
+        fields = resolve_fields(_fields_lower(_FIELDS) - {"reserved"} | {"planned"})
+        values = {"Planned": "00:05:00", "JobID": "7", "State": "COMPLETED"}
+        text = "|".join(values.get(name, "") for name in fields)
+        job = parse(text, fields=fields)[0]
+        assert job.queue_wait == 300.0
+
+    def test_a_field_this_slurm_never_had_is_dropped(self):
+        """Requesting one unknown field makes sacct reject the whole query."""
+        available = _fields_lower(_FIELDS) - {"stdout", "stderr", "submitline"}
+        chosen = resolve_fields(available)
+        assert "StdOut" not in chosen and "SubmitLine" not in chosen
+        assert "JobID" in chosen and "State" in chosen
+
+    def test_a_non_optional_field_is_kept_so_breakage_is_loud(self):
+        chosen = resolve_fields({"jobid"})
+        assert "State" in chosen, "silently dropping a load-bearing field hides the fault"
+
+    def test_no_probe_asks_for_everything(self):
+        assert resolve_fields(None) == [_ALIASES.get(f, (f,))[0] for f in _FIELDS]
+
+    def test_every_optional_name_is_actually_requested(self):
+        """A typo in _OPTIONAL makes a field un-droppable and breaks old clusters."""
+        assert not set(_OPTIONAL) - set(_FIELDS)
+
+
+class TestDelimiter:
+    """`--constraint="v100|a100"` is documented Slurm syntax, and `--parsable2`
+    does not escape the pipe it puts in the Constraints column."""
+
+    def test_a_pipe_in_a_value_no_longer_shifts_every_later_column(self):
+        fields = list(_FIELDS)
+        values = {
+            "JobID": "11",
+            "JobName": "train",
+            "State": "COMPLETED",
+            "Constraints": "v100|a100",
+            "ElapsedRaw": "600",
+            "AllocTRES": "cpu=8,mem=64G,node=1",
+            "AllocCPUS": "8",
+        }
+        text = SAFE_DELIMITER.join(str(values.get(name, "")) for name in fields)
+        job = parse(text, fields=fields, delimiter=SAFE_DELIMITER)[0]
+        assert job.constraints == "v100|a100"
+        # The columns after Constraints are the ones a shift corrupts.
+        assert job.alloc_tres == "cpu=8,mem=64G,node=1"
+        assert job.cpu_count == 8
+        assert job.elapsed == 600.0
+
+    def test_the_query_asks_for_the_safe_delimiter(self):
+        seen = []
+
+        def runner(args):
+            seen.append(args)
+            return ""
+
+        Sacct(runner=runner, probe=" ".join(_FIELDS)).history(user="u")
+        assert any("--delimiter=" + SAFE_DELIMITER in a for a in seen[0])
+
+    def test_an_ancient_sacct_without_the_option_falls_back(self):
+        calls = []
+
+        def runner(args):
+            calls.append(args)
+            if any(a.startswith("--delimiter") for a in args):
+                raise SacctError("sacct: unrecognized option '--delimiter=\\x1f'")
+            return row(JobID="12", JobName="w", State="COMPLETED", ElapsedRaw="60")
+
+        sacct = Sacct(runner=runner, probe=" ".join(_FIELDS))
+        jobs = sacct.history(user="u")
+        assert [j.job_id for j in jobs] == ["12"]
+        assert len(calls) == 2, "should retry exactly once, without the option"
+        # And it remembers, rather than paying for the failure on every query.
+        sacct.history(user="u")
+        assert len(calls) == 3
+
+    def test_a_real_error_is_not_retried_as_an_option_problem(self):
+        calls = []
+
+        def runner(args):
+            calls.append(args)
+            raise SacctError("sacct: fatal: Bad job/step specified: zzz")
+
+        with pytest.raises(SacctError, match="Bad job/step"):
+            Sacct(runner=runner, probe=" ".join(_FIELDS)).jobs(["zzz"])
+        assert len(calls) == 1
+
+    def test_a_pipe_bearing_row_is_dropped_not_misread_on_the_fallback(self):
+        """With `|` there is no way to realign, and a shifted row reports another
+        column's memory as this job's -- worse than reporting nothing."""
+        fields = list(_FIELDS)
+        good = row(JobID="20", JobName="w", State="COMPLETED", ElapsedRaw="60")
+        bad = row(JobID="21", JobName="a|b", State="COMPLETED", ElapsedRaw="60")
+        jobs = parse(good + "\n" + bad, fields=fields, delimiter="|")
+        assert [j.job_id for j in jobs] == ["20"]
+
+
+class TestTimestampFormat:
+    """SLURM_TIME_FORMAT rewrites every timestamp sacct prints. Verified live on
+    20.11.8: `relative` turns 2026-04-29T14:55:48 into "29 Apr 14:55"."""
+
+    def test_the_child_is_told_which_format_to_use(self):
+        env = child_env({"SLURM_TIME_FORMAT": "relative"})
+        assert env["SLURM_TIME_FORMAT"] == "standard"
+
+    def test_a_strftime_value_is_overridden_too(self):
+        assert child_env({"SLURM_TIME_FORMAT": "%s"})["SLURM_TIME_FORMAT"] == "standard"
+
+    def test_format_overrides_that_change_the_columns_are_dropped(self):
+        env = child_env({"SACCT_FORMAT": "jobid,user", "SQUEUE_FORMAT": "%i"})
+        assert "SACCT_FORMAT" not in env and "SQUEUE_FORMAT" not in env
+
+    def test_the_rest_of_the_environment_survives(self):
+        env = child_env({"HOME": "/home/me", "SLURM_CONF": "/etc/slurm/slurm.conf"})
+        assert env["HOME"] == "/home/me"
+        assert env["SLURM_CONF"] == "/etc/slurm/slurm.conf"
+
+
+class TestHostlistExpansion:
+    """Checked against `scontrol show hostnames`, which is the authority."""
+
+    @pytest.mark.parametrize(
+        "expression,expected",
+        [
+            ("node[1-3]", ["node1", "node2", "node3"]),
+            (
+                "midway3-[0277-0279,0281]",
+                ["midway3-0277", "midway3-0278", "midway3-0279", "midway3-0281"],
+            ),
+            ("tux[1,3,5-7]", ["tux1", "tux3", "tux5", "tux6", "tux7"]),
+            ("a1,b[2-3],c", ["a1", "b2", "b3", "c"]),
+            # Underscores and dots are legal in a node name; a character class
+            # enumerating "what a prefix may contain" got both of these wrong and
+            # returned the bracket expression itself as a node name.
+            ("cn_[01-02]", ["cn_01", "cn_02"]),
+            ("gpu.node[1-2]", ["gpu.node1", "gpu.node2"]),
+            # Shared suffix after the bracket, allowed from Slurm 23.11.
+            ("node[1-2]-ib", ["node1-ib", "node2-ib"]),
+            ("midway3-0600", ["midway3-0600"]),
+        ],
+    )
+    def test_matches_slurm(self, expression, expected):
+        assert expand_nodelist(expression) == expected
+
+    def test_several_ranges_in_one_name_are_a_cartesian_product(self):
+        """`unit[0-31]rack[0-41]` is documented in slurm.conf(5) under NodeName,
+        and `scontrol show hostnames unit[0-3]rack[0-2]` returns 12 names. The old
+        expander returned four, each still holding an unexpanded bracket -- so
+        every node of such an allocation was invisible to the node table."""
+        assert expand_nodelist("unit[0-1]rack[0-1]") == [
+            "unit0rack0",
+            "unit0rack1",
+            "unit1rack0",
+            "unit1rack1",
+        ]
+
+    def test_a_list_mixing_both_forms(self):
+        assert expand_nodelist("node[1-2],unit[0-1]rack[0-1]") == [
+            "node1",
+            "node2",
+            "unit0rack0",
+            "unit0rack1",
+            "unit1rack0",
+            "unit1rack1",
+        ]
+
+    def test_no_nodes_assigned_is_not_two_nodes_called_none_and_assigned(self):
+        assert expand_nodelist("None assigned") == []
+        assert expand_nodelist("") == []
+
+    def test_a_malformed_range_does_not_hang_or_invent_names(self):
+        assert expand_nodelist("node[a-b]") == ["nodea-b"]
+        assert expand_nodelist("node[5-1]") == ["node5-1"]
+
+    def test_expansion_is_bounded(self):
+        assert len(expand_nodelist("n[1-99999999]")) <= 65536
+
+    @pytest.mark.skipif(
+        subprocess.run(["which", "scontrol"], capture_output=True).returncode != 0,
+        reason="no Slurm on this machine",
+    )
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "node[1-3]",
+            "unit[0-3]rack[0-2]",
+            "midway3-[0277-0279,0281]",
+            "cn_[01-02]",
+            "a1,b[2-3],c",
+        ],
+    )
+    def test_agrees_with_the_local_scheduler(self, expression):
+        """Differential test against the real expander, where one is available."""
+        proc = subprocess.run(
+            ["scontrol", "show", "hostnames", expression], capture_output=True, text=True
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            pytest.skip("this Slurm rejects %s" % expression)
+        assert expand_nodelist(expression) == proc.stdout.split()
+
+
+class TestGpuCountAcrossConfigurations:
+    """How a cluster records GPUs differs by release and by gres.conf."""
+
+    def _job(self, **kw):
+        return parse(row(JobID="1", JobName="w", State="COMPLETED", ElapsedRaw="60", **kw))[0]
+
+    def test_untyped_tres(self):
+        assert self._job(AllocTRES="cpu=8,gres/gpu=4,mem=64G,node=1").gpu_count == 4
+
+    def test_typed_tres_alone_still_counts(self):
+        """Slurm usually emits the untyped total beside the typed entry, but not on
+        every release -- and without this the job reads as CPU-only, so its
+        GPU-hours vanish from every total and its group is ranked as CPU work."""
+        assert self._job(AllocTRES="cpu=8,gres/gpu:a100=4,mem=64G,node=1").gpu_count == 4
+
+    def test_two_models_on_one_node_are_summed(self):
+        job = self._job(AllocTRES="cpu=8,gres/gpu:a100=2,gres/gpu:v100=1,mem=64G,node=1")
+        assert job.gpu_count == 3
+
+    def test_the_untyped_total_wins_when_both_are_present(self):
+        job = self._job(AllocTRES="cpu=8,gres/gpu=4,gres/gpu:a100=4,mem=64G,node=1")
+        assert job.gpu_count == 4
+
+    def test_pre_2011_allocgres_spelling(self):
+        """AllocGRES/ReqGRES were removed in Slurm 20.11 in favour of TRES, so on
+        an older cluster they are the only place the count exists."""
+        assert self._job(AllocGRES="gpu:4").gpu_count == 4
+        assert self._job(AllocGRES="gpu:tesla:2").gpu_count == 2
+        assert self._job(ReqGRES="gpu").gpu_count == 1
+
+    def test_tres_is_preferred_over_the_legacy_field(self):
+        job = self._job(AllocTRES="cpu=8,gres/gpu=4,mem=64G,node=1", AllocGRES="gpu:1")
+        assert job.gpu_count == 4
+
+    def test_a_cluster_that_tracks_no_gpus_reports_none_not_zero_hours(self):
+        job = self._job(AllocTRES="cpu=8,mem=64G,node=1")
+        assert job.gpu_count == 0
+        assert job.gpu_hours is None
+
+
+class TestGpuUtilizationWhereRecorded:
+    """`gres/gpuutil` and `gres/gpumem` are gathered automatically wherever
+    gres.conf sets AutoDetect=nvml. Midway3 does not, which is why this tool used
+    to hardcode "not recorded by Slurm" as though no cluster records it."""
+
+    def _job(self, in_ave="", in_max=""):
+        text = "\n".join(
+            [
+                row(
+                    JobID="30",
+                    JobName="w",
+                    State="COMPLETED",
+                    ElapsedRaw="3600",
+                    AllocTRES="cpu=8,gres/gpu=2,mem=64G,node=1",
+                    AllocCPUS="8",
+                ),
+                row(
+                    JobID="30.batch",
+                    JobName="batch",
+                    State="COMPLETED",
+                    ElapsedRaw="3600",
+                    TotalCPU="01:00:00",
+                    CPUTimeRAW="28800",
+                    TRESUsageInAve=in_ave,
+                    TRESUsageInMax=in_max,
+                ),
+            ]
+        )
+        return parse(text)[0]
+
+    def test_average_utilization_is_read_as_a_fraction(self):
+        job = self._job(in_ave="cpu=00:59:00,gres/gpuutil=87,mem=100K")
+        assert job.gpu_utilization == pytest.approx(0.87)
+
+    def test_peak_gpu_memory_is_read_with_its_unit(self):
+        job = self._job(in_max="gres/gpumem=36266M,gres/gpuutil=100,mem=100K")
+        assert job.gpu_mem_peak_bytes == 36266 * 1024**2
+
+    def test_a_cluster_that_gathers_nothing_reports_none_not_zero(self):
+        job = self._job()
+        assert job.gpu_utilization is None
+        assert job.gpu_mem_peak_bytes is None
+
+    def test_a_recorded_idle_gpu_is_a_measurement_not_an_inference(self):
+        from slurmpast.diagnose import diagnose
+
+        verdict = diagnose(self._job(in_ave="gres/gpuutil=1,mem=100K"))
+        codes = {f.code for f in verdict.findings}
+        assert "gpu-idle" in codes
+        assert "gpu-suspect-idle" not in codes, "the CPU proxy must stand down"
+        finding = next(f for f in verdict.findings if f.code == "gpu-idle")
+        assert "as recorded by Slurm" in finding.evidence
+
+    def test_a_partly_busy_gpu_is_a_warning_not_a_verdict(self):
+        from slurmpast.diagnose import diagnose
+
+        codes = {f.code for f in diagnose(self._job(in_ave="gres/gpuutil=22")).findings}
+        assert "gpu-underused" in codes
+
+    def test_a_busy_gpu_draws_nothing(self):
+        from slurmpast.diagnose import diagnose
+
+        codes = {f.code for f in diagnose(self._job(in_ave="gres/gpuutil=94")).findings}
+        assert "gpu-idle" not in codes and "gpu-underused" not in codes
+
+    def test_the_note_names_the_site_setting_rather_than_blaming_slurm(self):
+        assert "AutoDetect=nvml" in gpu_utilization_note(Site(tres=("cpu", "gres/gpu")))
+        assert "for this job" in gpu_utilization_note(Site(tres=("cpu", "gres/gpuutil")))
+        # Nothing known about the cluster: no claim about why.
+        assert gpu_utilization_note(Site()) == "not recorded by Slurm"
+
+
+class TestPerNodeMemory:
+    """AllocTRES `mem=` totals the allocation; MaxRSS is one task's peak and
+    `--mem` is per node. Verified on job 51553906: `--mem=8G` on 2 nodes records
+    `mem=16G`."""
+
+    def _multinode(self, nodes=2, mem="16G", rss="7000000K", req_mem=""):
+        text = "\n".join(
+            [
+                row(
+                    JobID="40",
+                    JobName="w",
+                    State="COMPLETED",
+                    ElapsedRaw="600",
+                    End="2026-01-01T00:10:00",
+                    NNodes=str(nodes),
+                    ReqMem=req_mem,
+                    AllocTRES="cpu=8,mem=%s,node=%d" % (mem, nodes),
+                    AllocCPUS="8",
+                ),
+                row(
+                    JobID="40.batch",
+                    JobName="batch",
+                    State="COMPLETED",
+                    ElapsedRaw="600",
+                    TotalCPU="00:40:00",
+                    CPUTimeRAW="4800",
+                    MaxRSS=rss,
+                ),
+            ]
+        )
+        return parse(text)[0]
+
+    def test_the_per_node_ceiling_is_the_total_over_the_nodes(self):
+        job = self._multinode(nodes=2, mem="16G")
+        assert job.mem_limit_total_bytes == 16 * 1024**3
+        assert job.mem_limit_bytes == 8 * 1024**3
+
+    def test_utilization_is_no_longer_understated_by_the_node_count(self):
+        job = self._multinode(nodes=2, mem="16G", rss=str(7 * 1024 * 1024) + "K")
+        # 7 GiB of an 8 GiB per-node ceiling, not 7 of 16.
+        assert job.mem_utilization == pytest.approx(7 / 8.0, rel=1e-3)
+
+    def test_a_single_node_job_is_unchanged(self):
+        job = self._multinode(nodes=1, mem="8G")
+        assert job.mem_limit_bytes == job.mem_limit_total_bytes == 8 * 1024**3
+
+    def test_an_explicit_per_node_reqmem_is_not_divided(self):
+        """Slurm 20.11 and older write `8Gn`, which is already per node."""
+        job = self._multinode(nodes=2, mem="", req_mem="8Gn")
+        assert job.mem_limit_bytes == 8 * 1024**3
+        assert job.mem_limit_total_bytes == 16 * 1024**3
+
+    def test_a_per_cpu_reqmem_is_multiplied_out_for_the_total(self):
+        text = row(
+            JobID="41",
+            JobName="w",
+            State="COMPLETED",
+            ElapsedRaw="60",
+            NNodes="1",
+            ReqCPUS="4",
+            AllocCPUS="4",
+            ReqMem="1750Mc",
+        )
+        job = parse(text)[0]
+        assert job.mem_limit_total_bytes == 4 * 1750 * 1024**2
+
+    def test_a_21_08_style_reqmem_with_no_suffix_is_a_total(self):
+        """Slurm 21.08 changed ReqMem to mirror ReqTRES: no n/c marker, and the
+        figure is the allocation total."""
+        text = row(
+            JobID="42", JobName="w", State="COMPLETED", ElapsedRaw="60", NNodes="2", ReqMem="16G"
+        )
+        job = parse(text)[0]
+        assert job.req_mem_scope is None
+        assert job.mem_limit_total_bytes == 16 * 1024**3
+        assert job.mem_limit_bytes == 8 * 1024**3
+
+    def test_the_detail_screen_names_both_figures_on_a_multinode_job(self):
+        """The gauge shows the per-node ceiling and AllocTRES shows the total, so
+        without a row saying so the two look like a contradiction."""
+        from slurmpast.render import job_sections, mem_text
+
+        job = self._multinode(nodes=15, mem="750G", req_mem="50Gn")
+        assert mem_text(job) == "50.0 GiB per node (750.0 GiB over 15)"
+        memory = {label: value for _title, rows in job_sections(job) for label, value, _ in rows}
+        assert "per node" in memory["limit"]
+
+    def test_a_single_node_job_does_not_gain_a_redundant_row(self):
+        from slurmpast.render import job_sections
+
+        job = self._multinode(nodes=1, mem="8G", req_mem="8Gn")
+        labels = [label for _t, rows in job_sections(job) for label, _v, _b in rows]
+        assert "limit" not in labels
+
+    def test_the_provenance_quotes_what_reqmem_actually_read(self):
+        """`0n` is the Slurm 20.11 spelling of "not recorded"; 21.08 writes
+        something else, so hardcoding it printed a value the record did not hold."""
+        from slurmpast.render import mem_text
+
+        assert "ReqMem read 0n" in mem_text(self._multinode(nodes=1, mem="8G", req_mem="0n"))
+        assert "ReqMem read empty" in mem_text(self._multinode(nodes=1, mem="8G", req_mem=""))
+
+    def test_the_slack_finding_no_longer_fires_on_a_well_sized_multinode_job(self):
+        """ "Peak 40 GiB of a 750 GiB limit -- 710 GiB never used" was said about a
+        15-node job running at 80% of its real per-node ceiling."""
+        from slurmpast.diagnose import diagnose
+
+        job = self._multinode(nodes=15, mem="750G", rss=str(40 * 1024 * 1024) + "K")
+        assert {f.code for f in diagnose(job).findings}.isdisjoint({"memory-slack"})
+
+
+class TestPerTaskCpus:
+    """`--cpus-per-task` is per task; every CPU counter sacct reports is a total."""
+
+    def _job(self, cpus=8, ntasks=1, nnodes=1, total_cpu="00:10:00"):
+        text = "\n".join(
+            [
+                row(
+                    JobID="50",
+                    JobName="w",
+                    State="COMPLETED",
+                    ElapsedRaw="3600",
+                    End="2026-01-01T01:00:00",
+                    NNodes=str(nnodes),
+                    AllocCPUS=str(cpus),
+                    AllocTRES="cpu=%d,mem=64G,node=%d" % (cpus, nnodes),
+                ),
+                row(
+                    JobID="50.batch",
+                    JobName="batch",
+                    State="COMPLETED",
+                    ElapsedRaw="3600",
+                    TotalCPU=total_cpu,
+                    CPUTimeRAW=str(3600 * cpus),
+                    NTasks=str(ntasks),
+                    MaxRSS="1000K",
+                ),
+            ]
+        )
+        return parse(text)[0]
+
+    def test_a_single_task_job_is_unchanged(self):
+        job = self._job(cpus=8, ntasks=1)
+        assert job.cpus_per_task == 8
+
+    def test_cores_are_divided_among_the_tasks(self):
+        job = self._job(cpus=90, ntasks=15)
+        assert job.cpus_per_task == 6
+
+    def test_tasks_unrecorded_falls_back_to_the_node_count(self):
+        text = row(
+            JobID="51",
+            JobName="w",
+            State="COMPLETED",
+            ElapsedRaw="60",
+            NNodes="3",
+            AllocCPUS="12",
+        )
+        assert parse(text)[0].cpus_per_task == 4
+
+    # 90 cores over 15 tasks (6 each) for an hour, having burned 12h36m of CPU:
+    # 14% utilization, so 12.6 cores of real work in total and 0.84 per task.
+    # Reading the total as a per-task figure advised `--cpus-per-task=16` -- more
+    # than the 6 the job had, for a workload told to use fewer.
+    _FOURTEEN_PERCENT = "12:36:00"
+
+    def test_the_advice_is_per_task_not_per_allocation(self):
+        from slurmpast.sizing import cpu_advice
+
+        jobs = [
+            self._job(cpus=90, ntasks=15, total_cpu=self._FOURTEEN_PERCENT)._replace(job_id=str(i))
+            for i in range(4)
+        ]
+        advice = cpu_advice(jobs)
+        assert advice.requested == "6"
+        assert advice.suggestion == "2"
+        assert "per task" in advice.basis
+        assert "15" in advice.caution
+
+    def test_the_diagnosis_suggests_a_per_task_figure(self):
+        from slurmpast.diagnose import diagnose
+
+        job = self._job(cpus=90, ntasks=15, total_cpu=self._FOURTEEN_PERCENT)
+        finding = next(f for f in diagnose(job).findings if f.code == "cpu-overrequest")
+        assert "--cpus-per-task=1," in finding.action
+        # The total is still shown -- it is what was allocated -- but it is labelled.
+        assert "of 90 cores across 15 tasks" in finding.evidence
+
+
+class TestSiteConfiguration:
+    """Two of this tool's most-repeated sentences are only true on some clusters."""
+
+    def test_cgroup_gather_means_maxrss_is_a_real_high_water_mark(self):
+        text = maxrss_caveat(Site(jobacct_gather_type="jobacct_gather/cgroup"))
+        assert "cgroup peak" in text
+        assert "sums RSS" not in text
+
+    def test_linux_gather_keeps_the_warning_that_was_earned_here(self):
+        text = maxrss_caveat(Site(jobacct_gather_type="jobacct_gather/linux"))
+        assert "sums RSS across the process tree" in text
+
+    def test_an_unreachable_scheduler_hedges_rather_than_asserting(self):
+        text = maxrss_caveat(Site())
+        assert "depending on this cluster" in text
+
+    def test_config_is_parsed_case_insensitively(self):
+        found = site(
+            runner=lambda _a: (
+                "SLURM_VERSION           = 24.05.4\n"
+                "JobAcctGatherType       = jobacct_gather/cgroup\n"
+                "AccountingStorageTRES   = cpu,mem,node,billing,gres/gpu,gres/gpuutil\n"
+            ),
+            refresh=True,
+        )
+        assert found.slurm_version == "24.05.4"
+        assert found.rss_from_cgroup is True
+        assert found.tracks_gpu is True
+        assert found.tracks_gpu_utilization is True
+        assert found.known
+
+    def test_a_machine_with_no_scontrol_is_not_an_error(self):
+        def missing(_args):
+            raise SacctError("cannot execute scontrol")
+
+        found = site(runner=missing, refresh=True)
+        assert not found.known
+        assert found.rss_from_cgroup is None
+        assert found.tracks_gpu is None
+
+    def test_a_cluster_not_tracking_gpus_in_tres_is_distinguishable(self):
+        found = Site(tres=("cpu", "mem", "node"), jobacct_gather_type="jobacct_gather/linux")
+        assert found.tracks_gpu is False
+
+
+class TestPackageSurface:
+    def test_the_site_submodule_is_not_shadowed_by_a_re_export(self):
+        """Re-exporting the `site()` accessor from the package bound the name
+        `slurmpast.site` to a function, so `slurmpast.site.reset_cache` stopped
+        resolving and every fixture that patched it broke at collection time."""
+        import slurmpast
+        import slurmpast.site as submodule
+
+        assert slurmpast.site is submodule
+        assert callable(submodule.site)
+
+    def test_everything_named_in_all_actually_exists(self):
+        import slurmpast
+
+        missing = [name for name in slurmpast.__all__ if not hasattr(slurmpast, name)]
+        assert not missing
+
+    def test_the_analysis_layer_needs_no_third_party_package(self):
+        """The README promises this: usable as a library on a login node with no
+        UI framework installed. Only the four rendering modules may reach for
+        rich or textual."""
+        renderers = {"tui.py", "theme.py", "render.py", "report.py"}
+        analysis = {
+            name: found for name, found in _third_party_imports().items() if name not in renderers
+        }
+        assert not any(analysis.values()), analysis
+        # And the check is not vacuous: the renderers really do import them.
+        assert any(_third_party_imports()[name] for name in renderers)
+
+
+def _third_party_imports(packages=("textual", "rich")):
+    """Which slurmpast modules import which of ``packages``, by static read."""
+    import ast
+
+    found = {}
+    for path in sorted(_SRC.glob("*.py")):
+        hits = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            roots = []
+            if isinstance(node, ast.Import):
+                roots = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                roots = [node.module.split(".")[0]]
+            hits.update(r for r in roots if r in packages)
+        found[path.name] = sorted(hits)
+    return found
+
+
+class TestRecordedLogPaths:
+    """From Slurm 21.08 sacct records StdOut/StdErr -- as patterns, unexpanded."""
+
+    def _job(self, **kw):
+        base = {
+            "JobID": "60",
+            "JobName": "train",
+            "User": "me",
+            "State": "FAILED",
+            "ElapsedRaw": "60",
+            "WorkDir": "/work",
+            "NodeList": "node[5-6]",
+        }
+        base.update(kw)
+        return parse(row(**base))[0]
+
+    def test_the_default_pattern_is_expanded(self):
+        job = self._job(StdOut="/work/slurm-%j.out")
+        assert logs.expand_pattern(job.std_out, job) == "/work/slurm-60.out"
+
+    def test_an_array_element_uses_its_own_allocation_number_for_j(self):
+        job = self._job(JobID="60_4", JobIDRaw="73")
+        assert logs.expand_pattern("/w/o-%A_%a-%j.out", job) == "/w/o-60_4-73.out"
+
+    def test_the_job_name_and_user_codes(self):
+        job = self._job()
+        assert logs.expand_pattern("/w/%u-%x.log", job) == "/w/me-train.log"
+
+    def test_a_zero_pad_width_is_honoured(self):
+        job = self._job()
+        assert logs.expand_pattern("/w/%6j.out", job) == "/w/000060.out"
+
+    def test_a_literal_percent(self):
+        job = self._job()
+        assert logs.expand_pattern("/w/100%%.out", job) == "/w/100%.out"
+
+    def test_the_node_code_resolves_to_the_first_node(self):
+        job = self._job()
+        assert logs.expand_pattern("/w/%N.out", job) == "/w/node5.out"
+
+    def test_an_unresolvable_code_yields_nothing_rather_than_a_stray_percent(self):
+        job = self._job(NodeList="")
+        assert logs.expand_pattern("/w/%N.out", job) == ""
+
+    def test_a_relative_pattern_is_resolved_against_the_work_directory(self):
+        job = self._job(StdErr="logs/err-%j.txt")
+        assert logs.recorded_paths(job) == ["/work/logs/err-60.txt"]
+
+    def test_stderr_is_preferred_and_duplicates_collapse(self):
+        job = self._job(StdOut="/work/j-%j.out", StdErr="/work/j-%j.err")
+        assert logs.recorded_paths(job) == ["/work/j-60.err", "/work/j-60.out"]
+        same = self._job(StdOut="/work/j-%j.out", StdErr="/work/j-%j.out")
+        assert logs.recorded_paths(same) == ["/work/j-60.out"]
+
+    def test_a_cluster_recording_nothing_yields_nothing(self):
+        assert logs.recorded_paths(self._job()) == []
+
+    def test_the_recorded_path_is_searched_before_a_guessed_one(self):
+        job = self._job(StdErr="/work/real-%j.err")
+        candidates = logs.candidate_paths(job)
+        assert candidates[0] == "/work/real-60.err"
+        assert "/work/slurm-60.out" in candidates
+
+    def test_it_is_still_confirmed_to_exist_rather_than_trusted(self, tmp_path):
+        real = tmp_path / "out-60.err"
+        real.write_text("boom\n")
+        job = self._job(StdErr=str(tmp_path / "out-%j.err"))
+        assert logs.find_log(job) == str(real)
+        missing = self._job(StdErr=str(tmp_path / "absent-%j.err"))
+        assert logs.find_log(missing) is None
+
+
+class TestSqueueReconciliation:
+    def test_the_fallback_asks_for_one_user_not_the_whole_cluster(self):
+        """`--me` arrived in Slurm 20.02. The old fallback dropped the filter
+        entirely, which on a busy cluster returns every queued job there is."""
+        calls = []
+
+        def runner(args):
+            calls.append(args)
+            if "--me" in args:
+                raise SacctError("squeue: unrecognized option '--me'")
+            return "123\n456\n"
+
+        assert live_job_ids(runner=runner, user="alice") == {"123", "456"}
+        assert calls[1] == ["squeue", "--noheader", "-u", "alice", "--format=%i"]
+
+    def test_no_squeue_at_all_returns_none_so_nothing_is_guessed(self):
+        def broken(_args):
+            raise SacctError("no squeue")
+
+        assert live_job_ids(runner=broken, user="alice") is None
+
+
+class TestValueShapesAcrossReleases:
+    def test_reqmem_zero_is_not_a_zero_byte_ceiling(self):
+        assert parse_bytes("0n") in (0, None)
+        job = parse(row(JobID="70", JobName="w", State="COMPLETED", ReqMem="0n"))[0]
+        assert job.mem_limit_bytes is None
+
+    def test_units_are_read_whichever_sacct_chose(self):
+        """Default output converts to the largest unit; --noconvert and --units
+        do not. All three shapes reach this parser."""
+        assert parse_bytes("204800M") == 200 * 1024**2 * 1024
+        assert parse_bytes("200G") == 200 * 1024**3
+        assert parse_bytes("209715200K") == 200 * 1024**3
+        assert parse_bytes("1.50G") == int(1.5 * 1024**3)
+
+    def test_sentinels_are_matched_whatever_their_case(self):
+        job = parse(
+            row(
+                JobID="71",
+                JobName="w",
+                State="COMPLETED",
+                Timelimit="UNLIMITED",
+                Reason="none",
+                End="Unknown",
+            )
+        )[0]
+        assert job.timelimit is None
+        assert job.reason == ""
+
+    def test_a_partition_limit_timelimit_is_not_a_duration(self):
+        job = parse(row(JobID="72", JobName="w", State="PENDING", Timelimit="Partition_Limit"))[0]
+        assert job.timelimit is None
+
+    def test_a_heterogeneous_job_component_keys_to_its_own_component(self):
+        text = "\n".join(
+            [
+                row(JobID="80+0", JobName="w", State="COMPLETED", ElapsedRaw="60"),
+                row(JobID="80+0.0", JobName="s", State="COMPLETED", TotalCPU="00:01:00"),
+                row(JobID="80+1", JobName="w", State="COMPLETED", ElapsedRaw="60"),
+            ]
+        )
+        jobs = parse(text)
+        assert [j.job_id for j in jobs] == ["80+0", "80+1"]
+        assert len(jobs[0].steps) == 1 and not jobs[1].steps
+
+    def test_an_array_element_keeps_its_task_index(self):
+        text = "\n".join(
+            [
+                row(JobID="90_3", JobName="w", State="COMPLETED", ElapsedRaw="60"),
+                row(JobID="90_3.batch", JobName="batch", State="COMPLETED", TotalCPU="00:01:00"),
+            ]
+        )
+        jobs = parse(text)
+        assert jobs[0].job_id == "90_3"
+        assert jobs[0].total_cpu == 60.0
+
+    def test_a_pending_array_expression_is_not_treated_as_a_finished_job(self):
+        job = parse(row(JobID="91_[5-9]", JobName="w", State="PENDING"))[0]
+        assert job.open_ended, "no End and a non-terminal state: excluded from totals"
+
+
+class TestTresParsingIsExact:
+    def test_a_key_is_not_matched_by_prefix(self):
+        """`gres/gpumem` must not be read as `gres/gpu`."""
+        assert model._tres_int("gres/gpumem=36266,cpu=4", "gres/gpu") is None
+
+    def test_a_typed_key_is_not_confused_with_another_resource(self):
+        assert model._typed_tres_total("gres/gpumem:x=5", "gres/gpu") is None
+
+    def test_a_percentage_is_read_as_a_float(self):
+        assert model._tres_float("gres/gpuutil=87.5", "gres/gpuutil") == 87.5
+        assert model._tres_float("gres/gpuutil=nan-ish", "gres/gpuutil") is None
+        assert model._tres_float("", "gres/gpuutil") is None

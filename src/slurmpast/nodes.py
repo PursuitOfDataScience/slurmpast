@@ -22,10 +22,16 @@ from .patterns import usable
 MIN_SAMPLES = 10
 Z = 1.96  # 95%
 
-# Tolerates a suffix after the bracket (``node[1-2]-ib``), which some
-# site naming schemes produce; without it the whole string was treated as
-# a single node name.
-_RANGE = re.compile(r"^([A-Za-z0-9\-]*?)\[(.+?)\](.*)$")
+# The first bracketed range in a name, with whatever precedes and follows it.
+# The prefix is deliberately unconstrained: a character class enumerating what a
+# node name may contain got `cn_[01-02]` and `gpu.node[1-2]` wrong, both of which
+# `scontrol show hostnames` expands happily.
+_RANGE = re.compile(r"^([^\[\]]*)\[([^\[\]]+)\](.*)$")
+
+# Guard against a pathological expression eating memory. A real allocation is
+# thousands of nodes at the very top end; this is far above any of them and only
+# exists so a malformed `[0-999999999]` cannot hang the tool.
+MAX_EXPANSION = 65536
 
 
 def expand_nodelist(nodelist):
@@ -33,29 +39,63 @@ def expand_nodelist(nodelist):
 
     Slurm compresses NodeList, so counting occurrences of the raw string
     undercounts multi-node jobs and mis-attributes their failures.
+
+    Handles the whole hostlist grammar Slurm accepts, verified against
+    ``scontrol show hostnames``:
+
+      ``midway3-[0277-0279,0281]``  ranges and singletons, zero-padded
+      ``unit[0-3]rack[0-2]``        several ranges in one name, expanded as the
+                                    cartesian product -- 12 nodes, not 4
+      ``node[0001-0010]-int``       a shared suffix (Slurm 23.11 and later)
+      ``cn_[01-02]``                underscores and dots in the prefix
+      ``a1,b[2-3],c``               a list, with commas inside brackets kept
+
+    The multi-range form was the expensive one to get wrong: it yielded
+    ``unit0rack[0-2]`` as a *node name*, so every node in such an allocation was
+    invisible to the reliability table and none of its failures were attributed.
     """
     if not nodelist or nodelist.startswith("None"):
         return []
     out = []
     for chunk in _split_top_level(nodelist):
-        match = _RANGE.match(chunk)
-        if not match:
-            out.append(chunk)
-            continue
-        prefix, body, suffix = match.group(1), match.group(2), match.group(3)
-        for part in body.split(","):
-            part = part.strip()
-            if "-" in part:
-                low, _, high = part.partition("-")
-                width = len(low)
-                try:
-                    for value in range(int(low), int(high) + 1):
-                        out.append("%s%0*d%s" % (prefix, width, value, suffix))
-                except ValueError:
-                    out.append(prefix + part + suffix)
-            elif part:
-                out.append(prefix + part + suffix)
+        out.extend(_expand_one(chunk))
+        if len(out) > MAX_EXPANSION:
+            return out[:MAX_EXPANSION]
     return out
+
+
+def _expand_one(name):
+    """Expand every bracketed range in one host expression, left to right."""
+    match = _RANGE.match(name)
+    if not match:
+        return [name] if name else []
+    prefix, body, rest = match.group(1), match.group(2), match.group(3)
+
+    heads = []
+    for part in body.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        low, dash, high = part.partition("-")
+        if not dash:
+            heads.append(prefix + part)
+            continue
+        width = len(low)
+        try:
+            first, last = int(low), int(high)
+        except ValueError:
+            # Not a numeric range after all; keep it verbatim rather than invent
+            # names, so an unfamiliar expression degrades to one unmatched node.
+            heads.append(prefix + part)
+            continue
+        if last < first or last - first > MAX_EXPANSION:
+            heads.append(prefix + part)
+            continue
+        heads.extend("%s%0*d" % (prefix, width, value) for value in range(first, last + 1))
+
+    # `rest` may hold further ranges (`unit[0-3]rack[0-2]`) or a plain suffix.
+    tails = _expand_one(rest) if rest else [""]
+    return [head + tail for head in heads for tail in tails]
 
 
 def _split_top_level(text):

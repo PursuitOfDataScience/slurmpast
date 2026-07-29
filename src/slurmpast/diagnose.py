@@ -58,6 +58,14 @@ PAGING_FLOOR = 1000
 MEM_SLACK = 0.35
 MEM_SLACK_FLOOR = 32 * 1024**3  # 32 GiB unused
 
+# Recorded GPU utilization below which a card was not being driven at all, and
+# below which it was driven but not filled. Only reachable on a site running
+# AutoDetect=nvml; where Slurm gathers nothing these stay unused and the
+# host-CPU proxy speaks instead. 5% is generous -- an idle card that still
+# services memory copies reads a few percent.
+GPU_IDLE = 0.05
+GPU_UNDERUSED = 0.40
+
 _CUDA_OOM_MARKERS = (
     "cuda out of memory",
     "cuda error: out of memory",
@@ -188,11 +196,12 @@ def _memory_rules(job, add):
     if state == "OUT_OF_MEMORY":
         detail = "Killed by the cgroup OOM handler (this state is event-driven, so it is reliable)."
         if rss is not None and limit is not None and rss > limit:
+            from .site import maxrss_caveat
+
             detail += (
-                " Note MaxRSS reports %s against a %s limit -- above the hard limit, which is "
-                "impossible for a working set. jobacct_gather/linux sums RSS over the process "
-                "tree and double-counts shared pages, so do not size --mem from it."
-                % (format_bytes(rss), format_bytes(limit))
+                " Note MaxRSS reports %s against a %s per-node limit -- above the hard limit, "
+                "which is impossible for a working set: %s. Do not size --mem from it."
+                % (format_bytes(rss), format_bytes(limit), maxrss_caveat())
             )
         add(
             Finding(
@@ -207,14 +216,15 @@ def _memory_rules(job, add):
         return
 
     if rss is not None and limit is not None and rss > limit:
+        from .site import maxrss_caveat
+
         add(
             Finding(
                 WARNING,
                 "rss-above-limit",
                 "Peak memory reads above the limit, yet nothing was OOM-killed",
-                "%s against a %s limit: MaxRSS sums shared pages across the process "
-                "tree, so it is not this job's footprint."
-                % (format_bytes(rss), format_bytes(limit)),
+                "%s against a %s per-node limit, so it is not this job's footprint: %s."
+                % (format_bytes(rss), format_bytes(limit), maxrss_caveat()),
                 "Measure the cgroup working set live (slurmwatch) before sizing --mem.",
             )
         )
@@ -279,15 +289,23 @@ def _cpu_rules(job, add):
     cores = job.cpu_count
     if util is not None and cores and cores > 1 and util < LOW_CPU_UTIL:
         effective = util * cores
+        # --cpus-per-task is per task, while every CPU figure sacct reports is a
+        # total over the allocation. Suggesting the total told a 90-core, 15-node
+        # job to ask for 90 cores per task.
+        per_task = job.cpus_per_task or cores
+        busy_per_task = util * per_task
+        shape = ""
+        if job.task_count > 1:
+            shape = " across %d tasks" % job.task_count
         add(
             Finding(
                 WARNING,
                 "cpu-overrequest",
                 "Most allocated cores were idle",
-                "Utilization %s of %d cores, i.e. about %.1f cores of real work."
-                % (format_percent(util), cores, effective),
+                "Utilization %s of %d cores%s, i.e. about %.1f cores of real work."
+                % (format_percent(util), cores, shape, effective),
                 "Try --cpus-per-task=%d, unless those cores feed dataloader workers."
-                % max(1, int(effective + 0.999)),
+                % max(1, int(busy_per_task + 0.999)),
             )
         )
 
@@ -420,8 +438,43 @@ def _traceback_tail(log_text, max_lines=6):
 def _gpu_rules(job, add):
     if not job.gpu_count or job.open_ended:
         return
+    if looks_like_noop(job):
+        return
+
+    # Where the site runs AutoDetect=nvml, Slurm gathered gres/gpuutil and there
+    # is nothing to infer. Prefer the measurement over the proxy: the CPU-based
+    # hint below exists only because most clusters record no such thing.
+    measured = job.gpu_utilization
+    if measured is not None:
+        if measured < GPU_IDLE:
+            add(
+                Finding(
+                    CRITICAL,
+                    "gpu-idle",
+                    "GPUs were held but barely used",
+                    "%d GPU(s) held for %s at %s average utilization, as recorded by Slurm."
+                    % (job.gpu_count, format_duration(job.elapsed), format_percent(measured)),
+                    "This is a measurement, not an inference. Either the work is not on the "
+                    "device or the device is waiting on input -- check the dataloader before "
+                    "asking for more cards.",
+                )
+            )
+        elif measured < GPU_UNDERUSED:
+            add(
+                Finding(
+                    WARNING,
+                    "gpu-underused",
+                    "GPUs were only partly busy",
+                    "%s average utilization across %d device(s) over %s."
+                    % (format_percent(measured), job.gpu_count, format_duration(job.elapsed)),
+                    "Raise the work per step -- batch size, sequence length, or fewer "
+                    "grad-accumulation micro-steps -- until the card is the bottleneck.",
+                )
+            )
+        return
+
     util = job.cpu_utilization
-    if util is None or looks_like_noop(job):
+    if util is None:
         return
     # A CUDA process must burn host CPU to launch kernels. Very low CPU with GPUs
     # held is a strong hint the GPUs were never driven -- but it is a hint, so
@@ -435,8 +488,8 @@ def _gpu_rules(job, add):
                 "%d GPU(s) held for %s at %s CPU utilization; kernel launches consume host "
                 "CPU, so this suggests the GPUs were mostly unused."
                 % (job.gpu_count, format_duration(job.elapsed), format_percent(util)),
-                "Confirm with live telemetry (slurmwatch): post-hoc GPU utilization is not "
-                "recorded here.",
+                "Confirm with live telemetry (slurmwatch): this cluster does not record "
+                "post-hoc GPU utilization, so the reading above is a proxy.",
             )
         )
 

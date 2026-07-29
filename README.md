@@ -8,7 +8,7 @@
   <a href="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
-  <img src="https://img.shields.io/badge/tests-473-brightgreen.svg" alt="473 tests">
+  <img src="https://img.shields.io/badge/tests-769-brightgreen.svg" alt="769 tests">
 </p>
 
 <p align="center">
@@ -70,31 +70,66 @@ object afterwards. The marker carries the resource's identity, the bar and the
 number carry the magnitude, and the verdict lives in the findings below.
 
 ```
-  ● TIME   ████████████████▉░    94.0%   · 1h52m49s of 2h00m00s
-  ● CPU    █████████████▎░░░░    73.5%   · 5h31m39s of 7h31m16s over 4 cores
-  ● KERNEL ▉░░░░░░░░░░░░░░░░░     4.7%   · 15m36s of 5h31m39s in the kernel
-  ● MEM    ████████████████▋░    92.3%   · 184.6 GiB of 200.0 GiB, peak on midway3-0600
-  ● GPU    ░░░░░░░░░░░░░░░░░░      n/a   · 3 devices, 5.6 GPU-hours — not recorded by Slurm
-  ● DISK   ░░░░░░░░░░░░░░░░░░  35.5 MiB/s  · read 105.0 GiB, wrote 130.0 GiB
+  ● TIME   ████████████████▉░        94.0%   · 01:52:49 of the 02:00:00 limit
+  ● CPU    █████████████▎░░░░        73.5%   · 2.9 of 4 cores busy
+  ● MEM    ████████████████▋░        92.3%   · 184.6 GiB of the 200.0 GiB limit
 ```
+
+Three rows, because a gauge needs a ceiling to be a fraction of. Kernel share,
+disk rate and GPU count have none, so they are printed as numbers below rather
+than as bars that can never fill — an unfillable `░░░░` reads as a measured zero.
 
 Below that: every field Slurm recorded, then the findings.
 
+```
+  gpu
+    devices          3                       gpu-hours        5.6
+    utilization      87.4%
+    device memory    35.4 GiB peak
+```
+
+That `utilization` is real wherever `gres.conf` sets `AutoDetect=nvml`. Where the
+cluster does not gather it, the row says so and names the setting instead of
+printing a zero.
+
 ## Why the numbers differ from `seff`
 
-Six traps, each found on a real record, each with a regression test naming the
+Seven traps, each found on a real record, each with a regression test naming the
 job id:
 
 | Trap | Reality |
 |---|---|
 | `ReqMem` is `0n` on **2,130 of 6,574** jobs | the real ceiling is in `AllocTRES` |
-| `MaxRSS` reports **51.25 GiB against a 40 GiB limit** that OOM-killed | it sums RSS across the process tree, double-counting shared pages |
+| `AllocTRES` `mem=` is the **allocation total** | `--mem` and the cgroup are per *node*; a 2-node `--mem=8G` job records `mem=16G`, so dividing MaxRSS by it understates memory by the node count |
+| `MaxRSS` reports **51.25 GiB against a 40 GiB limit** that OOM-killed | under `jobacct_gather/linux` it sums RSS across the process tree, double-counting shared pages — so the caveat is read from your `JobAcctGatherType`, not assumed |
 | `MaxRSS` differs **4000×** between steps of one job | take the max, not a step |
 | `TotalCPU` exists **only on steps** | read it from `.batch` |
 | `State=RUNNING, End=Unknown` months after death | `Elapsed` becomes *now − start*; one record was 65% of a GPU-hour total |
 | `sacct --state=X` returns **zero rows** without `-E` | always pass an end time |
 
 A value that cannot be read prints `n/a`, never `0`.
+
+## Any Slurm cluster
+
+Developed on one cluster, but nothing here is calibrated to it. Every place the
+scheduler differs between sites is negotiated rather than assumed, and each of
+these is a regression test in `tests/test_portability.py`:
+
+| What varies | What it does about it |
+|---|---|
+| **Field names change.** Slurm 23.02 renamed `Reserved` → `Planned` | asks for whichever spelling your `sacct` accepts and reads it back under one name. Treating it as merely *optional* silently dropped queue wait on every cluster from 23.02 on |
+| **`SLURM_TIME_FORMAT`** rewrites every timestamp | pinned to `standard` for the child process. A site exporting `relative` turns `2026-04-29T14:55:48` into `29 Apr 14:55`, which stops dates parsing and makes the chronological sort alphabetical on a month name |
+| **`--constraint="v100\|a100"`** puts a pipe in a column, and `--parsable2` does not escape it | asks for an ASCII unit separator via `--delimiter` (in sacct since 17.11), falling back if absent. A pipe in field 32 shifted every memory, CPU and disk column after it |
+| **Hostlists** can be `unit[0-31]rack[0-41]`, `node[0001-0010]-int`, `cn_[01-02]` | full expansion, differential-tested against `scontrol show hostnames`. The multi-range form used to yield `unit0rack[0-2]` *as a node name*, hiding every node in such an allocation |
+| **GPUs** appear as `gres/gpu=4`, `gres/gpu:a100=4`, or pre-20.11 `AllocGRES=gpu:4` | all three read; typed entries summed |
+| **`gres/gpuutil`** is gathered wherever `gres.conf` sets `AutoDetect=nvml` | real GPU utilization and peak HBM where recorded — and the idle-GPU finding becomes a measurement instead of an inference from host CPU |
+| **`JobAcctGatherType`** decides what MaxRSS *is* | `jobacct_gather/cgroup` gives a genuine high-water mark, so the "double-counts shared pages" warning is withheld there rather than repeated |
+| **`StdOut`/`StdErr`** exist from Slurm 21.08 | used, with `%j`/`%A`/`%a`/`%x`/`%N` expanded, before falling back to guessing a filename |
+| **`--me`** needs Slurm 20.02 | falls back to `-u <you>`, not to an unfiltered `squeue` over the whole cluster |
+| **Accounting may be off**, or `sacct` absent | a one-line explanation and exit 2, never a traceback; the query has a timeout so an unreachable `slurmdbd` cannot hang the dashboard |
+
+`slurmpast --demo` pins a synthetic cluster config too, so the demo looks the
+same on a login node and on a laptop.
 
 ## Built for a real history
 
@@ -112,23 +147,28 @@ which does not justify a database. Logs are read only when you open a job.
 
 ## Everything it extracts
 
-All 107 `sacct` fields that carry a distinct measurement — 2.26s over seven
-months, against 1.38s for a minimal 27.
+85 `sacct` fields — every one of the 107 this Slurm offers that carries a
+distinct measurement, with pure redundancy (`DBIndex`, `BlockID`, duplicate
+spellings of the same TRES) left out. The wide query costs 2.26s over seven
+months against 1.38s for a minimal 27, so nobody has to re-run it because the
+number they wanted was never collected.
 
 | group | captured |
 |---|---|
 | **cpu** | total, **user vs kernel split**, utilization, frequency, per-task min/average, slowest task with its node |
-| **memory** | limit, peak with the **node and task that hit it**, average, task imbalance, virtual size, page faults |
+| **memory** | ceiling **per node and per allocation**, peak with the node and task that hit it, average, task imbalance, virtual size, page faults |
 | **filesystem** | **read and write separately**, rate |
+| **gpu** | devices, GPU-hours, and **utilization and peak HBM where the site gathers them** |
 | **timing** | submit/start/end, elapsed, limit, queue wait, **backfill vs main scheduler**, priority |
 | **outcome** | state, exit code and signal, worst step exit, reason |
+| **provenance** | work directory, recorded stdout/stderr paths, **the submit line itself** |
 | per step | all of the above, for `.batch`, `.extern` and each srun step |
 
 Two were entirely invisible with a narrow `--format`: **disk writes** (one run
 read 112 GB and wrote 139 GB) and the **user/kernel CPU split** (791 of 6,582
 jobs exceed 30% kernel time — syscall overhead no other tool surfaces).
 
-`--json` emits all of it — 165 values per job. Nothing is captured and then hidden; a test fails if a field is read but never surfaced.
+`--json` emits all of it — 174 values per job. Nothing is captured and then hidden; a test fails if a field is read but never surfaced.
 
 ## Also finds
 
@@ -161,11 +201,15 @@ for advice in recommend(history.groups[0].jobs):
     print(advice.flag, advice.verdict, advice.suggestion)
 ```
 
-Developed against Slurm 20.11.8 and Textual 0.89–8.2; CI covers Python 3.10–3.13,
-both Textual ends, and a no-Slurm machine. Field availability varies by Slurm
-version, so fields are probed and unsupported ones dropped.
+Developed against Slurm 20.11.8 and Textual 0.89–8.2; verified against the Slurm
+documentation and release notes from 17.11 to 26.05, and against `scontrol show
+hostnames` for node-name expansion. CI covers Python 3.10–3.13, both Textual
+ends, and a no-Slurm machine.
 
-Thresholds are heuristics tuned against one cluster's history — conservative, but
-not validated elsewhere. `--nodes` is the piece most likely to need recalibration.
+What is *measured* is portable; what is *judged* is not. The thresholds — when a
+CPU share is low, when kernel time is heavy, when a node counts as worse — are
+heuristics from one cluster's history. They are conservative and each one is a
+named constant, so recalibrating means editing a number rather than the logic.
+`--nodes` is the piece most likely to need it.
 
 MIT.

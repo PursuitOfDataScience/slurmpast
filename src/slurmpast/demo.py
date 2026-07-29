@@ -18,6 +18,17 @@ from __future__ import annotations
 
 from .sacct import parse
 
+# The synthetic cluster's own configuration, in `scontrol show config` form so it
+# feeds site.site() exactly as a real cluster would. Pinned so `--demo` renders
+# identically whether it runs on a login node or a laptop -- several messages are
+# worded from JobAcctGatherType, and without this the demo changed by machine.
+DEMO_SITE = """\
+SLURM_VERSION           = 20.11.8
+JobAcctGatherType       = jobacct_gather/linux
+AccountingStorageType   = accounting_storage/slurmdbd
+AccountingStorageTRES   = cpu,mem,energy,node,billing,fs/disk,vmem,pages,gres/gpu
+"""
+
 _FIELDS_ORDER = None  # resolved lazily from sacct._FIELDS
 
 

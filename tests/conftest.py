@@ -13,8 +13,30 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 from slurmpast.sacct import _FIELDS, parse  # noqa: E402
+from slurmpast.site import Site, reset_cache  # noqa: E402
 
 FIELDS = _FIELDS
+
+# The cluster these fixtures were recorded on. Pinned for every test because
+# several messages are worded from the site configuration -- MaxRSS means
+# something different under jobacct_gather/cgroup -- and without this the suite
+# would assert one thing on Midway3 and another on a CI runner with no scontrol
+# at all. Tests that care about a different site override it explicitly.
+RECORDED_SITE = Site(
+    slurm_version="20.11.8",
+    jobacct_gather_type="jobacct_gather/linux",
+    accounting_storage_type="accounting_storage/slurmdbd",
+    tres=("cpu", "mem", "energy", "node", "billing", "fs/disk", "vmem", "pages", "gres/gpu"),
+)
+
+
+@pytest.fixture(autouse=True)
+def _pinned_site(monkeypatch):
+    """No test may reach the local scheduler for its configuration."""
+    reset_cache()
+    monkeypatch.setattr("slurmpast.site._CACHE", [RECORDED_SITE])
+    yield
+    reset_cache()
 
 
 def _row(**kw):

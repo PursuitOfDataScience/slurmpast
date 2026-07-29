@@ -1,14 +1,16 @@
 """Typed records for a finished job.
 
-Slurm 20.11 exposes 107 accounting fields. This captures every one that carries
-a distinct measurement -- CPU split by user and kernel, memory peak *and*
-average with the node and task that hit it, disk read and write separately,
-paging, CPU frequency, per-task minima for straggler detection, queue wait, and
-how the scheduler placed the job. Pure redundancy (``DBIndex``, ``BlockID``,
-``McsLabel``, duplicate spellings of the same TRES) is left out.
+Slurm 20.11 offers 107 accounting fields; :data:`slurmpast.sacct._FIELDS` asks for
+the 85 that carry a distinct measurement -- CPU split by user and kernel, memory
+peak *and* average with the node and task that hit it, disk read and write
+separately, paging, CPU frequency, per-task minima for straggler detection, queue
+wait, and how the scheduler placed the job. Pure redundancy (``DBIndex``,
+``BlockID``, ``McsLabel``, duplicate spellings of the same TRES) is left out. Some
+of the 85 exist only on newer releases and are dropped where they do not; see
+``sacct``.
 
-The cost of the wide query was measured before committing to it: all 107 fields
-over a seven-month history take 2.26 s against 1.38 s for a minimal 27. Being
+The cost of the wide query was measured before committing to it: the full list
+over a seven-month history takes 2.26 s against 1.38 s for a minimal 27. Being
 thorough is nearly free, and it means a user never has to re-run with a bigger
 ``--format`` because the number they wanted was not collected.
 
@@ -90,6 +92,7 @@ class Step(NamedTuple):
     tres_out_tot: str = ""
     tres_in_max: str = ""
     tres_in_max_node: str = ""
+    tres_in_ave: str = ""
     consumed_energy: int | None = None
 
     @property
@@ -116,6 +119,30 @@ class Step(NamedTuple):
         """
         value = _tres_bytes(self.tres_out_tot, "fs/disk")
         return value if value is not None else self.max_disk_write
+
+    @property
+    def gpu_utilization(self) -> float | None:
+        """Average GPU busy-ness over the step, as a fraction, or None.
+
+        ``gres/gpuutil`` is a percentage Slurm gathers per rank when the site runs
+        ``AutoDetect=nvml``; ``TRESUsageInAve`` is its mean across the ranks of
+        this step. Absent on any cluster that does not autodetect -- including the
+        one this tool was written on -- which is why every other GPU figure here
+        is careful to say it was not measured rather than that it was zero.
+        """
+        percent = _tres_float(self.tres_in_ave, "gres/gpuutil")
+        if percent is None:
+            percent = _tres_float(self.tres_in_max, "gres/gpuutil")
+        if percent is None:
+            return None
+        return percent / 100.0
+
+    @property
+    def gpu_mem_bytes(self) -> int | None:
+        """Peak GPU memory across the step's ranks, from ``gres/gpumem``."""
+        return _tres_bytes(self.tres_in_max, "gres/gpumem") or _tres_bytes(
+            self.tres_in_ave, "gres/gpumem"
+        )
 
 
 class Job(NamedTuple):
@@ -159,6 +186,11 @@ class Job(NamedTuple):
     req_cpus: int | None = None
     req_nodes: int | None = None
     req_tres: str = ""
+    # Pre-20.11 spelling of the GPU request. Slurm removed these fields in 20.11
+    # in favour of TRES, so they are only ever populated on an older cluster --
+    # where they are the only place the GPU count exists.
+    req_gres: str = ""
+    alloc_gres: str = ""
     constraints: str = ""
     req_cpu_freq_min: str = ""
     req_cpu_freq_max: str = ""
@@ -186,6 +218,12 @@ class Job(NamedTuple):
     comment: str = ""
     admin_comment: str = ""
     layout: str = ""
+    # Recorded output paths, present from Slurm 21.08. Still *patterns*: sacct
+    # stores them as written, so ``%j`` and friends are unexpanded (until
+    # --expand-patterns in 24.05). See logs.expand_pattern.
+    std_out: str = ""
+    std_err: str = ""
+    submit_line: str = ""
 
     steps: tuple = ()
     open_ended: bool = False
@@ -229,7 +267,27 @@ class Job(NamedTuple):
 
     @property
     def gpu_count(self) -> int:
-        return _tres_int(self.alloc_tres, "gres/gpu") or _tres_int(self.req_tres, "gres/gpu") or 0
+        """Devices held by the whole allocation, however this cluster records them.
+
+        Three spellings, because sites differ in ways a post-mortem cannot ask
+        about. ``gres/gpu=4`` is the modern untyped form. ``gres/gpu:a100=4``
+        appears when the request named a model; Slurm normally emits the untyped
+        total alongside it, but not on every release, so the typed entries are
+        summed as a fallback. ``AllocGRES=gpu:4`` is the pre-20.11 field, which is
+        the only place the count exists on a cluster old enough to have it.
+        """
+        for tres in (self.alloc_tres, self.req_tres):
+            count = _tres_int(tres, "gres/gpu")
+            if count:
+                return count
+            count = _typed_tres_total(tres, "gres/gpu")
+            if count:
+                return count
+        for gres in (self.alloc_gres, self.req_gres):
+            count = _gres_int(gres, "gpu")
+            if count:
+                return count
+        return 0
 
     @property
     def cpu_count(self) -> int:
@@ -247,6 +305,22 @@ class Job(NamedTuple):
             return self.ntasks
         counts = [s.ntasks for s in self.steps if s.ntasks]
         return max(counts) if counts else 0
+
+    @property
+    def cpus_per_task(self) -> float | None:
+        """Cores behind one task -- the quantity ``--cpus-per-task`` actually sets.
+
+        Every CPU field sacct reports is a total over the allocation, so on a
+        single-task job this is just :attr:`cpu_count` and nothing changes. On a
+        15-node, 90-core job it is the difference between advising
+        ``--cpus-per-task=6`` and advising ``--cpus-per-task=90``.
+        """
+        cpus = self.cpu_count
+        if not cpus:
+            return None
+        # Tasks first; a job that recorded none still ran at least one per node.
+        divisor = self.task_count or self.node_count or 1
+        return cpus / float(divisor)
 
     @property
     def batch_step(self) -> Step | None:
@@ -477,8 +551,8 @@ class Job(NamedTuple):
         return (max(values) / float(low)) if low else None
 
     @property
-    def mem_limit_bytes(self) -> int | None:
-        """The memory ceiling the job actually had, or None.
+    def mem_limit_total_bytes(self) -> int | None:
+        """Memory granted to the whole allocation, summed over its nodes.
 
         ``ReqMem`` is NOT authoritative: it reads ``0n`` for 2,130 of 6,574 real
         jobs here -- the most common value in the whole history -- while
@@ -492,11 +566,50 @@ class Job(NamedTuple):
         if allocated:
             return allocated
         if self.req_mem_bytes:
+            scope = self.req_mem_scope
+            if scope == "node":
+                return self.req_mem_bytes * self.node_count
+            if scope == "cpu":
+                return self.req_mem_bytes * (self.cpu_count or 1)
+            # Slurm 21.08 changed ReqMem to mirror ReqTRES: no n/c suffix, and
+            # the figure is already the allocation total.
             return self.req_mem_bytes
         return _tres_bytes(self.req_tres, "mem") or None
 
     @property
+    def mem_limit_bytes(self) -> int | None:
+        """The ceiling **one node** had, which is what MaxRSS must be judged against.
+
+        ``AllocTRES`` reports ``mem=`` for the whole allocation: a 2-node job
+        submitted with ``--mem=8G`` records ``mem=16G`` (verified on job
+        51553906). ``MaxRSS`` is the peak of a single task, so dividing one by the
+        other understated memory use by exactly the node count -- and on a 15-node
+        job it produced "Peak 40 GiB of a 750 GiB limit, 710 GiB never used" about
+        a job that was running at 80% of its real ceiling.
+
+        ``--mem`` is per node too, so this is also the number the sizing advice
+        has to be built from. Single-node jobs are unaffected, which is why the
+        error stayed invisible on a history that is almost entirely single-node.
+        """
+        if self.req_mem_scope == "node" and self.req_mem_bytes:
+            # An explicit per-node request, on Slurm 20.11 and older. No division
+            # to get wrong: this is already the per-node figure.
+            return self.req_mem_bytes
+        total = self.mem_limit_total_bytes
+        if not total:
+            return None
+        nodes = self.node_count or 1
+        return int(total // nodes) or None
+
+    @property
     def mem_utilization(self) -> float | None:
+        """Peak resident memory on one node against that node's ceiling.
+
+        Both halves are per node -- see :attr:`mem_limit_bytes`. Still an
+        underestimate when several tasks share a node, since MaxRSS is one task's
+        peak rather than the node's; that is a limit of what Slurm records, not a
+        choice made here.
+        """
         rss, limit = self.max_rss, self.mem_limit_bytes
         if rss is None or not limit:
             return None
@@ -556,6 +669,25 @@ class Job(NamedTuple):
         return self.elapsed * self.gpu_count / 3600.0
 
     @property
+    def gpu_utilization(self) -> float | None:
+        """How busy the GPUs were, when the cluster gathered it.
+
+        The measurement no post-mortem tool has on most clusters, and the one this
+        codebase spent a warning inferring from host CPU time. Where
+        ``AutoDetect=nvml`` is configured it is simply recorded, so the inference
+        can stand down. Highest across work steps: a job whose training step ran
+        the cards hot is not idle because its setup step was.
+        """
+        values = [s.gpu_utilization for s in self.work_steps if s.gpu_utilization is not None]
+        return max(values) if values else None
+
+    @property
+    def gpu_mem_peak_bytes(self) -> int | None:
+        """Peak GPU memory used, when recorded. The HBM figure for right-sizing."""
+        values = [s.gpu_mem_bytes for s in self.steps if s.gpu_mem_bytes]
+        return max(values) if values else None
+
+    @property
     def core_hours(self) -> float | None:
         if self.elapsed is None or not self.cpu_count:
             return None
@@ -591,6 +723,16 @@ class Verdict(NamedTuple):
         return sorted(self.findings, key=lambda f: severity_rank(f.severity))[0]
 
 
+def _leading_int(value: str) -> int | None:
+    digits = ""
+    for char in value.strip():
+        if char.isdigit():
+            digits += char
+        else:
+            break
+    return int(digits) if digits else None
+
+
 def _tres_int(tres: str, key: str) -> int | None:
     """Integer out of ``cpu=6,gres/gpu=1,mem=80G``. None when absent."""
     if not tres:
@@ -599,14 +741,64 @@ def _tres_int(tres: str, key: str) -> int | None:
         name, _, value = field.partition("=")
         if name.strip() != key:
             continue
-        digits = ""
-        for char in value.strip():
-            if char.isdigit():
-                digits += char
-            else:
-                break
-        if digits:
-            return int(digits)
+        count = _leading_int(value)
+        if count is not None:
+            return count
+    return None
+
+
+def _typed_tres_total(tres: str, key: str) -> int | None:
+    """Sum of the model-qualified entries for ``key``: ``gres/gpu:a100=4`` -> 4.
+
+    Slurm usually emits the untyped total beside the typed ones, so this is a
+    fallback for the releases and configurations where it does not. Summing is
+    right rather than taking a max: a node can hold two models at once, and both
+    were allocated.
+    """
+    if not tres:
+        return None
+    prefix = key + ":"
+    total = 0
+    for field in tres.split(","):
+        name, _, value = field.partition("=")
+        if not name.strip().startswith(prefix):
+            continue
+        count = _leading_int(value)
+        if count is not None:
+            total += count
+    return total or None
+
+
+def _gres_int(gres: str, key: str) -> int | None:
+    """Count out of the pre-20.11 ``AllocGRES``/``ReqGRES`` form.
+
+    Colon-separated rather than TRES-shaped: ``gpu:4``, or ``gpu:tesla:4`` when
+    the request named a model. A bare ``gpu`` with no count means one device.
+    """
+    if not gres:
+        return None
+    total = 0
+    for field in gres.split(","):
+        parts = [p.strip() for p in field.strip().split(":") if p.strip()]
+        if not parts or parts[0].lower() != key:
+            continue
+        count = _leading_int(parts[-1]) if len(parts) > 1 else None
+        total += count if count is not None else 1
+    return total or None
+
+
+def _tres_float(tres: str, key: str) -> float | None:
+    """Decimal value out of a TRES string. Used for percentages, not sizes."""
+    if not tres:
+        return None
+    for field in tres.split(","):
+        name, _, value = field.partition("=")
+        if name.strip() != key:
+            continue
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
     return None
 
 

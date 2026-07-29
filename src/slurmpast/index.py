@@ -96,13 +96,19 @@ class GroupStats(NamedTuple):
     def cost(self) -> float:
         """Ranking weight, in core-hour equivalents.
 
-        Ordering GPU and CPU work in one list needs an exchange rate, and this
-        cluster does not supply one -- ``TRESBillingWeights`` is undefined on all
-        86 partitions, so there is no site answer to defer to. The hardware ratio
-        is the next most defensible thing: GPU nodes here carry 4 devices against
-        32-64 cores, i.e. 8-16 cores per GPU. ``GPU_CORE_EQUIVALENT`` takes the
-        upper end, which biases toward GPU work on the grounds that it is the
-        scarce resource (the ``gpu`` partition is 11 nodes against caslake's 191).
+        Ordering GPU and CPU work in one list needs an exchange rate, and Slurm
+        does not portably supply one. ``AllocTRES`` carries a ``billing=`` figure
+        that looks like the site's own answer, and deferring to it was tried and
+        rejected: where ``TRESBillingWeights`` is undefined -- the default, and the
+        case on the cluster this was measured on -- Slurm still emits ``billing``,
+        computed from default weights, so it comes out equal to the CPU count.
+        Ranking by it would silently price a GPU at one core and sort every GPU
+        workload down to where its CPU-hours put it.
+
+        So the hardware ratio is used instead: a GPU node typically carries 4 to 8
+        devices against 32-128 cores, i.e. roughly 8-16 cores per GPU.
+        ``GPU_CORE_EQUIVALENT`` takes the upper end, biasing toward GPU work on the
+        grounds that it is the scarcer resource almost everywhere.
 
         It is a convention, not a measurement, which is exactly why it is one
         named constant you can change rather than a factor buried in a sort key.

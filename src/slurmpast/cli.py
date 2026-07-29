@@ -147,17 +147,21 @@ def _glue_negative_values(argv):
     return out
 
 
-def _mark_open_records(jobs):
+def _mark_open_records(jobs, runner=None, user=None):
     """Reconcile anything unfinished against squeue.
 
     sacct reports State=RUNNING with End=Unknown for jobs that died long ago;
     its Elapsed is then now-minus-start. One such record read as 62 days and was
     65% of a GPU-hour total. Both a live job and a dead-but-open record have an
     unusable elapsed, so both get flagged.
+
+    ``runner`` is the same command runner the Sacct instance uses, so a caller
+    that injected one is not silently bypassed here and made to shell out for
+    real -- which is what a test or a replayed history would have done.
     """
     if not any(j.base_state == "RUNNING" or j.open_ended for j in jobs):
         return jobs
-    if live_job_ids() is None:
+    if live_job_ids(runner=runner, user=user) is None:
         return jobs  # cannot tell -- do not guess
     return [
         j._replace(open_ended=True) if (j.base_state == "RUNNING" or j.open_ended) else j
@@ -168,7 +172,15 @@ def _mark_open_records(jobs):
 def _load(args, sacct):
     if getattr(args, "demo", False):
         # Clearly synthetic; see demo.py. Never mixed with real records.
-        from .demo import history
+        from .demo import DEMO_SITE, history
+        from .site import reset_cache, site
+
+        # Pin the synthetic cluster's configuration too. Otherwise `--demo` on a
+        # real cluster words its memory and GPU notes from *that* cluster's
+        # scontrol output, so the demo differs by machine and the CI check of it
+        # depends on the runner having no Slurm.
+        reset_cache()
+        site(runner=lambda _args: DEMO_SITE)
 
         jobs = history()
         if args.job_ids:
@@ -180,11 +192,12 @@ def _load(args, sacct):
                 raise SacctError("no demo job matches: %s" % ", ".join(args.job_ids))
             return picked
         return jobs
+    runner = getattr(sacct, "_run", None)
     if args.job_ids:
         jobs = sacct.jobs(args.job_ids)
         if not jobs:
             raise SacctError("no accounting records for: %s" % ", ".join(args.job_ids))
-        return _mark_open_records(jobs)
+        return _mark_open_records(jobs, runner=runner, user=args.user)
 
     user = args.user or getpass.getuser()
     states = ["FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL"] if args.failed else None
@@ -196,7 +209,7 @@ def _load(args, sacct):
             "no jobs for %s since %s%s"
             % (user, args.since, " matching --failed" if args.failed else "")
         )
-    return _mark_open_records(jobs)
+    return _mark_open_records(jobs, runner=runner, user=user)
 
 
 def _logs_for(job, args):
@@ -243,6 +256,11 @@ def _job_json(job, log_path, verdict):
             "comment": job.comment or None,
             "admin_comment": job.admin_comment or None,
             "layout": job.layout or None,
+            # Recorded from Slurm 21.08; null on any older cluster. Patterns as
+            # stored, unexpanded -- see logs.expand_pattern for the resolved form.
+            "stdout_pattern": job.std_out or None,
+            "stderr_pattern": job.std_err or None,
+            "submit_line": job.submit_line or None,
         },
         "outcome": {
             "state": job.base_state,
@@ -274,12 +292,17 @@ def _job_json(job, log_path, verdict):
             "nodes": job.node_count,
             "node_list": job.node_list,
             "cpus": job.cpu_count,
+            # Per task, which is what --cpus-per-task sets; `cpus` is the total.
+            "cpus_per_task": job.cpus_per_task,
             "tasks": job.task_count,
             "gpus": job.gpu_count,
             "req_cpus": job.req_cpus,
             "req_nodes": job.req_nodes,
             "alloc_tres": job.alloc_tres,
             "req_tres": job.req_tres,
+            # Pre-20.11 spelling; null wherever TRES carries the GPUs instead.
+            "alloc_gres": job.alloc_gres or None,
+            "req_gres": job.req_gres or None,
             "constraints": job.constraints,
             "req_mem_scope": job.req_mem_scope,
             "req_cpu_freq_min": job.req_cpu_freq_min or None,
@@ -300,7 +323,11 @@ def _job_json(job, log_path, verdict):
             "core_hours": job.core_hours,
         },
         "memory": {
+            # Per node, which is the ceiling a cgroup enforces and what --mem
+            # sets. AllocTRES reports the allocation total; both are emitted so a
+            # consumer never has to guess which convention a figure is in.
             "limit_bytes": job.mem_limit_bytes,
+            "limit_total_bytes": job.mem_limit_total_bytes,
             "req_mem_raw": job.req_mem_raw,
             "peak_bytes": job.max_rss,
             "peak_node": job.max_rss_node or None,
@@ -328,8 +355,11 @@ def _job_json(job, log_path, verdict):
         "gpu": {
             "count": job.gpu_count,
             "gpu_hours": job.gpu_hours,
-            # gres/gpuutil is absent from AccountingStorageTRES on this cluster.
-            "utilization": None,
+            # Real values wherever the site runs AutoDetect=nvml, which is what
+            # makes Slurm gather gres/gpuutil and gres/gpumem; null otherwise,
+            # never 0 -- an unmeasured card is not an idle one.
+            "utilization": job.gpu_utilization,
+            "memory_peak_bytes": job.gpu_mem_peak_bytes,
         },
         "energy_joules": job.energy_joules,
         "log": log_path,
@@ -368,6 +398,9 @@ def _job_json(job, log_path, verdict):
                 "ave_disk_write_bytes": s.ave_disk_write,
                 "tres_usage_in_max": s.tres_in_max or None,
                 "tres_usage_in_max_node": s.tres_in_max_node or None,
+                "tres_usage_in_ave": s.tres_in_ave or None,
+                "gpu_utilization": s.gpu_utilization,
+                "gpu_memory_bytes": s.gpu_mem_bytes,
                 "consumed_energy": s.consumed_energy,
                 "ntasks": s.ntasks,
                 "nnodes": s.nnodes,
