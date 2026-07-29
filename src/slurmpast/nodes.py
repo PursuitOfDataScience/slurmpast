@@ -184,11 +184,20 @@ def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
             continue
         bad = hits.get(node, 0)
         low, high = wilson_interval(bad, trials)
-        if baseline is None:
+        # Against the REST of the fleet, not against a pooled rate that includes
+        # this node's own placements. midway3-0602 holds 403 of 1,098 placements
+        # here, so the pooled baseline is 37% made of the node under test and gets
+        # dragged toward whatever that node does -- which hides exactly the nodes
+        # that ran the most work. Leave-one-out is the comparison the verdict claims
+        # to be making.
+        other_trials = total_trials - trials
+        other_hits = total_hits - bad
+        comparison = (other_hits / float(other_trials)) if other_trials else None
+        if comparison is None:
             verdict = "unknown"
-        elif low > baseline:
+        elif low > comparison:
             verdict = "worse"
-        elif high < baseline:
+        elif high < comparison:
             verdict = "better"
         else:
             verdict = "inconclusive"
@@ -200,6 +209,7 @@ def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
                 "rate": bad / float(trials),
                 "ci_low": low,
                 "ci_high": high,
+                "comparison": comparison,
                 "verdict": verdict,
             }
         )
@@ -303,15 +313,17 @@ def note_for_node(jobs, node, workload=None):
     if not node:
         return ""
     table = node_table(jobs, workload=workload, metric="failure")
-    baseline = table["baseline"]
     for row in table["rows"]:
         if row["node"] != node:
             continue
-        if row["verdict"] != "worse" or baseline is None:
+        # The rate the verdict was actually reached against -- every other node --
+        # rather than the fleet-wide figure this row is itself part of.
+        comparison = row.get("comparison")
+        if row["verdict"] != "worse" or comparison is None:
             return ""
         return (
-            "%s failed %d of your %d jobs there (%.1f%%, 95%% CI %.1f-%.1f%%) against a "
-            "%.1f%% baseline%s."
+            "%s failed %d of your %d jobs there (%.1f%%, 95%% CI %.1f-%.1f%%) against "
+            "%.1f%% on every other node%s."
             % (
                 node,
                 row["bad"],
@@ -319,7 +331,7 @@ def note_for_node(jobs, node, workload=None):
                 100 * row["rate"],
                 100 * row["ci_low"],
                 100 * row["ci_high"],
-                100 * baseline,
+                100 * comparison,
                 (" for %s" % workload) if workload else "",
             )
         )

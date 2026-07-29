@@ -18,7 +18,7 @@ from ._version import __version__
 from .diagnose import diagnose
 from .duration import humanize_window
 from .index import History, filter_jobs
-from .logs import load_for
+from .logs import assign_logs, read_tail
 from .model import severity_rank
 from .nodes import expand_nodelist, note_for_node
 from .sacct import Sacct, SacctError, live_job_ids
@@ -35,6 +35,23 @@ examples:
 
 `sp` is a short alias for the same entry point.
 """
+
+
+def _row_limit(value):
+    """A row count for ``-n``, rejecting the ones that read as a silent bug.
+
+    Every consumer slices ``[:limit]``, so ``-n -5`` -- a plausible typo for ``-n 5``,
+    and one this tool invites by accepting ``-S -7days`` -- quietly drops the last
+    five rows and prints "5 more" instead of failing. ``-n 0`` renders a table with a
+    header, no rows, and a footer saying everything was omitted.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("not a number: %s" % value) from None
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more, got %s" % number)
+    return number
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-E", "--until", default=None, help="end of the window")
     parser.add_argument("-p", "--partition", default=None, help="restrict to a partition")
     parser.add_argument("--failed", action="store_true", help="only jobs that failed")
-    parser.add_argument("-n", "--limit", type=int, default=25, help="rows in plain output")
+    parser.add_argument("-n", "--limit", type=_row_limit, default=25, help="rows in plain output")
 
     parser.add_argument("--plain", action="store_true", help="text output, no dashboard")
     parser.add_argument("--overview", action="store_true", help="workload rollup as text")
@@ -212,10 +229,22 @@ def _load(args, sacct):
     return _mark_open_records(jobs, runner=runner, user=user)
 
 
-def _logs_for(job, args):
+def _logs_for_all(targets, args):
+    """``{job_id: (path, text, inferred)}`` for a whole list, resolved together.
+
+    A timing match has to be settled across jobs: several runs of one workload have
+    overlapping windows, so resolved one at a time they all claim the file nearest
+    their End and the same log is attached to four different post-mortems. See
+    :func:`slurmpast.logs.assign_logs`.
+    """
     if args.no_logs:
-        return None, None, False
-    return load_for(job, extra_dirs=args.log_dir)
+        return {job.job_id: (None, None, False) for job in targets}
+    assigned = assign_logs(targets, extra_dirs=args.log_dir)
+    out = {}
+    for job in targets:
+        path, inferred = assigned.get(job.job_id, (None, False))
+        out[job.job_id] = (path, read_tail(path) if path else None, inferred)
+    return out
 
 
 def _node_note(job, history):
@@ -600,8 +629,9 @@ def main(argv=None) -> int:
 
     if args.json:
         payload = []
+        resolved = _logs_for_all(targets, args)
         for job in targets:
-            log_path, log_text, _inferred = _logs_for(job, args)
+            log_path, log_text, _inferred = resolved[job.job_id]
             verdict = diagnose(job, log_text=log_text, node_note=_node_note(job, history))
             payload.append(_job_json(job, log_path, verdict))
         print(
@@ -615,8 +645,9 @@ def main(argv=None) -> int:
 
     worst_critical = False
     if args.job_ids:
+        resolved = _logs_for_all(targets, args)
         for job in targets:
-            log_path, log_text, inferred = _logs_for(job, args)
+            log_path, log_text, inferred = resolved[job.job_id]
             text, verdict = report.render_job(
                 job,
                 log_path=log_path,

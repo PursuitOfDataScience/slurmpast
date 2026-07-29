@@ -173,7 +173,24 @@ class TestSuggestions:
             "midway3-0600", 12, 218, job_id_base=5000
         )
         note = note_for_node(jobs, "midway3-0385", workload="node-evaluation")
-        assert "CI" in note and "baseline" in note
+        assert "CI" in note
+        # The rate it is compared against, stated as what it is: every OTHER node.
+        # A pooled "baseline" would include this node's own 36 placements, which is
+        # the comparison the verdict is not making.
+        assert "on every other node" in note
+        assert "5.5%" in note  # 12 of 218 elsewhere, not 31/254 pooled
+
+    def test_the_comparison_excludes_the_node_being_judged(self):
+        """A node holding most of the placements would otherwise be compared against
+        a rate it dominates. Real case: midway3-0602 is 403 of 1,098 placements."""
+        jobs = _placements("midway3-0385", 60, 100) + _placements(
+            "midway3-0600", 2, 20, job_id_base=5000
+        )
+        table = node_table(jobs, workload="node-evaluation")
+        row = next(r for r in table["rows"] if r["node"] == "midway3-0385")
+        assert row["comparison"] == pytest.approx(2 / 20)
+        assert table["baseline"] == pytest.approx(62 / 120)  # header keeps the pooled rate
+        assert row["verdict"] == "worse"
 
     def test_note_empty_for_ordinary_node(self):
         jobs = _placements("midway3-0385", 19, 36) + _placements(

@@ -6,8 +6,10 @@ release notes that changed the behaviour, or `scontrol show hostnames` itself.
 None of them fail on Midway3, which is exactly why they need pinning.
 """
 
+import os
 import pathlib
 import subprocess
+from datetime import datetime
 
 import pytest
 
@@ -682,7 +684,7 @@ def _third_party_imports(packages=("textual", "rich")):
 
 
 class TestRecordedLogPaths:
-    """From Slurm 21.08 sacct records StdOut/StdErr -- as patterns, unexpanded."""
+    """From Slurm 24.05 sacct records StdOut/StdErr -- as patterns, unexpanded."""
 
     def _job(self, **kw):
         base = {
@@ -769,6 +771,306 @@ class TestRecordedLogPaths:
         assert logs.find_log(job) == str(real)
         missing = self._job(StdErr=str(tmp_path / "absent-%j.err"))
         assert logs.find_log(missing) is None
+
+
+class TestSubmitLineLogPaths:
+    """SubmitLine arrived in Slurm 21.08, five releases before StdOut/StdErr (24.05).
+
+    On every cluster in between, the -o the job was submitted with is recorded and
+    the path is knowable -- reading it is the difference between knowing and guessing
+    on roughly three years' worth of releases.
+    """
+
+    def _job(self, line, **kw):
+        base = {
+            "JobID": "60",
+            "JobName": "train",
+            "User": "me",
+            "State": "FAILED",
+            "ElapsedRaw": "60",
+            "WorkDir": "/work",
+            "NodeList": "node[5-6]",
+            "SubmitLine": line,
+        }
+        base.update(kw)
+        return parse(row(**base))[0]
+
+    def test_the_long_form_with_equals(self):
+        job = self._job('sbatch --output="/work/report/144-train.out" run.sh')
+        assert logs.recorded_paths(job) == ["/work/report/144-train.out"]
+
+    def test_the_long_form_as_a_separate_argument(self):
+        job = self._job("sbatch --error /work/a.err run.sh")
+        assert logs.recorded_paths(job) == ["/work/a.err"]
+
+    def test_the_short_form(self):
+        job = self._job("sbatch -o /work/a.out run.sh")
+        assert logs.recorded_paths(job) == ["/work/a.out"]
+
+    def test_the_attached_short_form(self):
+        """getopt accepts ``-oslurm.out`` with no separator, and so does sbatch."""
+        job = self._job("sbatch -o/work/a.out run.sh")
+        assert logs.recorded_paths(job) == ["/work/a.out"]
+
+    def test_stderr_is_preferred_over_stdout(self):
+        job = self._job("sbatch -o /work/a.out -e /work/a.err run.sh")
+        assert logs.recorded_paths(job) == ["/work/a.err", "/work/a.out"]
+
+    def test_a_pattern_in_the_submit_line_is_expanded(self):
+        job = self._job("sbatch -o slurm-%j.out run.sh")
+        assert logs.recorded_paths(job) == ["/work/slurm-60.out"]
+
+    def test_a_relative_path_resolves_against_the_work_directory(self):
+        job = self._job("sbatch -o report/144-train.out run.sh")
+        assert logs.recorded_paths(job) == ["/work/report/144-train.out"]
+
+    def test_an_embedded_command_is_not_mistaken_for_an_output_option(self):
+        """``--wrap`` holds a shell command. Only the option name before ``=`` is
+        inspected, so the -o belonging to gcc is never seen as sbatch's."""
+        job = self._job('sbatch --wrap="gcc -o /tmp/a.out a.c"')
+        assert logs.recorded_paths(job) == []
+
+    def test_a_later_option_wins_because_that_is_what_sbatch_does(self):
+        job = self._job("sbatch -o /work/first.out -o /work/second.out run.sh")
+        assert logs.recorded_paths(job)[0] == "/work/second.out"
+
+    def test_a_truncated_option_yields_nothing_rather_than_a_flag(self):
+        job = self._job("sbatch -o --exclusive run.sh")
+        assert logs.recorded_paths(job) == []
+
+    def test_an_unbalanced_quote_does_not_raise(self):
+        job = self._job('sbatch -o "/work/a.out run.sh')
+        assert logs.recorded_paths(job) == []
+
+    def test_a_recorded_path_still_beats_a_conventional_name(self):
+        job = self._job("sbatch -o /work/real.out run.sh")
+        assert logs.candidate_paths(job)[0] == "/work/real.out"
+
+    def test_a_cluster_below_21_08_recording_nothing_yields_nothing(self):
+        assert logs.recorded_paths(self._job("")) == []
+
+    def test_stdout_is_preferred_over_the_submit_line_when_both_exist(self):
+        """On 24.05+ both are recorded. StdOut is what Slurm resolved and used;
+        the submit line is what was typed, so it loses ties."""
+        job = self._job("sbatch -o /work/typed.out run.sh", StdOut="/work/used.out")
+        assert logs.recorded_paths(job) == ["/work/used.out", "/work/typed.out"]
+
+
+class TestLogNamesCarryingTheJobId:
+    """``--output=%x-%j.out`` is the commonest convention there is, and no fixed
+    pattern list can hold it: the id is present but the rest of the name is the
+    job's. Measured on a real history, 20 jobs whose log sat in a searched directory
+    under their own id were sent to the timing guess instead."""
+
+    def _job(self, tmp_path, **kw):
+        base = {
+            "JobID": "60",
+            "JobName": "train",
+            "User": "me",
+            "State": "FAILED",
+            "Start": "2026-07-01T10:00:00",
+            "End": "2026-07-01T11:00:00",
+            "ElapsedRaw": "3600",
+            "WorkDir": str(tmp_path),
+        }
+        base.update(kw)
+        return parse(row(**base))[0]
+
+    def test_the_name_and_id_convention_is_found(self, tmp_path):
+        target = tmp_path / "sft-h100-60.out"
+        target.write_text("boom\n")
+        assert logs.find_log_by_id(self._job(tmp_path)) == str(target)
+
+    def test_it_counts_as_certain_not_a_guess(self, tmp_path):
+        (tmp_path / "sft-h100-60.out").write_text("boom\n")
+        _path, _text, inferred = logs.load_for(self._job(tmp_path))
+        assert inferred is False
+
+    def test_the_id_must_be_delimited_so_a_longer_number_does_not_match(self, tmp_path):
+        (tmp_path / "1060-train.out").write_text("not mine\n")
+        assert logs.find_log_by_id(self._job(tmp_path)) is None
+
+    def test_stderr_wins_when_both_carry_the_id(self, tmp_path):
+        (tmp_path / "run-60.out").write_text("out\n")
+        (tmp_path / "run-60.err").write_text("err\n")
+        assert logs.find_log_by_id(self._job(tmp_path)) == str(tmp_path / "run-60.err")
+
+    def test_an_array_element_prefers_its_own_id_over_the_master(self, tmp_path):
+        (tmp_path / "train-60.out").write_text("master\n")
+        (tmp_path / "train-60_4.out").write_text("mine\n")
+        job = self._job(tmp_path, JobID="60_4", JobIDRaw="73")
+        assert logs.find_log_by_id(job) == str(tmp_path / "train-60_4.out")
+
+    def test_a_recorded_path_still_outranks_it(self, tmp_path):
+        (tmp_path / "train-60.out").write_text("by id\n")
+        recorded = tmp_path / "recorded.err"
+        recorded.write_text("recorded\n")
+        job = self._job(tmp_path, StdErr=str(recorded))
+        assert logs.find_log_by_name(job) == str(recorded)
+
+
+class TestTimingIsNotLetLoose:
+    """Two measured failure modes of an mtime match, both fixed here: an unrelated
+    file in the submit directory, and one file claimed by several sibling runs."""
+
+    def _job(self, tmp_path, jid="60", start="10:00:00", end="11:00:00", name="train"):
+        return parse(
+            row(
+                JobID=jid,
+                JobName=name,
+                User="me",
+                State="FAILED",
+                Start="2026-07-01T" + start,
+                End="2026-07-01T" + end,
+                ElapsedRaw="3600",
+                WorkDir=str(tmp_path),
+            )
+        )[0]
+
+    def _at(self, path, when):
+        stamp = datetime.fromisoformat("2026-07-01T" + when).timestamp()
+        os.utime(path, (stamp, stamp))
+
+    def test_an_unrelated_file_in_the_submit_directory_is_refused(self, tmp_path):
+        """The real case: a backup script's log being appended to in $HOME, whose
+        mtime therefore lands in whichever job window it currently falls in."""
+        stray = tmp_path / "openclaw_backup_verify.log"
+        stray.write_text("nothing to do with the job\n")
+        self._at(stray, "10:59:00")
+        assert logs.find_log_by_time(self._job(tmp_path)) is None
+
+    def test_the_same_file_inside_a_log_directory_is_accepted(self, tmp_path):
+        """A report/ directory exists to hold job output, so mtime is evidence
+        there in a way it is not in a home directory."""
+        (tmp_path / "report").mkdir()
+        log = tmp_path / "report" / "144-train.out"
+        log.write_text("output\n")
+        self._at(log, "10:59:00")
+        assert logs.find_log_by_time(self._job(tmp_path)) == str(log)
+
+    def test_a_stray_is_accepted_once_the_user_names_its_directory(self, tmp_path):
+        stray = tmp_path / "whatever.log"
+        stray.write_text("mine after all\n")
+        self._at(stray, "10:59:00")
+        job = self._job(tmp_path)
+        assert logs.find_log_by_time(job) is None
+        assert logs.find_log_by_time(job, extra_dirs=[str(tmp_path)]) == str(stray)
+
+    def test_slurms_own_default_name_is_related_enough(self, tmp_path):
+        log = tmp_path / "slurm-99999.out"
+        log.write_text("out\n")
+        self._at(log, "10:59:00")
+        assert logs.find_log_by_time(self._job(tmp_path)) == str(log)
+
+    def test_a_name_carrying_the_job_name_is_related_enough(self, tmp_path):
+        log = tmp_path / "144-train.out"
+        log.write_text("out\n")
+        self._at(log, "10:59:00")
+        assert logs.find_log_by_time(self._job(tmp_path)) == str(log)
+
+    def test_one_file_is_not_handed_to_two_jobs(self, tmp_path):
+        """Measured: 51 of 296 timing matches pointed at a file another job also
+        claimed -- one was the nearest match for four runs of the same workload."""
+        (tmp_path / "report").mkdir()
+        log = tmp_path / "report" / "76-train.out"
+        log.write_text("output\n")
+        self._at(log, "11:00:00")
+        near = self._job(tmp_path, jid="60", end="11:00:30")
+        far = self._job(tmp_path, jid="61", end="10:50:00")
+        assigned = logs.assign_logs([far, near])
+        assert assigned["60"] == (str(log), True)
+        assert assigned["61"] == (None, False)
+
+    def test_the_loser_falls_through_to_its_own_next_candidate(self, tmp_path):
+        (tmp_path / "report").mkdir()
+        shared = tmp_path / "report" / "76-train.out"
+        shared.write_text("shared\n")
+        self._at(shared, "11:00:00")
+        other = tmp_path / "report" / "75-train.out"
+        other.write_text("other\n")
+        self._at(other, "10:50:00")
+        near = self._job(tmp_path, jid="60", end="11:00:10")
+        second = self._job(tmp_path, jid="61", end="10:50:20")
+        assigned = logs.assign_logs([near, second])
+        assert assigned["60"][0] == str(shared)
+        assert assigned["61"][0] == str(other)
+
+    def test_the_assignment_does_not_depend_on_the_order_jobs_arrive(self, tmp_path):
+        (tmp_path / "report").mkdir()
+        log = tmp_path / "report" / "76-train.out"
+        log.write_text("output\n")
+        self._at(log, "11:00:00")
+        a = self._job(tmp_path, jid="60", end="11:00:05")
+        b = self._job(tmp_path, jid="61", end="11:00:40")
+        assert logs.assign_logs([a, b]) == logs.assign_logs([b, a])
+
+    def test_a_name_match_is_exempt_because_two_jobs_can_share_an_output_path(self, tmp_path):
+        """``--output=night-placeholder.out`` reused by every run of a chain is a
+        real thing people do. There the name is evidence, not a coincidence."""
+        shared = tmp_path / "slurm-60.out"
+        shared.write_text("out\n")
+        one = self._job(tmp_path, jid="60")
+        two = parse(
+            row(
+                JobID="61",
+                JobName="train",
+                User="me",
+                State="FAILED",
+                Start="2026-07-01T10:00:00",
+                End="2026-07-01T11:00:00",
+                ElapsedRaw="3600",
+                WorkDir=str(tmp_path),
+                StdOut=str(shared),
+            )
+        )[0]
+        assigned = logs.assign_logs([one, two])
+        assert assigned["60"] == (str(shared), False)
+        assert assigned["61"] == (str(shared), False)
+
+    def test_a_caller_can_exclude_paths_it_has_already_used(self, tmp_path):
+        (tmp_path / "report").mkdir()
+        log = tmp_path / "report" / "76-train.out"
+        log.write_text("output\n")
+        self._at(log, "11:00:00")
+        job = self._job(tmp_path)
+        assert logs.find_log_by_time(job) == str(log)
+        assert logs.find_log_by_time(job, taken={str(log)}) is None
+
+
+class TestCommentLogPaths:
+    """Works on every Slurm, which is the point: below 21.08 nothing else does."""
+
+    def _job(self, comment, **kw):
+        base = {
+            "JobID": "60",
+            "JobName": "train",
+            "User": "me",
+            "State": "FAILED",
+            "ElapsedRaw": "60",
+            "WorkDir": "/work",
+            "Comment": comment,
+        }
+        base.update(kw)
+        return parse(row(**base))[0]
+
+    def test_an_absolute_log_path_is_read(self):
+        job = self._job("/home/me/report/144-train.out")
+        assert logs.recorded_paths(job) == ["/home/me/report/144-train.out"]
+
+    def test_free_text_is_not_resolved_into_a_candidate(self):
+        """The field is used for all sorts of things. Joining "rerun of 4412"
+        onto the work directory would invent a path out of a sentence."""
+        assert logs.recorded_paths(self._job("rerun of 4412")) == []
+
+    def test_a_relative_path_is_not_trusted_either(self):
+        assert logs.recorded_paths(self._job("report/144-train.out")) == []
+
+    def test_a_path_that_is_not_a_log_is_left_alone(self):
+        assert logs.recorded_paths(self._job("/home/me/checkpoint.pt")) == []
+
+    def test_it_loses_to_what_slurm_itself_recorded(self):
+        job = self._job("/home/me/stashed.out", StdErr="/work/real.err")
+        assert logs.recorded_paths(job) == ["/work/real.err", "/home/me/stashed.out"]
 
 
 class TestSqueueReconciliation:

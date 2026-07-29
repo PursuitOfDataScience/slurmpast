@@ -136,8 +136,18 @@ def walltime_advice(jobs) -> Advice:
         )
 
     elapsed = [j.elapsed for j in completed]
-    peak = _percentile(elapsed, 0.95)
-    target = _round_walltime(peak * WALLTIME_MARGIN)
+    p95 = _percentile(elapsed, 0.95)
+    longest = max(elapsed)
+    # The longest run that COMPLETED, not p95, because exceeding --time kills the
+    # job exactly as exceeding --mem does, and :func:`memory_advice` sizes from the
+    # highest observed peak for that reason. Sizing walltime from p95 instead told
+    # the `software` workload to "lower to 03:00:00" on the same screen as "longest
+    # 07:57:12" -- advice that would have timed out its slowest runs by design,
+    # since p95 excludes the top 5% and there is no headroom multiplier that
+    # recovers a 2.9x gap. A single pathological run cannot inflate this: a hang
+    # long enough to matter is caught by the no-CPU branch above and never reaches
+    # here. p95 stays in the basis as the shape of the distribution.
+    target = _round_walltime(longest * WALLTIME_MARGIN)
 
     # Any timeout means the true requirement is above the limit that truncated
     # it, so the floor is that limit -- never below.
@@ -146,10 +156,10 @@ def walltime_advice(jobs) -> Advice:
         target = max(target, _round_walltime(floor * WALLTIME_MARGIN))
 
     current = limits[-1] if limits else None
-    basis = "p95 of %d completed runs is %s (longest %s); +%d%% headroom." % (
+    basis = "longest of %d completed runs is %s (p95 %s); +%d%% headroom." % (
         len(completed),
-        format_duration(peak),
-        format_duration(max(elapsed)),
+        format_duration(longest),
+        format_duration(p95),
         round((WALLTIME_MARGIN - 1) * 100),
     )
     caution = ""
@@ -171,7 +181,7 @@ def walltime_advice(jobs) -> Advice:
         flag="--time",
         verdict=verdict,
         requested=requested,
-        observed="%s at p95, %s longest" % (format_duration(peak), format_duration(max(elapsed))),
+        observed="%s longest, %s at p95" % (format_duration(longest), format_duration(p95)),
         suggestion=_fmt_walltime(target) if verdict != "keep" else "",
         basis=basis,
         caution=caution,

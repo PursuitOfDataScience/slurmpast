@@ -238,11 +238,13 @@ def render_job(
         out.append("  %s %s%s" % (style("log", "grey"), log_path, style(note, "grey")))
     else:
         # One line, but which line depends on whether the cluster recorded a path.
-        # From Slurm 21.08 sacct has StdOut/StdErr, so the miss is "the file has
-        # moved or been deleted" and naming the expected path is actionable. Before
-        # that there is no such field anywhere a post-mortem can reach -- slurmctld
-        # forgets a job after MinJobAge -- so the path is genuinely unknowable and
-        # saying more would explain a limitation the reader cannot act on.
+        # Where one was recorded -- StdOut/StdErr from Slurm 24.05, the -o inside
+        # SubmitLine from 21.08, or a --comment on any version -- the miss is "the
+        # file has moved or been deleted" and naming the expected path is
+        # actionable. With none of the three there is no such record anywhere a
+        # post-mortem can reach (slurmctld forgets a job after MinJobAge), so the
+        # path is genuinely unknowable and saying more would explain a limitation
+        # the reader cannot act on.
         from .logs import recorded_paths
 
         expected = recorded_paths(job)
@@ -296,8 +298,18 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
         # "total" and "of them" are both load-bearing: "783 GPU-hours" alone was
         # read as a per-job figure, and a bare "18 never computed" did not say 18
         # of what.
-        line += " · %.0f GPU-hours total" % idle[1]
-        line += style(", %.0f of them never used" % idle[0], "yellow")
+        hours = " · %.0f GPU-hours total" % idle[1]
+        hours += style(", %.0f of them never used" % idle[0], "yellow")
+        # Onto its own line when the pair will not fit. Three clauses joined
+        # unconditionally reached 88 characters and wrapped on an 80-column
+        # terminal, splitting the one figure this tool exists to report across a
+        # fold. Dropping the leading separator is what makes the second line read
+        # as a sentence rather than a fragment.
+        if _visible_len(line + hours) <= _plain_width():
+            line += hours
+        else:
+            out.append(line)
+            line = "  " + hours.split("· ", 1)[1]
     out.append(line)
     # Both exclusions on one line. They are different -- an unterminated record
     # would report `now - start` as its elapsed, a record with no elapsed at all
@@ -329,7 +341,16 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
     if any("#" in g.name for g in shown):
         notes.append('"#" stands for a name\'s digits')
     if notes:
-        out.append(style("  " + " · ".join(notes), "grey"))
+        # One line while it fits, one per line when it does not. Joined
+        # unconditionally, the two clauses came to 86 characters and were the only
+        # thing in the whole plain output that wrapped on an 80-column terminal --
+        # and a wrapped grey caption reads as a rendering fault sitting directly
+        # above a table that lines up perfectly.
+        joined = "  " + " · ".join(notes)
+        if _visible_len(joined) <= _plain_width():
+            out.append(style(joined, "grey"))
+        else:
+            out.extend(style("  " + note, "grey") for note in notes)
     out.append("")
     layout = _plain_layout(spec, content={"JOB NAME": max((len(g.name) for g in shown), default=0)})
     rows = []

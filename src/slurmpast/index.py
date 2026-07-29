@@ -157,9 +157,10 @@ def build_groups(jobs: Iterable[Job]) -> list[GroupStats]:
     for key, members in buckets.items():
         members.sort(key=lambda j: _stamp(j), reverse=True)
         gpu_hours = sum(j.gpu_hours or 0.0 for j in members)
-        core_hours = sum(
-            (j.elapsed * j.cpu_count / 3600.0) for j in members if j.elapsed and j.cpu_count
-        )
+        # Through the model property, not a second copy of the formula here. The
+        # inline version silently stopped agreeing with `Job.core_hours` the moment
+        # either changed, and the two are summed into figures shown side by side.
+        core_hours = sum(j.core_hours or 0.0 for j in members)
         dead = [j for j in members if looks_like_noop(j)]
         stamps = sorted(s for s in (_stamp(j) for j in members) if s)
         out.append(

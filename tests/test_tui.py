@@ -701,3 +701,67 @@ class TestJobRowsHaveNoSelectionLookalike:
             await pilot.pause()
             grid = app.screen.query_one("#groups", DataTable)
             assert any("●" in str(grid.get_row_at(r)[0]) for r in range(grid.row_count))
+
+
+class TestLogResolutionIsCrossChecked:
+    """A job screen must not be shown a log that belongs to a different run.
+
+    Resolving one job at a time cannot see the conflict: measured on a real
+    history, 51 timing matches pointed at a file another job also claimed. The
+    dashboard therefore resolves the whole history in a worker and reads from that.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_logs_asks_the_filesystem_nothing(self, history_jobs, monkeypatch):
+        called = []
+        monkeypatch.setattr(tui, "assign_logs", lambda *a, **k: called.append(1) or {})
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert called == []
+            assert app.log_for(history_jobs[0]) == (None, None, False)
+
+    @pytest.mark.asyncio
+    async def test_the_whole_history_assignment_is_preferred(self, history_jobs, monkeypatch):
+        job = history_jobs[0]
+        monkeypatch.setattr(tui, "assign_logs", lambda *a, **k: {job.job_id: ("/x/mine.err", True)})
+        monkeypatch.setattr(tui, "read_tail", lambda path, **k: "tail of %s" % path)
+        monkeypatch.setattr(tui, "load_for", lambda *a, **k: pytest.fail("should not fall back"))
+        app = make_app(history_jobs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app._log_map is not None, "the worker should have landed"
+            assert app.log_for(job) == ("/x/mine.err", "tail of /x/mine.err", True)
+
+    @pytest.mark.asyncio
+    async def test_a_job_the_assignment_withheld_shows_nothing(self, history_jobs, monkeypatch):
+        """The point of the cross-check: a run whose only candidate belonged to a
+        sibling gets None, not the sibling's log."""
+        job = history_jobs[0]
+        monkeypatch.setattr(tui, "assign_logs", lambda *a, **k: {job.job_id: (None, False)})
+        app = make_app(history_jobs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.log_for(job) == (None, None, False)
+
+    @pytest.mark.asyncio
+    async def test_it_falls_back_before_the_worker_lands(self, history_jobs, monkeypatch):
+        monkeypatch.setattr(tui, "load_for", lambda *a, **k: ("/x/fallback.err", "text", True))
+        app = make_app(history_jobs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._log_map = None  # as it is for the first keypress after a load
+            assert app.log_for(history_jobs[0]) == ("/x/fallback.err", "text", True)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_scan_does_not_take_the_dashboard_down(self, history_jobs, monkeypatch):
+        def boom(*a, **k):
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(tui, "assign_logs", boom)
+        monkeypatch.setattr(tui, "load_for", lambda *a, **k: (None, None, False))
+        app = make_app(history_jobs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.history is not None
+            assert app._log_map is None

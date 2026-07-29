@@ -63,6 +63,26 @@ class TestWalltime:
         if advice.suggestion:
             assert advice.suggestion.count(":") == 2
 
+    def test_never_advises_a_limit_below_a_run_that_completed(self):
+        """The real failure: p95 of the `software` workload is 02:12:15 while its
+        longest completed run took 07:57:12, so sizing from p95 printed "lower to
+        03:00:00" on the same screen as "longest 07:57:12" -- advice that times out
+        the slowest runs by construction. Exceeding --time kills a job exactly as
+        exceeding --mem does, and memory_advice sizes from the highest peak."""
+        jobs = workload("midtrain")
+        slow = jobs[0]._replace(job_id="9992", state="COMPLETED", elapsed=6 * 3600.0)
+        advice = walltime_advice(jobs + [slow])
+        assert advice.suggestion, "a workload with a 6h run needs a limit stated"
+        hours, minutes, seconds = (int(p) for p in advice.suggestion.split(":"))
+        assert hours * 3600 + minutes * 60 + seconds >= 6 * 3600
+
+    def test_the_basis_leads_with_the_figure_it_sized_from(self):
+        jobs = workload("midtrain")
+        slow = jobs[0]._replace(job_id="9993", state="COMPLETED", elapsed=6 * 3600.0)
+        advice = walltime_advice(jobs + [slow])
+        assert advice.basis.startswith("longest of")
+        assert "p95" in advice.basis
+
 
 class TestMemory:
     def test_an_oom_sets_a_floor(self):

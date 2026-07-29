@@ -102,8 +102,10 @@ _FIELDS = [
     "ReqGRES", "AllocGRES",
     # scheduling and context
     "Priority", "Reservation", "WorkDir", "Comment", "AdminComment", "Layout",
-    # where the job's output went, and how it was submitted. Absent before Slurm
-    # 21.08; where present they replace guessing a log path with knowing it.
+    # where the job's output went, and how it was submitted. Three different
+    # boundaries: SubmitLine from 21.08, StdOut/StdErr only from 24.05, Comment
+    # (above) on every version. Where present they replace guessing a log path with
+    # knowing it, so all three are asked for and logs.py reads whichever arrived.
     "StdOut", "StdErr", "SubmitLine",
 ]
 # fmt: on

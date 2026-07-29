@@ -130,6 +130,113 @@ class TestCoresBusy:
         assert cores_text(Job(job_id="1")) == "n/a"
 
 
+class TestCpuAcrossSteps:
+    """An sbatch script whose work is one srun line has a near-zero batch step.
+    Reading the batch step alone wrote off 15 real jobs here as having done nothing.
+    """
+
+    def _job(self, rows, **alloc):
+        base = {
+            "JobID": "910",
+            "JobName": "w",
+            "State": "COMPLETED",
+            "ElapsedRaw": "1081",
+            "AllocCPUS": "16",
+            "NNodes": "4",
+            "AllocTRES": "cpu=16,node=4",
+            "CPUTimeRAW": str(16 * 1081),
+            "TotalCPU": "04:47:33",
+            "Start": "2026-01-01T00:00:00",
+            "End": "2026-01-01T00:18:01",
+        }
+        base.update(alloc)
+        return parse("\n".join([row(**base)] + rows))[0]
+
+    def test_the_srun_step_is_not_discarded_for_the_batch_step(self):
+        """Job 51554217: 16 cores over 4 nodes, 04:47:33 of CPU in step .0, and a
+        batch step of 0.037s. It reported 0.0009% utilization and read as idle."""
+        job = self._job(
+            [
+                row(JobID="910.batch", JobName="batch", State="COMPLETED", TotalCPU="00:00.037"),
+                row(JobID="910.extern", JobName="extern", State="COMPLETED", TotalCPU="00:00.002"),
+                row(
+                    JobID="910.0",
+                    JobName="bash",
+                    State="COMPLETED",
+                    TotalCPU="04:47:30",
+                    AllocCPUS="16",
+                    CPUTimeRAW=str(16 * 1081),
+                ),
+            ]
+        )
+        assert job.total_cpu == pytest.approx(4 * 3600 + 47 * 60 + 30 + 0.037, abs=0.01)
+        assert job.cpu_utilization > 0.9
+
+    def test_extern_is_excluded_from_the_sum(self):
+        """Job 49842638's extern claims 538 core-hours against work steps that all
+        report zero. Summing it in would invent CPU time for an idle reservation."""
+        job = self._job(
+            [
+                row(JobID="910.batch", JobName="batch", State="COMPLETED", TotalCPU="00:00.005"),
+                row(
+                    JobID="910.extern", JobName="extern", State="COMPLETED", TotalCPU="22-10:18:45"
+                ),
+            ]
+        )
+        assert job.total_cpu == pytest.approx(0.005, abs=0.001)
+
+    def test_the_denominator_covers_the_whole_allocation_not_one_node(self):
+        """The batch step's CPUTime counts the node the script ran on. Dividing a
+        4-node job's CPU by it reported 399% -- 16 cores' work over 4 cores' worth."""
+        job = self._job(
+            [
+                row(
+                    JobID="910.batch",
+                    JobName="batch",
+                    State="COMPLETED",
+                    TotalCPU="00:00.037",
+                    AllocCPUS="4",
+                    CPUTimeRAW=str(4 * 1081),
+                ),
+                row(
+                    JobID="910.0",
+                    JobName="bash",
+                    State="COMPLETED",
+                    TotalCPU="04:47:30",
+                    AllocCPUS="16",
+                    CPUTimeRAW=str(16 * 1081),
+                ),
+            ]
+        )
+        assert job.cpu_time == pytest.approx(16 * 1081)
+        assert job.cpu_utilization <= 1.0
+
+    def test_a_step_outliving_the_allocation_does_not_exceed_100_percent(self):
+        """Job 51554394: cancelled after 5s while step .0 ran 8s on 8 cores, so
+        sacct's own TotalCPU (00:44.686) exceeds its own CPUTime (40s)."""
+        job = self._job(
+            [
+                row(JobID="910.batch", JobName="batch", State="CANCELLED", TotalCPU="00:00.026"),
+                row(
+                    JobID="910.0",
+                    JobName="bash",
+                    State="CANCELLED",
+                    TotalCPU="00:44.562",
+                    AllocCPUS="8",
+                    CPUTimeRAW="64",
+                ),
+            ],
+            ElapsedRaw="5",
+            AllocCPUS="8",
+            NNodes="2",
+            AllocTRES="cpu=8,node=2",
+            CPUTimeRAW="40",
+            TotalCPU="00:44.686",
+        )
+        assert job.cpu_time == pytest.approx(64)
+        assert job.cpu_utilization <= 1.0
+
+
 class TestDiskReadWriteSplit:
     def test_read_and_write_are_separate(self):
         job = build(
@@ -465,6 +572,62 @@ class TestFalsePositivesFoundOnRealData:
             )
         )[0]
         assert job.max_rss == 16439052 * 1024
+
+    def _extern_job(self, extern, batch="3920K", mem="50G"):
+        return parse(
+            "\n".join(
+                [
+                    row(
+                        JobID="903",
+                        JobName="w",
+                        State="COMPLETED",
+                        ElapsedRaw="3600",
+                        AllocTRES="cpu=6,mem=%s,node=1" % mem,
+                        End="2026-01-01T01:00:00",
+                    ),
+                    row(JobID="903.batch", JobName="batch", State="COMPLETED", MaxRSS=batch),
+                    row(JobID="903.extern", JobName="extern", State="COMPLETED", MaxRSS=extern),
+                ]
+            )
+        )[0]
+
+    def test_an_extern_reading_the_allocation_rules_out_is_dropped(self):
+        """Job 49455391: extern reads 2.81 TiB against mem=50G, on a cluster whose
+        largest node holds 2.21 TiB, for a batch step that used 3.8 MiB and 0.004s.
+        Reporting that as a 5757% MEM% is a phantom."""
+        job = self._extern_job(extern="3018550856K")
+        assert job.max_rss == 3920 * 1024
+        assert job.mem_utilization < 0.01
+
+    def test_a_plausible_extern_peak_is_still_the_peak(self):
+        """The counter-example this rule must not break: job 51709094's extern
+        holds 15.7 GiB against a 50 GiB limit -- inside the allocation, so it is
+        the job's own processes accounted to the container step."""
+        job = self._extern_job(extern="16439052K")
+        assert job.max_rss == 16439052 * 1024
+
+    def test_work_steps_over_the_limit_too_keeps_the_plain_max(self):
+        """Then it is not an extern artefact but shared-page double counting, and
+        the honest answer is the upper bound with the caveat already attached."""
+        job = self._extern_job(extern="80G", batch="60G", mem="56G")
+        assert job.max_rss == 80 * 1024**3
+
+    def test_with_no_allocation_to_judge_against_the_max_stands(self):
+        job = parse(
+            "\n".join(
+                [
+                    row(JobID="904", JobName="w", State="COMPLETED", ElapsedRaw="3600"),
+                    row(JobID="904.batch", JobName="batch", State="COMPLETED", MaxRSS="4108K"),
+                    row(
+                        JobID="904.extern",
+                        JobName="extern",
+                        State="COMPLETED",
+                        MaxRSS="3018550856K",
+                    ),
+                ]
+            )
+        )[0]
+        assert job.max_rss == 3018550856 * 1024
 
     def test_spread_between_real_work_steps_is_still_measured(self):
         job = parse(

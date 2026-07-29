@@ -414,7 +414,14 @@ OVERVIEW_COLUMNS: tuple[Column, ...] = (
 # * Peak memory was missing outright, which is the number most post-mortems
 #   start from.
 JOB_COLUMNS: tuple[Column, ...] = (
-    Column("#", 4),
+    # 3, not 4, and the one cell matters in the dashboard: at the 2-cell padding
+    # Textual's DataTable is given, the columns that are never dropped cost 81 at
+    # width 4 -- one over a canonical 80-column terminal, so the table could not fit
+    # the narrowest width it has to work at. (The plain renderer pads by 1 and fit
+    # either way.) 3 numbers 999 rows against a default `-n 25`; beyond that the
+    # index clips rather than widening the table, and JOBID is the identifier that
+    # matters anyway.
+    Column("#", 3),
     Column("JOBID", 10),
     Column("NAME", 8, flex=True, grow_to=20, drop=3),
     # Wide enough for OUT_OF_MEMORY in full. Clipping the one state a reader most

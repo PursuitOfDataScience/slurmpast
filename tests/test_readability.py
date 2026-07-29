@@ -10,6 +10,8 @@ that the reader has no way to interpret.
   reference frame -- a GPU-hour total means nothing without the period it covers.
 """
 
+import os
+
 import pytest
 
 pytest.importorskip("textual")
@@ -772,3 +774,46 @@ class TestNothingIsShownTwiceOnOneScreen:
         )
         labels = [label for _, section in job_sections(grew) for label, _, _ in section]
         assert "average" in labels
+
+
+class TestNothingWrapsAtEightyColumns:
+    """80 columns is the canonical minimum -- an unresized login-node terminal, a
+    pasted snippet, a CI log. A single over-long line wraps and reads as a
+    rendering fault, especially sitting above a table that lines up perfectly.
+    """
+
+    def _at_eighty(self, monkeypatch, render):
+        import shutil
+
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((80, 24)))
+        return render()
+
+    def test_the_overview_fits(self, monkeypatch):
+        from slurmpast.report import Style, render_overview
+
+        text = self._at_eighty(
+            monkeypatch, lambda: render_overview(History(history()), style=Style(enabled=False))
+        )
+        too_long = [line for line in text.splitlines() if len(line) > 80]
+        assert not too_long, too_long
+
+    def test_the_ranking_caption_splits_rather_than_wrapping(self, monkeypatch):
+        """Joined with " · " the two clauses came to 86 characters."""
+        from slurmpast.report import Style, render_overview
+
+        text = self._at_eighty(
+            monkeypatch, lambda: render_overview(History(history()), style=Style(enabled=False))
+        )
+        head = text.split("#   JOB NAME")[0]
+        assert "compute used" in head and '"#" stands for' in head
+        assert "CPU-hours) · " not in head, "should have broken onto its own line"
+
+    def test_the_job_list_fits(self, monkeypatch):
+        from slurmpast.report import Style, render_list
+
+        jobs = History(history()).usable_jobs[:10]
+        text = self._at_eighty(
+            monkeypatch, lambda: render_list(jobs, style=Style(enabled=False), limit=10)
+        )
+        too_long = [line for line in text.splitlines() if len(line) > 80]
+        assert not too_long, too_long

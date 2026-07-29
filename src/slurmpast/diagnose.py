@@ -517,7 +517,12 @@ def _kernel_time_rules(job, add):
             # The percentage leads. "1h05m21s of 2h54m17s" is a duration divided by
             # a duration, and the denominator is core-time -- a synthetic figure the
             # reader has to reconstruct. The raw split is in the cpu section.
-            "%s of CPU time went to the kernel; a healthy run here is ~5%%."
+            # "~5%" was wrong and the comparison it invited was misleading: measured
+            # across 5,343 real jobs on this cluster the kernel share runs 6.2% at
+            # the first quartile and 16.7% at the median, so a reader at 20% was
+            # being told they were 4x off a healthy figure when they were below
+            # average. The threshold is the third quartile, so that is what it says.
+            "%s of CPU time went to the kernel, against a median of ~17%% here."
             % format_percent(fraction),
             "That is syscall overhead: batch small reads, or pack many small files into shards.",
         )

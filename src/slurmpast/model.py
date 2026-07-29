@@ -337,17 +337,31 @@ class Job(NamedTuple):
     # --------------------------------------------------------------------- cpu
 
     def _from_steps(self, attr: str):
-        """Batch-step value for ``attr``, else the largest work step.
+        """Sum of ``attr`` across work steps -- the job's CPU, however it was launched.
 
-        The allocation row carries no CPU counters on Slurm 20.11, so reading it
-        there yields None for every job and silently disables all utilization
-        analysis -- which is how a fleet of hung jobs stays invisible.
+        A sum, because Slurm's steps are disjoint sets of processes: the batch step
+        is the script, each srun step is its own launch, and no process is counted
+        twice. Verified against Slurm's own aggregate: ``TotalCPU`` on the allocation
+        row divided by this sum is 1.000 at the 5th percentile, the median and the
+        95th across 3,930 real jobs.
+
+        Reading the *batch step alone* was wrong, and wrong in the most damaging
+        direction. An ``sbatch`` script whose work is one ``srun`` line has a batch
+        step of a few hundredths of a second, so job 51554217 -- 16 cores over 4
+        nodes, ``04:47:33`` of CPU in step ``.0`` -- reported 0.037s, a utilization of
+        0.0009%, and was flagged as having done nothing. 15 jobs here were written
+        off that way. Falling back to the *largest* step was wrong too: it drops
+        every step but one.
+
+        The allocation row is not the answer either, despite carrying ``TotalCPU``
+        on all 6,609 jobs here -- which is itself contrary to what this method used
+        to claim. Slurm folds ``.extern`` into that total, and where extern's
+        accounting is polluted so is the row: job 49842638 reads 538 core-hours
+        against work steps that all report zero, for a reservation holder that
+        genuinely did nothing. See :attr:`max_rss` for the same artefact in memory.
         """
-        batch = self.batch_step
-        if batch is not None and getattr(batch, attr) is not None:
-            return getattr(batch, attr)
         values = [getattr(s, attr) for s in self.work_steps if getattr(s, attr) is not None]
-        return max(values) if values else None
+        return sum(values) if values else None
 
     @property
     def total_cpu(self) -> float | None:
@@ -394,15 +408,33 @@ class Job(NamedTuple):
 
     @property
     def cpu_time(self) -> float | None:
-        """Core-seconds allocated (elapsed x cores): the utilization denominator."""
-        batch = self.batch_step
-        if batch is not None and batch.cpu_time is not None:
-            return batch.cpu_time
-        if self.cpu_time_alloc is not None:
-            return self.cpu_time_alloc
+        """Core-seconds allocated (elapsed x cores): the utilization denominator.
+
+        The allocation row first, because that is the only row that covers the whole
+        allocation. The *batch step's* ``CPUTime`` counts one node -- the one the
+        script ran on -- so on job 51554217, 16 cores over 4 nodes, it reads
+        ``01:12:04`` where the allocation reads ``04:48:16``. Dividing the job's real
+        CPU by a quarter of its allocation reported 399% utilization, which is
+        16 cores' work measured against 4 cores' entitlement.
+
+        Unlike ``TotalCPU``, this figure cannot be polluted by ``.extern``: Slurm
+        computes it as elapsed x allocated cores, so it is arithmetic on the
+        allocation rather than anything jobacct_gather sampled.
+
+        A work step can outlive the allocation record, and then the allocation row
+        alone is too small a denominator. Job 51554394 was cancelled after 5s while
+        step ``.0`` ran 8s and burned ``00:44.686`` on 8 cores, so sacct's own
+        ``TotalCPU`` exceeds its own ``CPUTime`` (40s) and any tool dividing one by
+        the other reports 111.7% -- 8.9 of 8 cores busy. The cores were genuinely
+        held for the step's longer span, so the widest allocated span any work row
+        reports is the honest denominator. Extern is excluded, as in the numerator.
+        """
+        spans = [self.cpu_time_alloc]
         if self.elapsed is not None and self.cpu_count:
-            return self.elapsed * self.cpu_count
-        return None
+            spans.append(self.elapsed * self.cpu_count)
+        spans.extend(s.cpu_time for s in self.work_steps)
+        spans = [s for s in spans if s is not None]
+        return max(spans) if spans else None
 
     @property
     def cpu_utilization(self) -> float | None:
@@ -476,14 +508,40 @@ class Job(NamedTuple):
 
     @property
     def max_rss(self) -> int | None:
-        """Largest MaxRSS across steps.
+        """Largest MaxRSS across steps, less an ``.extern`` the allocation rules out.
 
         Must be a max, not a pick: job 51709094 reports batch=4108K against
         extern=16439052K -- a 4000x spread on one job -- so reading a single step
-        is wrong by three orders of magnitude in either direction.
+        is wrong by three orders of magnitude in either direction. That extern
+        figure is real, and is why extern is included: 15.7 GiB against a 50 GiB
+        limit, the job's own processes accounted to the container step.
+
+        But ``.extern`` is also where Slurm's accounting goes wrong. Eight jobs in a
+        6,417-job history report an extern MaxRSS *above the whole allocation* while
+        a work step sits comfortably inside it: job 49455391 reads 2.81 TiB against
+        ``mem=50G`` -- on a cluster whose largest node has 2.21 TiB of RAM, so the
+        figure is not merely wrong but impossible -- for a job whose batch step used
+        3.8 MiB and 0.004s of CPU. Reporting that as a 5757% MEM% is a phantom
+        measurement, which is the one thing this module exists to avoid.
+
+        So extern is dropped exactly when the allocation proves it impossible and a
+        work step does not. With no limit to judge against, or with the work steps
+        over the limit too -- genuine shared-page double counting, see
+        :attr:`mem_utilization` -- the plain max stands and the caller is told the
+        figure is an upper bound.
         """
         values = [s.max_rss for s in self.steps if s.max_rss is not None]
-        return max(values) if values else None
+        if not values:
+            return None
+        peak = max(values)
+        limit = self.mem_limit_bytes
+        if not limit or peak <= limit:
+            return peak
+        work = [s.max_rss for s in self.work_steps if s.max_rss is not None]
+        if not work or max(work) > limit:
+            return peak
+        extern = [s.max_rss for s in self.steps if s.is_extern and s.max_rss is not None]
+        return max(work) if extern and max(extern) == peak else peak
 
     @property
     def max_rss_node(self) -> str:

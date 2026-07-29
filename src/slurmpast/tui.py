@@ -43,7 +43,7 @@ from .index import (
     sort_groups,
     sort_label,
 )
-from .logs import load_for
+from .logs import assign_logs, load_for, read_tail
 from .nodes import MIN_SAMPLES, compress_nodelist, node_table, suggest_exclude
 
 BASE_CSS = """
@@ -1108,9 +1108,7 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         # Logs are read here and only here -- eagerly scanning logs for 6,574
         # jobs at load time would dominate startup for data most of them never
         # need.
-        log_path, log_text, inferred = (None, None, False)
-        if not self.sp.no_logs:
-            log_path, log_text, inferred = load_for(job, extra_dirs=self.sp.log_dirs)
+        log_path, log_text, inferred = self.sp.log_for(job)
         self._log_path, self._log_text = log_path, log_text
 
         history: History | None = self.sp.history
@@ -1492,6 +1490,11 @@ class SlurmpastApp(App[Any]):
         self.log_dirs = list(log_dirs)
         self.mouse_enabled = bool(mouse)
         self.load_error: str | None = None
+        # {job_id: (path, inferred)} for the loaded history, resolved across all
+        # jobs at once so no two of them are shown the same log. Filled by a
+        # background worker; until it lands, log lookups fall back to the per-job
+        # search. See :func:`slurmpast.logs.assign_logs`.
+        self._log_map: dict | None = None
 
         # The window was fixed at launch by -S, so answering "what about last
         # month?" meant quitting and re-running. `w` cycles it in place.
@@ -1547,9 +1550,40 @@ class SlurmpastApp(App[Any]):
             return
         self._previous = None
         self.history = history
+        self._log_map = None
+        if not self.no_logs:
+            # Off the UI thread: 1.7s over 6,600 jobs, which is invisible here and
+            # a visible stall if it happens on the keypress that opens a job.
+            self.run_worker(self._resolve_logs, thread=True, name="logs")
         screen = self.screen
         if isinstance(screen, OverviewScreen):
             screen.refresh_rows()
+
+    def _resolve_logs(self) -> None:
+        history = self.history
+        if history is None:
+            return
+        try:
+            resolved = assign_logs(history.usable_jobs, extra_dirs=self.log_dirs)
+        except OSError:
+            return  # a log search must never take the dashboard down with it
+        # Only if the history has not been replaced under us by a re-query.
+        if self.history is history:
+            self._log_map = resolved
+
+    def log_for(self, job):
+        """``(path, text, inferred)`` for one job, cross-checked against the rest.
+
+        Prefers the whole-history assignment, so a file that belongs to another run
+        is not offered here. Falls back to the single-job search while the worker is
+        still running, or for a job that is not part of the loaded history.
+        """
+        if self.no_logs:
+            return None, None, False
+        if self._log_map is not None and job.job_id in self._log_map:
+            path, inferred = self._log_map[job.job_id]
+            return path, (read_tail(path) if path else None), inferred
+        return load_for(job, extra_dirs=self.log_dirs)
 
     def _restore(self, error: str | None) -> None:
         """Undo a re-query that came back with nothing."""
@@ -1643,6 +1677,7 @@ class SlurmpastApp(App[Any]):
         this, and `w` inherited it.
         """
         self.history = None
+        self._log_map = None
         while len(self.screen_stack) > 1 and not isinstance(self.screen, OverviewScreen):
             self.pop_screen()
         if isinstance(self.screen, OverviewScreen):
