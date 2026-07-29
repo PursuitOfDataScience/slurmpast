@@ -182,13 +182,16 @@ def walltime_advice(jobs) -> Advice:
     spread = ""
     if abs(longest - p95) > max(1.0, 0.01 * longest):
         spread = " (p95 %s)" % format_duration(p95)
-    # What the figure MEANS, not how it was computed. "+25% headroom" was asked
-    # about because "headroom" says nothing; spelling the recipe out instead --
-    # "+25%, rounded up to the next 15 minutes" -- was worse, and got asked about
-    # twice: a reader wants to know where 00:40:00 came from and why it is not
-    # 00:30:18, and neither the multiplier nor the rounding step is that. The gap
-    # between the two numbers on screen IS the answer, so the text names it.
-    basis = "longest of %d completed runs took %s%s; the rest is room to spare." % (
+    # The evidence, and nothing else. Three attempts at saying more all failed:
+    # "+25% headroom" ("what does headroom mean in this context?"), then the recipe
+    # "+25%, rounded up to the next 15 minutes" ("you are making things far more
+    # confusing even further"), then "the rest is room to spare" ("why do we need
+    # this sentence here?"). It was not needed: the block's own header already says
+    # why a request sits above the observation -- over-requesting narrows which
+    # nodes can host the job, under-requesting kills the run -- so repeating it per
+    # flag, three times per workload, was the header again in smaller type. What
+    # only the line can supply is the measurement the number came from.
+    basis = "longest of %d completed runs took %s%s." % (
         len(completed),
         format_duration(longest),
         spread,
@@ -315,7 +318,7 @@ def memory_advice(jobs) -> Advice:
         requested=requested,
         observed="%s peak across %d runs" % (format_bytes(peak), len(usable)),
         suggestion="%dG" % target if verdict != "keep" else "",
-        basis="the most any run used was %s; the rest is room to spare." % format_bytes(peak),
+        basis="the most any run used was %s." % format_bytes(peak),
         caution=caution,
     )
 
@@ -386,8 +389,7 @@ def cpu_advice(jobs) -> Advice:
         observed="%.1f %s busy per task at peak across %d runs"
         % (peak, per_task_label, len(usable)),
         suggestion=str(target) if verdict != "keep" else "",
-        basis="the busiest run used %s of %s cores per task; the rest is room to spare."
-        % (_cores_text(peak), requested),
+        basis="the busiest run used %s of %s cores per task." % (_cores_text(peak), requested),
         caution=caution,
     )
 

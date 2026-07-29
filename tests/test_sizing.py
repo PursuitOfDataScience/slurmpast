@@ -240,15 +240,19 @@ class TestRulePrecedence:
         assert memory_advice(jobs).verdict == "unknown"
 
 
-class TestTheBasisSaysWhatTheNumberMeans:
-    """Asked twice. First of "+30% headroom": "what does headroom mean in this
-    context? it's so confusing." Spelling out the recipe instead -- "+30%, rounded
-    up to whole GiB" -- got asked again: "what does +30% mean? what does rounded up
-    to whole gib mean? you are making things far more confusing even further."
+class TestTheBasisIsTheEvidenceAndNothingElse:
+    """Asked three times, and every attempt to say more than the measurement failed.
 
-    The lesson: a reader wants to know where 73G came from and why it is not the
-    55.6 GiB the runs used. Neither the multiplier nor the rounding step answers
-    that. The gap between the two numbers is the answer, so the text names the gap.
+    "+30% headroom" -> "what does headroom mean in this context? it's so confusing."
+    "+30%, rounded up to whole GiB" -> "you are making things far more confusing
+    even further." "the rest is room to spare" -> "why do we need this sentence
+    here?"
+
+    It was not needed. The block's own header already says why a request sits above
+    the observation -- over-requesting narrows which nodes can host the job,
+    under-requesting kills the run -- so a clause per flag, three times per
+    workload, was the header again in smaller type. What only the line can supply is
+    the measurement the number came from.
     """
 
     def test_no_surface_says_headroom(self):
@@ -262,26 +266,38 @@ class TestTheBasisSaysWhatTheNumberMeans:
                 assert '"' not in line and "'" not in line, (module, line)
 
     def test_no_surface_recites_the_arithmetic(self):
-        """The multiplier and the rounding are implementation, not information."""
         for advice in recommend(workload("midtrain")):
-            assert "%" not in advice.basis or "p95" in advice.basis, advice.basis
             assert "rounded up" not in advice.basis, advice.basis
+            assert "room to spare" not in advice.basis, advice.basis
 
-    def test_memory_names_the_measurement_and_the_gap(self):
+    def test_each_basis_is_one_measurement(self):
+        """One clause, one sentence, and it ends where the evidence does."""
+        for advice in recommend(workload("midtrain")):
+            if not advice.actionable:
+                continue
+            assert advice.basis.count(";") == 0, advice.basis
+            assert advice.basis.endswith("."), advice.basis
+
+    def test_memory_names_the_measurement(self):
         advice = memory_advice(workload("midtrain"))
         assert advice.basis.startswith("the most any run used was")
-        assert "room to spare" in advice.basis
 
-    def test_cpu_names_the_measurement_and_the_gap(self):
+    def test_cpu_names_the_measurement(self):
         advice = cpu_advice(workload("tokenize-shards"))
         assert "the busiest run used" in advice.basis
         assert "cores per task" in advice.basis
-        assert "room to spare" in advice.basis
 
-    def test_walltime_names_the_measurement_and_the_gap(self):
+    def test_walltime_names_the_measurement(self):
         advice = walltime_advice(workload("midtrain"))
         assert "completed runs took" in advice.basis
-        assert "room to spare" in advice.basis
+
+    def test_the_header_is_where_the_reason_lives(self):
+        """So dropping the clause did not drop the reason."""
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_sizing
+
+        text = render_sizing(History(history()), style=Style(enabled=False))
+        assert "under-requesting kills the run" in text
 
     def test_a_core_count_that_displays_as_zero_says_so_honestly(self):
         """ "0.00 of 8 cores" reads as none at all, when the point is that a nonzero
