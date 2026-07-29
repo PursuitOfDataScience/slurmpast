@@ -831,3 +831,81 @@ class TestPathsGetTheRoomTheLineHas:
         log_prefix = len("  log  ")
         cell_prefix = 4 + render.PAIR_LABEL_WIDTH + 1
         assert log_prefix < cell_prefix
+
+
+class TestTheBlockIsCentred:
+    """fit_columns leaves width no column needs UNUSED -- stretching a table into
+    empty space makes canyons between its columns -- and the leftover then sat
+    entirely on the right, which reads as the layout having abandoned half the
+    terminal. Centring spends it evenly.
+    """
+
+    async def _probe(self, jobs, width, keys=(), table="#groups"):
+        """Measure inside the running app: the DOM is torn down on exit."""
+        from textual.widgets import DataTable, Footer, Header
+
+        app = make_app(jobs, no_logs=True)
+        async with app.run_test(size=(width, 30)) as pilot:
+            await pilot.pause()
+            for key in keys:
+                await pilot.press(key)
+                await pilot.pause()
+            await pilot.pause()
+            screen = app.screen
+            content = screen.query_one("#content")
+            found = screen.query(DataTable)
+            return {
+                "name": type(screen).__name__,
+                "width": content.size.width,
+                "x": content.region.x,
+                "columns": len(found.first().columns) if found else 0,
+                "header": screen.query_one(Header).size.width,
+                "footer": screen.query_one(Footer).size.width,
+            }
+
+    @pytest.mark.asyncio
+    async def test_the_overview_sits_in_the_middle(self, history_jobs):
+        got = await self._probe(history_jobs, 150)
+        assert got["width"] < 150, "nothing to centre if the table fills the terminal"
+        assert got["x"] == (150 - got["width"]) // 2
+        assert got["x"] > 0
+
+    @pytest.mark.asyncio
+    async def test_the_margins_are_even(self, history_jobs):
+        got = await self._probe(history_jobs, 150)
+        left, right = got["x"], 150 - got["width"] - got["x"]
+        assert abs(left - right) <= 1, (left, right)
+
+    @pytest.mark.asyncio
+    async def test_the_columns_still_track_the_terminal(self, history_jobs):
+        """The trap this refactor had to avoid. The table now sits in a container
+        sized to the columns it picked, so sizing the columns from the TABLE's own
+        width would be circular and would freeze the column set at the default on
+        every terminal."""
+        wide = await self._probe(history_jobs, 150)
+        narrow = await self._probe(history_jobs, 60)
+        assert wide["columns"] > narrow["columns"], (wide["columns"], narrow["columns"])
+
+    @pytest.mark.asyncio
+    async def test_it_never_asks_for_more_width_than_the_terminal(self, history_jobs):
+        """The never-dropped columns have a floor, so on a narrow terminal the table
+        wants more room than exists. Asking for it hands the Screen a horizontal
+        scrollbar where it used to simply clip."""
+        for term in (40, 60, 80):
+            got = await self._probe(history_jobs, term)
+            assert got["width"] <= term, (term, got["width"])
+            assert got["x"] == (term - got["width"]) // 2
+
+    @pytest.mark.asyncio
+    async def test_the_bars_still_span_the_terminal(self, history_jobs):
+        """A centred block, not a centred application: a header and footer stopping
+        short of the edges would look broken."""
+        got = await self._probe(history_jobs, 150)
+        assert got["header"] == 150
+        assert got["footer"] == 150
+
+    @pytest.mark.asyncio
+    async def test_the_node_screen_is_centred_too(self, history_jobs):
+        got = await self._probe(history_jobs, 150, keys=("n",))
+        assert got["name"] == "NodesScreen"
+        assert got["x"] == (150 - got["width"]) // 2 and got["x"] > 0

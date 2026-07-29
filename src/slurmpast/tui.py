@@ -47,7 +47,11 @@ from .logs import assign_logs, load_for, read_tail
 from .nodes import MIN_SAMPLES, compress_nodelist, node_table, suggest_exclude
 
 BASE_CSS = """
-Screen { background: $surface; }
+Screen { background: $surface; align-horizontal: center; }
+/* Banner, stats and table centred as ONE block so they keep a common left edge.
+   Width is set from Python -- see CentredContent. Header and Footer are 1fr bars
+   and span the terminal, which is what a bar should do. */
+#content { height: 1fr; }
 #banner { height: auto; padding: 0 1; color: $text-muted; }
 /* A blank line above and below. Header bar, stats and column headings on three
    consecutive rows read as one squeezed block. */
@@ -213,7 +217,7 @@ _MIN_TABLE_WIDTH = 40
 _SCROLLBAR = 2
 
 
-def _sync_columns(table: DataTable, spec, current, content=None):
+def _sync_columns(table: DataTable, spec, current, content=None, available=None):
     """Give ``table`` exactly the columns its current width calls for.
 
     Rebuilding is the only way to resize a DataTable's columns, and it drops the
@@ -222,15 +226,53 @@ def _sync_columns(table: DataTable, spec, current, content=None):
 
     ``content`` is the longest real cell per column, so a flexible column stops
     growing once its content fits instead of stretching into empty space.
+
+    ``available`` is the SCREEN's width, passed in rather than read off the table.
+    The table now sits inside a container sized to the columns this function picks,
+    so asking the table how wide it is would be asking about its own output: the
+    column set would freeze at _DEFAULT_TABLE_WIDTH and never track the terminal.
     """
     # `size` is zero until the first layout pass; on_resize calls back after it.
-    width = table.size.width or _DEFAULT_TABLE_WIDTH
+    width = available or table.size.width or _DEFAULT_TABLE_WIDTH
     layout = render.fit_columns(spec, max(_MIN_TABLE_WIDTH, width - _SCROLLBAR), content=content)
     if layout != current or not table.columns:
         table.clear(columns=True)
         for label, column_width in layout:
             table.add_column(label, width=column_width)
     return layout
+
+
+def _content_width(layout, padding: int = 2) -> int:
+    """Cells a table of ``layout`` occupies: columns, DataTable's cell padding, a
+    scrollbar. This is what the centring container is sized to."""
+    return sum(width for _, width in layout) + padding * len(layout) + _SCROLLBAR
+
+
+class CentredContent:
+    """Sizes ``#content`` to what is in it, so the Screen can centre the block.
+
+    fit_columns leaves width no column needs UNUSED -- deliberately, because
+    stretching a table into empty space makes canyons between its columns -- and
+    the leftover then sat entirely on the right, which reads as the layout having
+    given up half the terminal. Centring spends it evenly instead.
+
+    An explicit width rather than `width: auto`: the children are `1fr` so they
+    fill the block, and a 1fr child inside an auto parent is circular -- the parent
+    asks the child how wide it is while the child asks the parent.
+    """
+
+    def fit_content(self, layout) -> None:
+        try:
+            content = self.query_one("#content")  # type: ignore[attr-defined]
+        except Exception:
+            return  # a screen composed without the container centres nothing
+        # Never wider than the terminal. The never-dropped columns have a floor of
+        # their own, so on a very narrow terminal the table wants more room than
+        # there is; asking for it would hand the Screen a horizontal scrollbar
+        # where it used to simply clip.
+        screen_width = self.size.width  # type: ignore[attr-defined]
+        wanted = _content_width(layout)
+        content.styles.width = min(wanted, screen_width) if screen_width else wanted
 
 
 def _digit_bindings(action: str):
@@ -405,7 +447,7 @@ class HelpScreen(ModalScreen[None]):
 _OVERVIEW_COLUMNS = render.OVERVIEW_COLUMNS
 
 
-class OverviewScreen(ClipboardMixin, Screen[Any]):
+class OverviewScreen(ClipboardMixin, CentredContent, Screen[Any]):
     """Workload groups, ranked. The landing screen."""
 
     BINDINGS: ClassVar = [
@@ -446,18 +488,19 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
 
     def compose(self) -> ComposeResult:
         yield _header()
-        yield Static(id="summary")
-        with Horizontal(id="searchbar"):
-            yield SearchBar()
-        yield DataTable(
-            id="groups",
-            cursor_type="row",
-            zebra_stripes=False,
-            cell_padding=1,
-            # Without this the cursor's own foreground wins and every coloured
-            # glyph in the highlighted row turns solid white.
-            cursor_foreground_priority="renderable",
-        )
+        with Vertical(id="content"):
+            yield Static(id="summary")
+            with Horizontal(id="searchbar"):
+                yield SearchBar()
+            yield DataTable(
+                id="groups",
+                cursor_type="row",
+                zebra_stripes=False,
+                cell_padding=1,
+                # Without this the cursor's own foreground wins and every coloured
+                # glyph in the highlighted row turns solid white.
+                cursor_foreground_priority="renderable",
+            )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -489,9 +532,14 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
         # than stretching to a cap over empty space.
         names = [g.label for g in history.groups] if history is not None else []
         layout = _sync_columns(
-            table, spec, self._layout, content={"JOB NAME": max(map(len, names), default=0)}
+            table,
+            spec,
+            self._layout,
+            content={"JOB NAME": max(map(len, names), default=0)},
+            available=self.size.width,
         )
         self._layout = layout
+        self.fit_content(layout)
         if history is None:
             summary.update(Text("loading…", style=theme.DIM))
             return
@@ -770,7 +818,7 @@ def _job_clipboard_cells(job) -> list[str]:
     ]
 
 
-class JobListScreen(ClipboardMixin, Screen[Any]):
+class JobListScreen(ClipboardMixin, CentredContent, Screen[Any]):
     """A list of jobs -- inside one workload, or flat across everything."""
 
     BINDINGS: ClassVar = [
@@ -806,15 +854,16 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
 
     def compose(self) -> ComposeResult:
         yield _header()
-        yield Static(id="summary")
-        with Horizontal(id="searchbar"):
-            yield SearchBar()
-        yield DataTable(
-            id="jobs",
-            cursor_type="row",
-            cell_padding=1,
-            cursor_foreground_priority="renderable",
-        )
+        with Vertical(id="content"):
+            yield Static(id="summary")
+            with Horizontal(id="searchbar"):
+                yield SearchBar()
+            yield DataTable(
+                id="jobs",
+                cursor_type="row",
+                cell_padding=1,
+                cursor_foreground_priority="renderable",
+            )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -842,8 +891,10 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
                 "NAME": max((len(j.name or "") for j in jobs), default=0),
                 "NODE": max((len(j.node_list or "") for j in jobs), default=0),
             },
+            available=self.size.width,
         )
         self._layout = layout
+        self.fit_content(layout)
         # Newest first: after a failed run you look at the most recent attempt.
         jobs.sort(key=lambda j: (j.start or j.submit or "", j.job_id), reverse=True)
         self._rows = jobs
@@ -1337,7 +1388,7 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
         self.query_one("#body", Static).update(body)
 
 
-class NodesScreen(ClipboardMixin, Screen[Any]):
+class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
     """Per-node reliability, workload-controlled."""
 
     BINDINGS: ClassVar = [
@@ -1355,21 +1406,24 @@ class NodesScreen(ClipboardMixin, Screen[Any]):
 
     def compose(self) -> ComposeResult:
         yield _header()
-        yield Static(id="summary")
-        yield DataTable(id="nodes", cursor_type="row")
-        yield Static(id="exclude")
+        with Vertical(id="content"):
+            yield Static(id="summary")
+            yield DataTable(id="nodes", cursor_type="row")
+            yield Static(id="exclude")
         yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#nodes", DataTable)
-        for label, width in (
+        layout = (
             ("NODE", 18),
             ("N", 11),
             ("RATE", 8),
             ("95% CI", 18),
             ("VERDICT", 14),
-        ):
+        )
+        for label, width in layout:
             table.add_column(label, width=width)
+        self.fit_content(layout)
         self.refresh_rows()
 
     def refresh_rows(self) -> None:
