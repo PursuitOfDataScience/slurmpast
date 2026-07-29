@@ -215,6 +215,11 @@ def _header() -> Header:
 # anything and only hides the filename. The real budget comes from the width there
 # actually is -- see JobScreen._path_budget. `p` toggles the full value, and
 # --plain never elides, so a pasted report keeps the whole path.
+# Share of a workload's runs a qualifier must reach before the summary names it.
+# One idle run in 132 is 0.8% and not a fact anyone acts on; five cancelled in 15
+# is a third of the workload and is why its numbers do not add up.
+QUALIFIER_SHARE = 0.10
+
 _MIN_PATH_WIDTH = 28
 _MAX_PATH_WIDTH = 62
 _DEFAULT_TABLE_WIDTH = 96
@@ -964,29 +969,36 @@ class JobListScreen(ClipboardMixin, CentredContent, Screen[Any]):
         summary.append(
             "  ·  %d job%s" % (len(jobs), "" if len(jobs) == 1 else "s"), style=theme.DIM
         )
-        idle = sum(1 for j in jobs if looks_like_noop(j))
-        if idle:
-            # "of them" ties the count to the job count beside it. A bare "3 never
-            # computed" next to a GPU-hours figure elsewhere read as hours.
-            summary.append(
-                "  ·  %d of them never computed" % idle, style=theme.HEALTH_COLOR["warn"]
-            )
-        cancelled = sum(1 for j in jobs if j.cancelled)
-        if cancelled:
-            # The quantity that closes the arithmetic. The overview showed this
-            # workload as 15 runs / 10 completed / 2 flagged and was asked whether
-            # the math was wrong: the missing 5 were cancelled, and a cancellation
-            # is deliberately neither a success nor a problem, so it appeared in no
-            # column at all. Dim, because it is bookkeeping rather than a finding.
-            summary.append("  ·  %d cancelled" % cancelled, style=theme.DIM)
-        excluded = getattr(self, "_excluded", 0)
-        if excluded:
-            # Terse: the window is already in the title bar, and the long
-            # explanation belonged in one place, not on every workload.
-            summary.append(
-                "  ·  %d unterminated, excluded" % excluded,
-                style=theme.FAINT,
-            )
+
+        # Each qualifier only when it is a material share of the runs, not merely
+        # nonzero. "software · test · 132 jobs · 1 of them never computed · 1
+        # cancelled · 1 unterminated, excluded" is three separate ones out of 132 --
+        # 0.8% each -- taking three quarters of the line to report nothing anybody
+        # would act on. The same restraint index.IDLE_SHARE_WORTH_NAMING applies to
+        # the overview's idle figure, for the same reason: a headline that fires at
+        # every magnitude is how a headline turns into noise.
+        #
+        # On the workload this was asked about -- 5 of 15 cancelled -- every one of
+        # them clears the bar and the line says so, which is where they earn it.
+        def qualifier(count, text, style):
+            if count and count >= QUALIFIER_SHARE * len(jobs):
+                summary.append("  ·  %s" % (text % count), style=style)
+
+        # "of them" ties the count to the job count beside it. A bare "3 never
+        # computed" next to a GPU-hours figure elsewhere read as hours.
+        qualifier(
+            sum(1 for j in jobs if looks_like_noop(j)),
+            "%d of them never computed",
+            theme.HEALTH_COLOR["warn"],
+        )
+        # Cancellations close the arithmetic: the overview showed one workload as 15
+        # runs / 10 completed / 2 flagged and was asked whether the math was wrong.
+        # The missing 5 were cancelled, and a cancellation is deliberately neither a
+        # success nor a problem, so it appears in no column. Dim: bookkeeping, not a
+        # finding.
+        qualifier(sum(1 for j in jobs if j.cancelled), "%d cancelled", theme.DIM)
+        # Terse, and the overview reports the fleet-wide count anyway.
+        qualifier(getattr(self, "_excluded", 0), "%d unterminated, excluded", theme.FAINT)
         if self.search_text:
             summary.append("  ·  search: ", style=theme.FAINT)
             summary.append(self.search_text, style=theme.ACCENT)
@@ -1124,7 +1136,15 @@ class WorkloadScreen(JobListScreen):
             banner.append("\n" if banner.plain else "")
             banner.append("next run  " if index == 0 else "          ", style=theme.FAINT)
             banner.append("%-22s" % ("%s=%s" % (item.flag, item.suggestion)), style=theme.ACCENT)
-            banner.append("  ".join(render.wrap(item.basis, 84)[:1]), style=theme.DIM)
+            # Every line of it, not just the first. `[:1]` silently cut the basis
+            # mid-sentence -- "the rest is room to" -- which reads as the app having
+            # broken rather than as a sentence that did not fit. Wrapped to the
+            # width there is, and continuation lines indent under the text rather
+            # than under the flag.
+            lines = render.wrap(item.basis, max(40, self.size.width - 34))
+            banner.append(lines[0], style=theme.DIM)
+            for extra in lines[1:]:
+                banner.append("\n" + " " * 32 + extra, style=theme.DIM)
         return banner if banner.plain else None
 
     def action_patterns(self) -> None:

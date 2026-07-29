@@ -1061,3 +1061,86 @@ class TestChangingTheTimeRangeIsNoticeable:
             await pilot.press("w")
             await pilot.pause()
             assert any("window is fixed" in n.message for n in app._notifications)
+
+
+class TestTheWorkloadHeaderStaysShort:
+    """Reported: "can you tell me why the top of the ui needs all the useless info
+    like that? it's verbose and fucking annoying" -- of
+
+        software · test · 132 jobs · 1 of them never computed · 1 cancelled
+        · 1 unterminated, excluded
+
+    Three separate ones out of 132, 0.8% each, taking three quarters of the line.
+    """
+
+    def _screen(self, jobs, group_jobs, excluded=0):
+        from slurmpast.index import build_groups
+
+        group = build_groups(group_jobs)[0]
+        if excluded:
+            group = group._replace(excluded=excluded)
+        return group
+
+    async def _summary(self, jobs, group, width=150):
+        app = make_app(jobs, no_logs=True)
+        async with app.run_test(size=(width, 24)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.WorkloadScreen(group))
+            await pilot.pause()
+            await pilot.pause()
+            return app.screen.summary_text.plain
+
+    @pytest.mark.asyncio
+    async def test_one_stray_run_in_a_hundred_is_not_a_headline(self, healthy_job):
+        many = [healthy_job._replace(job_id=str(4000 + i)) for i in range(100)]
+        many[0] = many[0]._replace(state="CANCELLED by 1")
+        group = self._screen(many, many, excluded=1)
+        text = await self._summary(many, group)
+        assert "100 jobs" in text
+        assert "cancelled" not in text, text
+        assert "unterminated" not in text, text
+
+    @pytest.mark.asyncio
+    async def test_a_material_share_still_earns_its_clause(self, healthy_job):
+        """5 of 15 cancelled is a third of the workload, and is the answer to "15
+        total but 10 success and 2 flagged, where are the rest 3?"."""
+        some = [healthy_job._replace(job_id=str(4200 + i)) for i in range(15)]
+        for i in range(5):
+            some[i] = some[i]._replace(state="CANCELLED by 1")
+        group = self._screen(some, some)
+        text = await self._summary(some, group)
+        assert "5 cancelled" in text, text
+
+    @pytest.mark.asyncio
+    async def test_the_threshold_is_a_share_not_a_count(self, healthy_job):
+        from slurmpast.tui import QUALIFIER_SHARE
+
+        assert 0 < QUALIFIER_SHARE < 1
+
+
+class TestTheAdviceBasisIsNotCutOff:
+    """It was wrapped to 84 cells and then sliced to the FIRST line, so a basis of
+    any length lost its ending: "the rest is room to" reads as the app breaking
+    rather than as a sentence that did not fit.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_whole_sentence_survives(self, history_jobs):
+        from slurmpast.index import build_groups
+        from slurmpast.sizing import recommend
+
+        group = build_groups(history_jobs)[0]
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test(size=(150, 30)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.WorkloadScreen(group))
+            await pilot.pause()
+            await pilot.pause()
+            body = "".join(
+                "".join(s.text for s in st) for st in app.screen._compositor.render_strips()
+            )
+        for advice in recommend(group.jobs):
+            if not advice.actionable:
+                continue
+            # The last few words are what a first-line slice threw away.
+            assert advice.basis.rstrip(".").split()[-1] in body, advice.basis
