@@ -156,10 +156,19 @@ def walltime_advice(jobs) -> Advice:
         target = max(target, _round_walltime(floor * WALLTIME_MARGIN))
 
     current = limits[-1] if limits else None
-    basis = "longest of %d completed runs is %s (p95 %s); +%d%% headroom." % (
+    # p95 only when it says something the longest run does not. On a workload whose
+    # runs are all alike the two are the same number, and "longest of 8 completed
+    # runs is 00:30:18 (p95 00:30:18)" printed it twice in one clause -- noise
+    # dressed as evidence, which is worse than no evidence. It earns the space where
+    # the distribution has a tail: 07:57:12 longest against 02:12:15 at p95 is the
+    # difference between a workload with one slow run and one that is slow.
+    spread = ""
+    if abs(longest - p95) > max(1.0, 0.01 * longest):
+        spread = " (p95 %s)" % format_duration(p95)
+    basis = "longest of %d completed runs %s%s, +%d%% headroom." % (
         len(completed),
         format_duration(longest),
-        format_duration(p95),
+        spread,
         round((WALLTIME_MARGIN - 1) * 100),
     )
     caution = ""

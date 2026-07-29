@@ -81,7 +81,34 @@ class TestWalltime:
         slow = jobs[0]._replace(job_id="9993", state="COMPLETED", elapsed=6 * 3600.0)
         advice = walltime_advice(jobs + [slow])
         assert advice.basis.startswith("longest of")
-        assert "p95" in advice.basis
+
+    def test_p95_is_dropped_when_it_repeats_the_longest_run(self):
+        """`longest of 8 completed runs is 00:30:18 (p95 00:30:18)` printed one
+        number twice in one clause -- noise dressed as evidence."""
+        jobs = workload("midtrain")
+        same = [
+            j._replace(job_id=str(9500 + i), state="COMPLETED", elapsed=1800.0)
+            for i, j in enumerate(jobs)
+        ]
+        advice = walltime_advice(same)
+        assert "p95" not in advice.basis, advice.basis
+        assert "00:30:00" in advice.basis
+
+    def test_p95_is_kept_where_the_distribution_has_a_tail(self):
+        """07:57:12 longest against 02:12:15 at p95 is the difference between a
+        workload with one slow run and a workload that is slow.
+
+        Twenty quick runs, not fifteen: with sixteen values a lone outlier IS the
+        top 5%, so p95 lands on it and there is no spread to report. The real
+        `software` workload has 130 runs, where 5% is six of them.
+        """
+        base = workload("midtrain")[0]
+        quick = [
+            base._replace(job_id=str(9600 + i), state="COMPLETED", elapsed=600.0) for i in range(20)
+        ]
+        advice = walltime_advice(quick + [base._replace(job_id="9700", elapsed=8 * 3600.0)])
+        assert "p95" in advice.basis, advice.basis
+        assert "08:00:00" in advice.basis, "sized from the longest, not p95"
 
 
 class TestMemory:
