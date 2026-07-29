@@ -52,65 +52,38 @@ argonne35-pretrain   test · 101 runs
   #SBATCH --time=10:00:00
 ```
 
-That workload was running on a **seven-minute margin**. Four rules keep the advice
-honest: a TIMEOUT never sizes walltime *down*, a hung run is not evidence of
-needing more time, an OOM kill outranks `MaxRSS`, and below three usable runs it
-says *not enough evidence* rather than guessing.
+That workload was running on a seven-minute margin. With fewer than three usable
+runs it says *not enough evidence* instead of guessing.
 
 ## One job
 
 <p align="center">
-  <img src="assets/screenshot-job.svg" width="900" alt="One finished job: time, CPU and memory as gauges, then every field Slurm recorded.">
+  <img src="assets/screenshot-job.svg" width="900" alt="One finished job: time, CPU and memory against their limits, then every field Slurm recorded.">
 </p>
 
-Three gauges, because a bar needs a ceiling to be a fraction of. Kernel share,
-disk rate and GPU count have none, so they print as numbers — an unfillable
-`░░░░` reads as a measured zero. Below that: every field Slurm kept, the log
-excerpts if the paths are still on disk, then the findings.
-
-Same row idiom as `slurmwatch`, so a job you watched running looks like the same
-object afterwards.
+Time, CPU and memory against the limits you asked for, then every field Slurm
+recorded, the log excerpts if the files are still on disk, and the findings.
 
 ## Failure, across runs
 
 <p align="center">
-  <img src="assets/screenshot-nodes.svg" width="900" alt="Per-node failure rates with Wilson intervals and a ready-to-paste --exclude.">
+  <img src="assets/screenshot-nodes.svg" width="900" alt="Per-node failure rates with a ready-to-paste --exclude.">
 </p>
 
 `seff` describes one job and `slurmwatch` one live run. Neither can say *"you
-submitted this 115 times and it died 99 times."*
+submitted this 115 times and it died 99 times."* Runs group into workloads, so a
+repeated failure — and the node it keeps landing on — is visible at a glance, with
+a ready-to-paste `--exclude`.
 
-- **Hand-searched memory.** One real series walked `48G → 32G → 32G → 17G → 12G →
-  12G → 14G → 16G → 18G`, then succeeded at 32G — a value that had already OOM'd,
-  proving `--mem` was never the variable.
-- **Nodes that eat jobs**, controlled for workload. Uncontrolled, one node looked
-  25% bad almost entirely because a buggy campaign landed there — so a node is
-  called `worse` only when its Wilson interval clears the baseline.
+## Correct on any cluster
 
-## Numbers you can trust
+`sacct` misreports in ways that are easy to miss: the requested memory is often
+blank, limits are recorded per allocation but enforced per node, and a job left in
+`RUNNING` inflates every total. `slurmpast` handles those, adapts to how your
+Slurm version spells things, and prints `n/a` rather than `0` for anything it
+cannot read.
 
-Three places `seff` and a naive `sacct --format` go wrong — each found on a real
-record, each pinned by a test naming the job id:
-
-- `ReqMem` is `0n` on **2,130 of 6,574** jobs — the real ceiling is in `AllocTRES`.
-- `AllocTRES` `mem=` is the **allocation total**, while `--mem` and the cgroup are
-  per *node*, so dividing `MaxRSS` by it understates memory by the node count.
-- `State=RUNNING, End=Unknown` months after death makes `Elapsed` *now − start*;
-  one such record was 65% of a GPU-hour total.
-
-A value that cannot be read prints `n/a`, never `0`. Four more traps, and the
-full 85-field extraction table, are in **[docs/details.md](docs/details.md)**.
-
-## Any Slurm cluster
-
-Developed against Slurm 20.11.8, calibrated to no single site. Renamed fields
-(`Reserved` → `Planned` in 23.02), `SLURM_TIME_FORMAT`, pipes in `--constraint`,
-hostlists like `unit[0-31]rack[0-41]`, three GPU spellings, a missing `--me` —
-each negotiated rather than assumed, each a test in `tests/test_portability.py`.
-[Details](docs/details.md#any-slurm-cluster).
-
-What is *measured* is portable; what is *judged* is not. The thresholds are
-conservative heuristics from one cluster's history, each a named constant.
+[Every trap, and the 85 fields it extracts →](docs/details.md)
 
 ## As a library
 
@@ -125,10 +98,8 @@ for advice in recommend(history.groups[0].jobs):
     print(advice.flag, advice.verdict, advice.suggestion)
 ```
 
-`--json` emits all 174 values per job; a test fails if a field is read but never
-surfaced.
+`--json` emits everything — 174 values per job.
 
 ---
 
-Python 3.10–3.13 · Textual 0.89–8.2 · no Slurm needed to run the tests · MIT.
-Mouse capture is off by default, so text selection works as it does anywhere else.
+Slurm 20.11.8 · Python 3.10–3.13 · Textual 0.89–8.2 · MIT

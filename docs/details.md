@@ -90,6 +90,30 @@ to 592, and a `NAMES` column says how many real names a pattern covers.
 No cache: the full seven-month query is 1.54s and the index builds in 0.04s,
 which does not justify a database. Logs are read only when you open a job.
 
+## Also finds
+
+**Repeated failure.** `seff` describes one job; `slurmwatch` describes one live
+run. Neither can say *"you submitted this 115 times and it died 99 times."*
+
+**Hand-searched memory.** One real series walked `48G → 32G → 32G → 17G → 12G →
+12G → 14G → 16G → 18G`, then succeeded at 32G — a value that had already OOM'd,
+proving `--mem` was never the variable.
+
+**Nodes that eat jobs**, controlled for workload, with Wilson intervals and a
+ready-to-paste `--exclude`. Uncontrolled, one node looked 25% bad almost entirely
+because a buggy campaign landed there — so a node is only called `worse` when its
+interval clears the baseline.
+
+## Gauges
+
+Three rows — time, CPU, memory — because a bar needs a ceiling to be a fraction
+of. Kernel share, disk rate and GPU count have none, so they are printed as
+numbers rather than as bars that can never fill; an unfillable `░░░░` reads as a
+measured zero.
+
+Same row idiom as `slurmwatch`, so a job you watched running looks like the same
+object afterwards.
+
 ## Thresholds
 
 What is *measured* is portable; what is *judged* is not. The thresholds — when a
