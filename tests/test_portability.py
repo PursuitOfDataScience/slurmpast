@@ -807,6 +807,179 @@ class TestValueShapesAcrossReleases:
         assert job.open_ended, "no End and a non-terminal state: excluded from totals"
 
 
+class TestEndToEndOnASimulatedModernCluster:
+    """One replay of a cluster this code has never run on.
+
+    Slurm 24.05, `jobacct_gather/cgroup`, `AutoDetect=nvml`, typed GRES, recorded
+    StdErr, four nodes, `Planned` instead of `Reserved`. The unit tests above each
+    pin one difference; this drives the whole pipeline through all of them at once,
+    because the failure mode being guarded against is a query that comes back empty
+    or a number that is quietly per-allocation.
+    """
+
+    MODERN = """\
+SLURM_VERSION           = 24.05.4
+JobAcctGatherType       = jobacct_gather/cgroup
+AccountingStorageType   = accounting_storage/slurmdbd
+AccountingStorageTRES   = cpu,mem,node,billing,gres/gpu,gres/gpuutil,gres/gpumem
+"""
+
+    def _sacct(self):
+        # What `sacct --helpformat` prints on 24.05: Planned, not Reserved; StdOut,
+        # StdErr and SubmitLine present; AllocGRES and ReqGRES long gone.
+        available = (_fields_lower(_FIELDS) - {"reserved", "allocgres", "reqgres"}) | {"planned"}
+        probe = " ".join(sorted(available))
+        fields = resolve_fields(available)
+
+        def build(values):
+            return SAFE_DELIMITER.join(str(values.get(name, "")) for name in fields)
+
+        rows = [
+            build(
+                {
+                    "JobID": "884411",
+                    "JobName": "sft-h100-x",
+                    "User": "dana",
+                    "Account": "ml",
+                    "Cluster": "aurora",
+                    "Partition": "gpu",
+                    "State": "COMPLETED",
+                    "ExitCode": "0:0",
+                    "Submit": "2026-06-01T09:00:00",
+                    "Start": "2026-06-01T09:05:00",
+                    "End": "2026-06-01T11:05:00",
+                    "ElapsedRaw": "7200",
+                    "TimelimitRaw": "180",
+                    "Planned": "00:05:00",
+                    # No n/c suffix: 21.08 changed ReqMem to mirror ReqTRES, and
+                    # the figure totals the allocation.
+                    "ReqMem": "512G",
+                    "NNodes": "4",
+                    "AllocCPUS": "128",
+                    # `|` is the OR operator; it reaches the column verbatim.
+                    "Constraints": "h100|a100",
+                    "AllocTRES": "cpu=128,gres/gpu=16,gres/gpu:h100=16,mem=512G,node=4",
+                    "NodeList": "unit[0-1]rack[0-1]",
+                    "StdErr": "/scratch/dana/logs/%x-%A.err",
+                    "SubmitLine": "sbatch --gpus=16 --constraint=h100|a100 run.sh",
+                    "Flags": "SchedBackfill",
+                }
+            ),
+            build(
+                {
+                    "JobID": "884411.batch",
+                    "JobName": "batch",
+                    "State": "COMPLETED",
+                    "ElapsedRaw": "7200",
+                    "TotalCPU": "8-00:00:00",
+                    "UserCPU": "7-20:00:00",
+                    "SystemCPU": "0-04:00:00",
+                    "CPUTimeRAW": "921600",
+                    "NTasks": "16",
+                    "MaxRSS": "104857600K",
+                    "AveRSS": "104857600K",
+                    "TRESUsageInAve": "cpu=8-00:00:00,gres/gpumem=68000M,gres/gpuutil=91,mem=100G",
+                    "TRESUsageInMax": "gres/gpumem=72000M,gres/gpuutil=99,mem=100G",
+                    "TRESUsageInTot": "fs/disk=500000000000",
+                    "TRESUsageOutTot": "fs/disk=90000000000",
+                }
+            ),
+        ]
+
+        def runner(args):
+            if "--helpformat" in args:
+                return probe
+            assert any(a.startswith("--delimiter") for a in args), args
+            return "\n".join(rows)
+
+        return Sacct(runner=runner, probe=probe)
+
+    @pytest.fixture
+    def job(self, monkeypatch):
+        monkeypatch.setattr("slurmpast.site._CACHE", [])
+        site(runner=lambda _a: self.MODERN, refresh=True)
+        return self._sacct().jobs(["884411"])[0]
+
+    def test_the_query_returns_the_record_at_all(self, job):
+        assert job.job_id == "884411"
+        assert job.state == "COMPLETED"
+        assert job.elapsed == 7200.0
+
+    def test_queue_wait_survives_the_rename(self, job):
+        assert job.queue_wait == 300.0
+
+    def test_the_pipe_in_constraints_did_not_shift_the_columns(self, job):
+        assert job.constraints == "h100|a100"
+        assert job.alloc_tres == "cpu=128,gres/gpu=16,gres/gpu:h100=16,mem=512G,node=4"
+        assert job.cpu_count == 128
+
+    def test_the_four_node_hostlist_expands(self, job):
+        assert expand_nodelist(job.node_list) == [
+            "unit0rack0",
+            "unit0rack1",
+            "unit1rack0",
+            "unit1rack1",
+        ]
+
+    def test_gpus_and_gpu_hours(self, job):
+        assert job.gpu_count == 16
+        assert job.gpu_hours == pytest.approx(32.0)
+
+    def test_gpu_busy_ness_is_a_measurement_here(self, job):
+        assert job.gpu_utilization == pytest.approx(0.91)
+        assert job.gpu_mem_peak_bytes == 72000 * 1024**2
+
+    def test_memory_is_per_node_not_per_allocation(self, job):
+        assert job.mem_limit_total_bytes == 512 * 1024**3
+        assert job.mem_limit_bytes == 128 * 1024**3
+        assert job.max_rss == 100 * 1024**3
+        assert job.mem_utilization == pytest.approx(100 / 128.0)
+
+    def test_cores_are_per_task(self, job):
+        assert job.task_count == 16
+        assert job.cpus_per_task == 8
+
+    def test_the_recorded_log_path_is_expanded_from_the_pattern(self, job):
+        assert logs.recorded_paths(job) == ["/scratch/dana/logs/sft-h100-x-884411.err"]
+
+    def test_the_cgroup_wording_replaces_the_process_tree_warning(self, job):
+        assert job.max_rss < job.mem_limit_bytes
+        assert "cgroup peak" in maxrss_caveat()
+        assert "sums RSS" not in maxrss_caveat()
+
+    def test_the_whole_detail_screen_renders(self, job):
+        from slurmpast.diagnose import diagnose
+        from slurmpast.report import Style, render_job
+
+        text, verdict = render_job(job, style=Style(enabled=False))
+        assert "884411" in text
+        assert "h100|a100" in text
+        assert "91.0%" in text, "recorded GPU utilization should reach the screen"
+        assert "128.0 GiB per node (512.0 GiB over 4)" in text
+        assert "sbatch --gpus=16" in text
+        assert "not gathered by this cluster" not in text
+        # A healthy run: nothing critical, and the backfill note is informational.
+        assert not [f for f in diagnose(job).findings if f.severity == "critical"]
+
+    def test_sizing_advice_is_in_the_units_the_flags_take(self, job):
+        from slurmpast.sizing import recommend
+
+        runs = [job._replace(job_id="884411_%d" % i) for i in range(5)]
+        advice = {a.flag: a for a in recommend(runs)}
+        assert advice["--mem"].requested == "128.0 GiB"
+        assert advice["--cpus-per-task"].requested == "8"
+        assert "per task" in advice["--cpus-per-task"].basis
+
+    def test_the_rollup_ranks_it_as_gpu_work(self, job):
+        from slurmpast.index import History
+
+        history = History([job])
+        group = history.groups[0]
+        assert group.kind == "gpu"
+        assert group.gpu_hours == pytest.approx(32.0)
+        assert group.problems == 0
+
+
 class TestTresParsingIsExact:
     def test_a_key_is_not_matched_by_prefix(self):
         """`gres/gpumem` must not be read as `gres/gpu`."""
