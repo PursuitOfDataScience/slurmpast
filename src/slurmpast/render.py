@@ -776,7 +776,12 @@ def job_sections(job, summarized: bool = False):
                 _pct_of(job.mem_utilization, 1.0),
             )
         )
-    if job.max_rss_node:
+    # Only when "where" is a question with more than one answer. On 6,416 of the
+    # 6,440 real jobs here -- 99.6% -- there was one node and one task, so the row
+    # said "the peak was on the only node, in the only task". It earns its place on
+    # a multi-node or multi-task run, where which rank peaked is the thing you came
+    # to find.
+    if job.max_rss_node and (job.node_count > 1 or job.task_count > 1):
         mem.append(
             (
                 "peak on",
@@ -794,10 +799,19 @@ def job_sections(job, summarized: bool = False):
         imbalance = job.rss_task_imbalance
         extra = "   (%.1fx the average)" % imbalance if imbalance and imbalance >= 1.5 else ""
         mem.append(("average", "%s%s" % (format_bytes(job.ave_rss), extra), None))
-    if job.max_vmsize is not None:
-        ratio = job.vmsize_to_rss
-        note = "   (%.0fx resident - address space, not memory used)" % ratio if ratio else ""
-        mem.append(("virtual", "%s%s" % (format_bytes(job.max_vmsize), note), None))
+    # MaxVMSize is deliberately NOT here. It was shown to explain the figure rather
+    # than let it alarm, and it did the opposite: on this history it runs at a median
+    # of 44x the resident figure, has reached 5,449,406x, and has printed 43.2 TiB --
+    # so the row put an enormous number on screen and then spent its own text arguing
+    # that the number means nothing. "virtual 1.9 TiB (38x resident - address space,
+    # not memory used)" was read exactly that way and reported as making no sense.
+    #
+    # Nothing consumes it: no finding, no sizing rule. A CUDA process reserves that
+    # address space whether or not it touches any of it, so it says nothing about
+    # this job that this job did. It stays in --json (virtual_bytes,
+    # virtual_to_resident) and in --steps for anyone who has a reason to want it, and
+    # if a vmem-enforcing cluster ever needs it on screen, the finding that fires
+    # there can carry the number and the reason together.
     if job.max_pages:
         mem.append(("page faults", f"{int(job.max_pages):,}", None))
     sections.append(("memory", mem))

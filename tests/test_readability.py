@@ -850,3 +850,83 @@ class TestNothingWrapsAtEightyColumns:
         )
         too_long = [line for line in text.splitlines() if len(line) > 80]
         assert not too_long, too_long
+
+
+class TestTheMemorySectionOnlySaysThingsWorthSaying:
+    """Reported of "peak on midway3-0372 task 0" and "virtual 1.9 TiB (38x resident
+    - address space, not memory used)": "it makes no sense".
+
+    Both were measured against the real 6,440-job history and both earned the
+    complaint.
+    """
+
+    def _labels(self, job):
+        from slurmpast.render import job_sections
+
+        return [
+            label
+            for title, rows in job_sections(job, summarized=True)
+            if title == "memory"
+            for label, _value, _gauge in rows
+        ]
+
+    def _job(self, **alloc):
+        from slurmpast.sacct import parse
+
+        from .conftest import row
+
+        base = {
+            "JobID": "950",
+            "JobName": "w",
+            "State": "COMPLETED",
+            "ElapsedRaw": "3600",
+            "AllocTRES": "cpu=4,mem=64G,node=1",
+            "NNodes": "1",
+            "NTasks": "1",
+            "ReqMem": "64Gn",
+        }
+        base.update(alloc)
+        return parse(
+            "\n".join(
+                [
+                    row(**base),
+                    row(
+                        JobID="950.batch",
+                        JobName="batch",
+                        State="COMPLETED",
+                        MaxRSS="1048576K",
+                        MaxVMSize="2068502792K",
+                        MaxRSSNode="midway3-0372",
+                        MaxRSSTask="0",
+                        NTasks=base.get("NTasks", "1"),
+                    ),
+                ]
+            )
+        )[0]
+
+    def test_where_the_peak_was_is_dropped_when_there_is_one_place_it_could_be(self):
+        """6,416 of 6,440 real jobs -- 99.6% -- had one node and one task, so the row
+        named the only possible answer."""
+        assert "peak on" not in self._labels(self._job())
+
+    def test_it_is_kept_where_which_rank_peaked_is_a_real_question(self):
+        job = self._job(AllocTRES="cpu=16,mem=64G,node=4", NNodes="4", NTasks="4", ReqMem="16Gn")
+        assert "peak on" in self._labels(job)
+
+    def test_virtual_size_is_not_on_screen_at_all(self):
+        """It ran at a median of 44x the resident figure on this history, reached
+        5,449,406x, and printed 43.2 TiB -- an enormous number whose own text argued
+        that it meant nothing. Nothing consumes it: no finding, no sizing rule."""
+        for job in list(history()) + [self._job()]:
+            assert "virtual" not in self._labels(job)
+
+    def test_but_it_is_still_in_the_json(self):
+        """Removed from the summary, not from the tool."""
+        from slurmpast.cli import _job_json
+        from slurmpast.diagnose import diagnose
+
+        job = self._job()
+        payload = _job_json(job, None, diagnose(job))
+        assert payload["memory"]["virtual_bytes"] == 2068502792 * 1024
+        assert payload["memory"]["virtual_to_resident"] is not None
+        assert payload["memory"]["peak_node"] == "midway3-0372"
