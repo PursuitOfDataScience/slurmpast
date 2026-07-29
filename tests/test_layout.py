@@ -357,3 +357,67 @@ class TestPlainOutputFitsATerminal:
         monkeypatch.setenv("COLUMNS", "160")
         narrow_header = self._views(Style(enabled=False))["list"].splitlines()[0]
         assert len(wide_header) < len(narrow_header)
+
+
+class TestSpendingTheLeftoverWhenAskedTo:
+    """``fill_to`` exists because the two callers want opposite things: a pasted
+    table should be as narrow as its content so it survives a ticket comment, while
+    a 100-cell table centred in a 150-column terminal reads as thin.
+    """
+
+    CONTENT = {"JOB NAME": 14}
+
+    def test_zero_leaves_it_unused_as_before(self):
+        assert filled(fit_columns(SPEC, 200, content=self.CONTENT)) < 200
+
+    def test_it_fills_exactly_what_it_was_told_to(self):
+        assert filled(fit_columns(SPEC, 200, content=self.CONTENT, fill_to=160)) == 160
+
+    def test_it_never_exceeds_what_is_available(self):
+        layout = fit_columns(SPEC, 120, content=self.CONTENT, fill_to=500)
+        assert filled(layout) <= 120
+
+    def test_a_target_below_the_natural_width_changes_nothing(self):
+        natural = fit_columns(SPEC, 200, content=self.CONTENT)
+        assert fit_columns(SPEC, 200, content=self.CONTENT, fill_to=40) == natural
+
+    def test_the_leftover_goes_in_proportion_not_to_one_column(self):
+        """The anti-canyon property. Handing one flex column the whole leftover is
+        the reported 44-cells-around-18-characters defect; equal shares are wrong
+        the other way, turning a 3-cell "#" holding one digit into 13 cells."""
+        natural = dict(fit_columns(SPEC, 200, content=self.CONTENT))
+        wide = dict(fit_columns(SPEC, 200, content=self.CONTENT, fill_to=180))
+        grew = {label: wide[label] - natural[label] for label in natural}
+        assert grew["JOB NAME"] > grew["#"], grew
+        # Proportional, so the ratio of widths is roughly preserved rather than
+        # every column converging on the same size.
+        assert wide["#"] < wide["RUNS"] < wide["JOB NAME"], wide
+        # Shares track width: JOB NAME is ~3.5x "#" here, so it takes ~3.5x more.
+        assert grew["JOB NAME"] >= 3 * grew["#"], grew
+
+    def test_a_realistic_fill_barely_touches_the_narrow_columns(self):
+        """The screen case: 64 cells of content in a 100-cell terminal. The dramatic
+        growth in the test above comes from filling to nearly 3x the natural width,
+        which no terminal asks for."""
+        natural = dict(fit_columns(SPEC, 100, content=self.CONTENT))
+        wide = dict(fit_columns(SPEC, 100, content=self.CONTENT, fill_to=98))
+        assert wide["#"] - natural["#"] <= 2, (natural["#"], wide["#"])
+
+    def test_it_lands_on_the_target_exactly(self):
+        """Proportional shares round down, so the remainder has to go somewhere."""
+        for target in range(120, 181, 7):
+            assert filled(fit_columns(SPEC, 200, content=self.CONTENT, fill_to=target)) == target
+
+    def test_the_numbers_are_not_left_huddled_at_one_end(self):
+        """Spreading only across the flex columns would widen JOB NAME and leave
+        RUNS, COMPLETED and CPU-HOURS bunched together."""
+        natural = dict(fit_columns(SPEC, 200, content=self.CONTENT))
+        wide = dict(fit_columns(SPEC, 200, content=self.CONTENT, fill_to=180))
+        for label in ("RUNS", "COMPLETED", "CPU-HOURS"):
+            assert wide[label] > natural[label], label
+
+    def test_a_dropped_column_stays_dropped(self):
+        """Filling is not an excuse to re-add a column that did not fit."""
+        narrow = fit_columns(SPEC, 60, content=self.CONTENT)
+        filled_narrow = fit_columns(SPEC, 60, content=self.CONTENT, fill_to=60)
+        assert [label for label, _ in narrow] == [label for label, _ in filled_narrow]

@@ -139,7 +139,11 @@ class Column(NamedTuple):
 
 
 def fit_columns(
-    columns, available: int, padding: int = 2, content: dict[str, int] | None = None
+    columns,
+    available: int,
+    padding: int = 2,
+    content: dict[str, int] | None = None,
+    fill_to: int = 0,
 ) -> list[tuple[str, int]]:
     """Choose which columns fit in ``available`` cells, and how wide each gets.
 
@@ -152,10 +156,13 @@ def fit_columns(
     regardless produced a 44-wide JOB NAME holding 18-character names, which is a
     canyon rather than use of space.
 
-    Width that no column needs is LEFT UNUSED. A table should be as wide as its
-    content and no wider -- stretching to the terminal edge for its own sake was
-    what created the canyon, and trailing space to the right of a compact table is
-    what every well-behaved table does.
+    ``fill_to`` is the total width to spread whatever is still spare across, and
+    zero leaves it unused. Both behaviours are wanted: a pasted table should be as
+    wide as its content so it survives a ticket comment, while a 100-cell table
+    sitting in the middle of a 150-column terminal reads as thin. The spread is
+    round-robin over EVERY column, a cell at a time -- pouring it into one flex
+    column is exactly the canyon above, and giving it only to the text columns
+    leaves the numbers huddled together at one end.
 
     Returns ``(label, width)`` in display order. Callers must emit row cells in
     that same order, which is why the row builders key their cells by label.
@@ -196,6 +203,25 @@ def fit_columns(
                 break
             widths[index] += 1
             slack -= 1
+
+    # Whatever the content-capped growth above did not want, spread in proportion
+    # to what each column already is. Equal shares were tried and are wrong in a
+    # way that is obvious on screen: a 3-cell "#" holding one digit became 13 cells
+    # wide while JOB NAME gained the same 10, so the table expanded without looking
+    # expanded -- every gap grew and the columns stopped reading as a row. Weighting
+    # by width keeps the rhythm the table already has.
+    spare = min(slack, fill_to - (sum(widths) + padding * len(chosen))) if fill_to else 0
+    if spare > 0:
+        total = sum(widths) or 1
+        share = [spare * width // total for width in widths]
+        for index, extra in enumerate(share):
+            widths[index] += extra
+        # The rounding remainder to the widest columns first, so the table lands on
+        # exactly ``fill_to`` and the leftover cells go where they show least.
+        order = sorted(range(len(widths)), key=lambda i: -widths[i])
+        remainder = spare - sum(share)
+        for step in range(remainder):
+            widths[order[step % len(order)]] += 1
 
     return [(column.label, max(1, widths[index])) for index, column in enumerate(chosen)]
 
@@ -457,7 +483,21 @@ STEP_COLUMNS: tuple[Column, ...] = (
     Column("WROTE", 9, drop=2, align="right"),
 )
 
-register_alignment(OVERVIEW_COLUMNS, JOB_COLUMNS, STEP_COLUMNS, (CPU_HOURS_COLUMN,))
+# Node reliability. Declared here with the others rather than hardcoded at the
+# widget, so this table drops columns, tracks the terminal and spends the leftover
+# exactly as the other two do -- hardcoding them left it as the one screen that
+# stayed narrow while its neighbours filled, which reads as a broken layout.
+NODE_COLUMNS: tuple[Column, ...] = (
+    Column("NODE", 18, flex=True, grow_to=26),
+    Column("N", 11, align="right"),
+    Column("RATE", 8, align="right"),
+    # The interval before the verdict: the verdict is one word and recoverable
+    # from the numbers, while the interval is the evidence for it.
+    Column("95% CI", 18, drop=1, align="right"),
+    Column("VERDICT", 14, drop=2),
+)
+
+register_alignment(OVERVIEW_COLUMNS, JOB_COLUMNS, STEP_COLUMNS, NODE_COLUMNS, (CPU_HOURS_COLUMN,))
 
 
 def cpu_only_columns(columns):

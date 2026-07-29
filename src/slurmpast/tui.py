@@ -234,7 +234,11 @@ def _sync_columns(table: DataTable, spec, current, content=None, available=None)
     """
     # `size` is zero until the first layout pass; on_resize calls back after it.
     width = available or table.size.width or _DEFAULT_TABLE_WIDTH
-    layout = render.fit_columns(spec, max(_MIN_TABLE_WIDTH, width - _SCROLLBAR), content=content)
+    room = max(_MIN_TABLE_WIDTH, width - _SCROLLBAR)
+    # Spend the leftover here, unlike the plain renderer: a table that has to
+    # survive being pasted into a ticket should be as narrow as its content, but a
+    # dashboard owns the terminal and a 100-cell table centred in 150 reads as thin.
+    layout = render.fit_columns(spec, room, content=content, fill_to=room)
     if layout != current or not table.columns:
         table.clear(columns=True)
         for label, column_width in layout:
@@ -1404,6 +1408,10 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
     metric: reactive[str] = reactive("hang")
     controlled: reactive[bool] = reactive(True)
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._layout: list[tuple[str, int]] = []
+
     def compose(self) -> ComposeResult:
         yield _header()
         with Vertical(id="content"):
@@ -1413,22 +1421,21 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
         yield Footer()
 
     def on_mount(self) -> None:
-        table = self.query_one("#nodes", DataTable)
-        layout = (
-            ("NODE", 18),
-            ("N", 11),
-            ("RATE", 8),
-            ("95% CI", 18),
-            ("VERDICT", 14),
-        )
-        for label, width in layout:
-            table.add_column(label, width=width)
-        self.fit_content(layout)
         self.refresh_rows()
+        self.query_one("#nodes", DataTable).focus()
+
+    def on_resize(self) -> None:
+        if self.is_mounted:
+            self.refresh_rows()
 
     def refresh_rows(self) -> None:
         history: History | None = self.sp.history
-        if history is None or not self.query_one("#nodes", DataTable).columns:
+        table = self.query_one("#nodes", DataTable)
+        self._layout = _sync_columns(
+            table, render.NODE_COLUMNS, self._layout, available=self.size.width
+        )
+        self.fit_content(self._layout)
+        if history is None:
             return
         from .nodes import dominant_workload
 
@@ -1486,17 +1493,21 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
             self.query_one("#summary", Static).update(summary)
         for row in rows:
             grade = {"worse": "crit", "better": "ok"}.get(row["verdict"], "none")
-            table.add_row(
-                Text(row["node"], style=theme.INK),
-                Text("%d/%d" % (row["bad"], row["trials"]), style=theme.DIM),
-                Text(
+            # Keyed by label and emitted in layout order, like the other two
+            # tables: a narrow terminal drops a column, and a fixed tuple of five
+            # cells then raises rather than rendering.
+            cells = {
+                "NODE": Text(row["node"], style=theme.INK),
+                "N": Text("%d/%d" % (row["bad"], row["trials"]), style=theme.DIM),
+                "RATE": Text(
                     "%.1f%%" % (100 * row["rate"]), style=theme.HEALTH_COLOR.get(grade, theme.DIM)
                 ),
-                Text(
+                "95% CI": Text(
                     "%.1f – %.1f%%" % (100 * row["ci_low"], 100 * row["ci_high"]), style=theme.FAINT
                 ),
-                Text(row["verdict"], style=theme.HEALTH_COLOR.get(grade, theme.FAINT)),
-            )
+                "VERDICT": Text(row["verdict"], style=theme.HEALTH_COLOR.get(grade, theme.FAINT)),
+            }
+            table.add_row(*(cells[label] for label, _ in self._layout))
 
         excl = compress_nodelist(suggest_exclude(table_data))
         note = Text()

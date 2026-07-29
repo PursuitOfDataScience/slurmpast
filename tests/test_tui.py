@@ -864,14 +864,18 @@ class TestTheBlockIsCentred:
             }
 
     @pytest.mark.asyncio
-    async def test_the_overview_sits_in_the_middle(self, history_jobs):
+    async def test_the_block_uses_the_terminal(self, history_jobs):
+        """Centring came first and was not enough on its own: the columns stopped
+        at the width their content needed, so a 150-column terminal held a 100-cell
+        table with 25 cells of nothing either side. It now spends the leftover."""
         got = await self._probe(history_jobs, 150)
-        assert got["width"] < 150, "nothing to centre if the table fills the terminal"
-        assert got["x"] == (150 - got["width"]) // 2
-        assert got["x"] > 0
+        assert got["width"] >= 150 - 2, got["width"]
 
     @pytest.mark.asyncio
-    async def test_the_margins_are_even(self, history_jobs):
+    async def test_the_margins_are_even_when_there_are_any(self, history_jobs):
+        """Filling makes the margins zero on a normal terminal. Centring still
+        matters where the columns cannot absorb the width -- a spec whose every
+        column is capped -- and it must stay symmetric there."""
         got = await self._probe(history_jobs, 150)
         left, right = got["x"], 150 - got["width"] - got["x"]
         assert abs(left - right) <= 1, (left, right)
@@ -905,7 +909,18 @@ class TestTheBlockIsCentred:
         assert got["footer"] == 150
 
     @pytest.mark.asyncio
-    async def test_the_node_screen_is_centred_too(self, history_jobs):
+    async def test_the_node_screen_behaves_like_the_others(self, history_jobs):
+        """Its columns used to be hardcoded at the widget, so it was the one screen
+        that stayed narrow while its neighbours filled -- which looks like a broken
+        layout rather than a deliberate one. It goes through fit_columns now."""
         got = await self._probe(history_jobs, 150, keys=("n",))
         assert got["name"] == "NodesScreen"
-        assert got["x"] == (150 - got["width"]) // 2 and got["x"] > 0
+        assert got["width"] >= 150 - 2, got["width"]
+
+    @pytest.mark.asyncio
+    async def test_the_node_screen_drops_columns_when_narrow(self, history_jobs):
+        """And the reason keying its cells by label matters: a fixed tuple of five
+        cells raises the moment one is dropped."""
+        wide = await self._probe(history_jobs, 150, keys=("n",))
+        narrow = await self._probe(history_jobs, 55, keys=("n",))
+        assert narrow["columns"] < wide["columns"], (narrow["columns"], wide["columns"])

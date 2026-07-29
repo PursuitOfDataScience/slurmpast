@@ -60,8 +60,11 @@ class TestResizeRelayout:
         a hard stop at 94 columns leaving a wide terminal blank, then a JOB NAME
         column stretched to 44 cells around 18-character names.
 
-        The contract is now: wide enough for the content, never wider than the
-        terminal, and no further.
+        The contract has since changed once more: leaving the leftover unused read
+        as thin, so the dashboard now spends it -- but round-robin across every
+        column, so no single one can hog it the way JOB NAME did. The plain
+        renderer still leaves it unused, because a pasted table wants to be narrow.
+        See TestSpendingTheLeftoverWhenAskedTo for the spread itself.
         """
         from textual.widgets import DataTable
 
@@ -71,12 +74,24 @@ class TestResizeRelayout:
             table = app.screen.query_one(DataTable)
             used = sum(c.width for c in table.columns.values()) + 2 * len(table.columns)
             assert used <= table.size.width, (used, table.size.width)
+            # And now uses it, rather than stopping short and centring the gap.
+            # Two cells short of the full width on purpose: a vertical scrollbar
+            # claims them once the rows overflow, and filling them would push the
+            # table into a HORIZONTAL scrollbar instead.
+            from slurmpast.tui import _SCROLLBAR
 
-            longest = max(len(g.name) for g in app.history.groups)
+            assert used >= table.size.width - _SCROLLBAR, (used, table.size.width)
+
+            longest = max(len(g.label) for g in app.history.groups)
             columns = {str(c.label): c.width for c in table.columns.values()}
             assert columns["JOB NAME"] >= longest, "names would be truncated"
-            # Snug: the minimum floor is 22, so allow that but not a 44-wide canyon.
-            assert columns["JOB NAME"] <= max(longest, 22), columns["JOB NAME"]
+            # No hogging: an even share of the leftover, not all of it. The reported
+            # defect was 44 cells around 18-character names.
+            share = (table.size.width - used) // max(1, len(columns)) + 1
+            assert columns["JOB NAME"] <= max(longest, 22) + share + (used // len(columns)), (
+                columns["JOB NAME"]
+            )
+            assert columns["JOB NAME"] < used // 3, "one column must not dominate"
 
     @pytest.mark.asyncio
     async def test_a_long_name_still_gets_the_room_it_needs(self):
