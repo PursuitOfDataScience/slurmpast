@@ -11,6 +11,29 @@ The signal is real but heavily confounded, and both halves were measured:
 So this module always controls for workload and always reports a Wilson interval.
 A node is only called out when its interval excludes the baseline; otherwise the
 honest answer is "not enough evidence", which is what it says.
+
+One interval per node is not one test, though, and the table shows them together.
+Each node's interval is right in isolation and the *table* was still wrong: at
+Z = 1.96 each row trips about 2.5% of the time by chance, so a 20-node table
+handed the user a node to exclude more than half the time when every node was in
+truth identical -- an error rate set by how many nodes were tested rather than by
+the evidence. Measured on a null where every node shares one true rate, as the
+share of tables offering at least one innocent node to ``--exclude``:
+
+    nodes tested           10       20       40
+    uncorrected          36.5%    54.8%    77.8%
+    Benjamini-Hochberg    2.7%     2.8%     2.4%
+
+So the verdict is Benjamini-Hochberg controlled across the rows of the table (see
+:func:`_bh_reject`). What matters is not that the corrected figure is smaller but
+that it is *flat*: raising ``Z`` to 2.576 instead only slows the growth, from
+13.5% / 21.3% / 33.8% across the same three table sizes -- a wider interval
+treats the symptom, and the cause is the number of tests.
+
+The cost is power against one truly bad node (0.55 against 0.20 elsewhere, 20
+nodes): 63% at 20 placements per node, 87% at 30, 98% at 50. It is concentrated
+where evidence is thin, which is where this module already says it wants to hold
+back.
 """
 
 import math
@@ -20,7 +43,11 @@ from .diagnose import looks_like_noop
 from .patterns import usable
 
 MIN_SAMPLES = 10
-Z = 1.96  # 95%
+Z = 1.96  # 95%, and the interval the table displays stays a plain 95% interval
+# The false-discovery rate the table as a whole is held to. Not a per-row alpha:
+# the user reads every row at once and pastes whatever tripped into --exclude, so
+# the family is the table.
+FDR_ALPHA = 0.05
 
 # The first bracketed range in a name, with whatever precedes and follows it.
 # The prefix is deliberately unconstrained: a character class enumerating what a
@@ -149,6 +176,89 @@ def wilson_interval(successes, trials, z=Z):
     return (max(0.0, centre - margin), min(1.0, centre + margin))
 
 
+def _hypergeom_log_pmf(k, total, marked, drawn):
+    """log P(k marked in a draw of ``drawn`` from ``total`` holding ``marked``)."""
+    return (
+        math.lgamma(marked + 1)
+        - math.lgamma(k + 1)
+        - math.lgamma(marked - k + 1)
+        + math.lgamma(total - marked + 1)
+        - math.lgamma(drawn - k + 1)
+        - math.lgamma(total - marked - drawn + k + 1)
+        - math.lgamma(total + 1)
+        + math.lgamma(drawn + 1)
+        + math.lgamma(total - drawn + 1)
+    )
+
+
+def node_p_value(bad, trials, other_bad, other_trials, direction="worse"):
+    """One-sided Fisher exact p-value for one node against every other node.
+
+    Fisher rather than a binomial tail against the leave-one-out rate, because
+    that rate is *estimated* from the other nodes rather than known. Treating it as
+    known makes the zero case degenerate: with no failures anywhere else, a
+    binomial test against p = 0 scores a single failure on one node at exactly
+    p = 0, which no correction can ever withhold however many nodes were tested.
+    Fisher conditions on the margins instead and scores that same 1-of-10 against
+    0-of-500 at p = 0.0196 -- borderline, and so still subject to the size of the
+    table: it stands in a two-node table and is withheld once a third node is
+    there to have been tested too.
+
+    Exact rather than a chi-square, because a node with 3 failures in 12
+    placements is a typical row here and no approximation is trustworthy there.
+    """
+    total = trials + other_trials
+    marked = bad + other_bad
+    if trials <= 0 or other_trials <= 0 or marked <= 0 or marked >= total:
+        return 1.0
+
+    # The hypergeometric support: how many of this node's placements could have
+    # been the failing ones at all.
+    low = max(0, trials - (total - marked))
+    high = min(trials, marked)
+    start, stop, step = (bad, high, 1) if direction == "worse" else (bad, low, -1)
+    start = min(max(start, low), high)
+
+    term = math.exp(_hypergeom_log_pmf(start, total, marked, drawn=trials))
+    tail = term
+    mode = trials * marked / float(total)
+    for k in range(start, stop, step):
+        if step > 0:
+            # pmf(k+1)/pmf(k), by cancellation in the ratio of binomials.
+            term *= (marked - k) * (trials - k)
+            term /= float((k + 1) * (total - marked - trials + k + 1))
+        else:
+            # pmf(k-1)/pmf(k), the same ratio inverted.
+            term *= k * (total - marked - trials + k)
+            term /= float((marked - k + 1) * (trials - k + 1))
+        tail += term
+        # Terms only decay once the mode is behind us, so a small term before
+        # then is not a spent tail.
+        if term <= 1e-18 * tail and ((step > 0 and k >= mode) or (step < 0 and k <= mode)):
+            break
+    return min(1.0, max(0.0, tail))
+
+
+def _bh_reject(pvalues, alpha=FDR_ALPHA):
+    """Benjamini-Hochberg step-up: the indices whose null is rejected at FDR ``alpha``.
+
+    Sort the p-values, find the largest rank ``k`` with ``p_(k) <= alpha*k/m``,
+    reject the ``k`` smallest. What this buys over Bonferroni or a bigger ``Z`` is
+    that it scales with the *evidence* rather than the count: one node that is
+    genuinely broken still clears it in a 40-node table, while forty innocent
+    nodes do not start tripping just because there are forty of them.
+    """
+    count = len(pvalues)
+    if not count:
+        return set()
+    order = sorted(range(count), key=lambda i: pvalues[i])
+    cut = 0
+    for rank, index in enumerate(order, start=1):
+        if pvalues[index] <= alpha * rank / count:
+            cut = rank
+    return set(order[:cut])
+
+
 def _bad(job):
     """Outcomes attributable to the run failing. Cancellations excluded -- ambiguous."""
     return job.failed
@@ -193,26 +303,59 @@ def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
         other_trials = total_trials - trials
         other_hits = total_hits - bad
         comparison = (other_hits / float(other_trials)) if other_trials else None
-        if comparison is None:
-            verdict = "unknown"
-        elif low > comparison:
-            verdict = "worse"
-        elif high < comparison:
-            verdict = "better"
+        rate = bad / float(trials)
+        # Every row gets a test, including the ones no interval singles out --
+        # because the size of the family is how many nodes were *examined*, not how
+        # many happened to look extreme. Scoring only the extreme rows would set m
+        # to the number of candidates and correct for the wrong number of tests.
+        if comparison is None or rate == comparison:
+            direction, p_value = "", 1.0
         else:
-            verdict = "inconclusive"
+            direction = "worse" if rate > comparison else "better"
+            p_value = node_p_value(bad, trials, other_hits, other_trials, direction)
         rows.append(
             {
                 "node": node,
                 "bad": bad,
                 "trials": trials,
-                "rate": bad / float(trials),
+                "rate": rate,
                 "ci_low": low,
                 "ci_high": high,
                 "comparison": comparison,
-                "verdict": verdict,
+                "direction": direction,
+                "p_value": p_value,
+                "verdict": "unknown" if comparison is None else "inconclusive",
             }
         )
+
+    # Both conditions have to hold for a verdict, and each one is doing a
+    # different job. BH bounds how often the *table* invents a bad node. The
+    # interval keeps the verdict consistent with what the row displays -- "worse"
+    # printed beside a 95% CI containing the comparison rate reads as a
+    # contradiction, whatever the p-value says. Intersecting BH's rejections with
+    # any further condition cannot add false ones, so the FDR bound survives it.
+    survived = _bh_reject([r["p_value"] for r in rows])
+    for index, row in enumerate(rows):
+        if index not in survived or not row["direction"]:
+            continue
+        if row["direction"] == "worse" and row["ci_low"] > row["comparison"]:
+            row["verdict"] = "worse"
+        elif row["direction"] == "better" and row["ci_high"] < row["comparison"]:
+            row["verdict"] = "better"
+
+    # Rows the table will show with an interval clear of the comparison and no
+    # verdict beside it. Counted from the verdict actually reached, not from the
+    # branch that reached it, so it cannot drift from what the screens then claim.
+    # They need it: the interval is on display, and a user reading it against the
+    # verdict column deserves to be told why the two disagree rather than left to
+    # conclude the tool is broken.
+    held_back = sum(
+        1
+        for row in rows
+        if row["verdict"] == "inconclusive"
+        and (row["ci_low"] > row["comparison"] or row["ci_high"] < row["comparison"])
+    )
+
     rows.sort(key=lambda r: -r["rate"])
     return {
         "rows": rows,
@@ -221,6 +364,8 @@ def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
         "hits": total_hits,
         "metric": metric,
         "workload": workload,
+        "tested_nodes": len(rows),
+        "held_back": held_back,
         "skipped_nodes": sum(1 for n, t in totals.items() if t < min_samples),
     }
 
@@ -239,6 +384,17 @@ def dominant_workload(jobs, metric=None):
     This picks a sample where the question is answerable rather than selecting on
     the outcome: the confound being held fixed is still the workload, and the
     comparison is still strictly between nodes inside it.
+
+    Choosing the densest-failure stratum before testing every node in it does read
+    like it should push the same way as the multiple-comparison problem, so it was
+    measured once that was fixed. It does not, and the reason is structural: the
+    Fisher test in :func:`node_p_value` *conditions on* the total number of
+    failures in the table, and the total is precisely what this function selects
+    on. Selecting on a statistic the test conditions away cannot bias it. Paired
+    against a workload chosen at random on the same 3,000 simulated histories, all
+    nodes null within each workload: 3.73% against 3.03% at 10 nodes and 3.17%
+    against 2.97% at 20 (SE ~0.35%). At most a fraction of a point, and under the
+    5% target either way.
 
     ``metric`` mirrors :func:`node_table`. Without it the choice is by run count,
     which is all that can be said when no metric is named.
@@ -265,7 +421,12 @@ def dominant_workload(jobs, metric=None):
 
 
 def suggest_exclude(table, limit=8):
-    """Nodes whose interval is entirely above the baseline."""
+    """Nodes worse than the rest of the fleet, after correcting for the whole table.
+
+    Both halves of that matter. This is the one output a user acts on directly --
+    it is pasted into a submission script -- so it is the one place an uncorrected
+    per-row test was actually expensive.
+    """
     bad = [r["node"] for r in table["rows"] if r["verdict"] == "worse"]
     return bad[:limit]
 

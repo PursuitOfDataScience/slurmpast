@@ -535,6 +535,31 @@ NODE_COLUMNS: tuple[Column, ...] = (
 register_alignment(OVERVIEW_COLUMNS, JOB_COLUMNS, STEP_COLUMNS, NODE_COLUMNS, (CPU_HOURS_COLUMN,))
 
 
+def held_back_note(count: int, tested: int) -> str:
+    """Why the CI column can disagree with the verdict beside it.
+
+    The node table shows one interval per node and the verdict is corrected across
+    all of them, so an interval that clears the baseline can sit next to
+    "inconclusive". Unexplained that reads as the tool contradicting its own
+    evidence column, which is worse than either answer alone.
+
+    Careful about what it claims. It does *not* say these particular intervals are
+    chance -- one of them may well be the genuinely bad node the correction cost us.
+    It says an interval on its own is not enough when this many nodes were tested,
+    which is true of every one of them. Shared by both front ends so the two screens
+    cannot explain the same number differently.
+    """
+    subject = (
+        "1 interval clears the baseline on its own"
+        if count == 1
+        else "%d intervals clear the baseline on their own" % count
+    )
+    return (
+        "%s — but about one in twenty does that by chance and %d nodes were tested, "
+        "so on its own that is not yet evidence." % (subject, tested)
+    )
+
+
 def cpu_only_columns(columns):
     """The overview spec with the paired hours cell collapsed to CPU-hours.
 

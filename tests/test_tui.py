@@ -177,6 +177,44 @@ class TestNodesScreenControls:
             await pilot.pause()
             assert app.screen.controlled is False
 
+    @pytest.mark.asyncio
+    async def test_a_withheld_interval_is_explained_on_screen(self):
+        """The dashboard shows the same CI column as the report, so it needs the same
+        sentence when the correction withholds a verdict -- and this is the branch
+        that only paints on a history where that actually happens."""
+        import random
+
+        from slurmpast.model import Job
+        from slurmpast.nodes import node_table
+
+        rng = random.Random(4242)
+        jobs = []
+        for node in range(20):
+            for _ in range(30):
+                jobs.append(
+                    Job(
+                        job_id="%d" % len(jobs),
+                        name="w",
+                        node_list="node%03d" % node,
+                        elapsed=600.0,
+                        timelimit=3600.0,
+                        state="FAILED" if rng.random() < 0.20 else "COMPLETED",
+                    )
+                )
+        assert node_table(jobs, workload="w")["held_back"], "seed no longer exercises the note"
+
+        app = make_app(jobs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("n")
+            await pilot.pause()
+            await pilot.press("m")  # the failure metric, which is what these carry
+            await pilot.pause()
+            assert isinstance(app.screen, tui.NodesScreen)
+            flat = " ".join(app.screen.exclude_text.plain.split())
+        assert "not yet evidence" in flat, flat
+        assert "20 nodes were tested" in flat
+
 
 class TestRowJump:
     def test_single_digit(self):

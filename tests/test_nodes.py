@@ -1,9 +1,13 @@
+import random
+
 import pytest
 
 from slurmpast.nodes import (
+    _bh_reject,
     compress_nodelist,
     dominant_workload,
     expand_nodelist,
+    node_p_value,
     node_table,
     note_for_node,
     suggest_exclude,
@@ -221,6 +225,277 @@ class TestDominantWorkload:
     def test_falls_back_to_the_count_when_nothing_exhibits_it(self, healthy_job):
         jobs = [healthy_job._replace(job_id=str(9000 + i)) for i in range(5)]
         assert dominant_workload(jobs, metric="hang") == healthy_job.name
+
+
+class TestOneTestPerNodeIsStillManyTests:
+    """The table runs a test per node and shows them together, so the error rate
+    that matters is the whole table's. Uncorrected it was a function of how many
+    nodes were tested rather than of the evidence: on a null where every node
+    shares one true rate, a 20-node table offered an innocent node to --exclude
+    54.8% of the time and a 40-node table 77.8%.
+    """
+
+    @staticmethod
+    def _null_tables(n_nodes, tables, seed, jobs_per=30, rate=0.20):
+        """Fraction of tables flagging at least one node, with every node identical.
+
+        Jobs are built directly rather than through `parse` -- this generates tens
+        of thousands of records and the sacct reader is far too slow for that.
+        """
+        from slurmpast.model import Job
+
+        rng = random.Random(seed)
+        flagged = 0
+        for _ in range(tables):
+            jobs = []
+            for node in range(n_nodes):
+                for _ in range(jobs_per):
+                    jobs.append(
+                        Job(
+                            job_id="%d" % len(jobs),
+                            name="w",
+                            node_list="node%03d" % node,
+                            elapsed=600.0,
+                            timelimit=3600.0,
+                            state="FAILED" if rng.random() < rate else "COMPLETED",
+                        )
+                    )
+            if suggest_exclude(node_table(jobs, workload="w")):
+                flagged += 1
+        return flagged / float(tables)
+
+    def test_an_innocent_node_is_rarely_offered_to_exclude(self):
+        rate = self._null_tables(20, tables=120, seed=4242)
+        # Corrected this sits near 3%; uncorrected it was 54.8%. The bound is loose
+        # enough not to flake on 120 samples and far below what a regression costs.
+        assert rate < 0.15, "%.1f%% of null tables flagged a node" % (100 * rate)
+
+    def test_the_error_rate_does_not_grow_with_the_table(self):
+        """The signature of the defect, and the reason a bigger Z is not the fix:
+        raising Z to 2.576 still went 13.5% -> 21.3% -> 33.8% across these sizes."""
+        small = self._null_tables(10, tables=120, seed=7)
+        large = self._null_tables(40, tables=120, seed=8)
+        assert large < 0.15
+        # Uncorrected this gap was +41 points (36.5% -> 77.8%).
+        assert large < small + 0.10, "%.1f%% at 10 nodes, %.1f%% at 40" % (100 * small, 100 * large)
+
+    def test_a_genuinely_bad_node_still_survives_a_large_table(self):
+        """The correction must cost power where evidence is thin, not everywhere.
+        This is the module's own headline case, buried in 39 innocent nodes."""
+        from slurmpast.model import Job
+
+        rng = random.Random(11)
+        jobs = []
+        for node in range(40):
+            bad_rate = 0.55 if node == 0 else 0.20
+            for _ in range(50):
+                jobs.append(
+                    Job(
+                        job_id="%d" % len(jobs),
+                        name="w",
+                        node_list="node%03d" % node,
+                        elapsed=600.0,
+                        timelimit=3600.0,
+                        state="FAILED" if rng.random() < bad_rate else "COMPLETED",
+                    )
+                )
+        assert suggest_exclude(node_table(jobs, workload="w")) == ["node000"]
+
+    def test_the_real_recorded_signal_is_untouched(self):
+        """19/36 against 12/218 is a 9.6x spread on identical work. No correction
+        may be allowed to talk the tool out of that one."""
+        jobs = _placements("midway3-0385", 19, 36) + _placements(
+            "midway3-0600", 12, 218, job_id_base=5000
+        )
+        table = node_table(jobs, workload="node-evaluation")
+        rows = {r["node"]: r for r in table["rows"]}
+        assert rows["midway3-0385"]["verdict"] == "worse"
+        assert rows["midway3-0385"]["p_value"] < 1e-9
+
+    def test_a_withheld_verdict_is_counted_so_the_screen_can_explain_it(self):
+        """The table displays the interval that the verdict no longer rests on
+        alone, so a row reading `inconclusive` beside a CI clear of the baseline
+        has to be explainable rather than looking like a contradiction."""
+        from slurmpast.model import Job
+
+        rng = random.Random(2026)
+        found = False
+        for seed in range(60):
+            rng.seed(seed)
+            jobs = []
+            for node in range(20):
+                for _ in range(30):
+                    jobs.append(
+                        Job(
+                            job_id="%d" % len(jobs),
+                            name="w",
+                            node_list="node%03d" % node,
+                            elapsed=600.0,
+                            timelimit=3600.0,
+                            state="FAILED" if rng.random() < 0.20 else "COMPLETED",
+                        )
+                    )
+            table = node_table(jobs, workload="w")
+            if table["held_back"]:
+                found = True
+                clears = [
+                    r
+                    for r in table["rows"]
+                    if r["verdict"] == "inconclusive"
+                    and (r["ci_low"] > r["comparison"] or r["ci_high"] < r["comparison"])
+                ]
+                assert len(clears) == table["held_back"]
+                break
+        assert found, "no null table in 60 draws produced an interval the correction withheld"
+
+    def test_tested_nodes_is_the_family_the_correction_used(self):
+        jobs = _placements("midway3-0385", 19, 36) + _placements(
+            "midway3-0600", 12, 218, job_id_base=5000
+        )
+        table = node_table(jobs, workload="node-evaluation")
+        assert table["tested_nodes"] == len(table["rows"]) == 2
+
+
+class TestNodePValue:
+    def test_matches_the_hand_computed_fisher_tail(self):
+        """1 failure in 10 placements against 0 in 500: P = 10/510."""
+        assert node_p_value(1, 10, 0, 500, "worse") == pytest.approx(10 / 510.0)
+
+    def test_a_zero_baseline_does_not_become_a_certainty(self):
+        """The reason this is Fisher and not a binomial tail against the
+        leave-one-out rate: that rate is estimated, and a binomial test against an
+        estimated 0% scores one bad run at exactly p = 0 -- which no correction can
+        withhold, in a table of any size. Fisher leaves it borderline instead, so
+        the size of the table still gets a say."""
+        borderline = node_p_value(1, 10, 0, 500, "worse")
+        assert borderline > 0.0
+        assert 0.05 / 3 < borderline < 0.05 / 2
+
+        # Two nodes: p = 0.0196 clears 0.05*1/2, and stands.
+        two = _placements("midway3-0009", 1, 10) + _placements(
+            "midway3-0010", 0, 500, job_id_base=5000
+        )
+        assert suggest_exclude(node_table(two, workload="node-evaluation")) == ["midway3-0009"]
+
+        # The same one bad run, with a third node that was also tested. Nothing
+        # about midway3-0009 changed; the number of chances to produce it did.
+        three = (
+            _placements("midway3-0009", 1, 10)
+            + _placements("midway3-0010", 0, 250, job_id_base=5000)
+            + _placements("midway3-0011", 0, 250, job_id_base=7000)
+        )
+        assert suggest_exclude(node_table(three, workload="node-evaluation")) == []
+
+    def test_a_strong_signal_against_a_clean_fleet_still_lands(self):
+        assert node_p_value(3, 10, 0, 500, "worse") < 0.001
+
+    def test_the_two_directions_agree_on_one_2x2_table(self):
+        """In a two-node table "A is worse" and "B is better" are the same event."""
+        worse = node_p_value(19, 36, 12, 218, "worse")
+        better = node_p_value(12, 218, 19, 36, "better")
+        assert worse == pytest.approx(better)
+
+    def test_identical_rates_are_not_surprising(self):
+        assert node_p_value(6, 12, 30, 60, "worse") > 0.5
+
+    def test_no_failures_anywhere_is_not_a_finding(self):
+        assert node_p_value(0, 20, 0, 20, "worse") == 1.0
+
+    def test_a_single_node_cannot_be_compared(self):
+        assert node_p_value(5, 10, 0, 0, "worse") == 1.0
+
+
+class TestBenjaminiHochberg:
+    def test_rejects_the_clearly_small_one_only(self):
+        assert _bh_reject([0.001, 0.4, 0.6]) == {0}
+
+    def test_step_up_rescues_the_larger_of_two_small_ones(self):
+        """Bonferroni would keep only the first at alpha/m = 0.025. BH steps up:
+        0.03 <= 0.05*2/2, so both are rejected. This is the power BH buys."""
+        assert _bh_reject([0.02, 0.03]) == {0, 1}
+
+    def test_nothing_survives_when_nothing_is_small(self):
+        assert _bh_reject([0.2, 0.3, 0.9]) == set()
+
+    def test_empty_family(self):
+        assert _bh_reject([]) == set()
+
+    def test_the_bar_tightens_as_the_family_grows(self):
+        """The whole point: the same p-value is a finding in a small table and not
+        in a large one, because the large table ran more chances to produce it."""
+        assert 0 in _bh_reject([0.02, 0.5])
+        assert _bh_reject([0.02] + [0.5] * 39) == set()
+
+
+class TestTheScreenExplainsAWithheldVerdict:
+    """The table shows one interval per node and corrects the verdict across all of
+    them, so an interval clear of the baseline can sit beside "inconclusive". Left
+    unexplained that reads as the tool contradicting its own evidence column.
+    """
+
+    @staticmethod
+    def _null_history(seed, n_nodes=20, jobs_per=30, rate=0.20):
+        from slurmpast.model import Job
+
+        rng = random.Random(seed)
+        jobs = []
+        for node in range(n_nodes):
+            for _ in range(jobs_per):
+                jobs.append(
+                    Job(
+                        job_id="%d" % len(jobs),
+                        name="w",
+                        node_list="node%03d" % node,
+                        elapsed=600.0,
+                        timelimit=3600.0,
+                        state="FAILED" if rng.random() < rate else "COMPLETED",
+                    )
+                )
+        return jobs
+
+    def test_the_note_is_shown_when_an_interval_was_withheld(self):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_nodes
+
+        for seed in range(60):
+            jobs = self._null_history(seed)
+            table = node_table(jobs, workload="w")
+            if not table["held_back"]:
+                continue
+            text = render_nodes(History(jobs), metric="failure", style=Style(enabled=False))
+            # Wrapped to the terminal, so the sentence spans lines. Matched against
+            # the flattened text rather than asserting where the breaks landed.
+            flat = " ".join(text.split())
+            assert "baseline on their own" in flat or "baseline on its own" in flat
+            assert "20 nodes were tested" in flat
+            return
+        pytest.fail("no null history in 60 draws withheld an interval")
+
+    def test_the_note_does_not_claim_those_intervals_are_chance(self):
+        """One of them may be the genuinely bad node the correction cost us, so the
+        sentence has to be about what an interval alone can support."""
+        from slurmpast.render import held_back_note
+
+        note = held_back_note(2, 20)
+        assert "not yet evidence" in note
+        assert "about one in twenty" in note
+
+    def test_the_note_is_grammatical_either_way(self):
+        from slurmpast.render import held_back_note
+
+        assert held_back_note(1, 20).startswith("1 interval clears the baseline on its own")
+        assert held_back_note(3, 20).startswith("3 intervals clear the baseline on their own")
+
+    def test_the_exclude_header_names_the_family_it_corrected_over(self):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_nodes
+
+        jobs = _placements("midway3-0385", 19, 36) + _placements(
+            "midway3-0600", 12, 218, job_id_base=5000
+        )
+        text = render_nodes(History(jobs), metric="failure", style=Style(enabled=False))
+        assert "after correcting for 2 tested" in text
+        assert "#SBATCH --exclude=midway3-0385" in text
 
 
 class TestEmptyTablesSayWhyNotNothing:

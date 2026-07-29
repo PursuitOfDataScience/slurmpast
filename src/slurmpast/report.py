@@ -32,6 +32,7 @@ from .render import (
     cores_text,
     cpu_only_columns,
     fit_columns,
+    held_back_note,
     hours_pair_text,
     hours_text,
     job_sections,
@@ -512,6 +513,7 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
         )
         out.append("")
         return "\n".join(_titled("node reliability (%s rate)" % metric, out, style))
+    tested = table["tested_nodes"]
     out.append("  %-16s %9s %10s %20s  %s" % ("NODE", "N", "RATE", "95% CI", "VERDICT"))
     for row in table["rows"]:
         colour = {"worse": "red", "better": "green"}.get(row["verdict"])
@@ -528,7 +530,7 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
     out.append("")
     excl = compress_nodelist(suggest_exclude(table))
     if excl:
-        out.append("  intervals entirely above baseline:")
+        out.append("  worse than every other node, after correcting for %d tested:" % tested)
         out.append("    %s" % style("#SBATCH --exclude=" + excl, "bold"))
         out.append(
             style(
@@ -537,7 +539,16 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
             )
         )
     else:
-        out.append(style("  no node's interval clears the baseline; nothing to exclude.", "grey"))
+        out.append(style("  no node is worse than the rest; nothing to exclude.", "grey"))
+    # Said whenever an interval on screen disagrees with the verdict beside it.
+    # About one row in twenty clears the baseline by chance, so in a table this size
+    # such a row is expected -- and without this line it reads as the tool
+    # contradicting its own CI column. Deliberately not a claim that these
+    # particular intervals ARE chance: it says an interval alone is not enough when
+    # this many nodes were tested, which is the part that is true of all of them.
+    if table["held_back"]:
+        for line in wrap(held_back_note(table["held_back"], tested), _prose_width(2)):
+            out.append("  " + style(line, "grey"))
     out.append("")
     return "\n".join(_titled("node reliability (%s rate)" % metric, out, style))
 

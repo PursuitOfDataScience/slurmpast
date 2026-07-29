@@ -851,6 +851,37 @@ class TestNothingWrapsAtEightyColumns:
         too_long = [line for line in text.splitlines() if len(line) > 80]
         assert not too_long, too_long
 
+    def test_the_node_screen_fits_including_the_correction_note(self, monkeypatch):
+        """The note explaining a withheld verdict is a whole sentence of prose under
+        a table that lines up exactly, so it is the line most likely to overrun."""
+        import random
+
+        from slurmpast.model import Job
+        from slurmpast.nodes import node_table
+        from slurmpast.report import Style, render_nodes
+
+        rng = random.Random(4242)
+        jobs = []
+        for node in range(20):
+            for _ in range(30):
+                jobs.append(
+                    Job(
+                        job_id="%d" % len(jobs),
+                        name="w",
+                        node_list="node%03d" % node,
+                        elapsed=600.0,
+                        timelimit=3600.0,
+                        state="FAILED" if rng.random() < 0.20 else "COMPLETED",
+                    )
+                )
+        assert node_table(jobs, workload="w")["held_back"], "seed no longer exercises the note"
+        text = self._at_eighty(
+            monkeypatch,
+            lambda: render_nodes(History(jobs), metric="failure", style=Style(enabled=False)),
+        )
+        too_long = [line for line in text.splitlines() if len(line) > 80]
+        assert not too_long, too_long
+
 
 class TestTheMemorySectionOnlySaysThingsWorthSaying:
     """Reported of "peak on midway3-0372 task 0" and "virtual 1.9 TiB (38x resident

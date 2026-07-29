@@ -102,7 +102,13 @@ proving `--mem` was never the variable.
 **Nodes that eat jobs**, controlled for workload, with Wilson intervals and a
 ready-to-paste `--exclude`. Uncontrolled, one node looked 25% bad almost entirely
 because a buggy campaign landed there — so a node is only called `worse` when its
-interval clears the baseline.
+interval clears the baseline *and* the claim survives the fact that every other
+node in the table was tested too. That second half was measured, not assumed: with
+every node given one identical true failure rate, the interval test alone offered
+an innocent node to `--exclude` in 54.8% of 20-node tables and 77.8% of 40-node
+ones, because its error rate was a function of how many nodes were tested. A
+Benjamini–Hochberg correction across the rows holds that near 2.7% and, more to
+the point, flat as the table grows.
 
 ## Gauges
 

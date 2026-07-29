@@ -1445,6 +1445,8 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
     def __init__(self) -> None:
         super().__init__()
         self._layout: list[tuple[str, int]] = []
+        # Retained so tests and callers read what was composed, never the widget.
+        self.exclude_text = Text()
 
     def compose(self) -> ComposeResult:
         yield _header()
@@ -1544,9 +1546,13 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
             table.add_row(*(cells[label] for label, _ in self._layout))
 
         excl = compress_nodelist(suggest_exclude(table_data))
+        tested = table_data["tested_nodes"]
         note = Text()
         if excl:
-            note.append("\n  intervals entirely above baseline:\n", style=theme.DIM)
+            note.append(
+                "\n  worse than every other node, after correcting for %d tested:\n" % tested,
+                style=theme.DIM,
+            )
             note.append("    #SBATCH --exclude=%s\n" % excl, style="bold %s" % theme.ACCENT)
             note.append(
                 "    not applied for you — excluding nodes trades availability for "
@@ -1555,9 +1561,18 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
             )
         else:
             note.append(
-                "\n  no node's interval clears the baseline; nothing to exclude.\n",
+                "\n  no node is worse than the rest; nothing to exclude.\n",
                 style=theme.FAINT,
             )
+        # Why the CI column can disagree with the verdict beside it. Same sentence as
+        # the plain-text report, from render, so the two screens cannot drift.
+        if table_data["held_back"]:
+            for line in render.wrap(
+                render.held_back_note(table_data["held_back"], tested),
+                max(40, self.size.width - 6),
+            ):
+                note.append("  %s\n" % line, style=theme.FAINT)
+        self.exclude_text = note
         self.query_one("#exclude", Static).update(note)
         self.sub_title = "nodes · %s%s" % (
             self.metric,
