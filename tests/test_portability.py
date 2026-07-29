@@ -856,6 +856,60 @@ class TestSubmitLineLogPaths:
         assert logs.recorded_paths(job) == ["/work/used.out", "/work/typed.out"]
 
 
+class TestTheScanAnswersFromOneListdir:
+    """``find_log`` probes ~170 conventional spellings per job, which over a
+    6,600-job history is more than a million ``stat`` calls for questions one
+    ``listdir`` per directory already answers -- the difference between a
+    cross-job pass being affordable behind a keypress and not.
+    """
+
+    def _job(self, tmp_path, **kw):
+        base = {
+            "JobID": "60",
+            "JobName": "train",
+            "User": "me",
+            "State": "FAILED",
+            "ElapsedRaw": "60",
+            "WorkDir": str(tmp_path),
+        }
+        base.update(kw)
+        return parse(row(**base))[0]
+
+    def test_a_log_suffixed_name_is_answered_without_a_stat(self, tmp_path, monkeypatch):
+        (tmp_path / "slurm-60.out").write_text("out\n")
+        scan = logs.Scan()
+        monkeypatch.setattr(os.path, "isfile", lambda p: pytest.fail("should not stat"))
+        assert scan.exists(str(tmp_path / "slurm-60.out")) is True
+        assert scan.exists(str(tmp_path / "slurm-99.out")) is False
+
+    def test_a_recorded_path_with_no_log_suffix_still_resolves(self, tmp_path):
+        """``--output=/scratch/me/mylog`` has no suffix, so the directory listing
+        cannot speak for it and it has to be stat'd."""
+        target = tmp_path / "mylog"
+        target.write_text("boom\n")
+        job = self._job(tmp_path, StdErr=str(target))
+        assert logs.Scan().exists(str(target)) is True
+        assert logs.find_log_by_name(job) == str(target)
+
+    def test_one_directory_is_listed_once_however_many_jobs_ask(self, tmp_path, monkeypatch):
+        (tmp_path / "slurm-1.out").write_text("x\n")
+        calls = []
+        real = os.listdir
+        monkeypatch.setattr(os, "listdir", lambda d: calls.append(d) or real(d))
+        scan = logs.Scan()
+        jobs = [self._job(tmp_path, JobID=str(n)) for n in range(1, 6)]
+        for job in jobs:
+            logs.find_log_by_name(job, scan=scan)
+        assert len(set(calls)) == len(calls), "a directory was listed twice"
+
+    def test_the_digit_index_delimits_so_a_longer_number_does_not_match(self, tmp_path):
+        (tmp_path / "1060-train.out").write_text("x\n")
+        (tmp_path / "run-60.out").write_text("mine\n")
+        index = logs.Scan().by_digits(str(tmp_path))
+        assert index["1060"] == ["1060-train.out"]
+        assert index["60"] == ["run-60.out"]
+
+
 class TestLogNamesCarryingTheJobId:
     """``--output=%x-%j.out`` is the commonest convention there is, and no fixed
     pattern list can hold it: the id is present but the rest of the name is the

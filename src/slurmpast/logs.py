@@ -388,11 +388,6 @@ class Scan:
         return self.exists(path)
 
 
-def _log_entries(directory, scan=None):
-    """Names in ``directory`` that could be a job log at all, or ``()``."""
-    return (scan or Scan()).entries(directory)
-
-
 # stderr before stdout: a post-mortem is looking for the traceback. ``.log`` last --
 # it is the least conventional of the three for Slurm output.
 _SUFFIX_RANK = {".err": 0, ".out": 1, ".log": 2}
