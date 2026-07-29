@@ -918,22 +918,25 @@ def resource_rows(job, ascii_mode: bool = False, width: int = 18, flat: bool = F
     marker = _MARKER_ASCII if ascii_mode else _MARKER
     rows = []
 
-    def row(label, color, fraction, value, detail="", gauge=True):
+    def row(label, color, fraction, value, detail=""):
         text = Text()
         text.append("  %s " % marker, style=color)
         text.append("%-6s " % label, style=color)
-        if gauge:
-            text.append_text(
-                bar(
-                    None if fraction is None else fraction * 100.0,
-                    color,
-                    width=width,
-                    ascii_mode=ascii_mode,
-                    flat=flat,
-                )
+        # Always a gauge, even with nothing to plot. ``bar(None)`` is an empty
+        # track, which is this module's established way of saying "no measurement"
+        # -- TIME already draws it on a job submitted without a limit. Blanking the
+        # cells instead left a hole where the two rows above had bars, and the three
+        # rows stopped reading as one block: reported as "why does mem sometimes
+        # have the progress bar and sometimes not? it looks very inconsistent".
+        text.append_text(
+            bar(
+                None if fraction is None else fraction * 100.0,
+                color,
+                width=width,
+                ascii_mode=ascii_mode,
+                flat=flat,
             )
-        else:
-            text.append(" " * width)
+        )
         text.append("  ")
         # 11 is the widest cell measured over 1,342 real jobs ("123.4 MiB/s");
         # anything narrower lets the DISK rate overrun and shifts its "·" one cell
@@ -960,15 +963,17 @@ def resource_rows(job, ascii_mode: bool = False, width: int = 18, flat: bool = F
         "%s cores busy" % cores_text(job),
     )
     if job.mem_limit_bytes and job.max_rss and job.max_rss > job.mem_limit_bytes:
-        # No gauge: the findings below say this number is not a working set, so
-        # drawing it as a 101%-full bar had the summary contradicting the diagnosis.
+        # An empty track, not a 101%-full bar: the findings below say this number is
+        # not a working set, and a full bar would have the summary asserting a
+        # magnitude the diagnosis has just disowned. The value beside it reads
+        # "58.5 GiB · over the 56.0 GiB limit, so not a real footprint", so there is
+        # no reading it as low usage.
         row(
             "MEM",
             theme.MEM_COLOR,
             None,
             format_bytes(job.max_rss),
             "over the %s limit, so not a real footprint" % format_bytes(job.mem_limit_bytes),
-            gauge=False,
         )
     else:
         row(

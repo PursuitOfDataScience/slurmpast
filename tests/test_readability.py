@@ -590,10 +590,7 @@ class TestResourceRowsMatchSlurmwatch:
         labels = [label for _t, rows in job_sections(job) for label, _v, _b in rows]
         assert "kernel share" in labels
 
-    def test_an_unusable_peak_is_not_drawn_as_a_gauge(self):
-        """MaxRSS above the cgroup limit is not a working set -- the findings say
-        so -- and drawing it as a 101%-full bar had the summary contradicting the
-        diagnosis on the same screen."""
+    def _over_limit_mem_row(self):
         from slurmpast.render import resource_rows
 
         over = [
@@ -602,9 +599,32 @@ class TestResourceRowsMatchSlurmwatch:
             if j.mem_limit_bytes and j.max_rss and j.max_rss > j.mem_limit_bytes
         ]
         assert over, "the fixture should contain an over-limit MaxRSS"
-        row = [r.plain for r in resource_rows(over[0]) if " MEM " in r.plain][0]
-        assert "█" not in row and "░" not in row, row
+        return [r.plain for r in resource_rows(over[0]) if " MEM " in r.plain][0]
+
+    def test_an_unusable_peak_claims_no_magnitude(self):
+        """MaxRSS above the cgroup limit is not a working set -- the findings say so
+        -- and drawing it as a 101%-full bar had the summary contradicting the
+        diagnosis on the same screen. So: no fill."""
+        row = self._over_limit_mem_row()
+        assert "█" not in row, row
         assert "over the" in row and "not a real footprint" in row
+
+    def test_an_unusable_peak_still_draws_its_track(self):
+        """Blanking the cells left a hole where the two rows above had bars, and the
+        three stopped reading as one block -- reported as "why does mem sometimes
+        have the progress bar and sometimes not? it looks very inconsistent". An
+        empty track is already how this module says "no measurement": TIME draws one
+        on a job submitted without a limit."""
+        row = self._over_limit_mem_row()
+        assert row.count("░") == 18, row
+
+    def test_the_two_unmeasurable_cases_look_alike(self):
+        """Whatever the reason there is nothing to plot, the row keeps its shape."""
+        from slurmpast.model import Job
+        from slurmpast.render import resource_rows
+
+        no_limit = [r.plain for r in resource_rows(Job(job_id="1")) if " TIME " in r.plain][0]
+        assert no_limit.count("░") == 18, no_limit
 
     def test_no_row_overflows_a_normal_terminal(self):
         """Two rows wrapped in practice -- the memory limit's provenance note and
