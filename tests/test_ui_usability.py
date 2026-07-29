@@ -11,7 +11,7 @@ import pytest
 
 pytest.importorskip("textual")
 
-from slurmpast import render, tui  # noqa: E402
+from slurmpast import render, theme, tui  # noqa: E402
 from slurmpast.demo import history  # noqa: E402
 
 
@@ -572,6 +572,53 @@ class TestBarLooksLikeAGauge:
     def test_ascii_mode_has_no_block_glyphs(self):
         text = render.bar(50, "cyan", width=10, ascii_mode=True).plain
         assert set(text) <= set("#-")
+
+    def test_the_tip_has_track_behind_it(self):
+        """Reported: "there is nothing at the end of the final tip". At 95.9% of 18
+        cells the fill lands IN the last cell, so there is no "░" left to follow it
+        -- and an eighth-block paints only its own fraction. The remaining 6/8 of
+        that cell was bare background, so the same gauge looked finished at 94.4%
+        and at 100% but notched in between."""
+        text = render.bar(95.9, "cyan", width=18)
+        assert text.plain == "█" * 17 + "▎", text.plain
+        tip = [sp for sp in text.spans if sp.start == 17]
+        assert tip, "the tip must carry a style of its own"
+        assert "on " in str(tip[0].style), str(tip[0].style)
+        assert theme.TRACK_BG in str(tip[0].style)
+
+    @pytest.mark.parametrize("pct", [0.0, 1.0, 30.0, 50.0, 94.4, 95.9, 99.6, 100.0])
+    def test_every_cell_of_every_bar_is_painted(self, pct):
+        """No unstyled cell anywhere in the width: an unstyled cell is a hole, and a
+        hole in the middle of a gauge is indistinguishable from the end of it."""
+        text = render.bar(pct, "cyan", width=18)
+        painted = set()
+        for span in text.spans:
+            painted.update(range(span.start, span.end))
+        assert painted == set(range(18)), (pct, sorted(set(range(18)) - painted))
+
+    def test_a_surface_that_discards_styles_gets_whole_cells(self):
+        """render_job appends line.plain, so no background survives there. Without
+        one the tip is a notch, so that surface rounds to whole cells instead --
+        the percentage is printed beside it either way."""
+        text = render.bar(95.9, "cyan", width=18, flat=True).plain
+        assert text == "█" * 17 + "░", text
+        assert not any(g in text for g in "▏▎▍▌▋▊▉")
+
+    def test_the_flat_bar_still_spans_the_full_width(self):
+        for pct in (0.0, 1.0, 55.5, 95.9, 100.0):
+            assert len(render.bar(pct, "cyan", width=18, flat=True).plain) == 18
+
+    def test_the_plain_report_uses_the_flat_bar(self):
+        """The path that actually showed the notch."""
+        from slurmpast.demo import history
+        from slurmpast.report import Style, render_job
+
+        job = max(history(), key=lambda j: j.walltime_used or 0)
+        text, _ = render_job(job, style=Style(enabled=False))
+        bars = [ln for ln in text.splitlines() if "█" in ln or "░" in ln]
+        assert bars, "expected gauge rows"
+        for line in bars:
+            assert not any(g in line for g in "▏▎▍▌▋▊▉"), line
 
     @pytest.mark.parametrize("percent", [0.0, 0.4, 0.6, 0.94, 0.95, 1.0, 4.0, 50.0, 99.6, 100.0])
     def test_ascii_and_unicode_agree_on_whether_anything_is_lit(self, percent):

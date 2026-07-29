@@ -13,6 +13,13 @@ from __future__ import annotations
 INK = "#ede7dd"  # primary text (warm off-white)
 DIM = "#b3a998"  # secondary text
 FAINT = "#857d70"  # faint text / empty bar track
+# What the empty track AVERAGES to, for the one cell that cannot use the stipple.
+# The track is "░" -- a 25% pattern -- in FAINT over surface #1e1c1b, so a solid
+# fill matching it is 0.25*FAINT + 0.75*surface. Needed because a bar's partial
+# cell paints only its filled fraction: with nothing behind it the remainder of
+# that cell is bare background, and a bar at 95.9% ended in a notch while the
+# same bar at 94.4% and 100% did not. See render.bar.
+TRACK_BG = "#383430"
 ACCENT = "#d97757"  # coral — the one chrome accent
 
 # Per-resource identity hues, spread across the wheel so no two read alike even

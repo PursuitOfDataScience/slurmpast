@@ -177,7 +177,9 @@ def render_job(
     # read alike -- and so the sections below can drop these rows instead of
     # repeating every headline number a few lines later.
     out.append("")
-    for line in resource_rows(job, ascii_mode=ascii_mode):
+    # flat=True: only the characters survive here, and an eighth-block tip with no
+    # background behind it reads as a notch rather than as the end of a bar.
+    for line in resource_rows(job, ascii_mode=ascii_mode, flat=True):
         out.append(line.plain)
     for title, rows in job_sections(job, summarized=True):
         out.append("")

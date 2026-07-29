@@ -49,7 +49,13 @@ def bar_cells(percent: float | None, width: int) -> int:
 _EIGHTHS = "▏▎▍▌▋▊▉"
 
 
-def bar(percent: float | None, color: str, width: int = theme.BAR_WIDTH, ascii_mode: bool = False):
+def bar(
+    percent: float | None,
+    color: str,
+    width: int = theme.BAR_WIDTH,
+    ascii_mode: bool = False,
+    flat: bool = False,
+):
     """A magnitude bar, matching slurmwatch's.
 
     The empty track is a shaded block (``░``) in a faint neutral, NOT a line
@@ -63,6 +69,12 @@ def bar(percent: float | None, color: str, width: int = theme.BAR_WIDTH, ascii_m
     never reads empty next to a non-zero figure.
 
     ``None`` draws an empty track -- never a full or a zero bar.
+
+    ``flat`` is for a caller that throws the styles away and keeps only the
+    characters -- the plain report does, appending ``line.plain``. The eighth-block
+    tip needs a background behind it to read as anything but a notch, so without
+    styles it rounds to whole cells instead, exactly as ``ascii_mode`` does. The
+    percentage is printed beside it either way.
     """
     if width <= 0:
         return Text()
@@ -76,6 +88,11 @@ def bar(percent: float | None, color: str, width: int = theme.BAR_WIDTH, ascii_m
         text.append("#" * full, style=color)
         text.append("-" * (width - full), style=theme.FAINT)
         return text
+    if flat:
+        full = bar_cells(percent, width)
+        text.append("█" * full, style=color)
+        text.append("░" * (width - full), style=theme.FAINT)
+        return text
 
     eighths = min(width * 8, round(percent / 100.0 * width * 8))
     # Withhold the last eighth until the value rounds to 100 *at the precision we
@@ -85,9 +102,18 @@ def bar(percent: float | None, color: str, width: int = theme.BAR_WIDTH, ascii_m
         eighths = width * 8 - 1
     eighths = 0 if round(percent, 1) < 1.0 else max(1, eighths)
     full, rem = divmod(int(eighths), 8)
-    fill = "█" * full + (_EIGHTHS[rem - 1] if rem else "")
-    if fill:
-        text.append(fill, style=color)
+    if full:
+        text.append("█" * full, style=color)
+    if rem:
+        # The partial cell paints only its filled fraction, so whatever is behind
+        # it has to read as track -- otherwise the bar ends in a notch of bare
+        # background. Reported as "there is nothing at the end of the final tip":
+        # at 95.9% of 18 cells the fill lands in the last cell with no "░" left to
+        # follow it, so the same bar looked complete at 94.4% and at 100% but
+        # unfinished in between. The stipple cannot be used for this one cell --
+        # it is already carrying the fill -- so it gets the colour the stipple
+        # averages to.
+        text.append(_EIGHTHS[rem - 1], style="%s on %s" % (color, theme.TRACK_BG))
     empty = width - full - (1 if rem else 0)
     if empty > 0:
         text.append("░" * empty, style=theme.FAINT)
@@ -861,7 +887,7 @@ _MARKER = "●"
 _MARKER_ASCII = "*"
 
 
-def resource_rows(job, ascii_mode: bool = False, width: int = 18):
+def resource_rows(job, ascii_mode: bool = False, width: int = 18, flat: bool = False):
     """The job's resources in slurmwatch's row idiom: ``● LABEL bar value · detail``.
 
     Deliberately the same shape as the live view. The two tools sit either side of
@@ -894,6 +920,7 @@ def resource_rows(job, ascii_mode: bool = False, width: int = 18):
                     color,
                     width=width,
                     ascii_mode=ascii_mode,
+                    flat=flat,
                 )
             )
         else:
