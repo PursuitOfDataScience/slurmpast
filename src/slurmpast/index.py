@@ -75,6 +75,23 @@ class GroupStats(NamedTuple):
     last_seen: str
 
     @property
+    def label(self) -> str:
+        """The name to put on screen.
+
+        ``name`` is the folded pattern -- ``exp-a#-newckpt`` -- and it earns its
+        place only when it stands for more than one real name. A group covering a
+        single name shows ``exp-a#-newckpt · 1 job`` above a row whose job is
+        plainly called ``exp-a35-newckpt``, which reads as a bug: the ``#`` hides
+        the one name it is standing in for and invents a family that does not exist.
+
+        Grouping still keys on the pattern, so a second differently-numbered run
+        joins this same group and the label folds the moment it means something.
+        """
+        if self.distinct_names == 1 and self.jobs:
+            return self.jobs[0].name or self.name
+        return self.name
+
+    @property
     def failure_rate(self) -> float | None:
         """Failures as a share of *judged* runs -- cancellations excluded.
 

@@ -560,9 +560,16 @@ class TestLongPathsDoNotBreakTheLayout:
     """A 118-character workdir wrapped to column 0, leaving the label looking
     empty with an orphaned line of path beneath it."""
 
+    # Longer than the line has room for at the 118-wide size used below, which is
+    # the condition eliding exists for -- not merely longer than some constant.
+    LONG_DIR = (
+        "/project/rcc/youzhi/.cache/tmp/claude-940740146/-home-youzhi-ArgonneAI"
+        "/deeper/still/and/deeper/again/until/it/cannot/fit"
+    )
+
     def _job_with_a_long_workdir(self, history_jobs):
-        long_dir = "/project/rcc/youzhi/.cache/tmp/claude-940740146/-home-youzhi-ArgonneAI/deep/er"
-        assert len(long_dir) > tui._MAX_PATH_WIDTH
+        long_dir = self.LONG_DIR
+        assert len(long_dir) > 118 - (4 + 16 + 1) - tui._SCROLLBAR
         return history_jobs[0]._replace(work_dir=long_dir), long_dir
 
     @pytest.mark.asyncio
@@ -580,7 +587,7 @@ class TestLongPathsDoNotBreakTheLayout:
             assert "…" in row, row
             assert long_dir not in row
             # Elided, not emptied: both ends of the path survive.
-            assert "/project" in row and "er" in row
+            assert "/project" in row and "fit" in row
 
     @pytest.mark.asyncio
     async def test_p_reveals_the_whole_path(self, history_jobs):
@@ -765,3 +772,62 @@ class TestLogResolutionIsCrossChecked:
             await pilot.pause()
             assert app.history is not None
             assert app._log_map is None
+
+
+class TestPathsGetTheRoomTheLineHas:
+    """Reported: a 47-character log path shown as `/home/…/145-train.err` on a
+    150-column terminal. Both budgets were constants -- and the log line used
+    _elide's default 46 while the workdir above it used 62, so the path a reader
+    most wants to copy was cut shortest of anything on the screen.
+    """
+
+    LOG = "/home/youzhi/ArgonneAI-4.0/report/145-train.err"  # 47 characters
+
+    def _screen_text(self, app):
+        return "\n".join(
+            "".join(s.text for s in strip) for strip in app.screen._compositor.render_strips()
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_log_path_that_fits_is_shown_whole(self, history_jobs, monkeypatch):
+        job = history_jobs[0]
+        monkeypatch.setattr(tui, "assign_logs", lambda *a, **k: {job.job_id: (self.LOG, True)})
+        monkeypatch.setattr(tui, "read_tail", lambda *a, **k: "text")
+        app = make_app(history_jobs)
+        async with app.run_test(size=(150, 44)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(history_jobs[0]))
+            await pilot.pause()
+            body = self._screen_text(app)
+            assert self.LOG in body, "47 chars on a 150-wide terminal must not be elided"
+            assert "/home/…/" not in body
+
+    @pytest.mark.asyncio
+    async def test_it_is_still_elided_when_the_line_is_genuinely_too_narrow(
+        self, history_jobs, monkeypatch
+    ):
+        job = history_jobs[0]
+        monkeypatch.setattr(tui, "assign_logs", lambda *a, **k: {job.job_id: (self.LOG, True)})
+        monkeypatch.setattr(tui, "read_tail", lambda *a, **k: "text")
+        app = make_app(history_jobs)
+        async with app.run_test(size=(40, 44)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(history_jobs[0]))
+            await pilot.pause()
+            body = self._screen_text(app)
+            assert self.LOG not in body
+            assert "145-train.err" in body, "the filename is the part that must survive"
+
+    def test_the_budget_never_drops_below_the_floor(self):
+        """Eliding below this hides the filename, which is the one part that has to
+        survive; a two-column terminal is not worth degrading further for."""
+        assert len("…/145-train.err") <= tui._MIN_PATH_WIDTH
+
+    def test_the_log_line_is_no_longer_the_tightest_budget_on_the_screen(self):
+        """It has a 7-character prefix against the workdir row's 21, so it has MORE
+        room, not sixteen cells less."""
+        from slurmpast import render
+
+        log_prefix = len("  log  ")
+        cell_prefix = 4 + render.PAIR_LABEL_WIDTH + 1
+        assert log_prefix < cell_prefix

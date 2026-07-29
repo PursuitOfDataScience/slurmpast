@@ -88,3 +88,95 @@ class TestTailSummary:
         from slurmpast.index import History
 
         assert History(repeat_timeouts).tail_summary(50) == ""
+
+
+class TestTheFoldIsOnlyShownWhenItStandsForSomething:
+    """Reported: `exp-a#-newckpt · test · 1 job` above a row whose job is plainly
+    called `exp-a35-newckpt`. The `#` summarises a family of names; with one name
+    there is no family, and the notation hides the only name it stands for.
+
+    Measured on a real 7-day history: 29 of 34 folded groups covered a single name.
+    """
+
+    def _groups(self, job, names):
+        from slurmpast.index import build_groups
+
+        return build_groups(
+            [job._replace(job_id=str(1000 + i), name=n) for i, n in enumerate(names)]
+        )
+
+    def test_one_name_shows_that_name(self, healthy_job):
+        group = self._groups(healthy_job, ["exp-a35-newckpt"])[0]
+        assert group.name == "exp-a#-newckpt", "the key still folds, so a sibling joins it"
+        assert group.label == "exp-a35-newckpt"
+        assert "#" not in group.label
+
+    def test_repeats_of_one_name_still_show_it(self, healthy_job):
+        """Five runs of the same name are not a family either."""
+        group = self._groups(healthy_job, ["argonne35-pretrain"] * 5)[0]
+        assert group.total == 5 and group.distinct_names == 1
+        assert group.label == "argonne35-pretrain"
+
+    def test_two_names_keep_the_fold(self, healthy_job):
+        group = self._groups(healthy_job, ["exp-a35-gate", "exp-a4-gate"])[0]
+        assert group.distinct_names == 2
+        assert group.label == "exp-a#-gate" == group.name
+
+    def test_the_plain_overview_prints_the_label(self, healthy_job):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_overview
+
+        text = render_overview(
+            History([healthy_job._replace(name="exp-a35-newckpt")]), style=Style(enabled=False)
+        )
+        assert "exp-a35-newckpt" in text
+        assert "exp-a#-newckpt" not in text
+
+    def test_the_hash_footnote_goes_with_it(self, healthy_job):
+        """The "#" stands for a name's digits note explained notation that is no
+        longer on screen."""
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_overview
+
+        text = render_overview(
+            History([healthy_job._replace(name="exp-a35-newckpt")]), style=Style(enabled=False)
+        )
+        assert '"#" stands for' not in text
+
+
+class TestTheColumnsReconcile:
+    """Reported: "15 in total but 10 success and 2 flagged, where are the rest 3?
+    is the math wrong here?" It was not -- 5 of the 15 were cancelled, 2 of those
+    held GPUs without computing and so are the 2 FLAGGED -- but nothing on screen
+    let a reader close the arithmetic.
+    """
+
+    def _mixed(self, healthy_job):
+        jobs = [
+            healthy_job._replace(job_id=str(2000 + i), name="argonne35-pretrain") for i in range(6)
+        ]
+        for i in (4, 5):
+            jobs[i] = jobs[i]._replace(state="CANCELLED by 1000")
+        return jobs
+
+    def test_cancelled_runs_are_in_runs_but_neither_completed_nor_flagged(self, healthy_job):
+        from slurmpast.index import build_groups
+
+        group = build_groups(self._mixed(healthy_job))[0]
+        assert group.total == 6
+        assert group.completed == 4
+        assert group.cancelled == 2
+        assert group.failed == 0
+        # The gap the reader was doing arithmetic on.
+        assert group.total - group.completed - group.problems == group.cancelled
+
+    def test_the_overview_stays_within_its_four_lines(self, healthy_job):
+        """The reconciliation belongs on the workload screen, not above the table:
+        test_the_summary_is_brief caps that at four lines on purpose."""
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_overview
+
+        text = render_overview(History(self._mixed(healthy_job)), style=Style(enabled=False))
+        head = text.split("#    JOB NAME")[0].strip().splitlines()
+        body = [ln for ln in head if ln.strip() and not set(ln.strip()) <= {"-"}]
+        assert len(body) <= 4, body

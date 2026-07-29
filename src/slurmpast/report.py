@@ -338,8 +338,16 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
     notes = []
     if has_gpu:
         notes.append("ordered by compute used (1 GPU-hour = %d CPU-hours)" % GPU_CORE_EQUIVALENT)
-    if any("#" in g.name for g in shown):
+    if any("#" in g.label for g in shown):
         notes.append('"#" stands for a name\'s digits')
+    # RUNS, COMPLETED and FLAGGED read as a partition of the same runs and are not:
+    # argonne35-pretrain showed 15 / 10 / 2 and was asked whether the math was
+    # wrong. It was not -- the other 5 were cancelled, and 2 of those held GPUs
+    # without computing, which is what FLAGGED counts. A clause explaining that was
+    # tried here and reverted: test_the_summary_is_brief caps everything above the
+    # table at four lines, deliberately, and this was a fifth. The count lives on
+    # the workload screen instead, which is where a reader who is doing the
+    # arithmetic goes next.
     if notes:
         # One line while it fits, one per line when it does not. Joined
         # unconditionally, the two clauses came to 86 characters and were the only
@@ -352,14 +360,16 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
         else:
             out.extend(style("  " + note, "grey") for note in notes)
     out.append("")
-    layout = _plain_layout(spec, content={"JOB NAME": max((len(g.name) for g in shown), default=0)})
+    layout = _plain_layout(
+        spec, content={"JOB NAME": max((len(g.label) for g in shown), default=0)}
+    )
     rows = []
     for index, group in enumerate(shown, start=1):
         colour = {"crit": "red", "warn": "yellow"}.get(group.severity)
         rows.append(
             {
                 "#": str(index),
-                "JOB NAME": (group.name, colour) if colour else group.name,
+                "JOB NAME": (group.label, colour) if colour else group.label,
                 "PARTITION": group.partition,
                 "RUNS": str(group.total),
                 "COMPLETED": str(group.completed or "-"),
@@ -556,7 +566,7 @@ def render_sizing(history, style=None, limit=12):
         out.append(
             "  %s  %s"
             % (
-                style(group.name, "bold"),
+                style(group.label, "bold"),
                 style("%s · %d runs" % (group.partition, group.total), "grey"),
             )
         )

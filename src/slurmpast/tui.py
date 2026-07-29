@@ -202,8 +202,11 @@ def _header() -> Header:
 # which shrinking columns stops helping. A vertical scrollbar takes a couple of
 # cells once the rows overflow, so the layout leaves room for one rather than
 # spilling into a horizontal scrollbar.
-# Longest path shown inline on a job screen before it is elided. `p` toggles the
-# full value; --plain never elides, so a pasted report keeps the whole path.
+# Floor for an inline path on a job screen: below this, eliding stops buying
+# anything and only hides the filename. The real budget comes from the width there
+# actually is -- see JobScreen._path_budget. `p` toggles the full value, and
+# --plain never elides, so a pasted report keeps the whole path.
+_MIN_PATH_WIDTH = 28
 _MAX_PATH_WIDTH = 62
 _DEFAULT_TABLE_WIDTH = 96
 _MIN_TABLE_WIDTH = 40
@@ -484,7 +487,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
             spec = render.cpu_only_columns(spec)
         # The longest real name, so JOB NAME stops growing once it fits rather
         # than stretching to a cap over empty space.
-        names = [g.name for g in history.groups] if history is not None else []
+        names = [g.label for g in history.groups] if history is not None else []
         layout = _sync_columns(
             table, spec, self._layout, content={"JOB NAME": max(map(len, names), default=0)}
         )
@@ -514,7 +517,7 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
                 # both read as clutter hanging off an identifier: the "#" already
                 # says digits were folded, and the real names are one keypress away
                 # in this workload's own NAME column. It stays in the JSON payload.
-                "JOB NAME": Text(group.name, style=theme.INK),
+                "JOB NAME": Text(group.label, style=theme.INK),
                 "PARTITION": Text(group.partition, style=theme.DIM),
                 "RUNS": Text(str(group.total), style=theme.DIM),
                 "COMPLETED": Text(
@@ -632,7 +635,8 @@ class OverviewScreen(ClipboardMixin, Screen[Any]):
             return ""
         return "\t".join(
             [
-                group.name,
+                # What the row said on screen, not the internal pattern.
+                group.label,
                 group.partition,
                 str(group.total),
                 "%d completed" % group.completed,
@@ -898,6 +902,14 @@ class JobListScreen(ClipboardMixin, Screen[Any]):
             summary.append(
                 "  ·  %d of them never computed" % idle, style=theme.HEALTH_COLOR["warn"]
             )
+        cancelled = sum(1 for j in jobs if j.cancelled)
+        if cancelled:
+            # The quantity that closes the arithmetic. The overview showed this
+            # workload as 15 runs / 10 completed / 2 flagged and was asked whether
+            # the math was wrong: the missing 5 were cancelled, and a cancellation
+            # is deliberately neither a success nor a problem, so it appeared in no
+            # column at all. Dim, because it is bookkeeping rather than a finding.
+            summary.append("  ·  %d cancelled" % cancelled, style=theme.DIM)
         excluded = getattr(self, "_excluded", 0)
         if excluded:
             # Terse: the window is already in the title bar, and the long
@@ -1009,7 +1021,7 @@ class WorkloadScreen(JobListScreen):
     ]
 
     def __init__(self, group: GroupStats) -> None:
-        super().__init__(group.jobs, "%s · %s" % (group.name, group.partition))
+        super().__init__(group.jobs, "%s · %s" % (group.label, group.partition))
         self._group = group
         self._excluded = group.excluded
 
@@ -1102,6 +1114,23 @@ class JobScreen(ClipboardMixin, Screen[Any]):
     def action_help(self) -> None:
         self.sp.push_screen(HelpScreen())
 
+    def _path_budget(self, prefix: int) -> int:
+        """Cells a path may fill on a full-width line before it has to be elided.
+
+        Fixed budgets were the defect. The log line called :func:`_elide` with its
+        default 46 while the workdir two rows above used 62, so the one path a
+        reader actually wants to copy was cut sixteen cells shorter than the one
+        above it -- and a 47-character path came out as ``/home/…/145-train.err``
+        on a 150-column terminal with a hundred cells to spare, throwing away the
+        two directories that were the only reason to print a path at all.
+
+        Eliding exists to stop a path wrapping to column 0, and whether it wraps is
+        a function of the width there is. So that is what it is measured against.
+        """
+        width = self.size.width or self.app.size.width or _DEFAULT_TABLE_WIDTH
+        # One cell for the scrollbar, one so the text never touches the edge.
+        return max(_MIN_PATH_WIDTH, width - prefix - _SCROLLBAR)
+
     def render_body(self) -> None:
         job = self._job
         ascii_mode = self.sp.ascii_mode
@@ -1160,8 +1189,12 @@ class JobScreen(ClipboardMixin, Screen[Any]):
                 # looking empty with an orphaned line of path beneath it. Elided
                 # here only -- `p` shows it in full, and --plain always does,
                 # because a path you cannot copy whole is no use in a ticket.
-                if not self._show_paths and "/" in value and len(value) > _MAX_PATH_WIDTH:
-                    value = _elide(value, keep=_MAX_PATH_WIDTH)
+                if not self._show_paths and "/" in value:
+                    # A paired cell must fit its column; a row on its own gets the
+                    # rest of the line rather than a constant.
+                    budget = pad or self._path_budget(4 + render.PAIR_LABEL_WIDTH + 1)
+                    if len(value) > budget:
+                        value = _elide(value, keep=budget)
                 body.append("    %-*s " % (render.PAIR_LABEL_WIDTH, label), style=theme.FAINT)
                 if gauge is not None:
                     body.append_text(render.bar(gauge, colour, width=14, ascii_mode=ascii_mode))
@@ -1193,7 +1226,11 @@ class JobScreen(ClipboardMixin, Screen[Any]):
 
         body.append("\n")
         if log_path:
-            shown = log_path if self._show_paths else _elide(log_path)
+            shown = (
+                log_path
+                if self._show_paths
+                else _elide(log_path, keep=self._path_budget(len("  log  ")))
+            )
             body.append("  log  %s\n" % shown, style=theme.FAINT)
             if inferred:
                 # Matched by when it was written, not by its name. Say so: a wrong
@@ -1264,7 +1301,7 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
 
     def on_mount(self) -> None:
         history: History | None = self.sp.history
-        self.sub_title = "patterns" + (" · %s" % self._group.name if self._group else "")
+        self.sub_title = "patterns" + (" · %s" % self._group.label if self._group else "")
         body = Text()
         if history is None:
             body.append("loading…", style=theme.DIM)
