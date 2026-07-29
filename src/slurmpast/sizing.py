@@ -60,7 +60,7 @@ class Advice(NamedTuple):
 
     flag: str  # "--time", "--mem", "--cpus-per-task"
     verdict: str  # "raise" | "lower" | "keep" | "unknown"
-    requested: str  # what was typically asked for
+    requested: str  # what the LAST run asked for -- see _latest
     observed: str  # what the runs actually used
     suggestion: str  # what to ask for next, or ""
     basis: str  # the evidence, in words
@@ -69,6 +69,43 @@ class Advice(NamedTuple):
     @property
     def actionable(self) -> bool:
         return self.verdict in ("raise", "lower") and bool(self.suggestion)
+
+
+def _job_ordinal(job):
+    """The numeric part of a job id, for ordering records with no usable stamp."""
+    digits = ""
+    for ch in job.job_id or "":
+        if not ch.isdigit():
+            break
+        digits += ch
+    return int(digits) if digits else 0
+
+
+def _latest(jobs, attribute):
+    """``attribute`` on the most recently run job that has one, or ``None``.
+
+    What the *next* submission will ask for is what the *last* one asked for, and
+    the two are not the same as the largest thing ever asked for in the window.
+    ``patterns.group_key`` deliberately excludes resource magnitudes -- "raising
+    --mem must not fork the history you are trying to learn from" -- which is the
+    right call and guarantees a group spans every limit the user has tried. Taking
+    ``max()`` over that reaches back across exactly the history the grouping exists
+    to unify, and it does not degrade gracefully: one stale 8-hour run among twenty
+    tightened 40-minute ones was reported as ``requested 08:00:00`` and turned
+    "raise to 02:30:00" into "lower", which is the opposite instruction. Where the
+    same stale limit happened to sit near the target the verdict became ``keep``,
+    and ``keep`` suppresses the suggestion -- so the tool went silent about a
+    40-minute limit that every recent run needed 01:52:49 to finish.
+
+    Ordered by ``start or submit``, matching :func:`index._stamp`, so this agrees
+    with the ordering the rest of the tool already presents a workload in. Ties and
+    missing stamps fall back to the job id, which is monotonic per cluster.
+    """
+    stamped = [j for j in jobs if getattr(j, attribute, None)]
+    if not stamped:
+        return None
+    newest = max(stamped, key=lambda j: (j.start or j.submit or "", _job_ordinal(j)))
+    return getattr(newest, attribute)
 
 
 def _percentile(values, fraction):
@@ -120,8 +157,9 @@ def walltime_advice(jobs) -> Advice:
     completed = [j for j in jobs if j.completed and j.elapsed and not looks_like_noop(j)]
     timeouts = [j for j in jobs if j.base_state == "TIMEOUT"]
     hung = [j for j in timeouts if looks_like_noop(j)]
-    limits = sorted({j.timelimit for j in jobs if j.timelimit})
-    requested = format_duration(limits[-1]) if limits else "n/a"
+    # The limit the last run asked for, not the largest in the window. See _latest.
+    current = _latest(jobs, "timelimit")
+    requested = format_duration(current) if current else "n/a"
 
     # A workload whose timeouts never computed does not need more time -- but
     # only when the hangs are the story, not a stray outlier.
@@ -167,12 +205,13 @@ def walltime_advice(jobs) -> Advice:
     target = _round_walltime(longest * WALLTIME_MARGIN)
 
     # Any timeout means the true requirement is above the limit that truncated
-    # it, so the floor is that limit -- never below.
+    # it, so the floor is that limit -- never below. Still max(), and still right:
+    # a floor is a claim about the requirement, which no later run retracts, unlike
+    # a claim about what the script currently says.
     floor = max((j.timelimit for j in timeouts if j.timelimit), default=0)
     if floor:
         target = max(target, _round_walltime(floor * WALLTIME_MARGIN))
 
-    current = limits[-1] if limits else None
     # p95 only when it says something the longest run does not. On a workload whose
     # runs are all alike the two are the same number, and "longest of 8 completed
     # runs is 00:30:18 (p95 00:30:18)" printed it twice in one clause -- noise
@@ -230,8 +269,12 @@ def memory_advice(jobs) -> Advice:
     multiplied by the node count. Comparing MaxRSS (one task's peak) against the
     total understated use by exactly that factor.
     """
-    limits = [j.mem_limit_bytes for j in jobs if j.mem_limit_bytes]
-    requested = format_bytes(max(limits)) if limits else "n/a"
+    # The ceiling the last run asked for, not the largest in the window. On the
+    # recorded rc-tok-github_code history this is the difference between "48.0 GiB"
+    # -- a cancelled run five submissions back -- and the 17 GiB the script actually
+    # says. See _latest.
+    current = _latest(jobs, "mem_limit_bytes")
+    requested = format_bytes(current) if current else "n/a"
     ooms = [j for j in jobs if j.base_state == "OUT_OF_MEMORY"]
 
     # Checked FIRST: a cgroup OOM kill is an event, not a sample, so it is the
@@ -291,7 +334,6 @@ def memory_advice(jobs) -> Advice:
     peaks = [j.max_rss for j in usable]
     peak = max(peaks)
     target = _round_gib(peak * MEMORY_MARGIN)
-    current = max(limits) if limits else None
 
     if current is None:
         verdict = "raise"
@@ -332,9 +374,13 @@ def cpu_advice(jobs) -> Advice:
     15-node, 90-core job to request 90 cores for each of its tasks.
     """
     # Cores per task, which is the quantity the flag sets. Identical to cpu_count
-    # whenever there is one task, so single-task advice is unchanged.
-    per_task = sorted({j.cpus_per_task for j in jobs if j.cpus_per_task})
-    requested = ("%g" % per_task[-1]) if per_task else "n/a"
+    # whenever there is one task, so single-task advice is unchanged. From the last
+    # run rather than the largest in the window, for the reason in _latest -- and
+    # here the stale figure was also printed as the denominator of the basis text,
+    # so "used 1.2 of 16 cores per task" named a 16 the script had already left
+    # behind.
+    current = _latest(jobs, "cpus_per_task")
+    requested = ("%g" % current) if current else "n/a"
 
     usable = [
         j
@@ -355,7 +401,6 @@ def cpu_advice(jobs) -> Advice:
     effective = [j.cpu_utilization * j.cpus_per_task for j in usable]
     peak = max(effective)
     target = max(1, int(math.ceil(peak * CPU_MARGIN)))
-    current = per_task[-1] if per_task else None
 
     if current is None:
         verdict = "unknown"

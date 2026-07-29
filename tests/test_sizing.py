@@ -176,6 +176,111 @@ class TestCpu:
             assert int(advice.suggestion) >= 1
 
 
+class TestRequestedIsWhatTheNextRunWillAsk:
+    """`requested` is rendered as "raise to X (from Y)", so Y has to be the value
+    the user's script currently holds. It was `max()` over the whole window, and
+    `patterns.group_key` deliberately folds every resource magnitude into one group
+    -- "raising --mem must not fork the history you are trying to learn from" --
+    so `max()` reached straight back across the history the grouping exists to
+    unify. One stale run was enough to misstate the request, invert the verdict,
+    or suppress the advice entirely.
+    """
+
+    @staticmethod
+    def _tightened(limit, stale_limit, stale_count=2):
+        """A workload the user has since tightened, oldest run first."""
+        jobs = sorted(workload("midtrain"), key=lambda j: j.submit or "")
+        stale = [
+            j._replace(
+                job_id="800%d" % index,
+                timelimit=float(stale_limit),
+                submit="2026-01-0%dT00:00:00" % (index + 1),
+                start="2026-01-0%dT00:01:00" % (index + 1),
+            )
+            for index, j in enumerate(jobs[:stale_count])
+        ]
+        return stale + [j._replace(timelimit=float(limit)) for j in jobs[stale_count:]]
+
+    def test_requested_is_the_last_run_not_the_largest(self):
+        advice = walltime_advice(self._tightened(40 * 60, 8 * 3600))
+        assert advice.requested == "00:40:00", advice.requested
+
+    def test_a_stale_limit_does_not_invert_the_verdict(self):
+        """The damaging case. midtrain's longest run takes 01:52:49, so a workload
+        held at 00:40:00 must be told to RAISE. Measured against the stale 08:00:00
+        it was told to lower -- the opposite instruction, above a `requested`
+        figure that matched nothing in the script."""
+        advice = walltime_advice(self._tightened(40 * 60, 8 * 3600))
+        assert advice.verdict == "raise", advice
+        assert advice.suggestion == "02:30:00"
+
+    def test_the_direction_does_not_depend_on_how_many_runs_are_stale(self):
+        """Twelve old runs and two new ones is the same situation as two and
+        twelve: what the script says now is what the last run asked for."""
+        advice = walltime_advice(self._tightened(40 * 60, 8 * 3600, stale_count=12))
+        assert advice.requested == "00:40:00"
+        assert advice.verdict == "raise"
+
+    def test_one_stale_run_cannot_silence_the_advice(self):
+        """The worst of the three, because it produced no output at all. A single
+        old run at the target made the verdict `keep`, and `keep` suppresses the
+        suggestion -- so the tool said nothing about a 00:40:00 limit that every
+        recent run needed 01:52:49 to finish."""
+        jobs = self._tightened(40 * 60, 2.5 * 3600, stale_count=1)
+        advice = walltime_advice(jobs)
+        assert advice.verdict == "raise"
+        assert advice.suggestion == "02:30:00"
+        assert "#SBATCH --time=02:30:00" in sbatch_lines(recommend(jobs))
+
+    def test_a_workload_at_one_limit_throughout_is_unchanged(self):
+        """The control: no stale rows, so the old and new readings must agree."""
+        jobs = workload("midtrain")
+        assert len({j.timelimit for j in jobs}) == 1
+        advice = walltime_advice(jobs)
+        assert advice.requested == "02:00:00"
+        assert advice.verdict == "raise"
+
+    def test_a_timeout_floor_is_still_taken_from_the_largest(self):
+        """A floor is a claim about the requirement, which a later, smaller request
+        does not retract -- unlike a claim about what the script says. So max()
+        stays right there, and this must not have been swept up in the fix."""
+        jobs = sorted(workload("midtrain"), key=lambda j: j.submit or "")
+        jobs = [j._replace(timelimit=40 * 60.0) for j in jobs]
+        jobs[0] = jobs[0]._replace(
+            job_id="8500",
+            state="TIMEOUT",
+            timelimit=20 * 3600.0,
+            submit="2026-01-01T00:00:00",
+            start="2026-01-01T00:01:00",
+        )
+        advice = walltime_advice(jobs)
+        assert advice.requested == "00:40:00", "the request is still the last one"
+        # 20h floor x 1.25, rendered in the D-HH:MM:SS form Slurm takes past a day.
+        assert advice.suggestion == "1-01:00:00", "the floor is the limit that cut a run off"
+
+    def test_memory_requested_is_the_last_ceiling_not_the_largest(self):
+        """On the recorded rc-tok-github_code history this is the difference between
+        the 17 GiB the script says and 48.0 GiB -- a cancelled run five
+        submissions back."""
+        advice = memory_advice(workload("rc-tok-github_code"))
+        assert advice.requested == "17.0 GiB", advice.requested
+
+    def test_cpu_requested_is_the_last_count_not_the_largest(self):
+        """`requested` is also the denominator of the cpu basis text, so a stale
+        figure there read "used 1.2 of 64 cores per task" about a script that had
+        already come down to 8."""
+        jobs = sorted(workload("midtrain"), key=lambda j: j.submit or "")
+        wide = jobs[0]._replace(
+            job_id="8600",
+            alloc_tres="billing=64,cpu=64,gres/gpu=3,mem=200G,node=1",
+            submit="2026-01-01T00:00:00",
+            start="2026-01-01T00:01:00",
+        )
+        advice = cpu_advice([wide] + jobs[1:])
+        assert advice.requested != "64"
+        assert " of %s cores per task" % advice.requested in advice.basis
+
+
 class TestRecommendAndPaste:
     def test_three_directives_per_workload(self):
         advice = recommend(workload("midtrain"))
