@@ -566,6 +566,15 @@ def render_sizing(history, style=None, limit=12):
     ]
     out.append("")
     shown = 0
+    # Groups with advice that the limit cut off, and the runs behind them. Counted
+    # rather than just dropped: this list is ordered by compute burned, not by how
+    # wrong the request is, so the workload most worth re-sizing can sit at
+    # position 13 -- and every other truncated view here names its tail
+    # (History.tail_summary, patterns.find_repeat_failures) while this one went
+    # quiet. `tail_summary` cannot serve: what is shown here is the first N groups
+    # *with actionable advice*, which is not a prefix of history.groups.
+    hidden_groups = 0
+    hidden_runs = 0
     for group in history.groups:
         advice = recommend(group.jobs)
         if not advice:
@@ -575,7 +584,9 @@ def render_sizing(history, style=None, limit=12):
             continue
         shown += 1
         if shown > limit:
-            break
+            hidden_groups += 1
+            hidden_runs += group.total
+            continue
         out.append(
             "  %s  %s"
             % (
@@ -627,5 +638,16 @@ def render_sizing(history, style=None, limit=12):
         out.append(
             style("  every workload is already about right, or lacks the runs to say.", "green")
         )
+        out.append("")
+    elif hidden_groups:
+        tail = "… %d more workload%s (%d runs) also have advice, below the %d shown. " % (
+            hidden_groups,
+            "" if hidden_groups == 1 else "s",
+            hidden_runs,
+            limit,
+        )
+        tail += "Narrow --since, or ask about one with `slurmpast --sizing -p <partition>`."
+        for line in wrap(tail, _prose_width(2)):
+            out.append("  " + style(line, "grey"))
         out.append("")
     return "\n".join(_titled("what to request next time", out, style))

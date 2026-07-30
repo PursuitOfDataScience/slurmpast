@@ -311,6 +311,82 @@ class TestRecommendAndPaste:
                 assert a.basis
 
 
+class TestTruncationIsNeverSilent:
+    """`render_sizing` caps the list at `limit`. It used to stop there and say
+    nothing, while every other truncated view in the tool names its tail
+    (History.tail_summary, patterns.find_repeat_failures). The list is ordered by
+    compute burned rather than by how wrong the request is, so the workload most
+    worth re-sizing can sit just past the cut.
+    """
+
+    @staticmethod
+    def _many(count):
+        """`count` distinct workloads, each over-requesting time so each is actionable.
+
+        Names must not share a digit-folded shape: `patterns.normalize_name` collapses
+        digit runs, so wl00..wl19 would arrive as ONE group called `wl##`.
+        """
+        from slurmpast.model import Job
+
+        words = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf",
+            "hotel", "india", "juliet", "kilo", "lima", "mike", "november",
+            "oscar", "papa", "quebec", "romeo", "sierra", "tango",
+        ]  # fmt: skip
+        jobs = []
+        for index, name in enumerate(words[:count]):
+            for run in range(5):
+                jobs.append(
+                    Job(
+                        job_id="%d-%d" % (index, run),
+                        name=name,
+                        partition="test",
+                        node_list="n1",
+                        state="COMPLETED",
+                        elapsed=600.0 + index,
+                        timelimit=8 * 3600.0,
+                        start="2026-07-%02dT00:00:00" % (1 + run),
+                        submit="2026-07-%02dT00:00:00" % (1 + run),
+                    )
+                )
+        return jobs
+
+    def test_the_dropped_workloads_are_counted_and_named(self):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_sizing
+
+        jobs = self._many(20)
+        history = History(jobs)
+        with_advice = [g for g in history.groups if any(a.actionable for a in recommend(g.jobs))]
+        assert len(with_advice) == 20, "fixture no longer produces 20 actionable groups"
+
+        text = render_sizing(history, style=Style(enabled=False), limit=12)
+        flat = " ".join(text.split())
+        assert "8 more workloads" in flat, flat[-200:]
+        assert "40 runs" in flat, "the runs behind them, not just the group count"
+
+    def test_a_list_that_fits_says_nothing_about_a_tail(self):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_sizing
+
+        text = render_sizing(History(self._many(3)), style=Style(enabled=False), limit=12)
+        assert "more workload" not in text
+
+    def test_exactly_at_the_limit_is_not_a_tail(self):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_sizing
+
+        text = render_sizing(History(self._many(12)), style=Style(enabled=False), limit=12)
+        assert "more workload" not in text
+
+    def test_one_dropped_workload_reads_singular(self):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_sizing
+
+        text = render_sizing(History(self._many(13)), style=Style(enabled=False), limit=12)
+        assert "1 more workload " in " ".join(text.split())
+
+
 class TestHeadroomArithmetic:
     def test_margins_render_as_round_percentages(self):
         """int(0.2 * 100) truncates to 19 through float error."""
