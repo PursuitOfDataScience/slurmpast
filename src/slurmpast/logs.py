@@ -67,6 +67,15 @@ def base_job_id(job_id):
 # digits are a zero-pad width: `%4j` on job 128 gives `0128`.
 _PATTERN_CODE = re.compile(r"%(\d*)([%AaJjNnstux])")
 
+# Widest zero-pad worth honouring. The pattern comes out of the accounting
+# database -- StdOut, StdErr, or the recorded submit line -- so the width is
+# whatever the user typed, and `zfill` on it allocates that many bytes: a fat
+# fingered `--output=o-%2000000000j.out` built a 2 GB string and took `find_log`
+# down with an uncaught MemoryError, in a tool whose whole job is to explain a
+# crash rather than add one. Same reasoning as nodes.MAX_EXPANSION, and the same
+# shape of bound: far above any real filename, so nothing legitimate notices.
+MAX_PAD_WIDTH = 64
+
 
 def expand_pattern(pattern, job):
     """Substitute Slurm's ``%`` filename codes for one job.
@@ -114,7 +123,7 @@ def expand_pattern(pattern, job):
         if value == "":
             raise KeyError(code)
         if width and value.isdigit():
-            return value.zfill(int(width))
+            return value.zfill(min(int(width), MAX_PAD_WIDTH))
         return value
 
     try:

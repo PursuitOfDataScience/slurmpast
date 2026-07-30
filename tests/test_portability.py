@@ -715,6 +715,22 @@ class TestRecordedLogPaths:
         job = self._job()
         assert logs.expand_pattern("/w/%6j.out", job) == "/w/000060.out"
 
+    def test_an_absurd_zero_pad_width_is_bounded_not_allocated(self):
+        """The pattern comes out of the accounting database, so the width is whatever
+        the user typed. `--output=o-%2000000000j.out` had zfill allocate 2 GB and took
+        find_log down with an uncaught MemoryError -- in a tool whose job is to
+        explain a crash, not add one."""
+        job = self._job()
+        got = logs.expand_pattern("/w/o-%2000000000j.out", job)
+        assert len(got) < 200, len(got)
+        assert got.endswith(".out")
+        # And through the caller, which is where the crash actually surfaced.
+        assert logs.find_log(job._replace(std_out="/w/o-%2000000000j.out")) is None
+
+    def test_a_width_at_the_bound_still_pads(self):
+        job = self._job()
+        assert logs.expand_pattern("/w/%64j.out", job) == "/w/" + "60".zfill(64) + ".out"
+
     def test_a_literal_percent(self):
         job = self._job()
         assert logs.expand_pattern("/w/100%%.out", job) == "/w/100%.out"
