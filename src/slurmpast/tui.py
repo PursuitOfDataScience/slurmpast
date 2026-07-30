@@ -1232,11 +1232,11 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         history: History | None = self.sp.history
         note = ""
         if history is not None and len(history) > 20:
-            from .nodes import expand_nodelist, note_for_node
+            from .nodes import note_for_allocation
 
-            nodes = expand_nodelist(job.node_list)
-            if nodes:
-                note = note_for_node(history.usable_jobs, nodes[0], workload=job.name)
+            # The whole allocation, not just its first node -- a multi-node job's
+            # bad node is rarely the one Slurm happened to list first.
+            note = note_for_allocation(history.usable_jobs, job.node_list, workload=job.name)
 
         verdict = diagnose(job, log_text=log_text, node_note=note)
 

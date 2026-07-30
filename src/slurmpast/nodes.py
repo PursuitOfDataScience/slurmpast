@@ -469,31 +469,70 @@ def compress_nodelist(nodes):
     return ",".join(parts)
 
 
+def note_for_allocation(jobs, nodelist, workload=None):
+    """Reliability note for the worst node in one job's allocation, or "".
+
+    Both front ends used to pass ``expand_nodelist(job.node_list)[0]`` -- the first
+    node of the allocation and nothing else. On the single-node job that is 99.6% of
+    a real history that is the whole allocation and the same answer. On a multi-node
+    job it silently examined one node of however many, so the note went missing
+    exactly when the job had the most places to have gone wrong: a run on
+    ``midway3-[0600-0607]`` whose failures all came from ``0607`` was told nothing,
+    because ``0600`` is clean and is what got looked at.
+
+    One table for the whole allocation rather than one per node: :func:`node_table`
+    walks the entire history, and the family the correction is applied over has to
+    be the table, not a per-node slice of it.
+    """
+    nodes = expand_nodelist(nodelist)
+    if not nodes:
+        return ""
+    table = node_table(jobs, workload=workload, metric="failure")
+    wanted = set(nodes)
+    # Rows arrive worst-rate first, so the first match is the node most worth
+    # naming -- and only one is named. A job on eight bad nodes needs to know that
+    # its placement is the problem, not a list of eight intervals.
+    for row in table["rows"]:
+        if row["node"] in wanted:
+            note = _note_from_row(row, workload)
+            if note:
+                return note
+    return ""
+
+
+def _note_from_row(row, workload=None):
+    """The note one table row supports, or "" when it supports none."""
+    # The rate the verdict was actually reached against -- every other node --
+    # rather than the fleet-wide figure this row is itself part of.
+    comparison = row.get("comparison")
+    if row["verdict"] != "worse" or comparison is None:
+        return ""
+    return (
+        "%s failed %d of your %d jobs there (%.1f%%, 95%% CI %.1f-%.1f%%) against "
+        "%.1f%% on every other node%s."
+        % (
+            row["node"],
+            row["bad"],
+            row["trials"],
+            100 * row["rate"],
+            100 * row["ci_low"],
+            100 * row["ci_high"],
+            100 * comparison,
+            (" for %s" % workload) if workload else "",
+        )
+    )
+
+
 def note_for_node(jobs, node, workload=None):
-    """One-line reliability note for a node, or "" when evidence is thin."""
+    """One-line reliability note for one named node, or "" when evidence is thin.
+
+    :func:`note_for_allocation` is what a job screen wants; this stays for asking
+    about a node on its own.
+    """
     if not node:
         return ""
     table = node_table(jobs, workload=workload, metric="failure")
     for row in table["rows"]:
-        if row["node"] != node:
-            continue
-        # The rate the verdict was actually reached against -- every other node --
-        # rather than the fleet-wide figure this row is itself part of.
-        comparison = row.get("comparison")
-        if row["verdict"] != "worse" or comparison is None:
-            return ""
-        return (
-            "%s failed %d of your %d jobs there (%.1f%%, 95%% CI %.1f-%.1f%%) against "
-            "%.1f%% on every other node%s."
-            % (
-                node,
-                row["bad"],
-                row["trials"],
-                100 * row["rate"],
-                100 * row["ci_low"],
-                100 * row["ci_high"],
-                100 * comparison,
-                (" for %s" % workload) if workload else "",
-            )
-        )
+        if row["node"] == node:
+            return _note_from_row(row, workload)
     return ""

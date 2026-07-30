@@ -9,6 +9,7 @@ from slurmpast.nodes import (
     expand_nodelist,
     node_p_value,
     node_table,
+    note_for_allocation,
     note_for_node,
     suggest_exclude,
     wilson_interval,
@@ -201,6 +202,65 @@ class TestSuggestions:
             "midway3-0600", 12, 218, job_id_base=5000
         )
         assert note_for_node(jobs, "midway3-0600", workload="node-evaluation") == ""
+
+
+class TestTheNoteCoversTheWholeAllocation:
+    """Both front ends passed ``expand_nodelist(job.node_list)[0]`` -- the first node
+    and nothing else. On the single-node job that is 99.6% of a real history that is
+    the whole allocation; on a multi-node job it examined one node of however many,
+    so the warning went missing exactly where the job had the most places to have
+    gone wrong.
+    """
+
+    @staticmethod
+    def _fleet():
+        """40 clean placements on midway3-0600, 30 of 40 failing on midway3-0607."""
+        return _placements("midway3-0600", 0, 40) + _placements(
+            "midway3-0607", 30, 40, job_id_base=5000
+        )
+
+    def test_a_multi_node_job_is_warned_about_its_bad_node(self):
+        jobs = self._fleet()
+        # The bad node is listed SECOND, which is what the old code walked past.
+        note = note_for_allocation(jobs, "midway3-[0600-0607]", workload="node-evaluation")
+        assert "midway3-0607" in note, note
+        assert "on every other node" in note
+
+    def test_a_single_node_allocation_is_unchanged(self):
+        jobs = self._fleet()
+        assert note_for_allocation(jobs, "midway3-0607", workload="node-evaluation") == (
+            note_for_node(jobs, "midway3-0607", workload="node-evaluation")
+        )
+
+    def test_an_allocation_of_only_good_nodes_stays_silent(self):
+        jobs = self._fleet()
+        assert note_for_allocation(jobs, "midway3-0600", workload="node-evaluation") == ""
+
+    def test_no_nodelist_is_not_an_accusation(self):
+        jobs = self._fleet()
+        for value in ("", None, "None assigned"):
+            assert note_for_allocation(jobs, value, workload="node-evaluation") == ""
+
+    def test_only_the_worst_node_is_named(self):
+        """A job on several bad nodes needs to know its placement is the problem,
+        not a list of intervals."""
+        jobs = (
+            _placements("midway3-0600", 0, 40)
+            + _placements("midway3-0606", 25, 40, job_id_base=4000)
+            + _placements("midway3-0607", 35, 40, job_id_base=5000)
+        )
+        note = note_for_allocation(jobs, "midway3-[0600-0607]", workload="node-evaluation")
+        assert note.count("failed") == 1
+        assert note.startswith("midway3-0607"), "the worse of the two, by rate"
+
+    def test_the_job_screen_reaches_the_bad_node(self):
+        """End to end through the CLI helper, which is what a reader actually sees."""
+        from slurmpast.cli import _node_note
+        from slurmpast.index import History
+
+        jobs = self._fleet()
+        job = jobs[0]._replace(job_id="9999", node_list="midway3-[0600-0607]", state="FAILED")
+        assert "midway3-0607" in _node_note(job, History(list(jobs) + [job]))
 
 
 class TestDominantWorkload:

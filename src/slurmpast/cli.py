@@ -20,7 +20,7 @@ from .duration import humanize_window
 from .index import History, filter_jobs
 from .logs import assign_logs, read_tail
 from .model import severity_rank
-from .nodes import expand_nodelist, note_for_node
+from .nodes import note_for_allocation
 from .sacct import Sacct, SacctError, live_job_ids
 
 EPILOG = """\
@@ -250,10 +250,8 @@ def _logs_for_all(targets, args):
 def _node_note(job, history):
     if history is None or len(history) <= 20:
         return ""
-    nodes = expand_nodelist(job.node_list)
-    if not nodes:
-        return ""
-    return note_for_node(history.usable_jobs, nodes[0], workload=job.name)
+    # The whole allocation, not just its first node -- see note_for_allocation.
+    return note_for_allocation(history.usable_jobs, job.node_list, workload=job.name)
 
 
 def _job_json(job, log_path, verdict):
