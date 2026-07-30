@@ -9,6 +9,7 @@ Every guard rail below exists because a naive rule got it wrong on real records.
 
 from slurmpast.demo import history
 from slurmpast.index import build_groups
+from slurmpast.sacct import parse
 from slurmpast.sizing import (
     MIN_RUNS,
     cpu_advice,
@@ -17,10 +18,57 @@ from slurmpast.sizing import (
     sbatch_lines,
     walltime_advice,
 )
+from tests.conftest import make_text, row
 
 
 def workload(name):
     return [j for j in history() if j.name == name]
+
+
+def _mem_run(job_id, ceiling, state, day, peak=None):
+    """One allocation row, plus the batch step that carries MaxRSS when there is one.
+
+    MaxRSS lives on the step rows, not the allocation, so a fixture that sets it
+    on the allocation alone produces a job with no memory reading at all -- which
+    is a different case from the one under test.
+    """
+    tres = "cpu=4,mem=%s,node=1" % ceiling
+    rows = [
+        row(
+            JobID=job_id,
+            JobName="tok",
+            State=state,
+            ExitCode="0:125" if state == "OUT_OF_MEMORY" else "0:0",
+            Submit="%sT01:00:00" % day,
+            Start="%sT01:00:01" % day,
+            End="%sT02:00:00" % day,
+            Elapsed="01:00:00",
+            Timelimit="08:00:00",
+            ReqMem="%sn" % ceiling,
+            ReqCPUS="4",
+            AllocTRES=tres,
+            NodeList="n1",
+            NTasks="1",
+            TotalCPU="00:50:00",
+            CPUTime="04:00:00",
+        )
+    ]
+    if peak:
+        rows.append(
+            row(
+                JobID="%s.batch" % job_id,
+                JobName="batch",
+                State="COMPLETED",
+                ExitCode="0:0",
+                Elapsed="01:00:00",
+                MaxRSS=peak,
+                AllocTRES=tres,
+                NTasks="1",
+                TotalCPU="00:50:00",
+                CPUTime="04:00:00",
+            )
+        )
+    return rows
 
 
 class TestWalltime:
@@ -151,6 +199,67 @@ class TestMemory:
 
     def test_too_few_runs_declines(self):
         assert memory_advice(workload("midtrain")[:1]).verdict == "unknown"
+
+
+class TestAnOomFloorIsNotTheWholeAnswer:
+    """A workload that OOM'd and was then FIXED must not be told to cut back.
+
+    The OOM branch used to return with ``verdict`` hard-coded to ``"raise"``,
+    having consulted neither what the last run requested nor the runs that
+    succeeded after the request went up. So a workload that OOM'd at 16 GiB and
+    was raised to 64 GiB was told to "raise to 21G" -- a two-thirds cut, labelled
+    as an increase, emitted as a paste-ready ``#SBATCH --mem=21G`` that walks
+    straight back into the OOM the user had already fixed. This is issues.md #2
+    in the one branch that fix did not reach; ``walltime_advice`` never had it,
+    because it folds its TIMEOUT floor into the same target everything else is
+    judged against instead of short-circuiting past the comparison.
+    """
+
+    def _fixed_history(self, oomed_at="16G", now_at="64G", peak="20971520K"):
+        """OOM'd five times at one ceiling, then six clean runs at a higher one."""
+        jobs = []
+        for index in range(5):
+            jobs += _mem_run(
+                "40%d" % index, oomed_at, "OUT_OF_MEMORY", "2026-06-%02d" % (index + 1)
+            )
+        for index in range(6):
+            jobs += _mem_run(
+                "50%d" % index, now_at, "COMPLETED", "2026-07-%02d" % (index + 1), peak=peak
+            )
+        return parse(make_text(*jobs))
+
+    def test_a_fixed_workload_is_not_told_to_raise_to_a_smaller_number(self):
+        advice = memory_advice(self._fixed_history())
+        assert advice.verdict == "lower", advice
+        assert advice.requested == "64.0 GiB"
+
+    def test_the_suggestion_still_clears_what_the_successful_runs_used(self):
+        """26 GiB covers a 20 GiB peak; the old code said 21G, sized off the floor."""
+        advice = memory_advice(self._fixed_history())
+        assert advice.suggestion == "26G", advice
+        assert "peaked higher still" in advice.basis
+
+    def test_no_sbatch_line_ever_undercuts_the_measured_peak(self):
+        """The paste-ready line is the one output a user acts on directly."""
+        jobs = self._fixed_history()
+        peak = max(j.max_rss for j in jobs if j.max_rss and j.max_rss <= j.mem_limit_bytes)
+        lines = [line for line in sbatch_lines(recommend(jobs)) if "--mem" in line]
+        assert lines, "expected a --mem line"
+        suggested = int(lines[0].split("=")[1].rstrip("G")) * 1024**3
+        assert suggested > peak, "%s undercuts the %d-byte peak" % (lines[0], peak)
+
+    def test_a_request_already_at_the_floor_is_left_alone(self):
+        """Neither raise nor lower: 'keep' suppresses the suggestion, correctly."""
+        advice = memory_advice(self._fixed_history(oomed_at="16G", now_at="21G", peak=None))
+        assert advice.verdict == "keep", advice
+        assert advice.suggestion == ""
+
+    def test_the_floor_still_holds_when_no_run_has_a_usable_peak(self):
+        """With nothing trustworthy to measure, floor-only sizing is all there is."""
+        advice = memory_advice(self._fixed_history(oomed_at="40G", now_at="40G", peak=None))
+        assert advice.verdict == "raise", advice
+        assert advice.suggestion == "52G"
+        assert "floor" in advice.basis
 
 
 class TestCpu:

@@ -145,6 +145,23 @@ def _round_gib(byte_count):
     return int(math.ceil(byte_count / float(1024**3)))
 
 
+def _memory_verdict(target_gib, current_bytes):
+    """raise/lower/keep for a GiB target against the bytes the last run asked for.
+
+    Shared by both halves of :func:`memory_advice` so that a target derived from an
+    OOM floor is judged the same way as one derived from measured peaks. It was
+    only ever applied to the second, which is how the OOM branch came to announce
+    "raise" beside a number below the current request.
+    """
+    if current_bytes is None:
+        return "raise"
+    if target_gib * 1024**3 < current_bytes * (1 - MIN_RELATIVE_CHANGE):
+        return "lower"
+    if target_gib * 1024**3 > current_bytes * (1 + MIN_RELATIVE_CHANGE):
+        return "raise"
+    return "keep"
+
+
 def walltime_advice(jobs) -> Advice:
     """How long the next run should be allowed."""
     completed = [j for j in jobs if j.completed and j.elapsed and not looks_like_noop(j)]
@@ -270,31 +287,59 @@ def memory_advice(jobs) -> Advice:
     requested = format_bytes(current) if current else "n/a"
     ooms = [j for j in jobs if j.base_state == "OUT_OF_MEMORY"]
 
+    measured = [j for j in jobs if j.max_rss and j.mem_limit_bytes and not looks_like_noop(j)]
+    # MaxRSS above the cgroup limit is definitionally not a working set. Those
+    # runs are excluded; only when they dominate is the metric unusable outright.
+    untrustworthy = [j for j in measured if j.max_rss > j.mem_limit_bytes]
+    trustworthy = [j for j in measured if j.max_rss <= j.mem_limit_bytes]
+
     # Checked FIRST: a cgroup OOM kill is an event, not a sample, so it is the
     # most reliable thing here. Ordering this after the MaxRSS-trust check let an
     # unreliable metric veto advice that an authoritative one had already settled.
     if ooms:
         floor = max((j.mem_limit_bytes for j in ooms if j.mem_limit_bytes), default=0)
         target = _round_gib(floor * MEMORY_MARGIN) if floor else None
+        # A floor is a lower bound on the requirement, not the whole answer, and
+        # it says nothing about whether the request has since been fixed. This
+        # branch used to return here with verdict hard-coded to "raise", so a
+        # workload that OOM'd at 16 GiB and was then raised to 64 GiB was told to
+        # "raise to 21G" -- a two-thirds cut, announced as an increase, and
+        # emitted as a paste-ready `#SBATCH --mem=21G` that walks straight back
+        # into the OOM the user had already fixed. Both halves of that are the
+        # defect issues.md #2 describes: a verdict measured against something
+        # other than what the last run asked for. `walltime_advice` had it right
+        # all along -- it folds its TIMEOUT floor into the same target everything
+        # else is judged against, rather than short-circuiting past the
+        # comparison -- so this now does the same.
+        peak_floor = None
+        if target and len(trustworthy) >= MIN_RUNS:
+            peak_floor = max(j.max_rss for j in trustworthy)
+            target = max(target, _round_gib(peak_floor * MEMORY_MARGIN))
+        verdict = _memory_verdict(target, current) if target else "unknown"
+        basis = "A request that OOM'd is a floor: the requirement is above it."
+        if peak_floor is not None and _round_gib(peak_floor * MEMORY_MARGIN) > _round_gib(
+            floor * MEMORY_MARGIN
+        ):
+            # Say which measurement is actually binding. Reporting the floor alone
+            # while sizing from something larger is how the old text came to
+            # disagree with its own number.
+            basis += "  The runs that did not OOM peaked higher still, at %s." % format_bytes(
+                peak_floor
+            )
         return Advice(
             flag="--mem",
-            verdict="raise" if target else "unknown",
+            verdict=verdict,
             requested=requested,
             observed="%d OOM kill%s, the largest at %s"
             % (len(ooms), "" if len(ooms) == 1 else "s", format_bytes(floor) if floor else "n/a"),
-            suggestion="%dG" % target if target else "",
-            basis="A request that OOM'd is a floor: the requirement is above it.",
+            suggestion="%dG" % target if target and verdict != "keep" else "",
+            basis=basis,
             caution=(
                 "If the same request both failed and succeeded, --mem is not the "
                 "deciding variable -- look for what else changed."
             ),
         )
 
-    measured = [j for j in jobs if j.max_rss and j.mem_limit_bytes and not looks_like_noop(j)]
-    # MaxRSS above the cgroup limit is definitionally not a working set. Those
-    # runs are excluded; only when they dominate is the metric unusable outright.
-    untrustworthy = [j for j in measured if j.max_rss > j.mem_limit_bytes]
-    trustworthy = [j for j in measured if j.max_rss <= j.mem_limit_bytes]
     if untrustworthy and (
         len(untrustworthy) >= VETO_MIN_SHARE * max(1, len(measured)) and len(trustworthy) < MIN_RUNS
     ):
@@ -328,14 +373,7 @@ def memory_advice(jobs) -> Advice:
     peak = max(peaks)
     target = _round_gib(peak * MEMORY_MARGIN)
 
-    if current is None:
-        verdict = "raise"
-    elif target * 1024**3 < current * (1 - MIN_RELATIVE_CHANGE):
-        verdict = "lower"
-    elif target * 1024**3 > current * (1 + MIN_RELATIVE_CHANGE):
-        verdict = "raise"
-    else:
-        verdict = "keep"
+    verdict = _memory_verdict(target, current)
 
     caution = maxrss_caveat() + "."
     if untrustworthy:
