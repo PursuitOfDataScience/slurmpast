@@ -6,6 +6,7 @@ from slurmpast.nodes import (
     _bh_reject,
     compress_nodelist,
     dominant_workload,
+    excluded_tail,
     expand_nodelist,
     node_p_value,
     node_table,
@@ -597,3 +598,82 @@ class TestEmptyTablesSayWhyNotNothing:
         text = render_nodes(History(jobs), metric="failure", style=Style(enabled=False))
         assert "VERDICT" in text
         assert "midway3-0385" in text
+
+
+class TestAWorkloadIsTheFoldedName:
+    """A parameter sweep is one piece of work and many literal names.
+
+    Both `dominant_workload` and `node_table`'s filter compared raw `job.name`, so
+    a sweep fragmented into one stratum per arm. A fragment is too small to test:
+    every node fell under MIN_SAMPLES and a genuinely bad node produced an empty
+    table, while an unrelated single-name workload won the "dominant" vote on
+    fewer total runs.
+    """
+
+    def _sweep(self, healthy_job, bad_node="midway3-bad", arms=6, per_arm=6):
+        """One sweep, distinct literal names, one node failing most of its runs."""
+        jobs = []
+        for arm in range(arms):
+            for index in range(per_arm):
+                on_bad = index < 3
+                jobs.append(
+                    healthy_job._replace(
+                        job_id="s%d%d" % (arm, index),
+                        name="sweep-e%d" % (arm * 7),
+                        node_list=bad_node if on_bad else "midway3-good%d" % index,
+                        state="FAILED" if (on_bad and index < 2) else "COMPLETED",
+                    )
+                )
+        return jobs
+
+    def test_the_sweep_is_one_stratum(self, healthy_job):
+        jobs = self._sweep(healthy_job)
+        assert len({j.name for j in jobs}) > 1, "fixture must have distinct raw names"
+        assert dominant_workload(jobs, metric="failure") == "sweep-e#"
+
+    def test_filtering_by_the_folded_name_keeps_every_arm(self, healthy_job):
+        """18 placements pooled across 6 arms, versus 3 per arm on its own.
+
+        MIN_SAMPLES is 10, so the fragmented version cannot produce a row at all --
+        which is how a node failing most of its runs became invisible.
+        """
+        jobs = self._sweep(healthy_job)
+        table = node_table(jobs, workload=dominant_workload(jobs, metric="failure"))
+        bad = [r for r in table["rows"] if r["node"] == "midway3-bad"]
+        assert bad, "the pooled sweep should give the bad node enough placements"
+        assert bad[0]["trials"] == 18
+
+    def test_raw_name_equality_would_have_found_nothing(self, healthy_job):
+        """The old behaviour, asserted directly so the fix cannot silently revert."""
+        jobs = self._sweep(healthy_job)
+        one_arm = [j for j in jobs if j.name == "sweep-e7"]
+        assert len(one_arm) == 6
+        assert node_table(one_arm)["rows"] == []
+
+    def test_a_single_name_workload_still_matches_itself(self, healthy_job):
+        jobs = [healthy_job._replace(job_id=str(i), name="node-evaluation") for i in range(12)]
+        table = node_table(jobs, workload="node-evaluation")
+        assert sum(r["trials"] for r in table["rows"]) == 12
+
+
+class TestTheExcludeLineSaysWhatItLeftOut:
+    """`suggest_exclude` caps at 8, which is right, but it was silent.
+
+    The paste-ready line read as the complete answer while the table above it
+    showed more rows with the same verdict. Every other truncation here names its
+    tail.
+    """
+
+    def _table(self, worse):
+        return {"rows": [{"node": "n%d" % i, "verdict": "worse"} for i in range(worse)]}
+
+    def test_nothing_left_out_when_under_the_cap(self):
+        assert excluded_tail(self._table(5)) == 0
+
+    def test_the_remainder_is_counted(self):
+        assert excluded_tail(self._table(12)) == 4
+        assert len(suggest_exclude(self._table(12))) == 8
+
+    def test_it_agrees_with_the_list_it_describes(self):
+        table = self._table(11)
+        assert len(suggest_exclude(table)) + excluded_tail(table) == 11

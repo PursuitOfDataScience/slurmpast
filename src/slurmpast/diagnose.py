@@ -260,11 +260,32 @@ def _memory_rules(job, add):
     # "what does this message mean here?", fairly.
 
 
+# States whose own outcome already accounts for a near-zero CPU total, so that
+# "the allocation did nothing, find the blocking call" would be a second, wrong
+# story told on top of the right one. See _cpu_rules.
+_NOOP_ALREADY_EXPLAINED = frozenset(["OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED"])
+
+
 def _cpu_rules(job, add):
     if job.base_state == "TIMEOUT" or job.open_ended:
         return  # already covered, or not measurable
 
-    if looks_like_noop(job):
+    # "Find the blocking call" is advice about the user's own code, and it is only
+    # honest when nothing else already explains the missing CPU time. For these
+    # three states something does, so the finding is suppressed rather than shown
+    # beside an explanation that contradicts it:
+    #
+    #   OUT_OF_MEMORY  the kill IS the explanation, and pairing "raise --mem" with
+    #                  "this is not a resource problem" left the user two
+    #                  incompatible remedies for one event.
+    #   NODE_FAIL      the node died, so the final accounting sample was never
+    #                  taken -- a TotalCPU near zero is missing data, not evidence.
+    #   PREEMPTED      the scheduler evicted it, often during setup. Real, and not
+    #                  a hang in the user's code.
+    #
+    # Each of the three gets a finding of its own in _exit_rules that names what
+    # actually happened. TIMEOUT is handled by the wholesale return above.
+    if looks_like_noop(job) and job.base_state not in _NOOP_ALREADY_EXPLAINED:
         add(
             Finding(
                 CRITICAL,
@@ -324,6 +345,38 @@ def _exit_rules(job, log_text, add):
                 "A deliberate kill and an abandoned run are identical in accounting, so this "
                 "is excluded from failure statistics.",
                 "",
+            )
+        )
+
+    # NODE_FAIL and PREEMPTED get named for the same reason CANCELLED does: the
+    # state is the whole explanation, and without a finding to say so the only
+    # plain-English guidance on the screen was the noop rule's "find the blocking
+    # call" -- sending the user to debug their own code for a dead node or for the
+    # scheduler's own eviction. Both are now suppressed there and explained here.
+    if state == "NODE_FAIL":
+        add(
+            Finding(
+                WARNING,
+                "node-failed",
+                "The node failed under this job",
+                "Slurm ended this as NODE_FAIL, so the job did not choose to stop and its "
+                "last accounting sample may never have been taken -- a CPU or memory total "
+                "near zero here is missing data, not a measurement.",
+                "Not your code: resubmit. If one node keeps doing this, the nodes screen "
+                "tests whether it fails more than the rest.",
+            )
+        )
+
+    if state == "PREEMPTED":
+        add(
+            Finding(
+                INFO,
+                "preempted",
+                "Preempted, not failed",
+                "The scheduler reclaimed this allocation for higher-priority work, so how "
+                "far it got says nothing about whether the job was healthy.",
+                "Requeue it. If this keeps happening, a higher-priority QOS or a partition "
+                "with less contention will hold onto the allocation.",
             )
         )
 

@@ -157,7 +157,14 @@ def build_groups(jobs: Iterable[Job]) -> list[GroupStats]:
     Ranking is by cost, not count: a 5-run group that burned 400 GPU-hours
     matters more than a 400-run group of two-second probes, and a
     count-ordered list buries the former under the latter.
+
+    Materialised once up front because this walks ``jobs`` twice -- once for the
+    buckets and once for the open-ended count below. An ``Iterable`` is what the
+    signature accepts and a one-shot iterator is exhausted by the first pass, which
+    did not fail loudly: it reported ``excluded=0`` for every workload, quietly
+    undoing the guarantee the second loop exists to provide.
     """
+    jobs = list(jobs)
     buckets: dict[tuple, list[Job]] = {}
     for job in usable(jobs):
         buckets.setdefault(group_key(job), []).append(job)
@@ -226,7 +233,11 @@ SORTS: tuple[tuple[str, str], ...] = (
 
 _SORT_KEYS: dict[str, Callable[[GroupStats], tuple]] = {
     "cost": lambda g: (-g.cost, -g.total),
-    "failures": lambda g: (-(g.failed + g.noop), -g.cost),
+    # `problems`, not `failed + noop`: those two overlap, and GroupStats.problems
+    # exists precisely to be their union. Summing them counted a hung TIMEOUT
+    # twice, so a workload with 5 hung timeouts (5 + 5 = 10) sorted above one with
+    # 8 genuine OOM kills (8 + 0 = 8) under a sort the UI labels "failed runs".
+    "failures": lambda g: (-g.problems, -g.cost),
     "rate": lambda g: (-(g.failure_rate or 0.0), -g.total),
     "recent": lambda g: (g.last_seen or "", g.name),
     "runs": lambda g: (-g.total, g.name),

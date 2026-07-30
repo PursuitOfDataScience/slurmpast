@@ -421,3 +421,60 @@ class TestSpendingTheLeftoverWhenAskedTo:
         narrow = fit_columns(SPEC, 60, content=self.CONTENT)
         filled_narrow = fit_columns(SPEC, 60, content=self.CONTENT, fill_to=60)
         assert [label for label, _ in narrow] == [label for label, _ in filled_narrow]
+
+
+class TestATruncatedListSaysSo:
+    """Everything else here names its tail; the job list did not.
+
+    `cli.py` pre-sliced the list to `--limit` before `render_list` could compare
+    against it, so the "… N more" line was unreachable in production and `-n 5`
+    showed 5 of 28 problem jobs in silence.
+    """
+
+    def test_the_tail_is_named(self):
+        from slurmpast.demo import history
+        from slurmpast.report import Style, render_list
+
+        jobs = history()
+        assert len(jobs) > 5
+        text = render_list(jobs, style=Style(enabled=False), limit=5)
+        assert "%d more" % (len(jobs) - 5) in text, text
+
+    def test_nothing_is_claimed_when_nothing_is_hidden(self):
+        from slurmpast.demo import history
+        from slurmpast.report import Style, render_list
+
+        jobs = history()[:4]
+        assert "more" not in render_list(jobs, style=Style(enabled=False), limit=10)
+
+
+class TestTheOverviewCaptionDescribesTheTableBelowIt:
+    """ "ordered by compute used" was printed under every `--sort`.
+
+    The dashboard has always got this right -- it appends "by <mode>" only when the
+    mode is not the default -- while the plain caption asserted a cost ordering over
+    an alphabetical table.
+    """
+
+    def _caption(self, sort):
+        from slurmpast.demo import history
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_overview
+
+        text = render_overview(History(history()), style=Style(enabled=False), sort=sort)
+        return next(line for line in text.splitlines() if "ordered by" in line)
+
+    def test_the_default_still_says_compute_used(self):
+        assert "ordered by compute used" in self._caption("cost")
+
+    def test_another_sort_names_itself_instead(self):
+        from slurmpast.index import sort_label
+
+        caption = self._caption("name")
+        assert "ordered by compute used" not in caption
+        assert "ordered by %s" % sort_label("name") in caption
+
+    def test_the_exchange_rate_survives_either_way(self):
+        """It is load-bearing: without it a row outranking another looks arbitrary."""
+        for sort in ("cost", "name", "recent"):
+            assert "GPU-hour" in self._caption(sort)

@@ -237,7 +237,22 @@ class Job(NamedTuple):
 
     @property
     def failed(self) -> bool:
-        return self.base_state in ("FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "BOOT_FAIL")
+        # DEADLINE belongs here for the same reason TIMEOUT does: the scheduler
+        # killed the job for exceeding a time it was given. Leaving it out made a
+        # job that missed its --deadline count as neither failed nor completed, so
+        # it fell out of `GroupStats.failed`, out of `problems`, and out of
+        # `fail_rate`'s denominator entirely -- a workload of five COMPLETED and
+        # five DEADLINE runs reported a 0% failure rate and rendered as `FLAGGED -`.
+        # `theme.STATE_HEALTH` already grades DEADLINE "crit" alongside these five,
+        # so the tool was colouring it red while counting it as nothing.
+        return self.base_state in (
+            "FAILED",
+            "TIMEOUT",
+            "OUT_OF_MEMORY",
+            "NODE_FAIL",
+            "BOOT_FAIL",
+            "DEADLINE",
+        )
 
     @property
     def completed(self) -> bool:
@@ -622,7 +637,7 @@ class Job(NamedTuple):
         ``22860M``, which is DefMemPerCPU x cores -- the default that would have
         applied, not the 80G granted.
         """
-        allocated = _tres_bytes(self.alloc_tres, "mem")
+        allocated = _tres_bytes(self.alloc_tres, "mem", zero_is_missing=True)
         if allocated:
             return allocated
         if self.req_mem_bytes:
@@ -634,7 +649,7 @@ class Job(NamedTuple):
             # Slurm 21.08 changed ReqMem to mirror ReqTRES: no n/c suffix, and
             # the figure is already the allocation total.
             return self.req_mem_bytes
-        return _tres_bytes(self.req_tres, "mem") or None
+        return _tres_bytes(self.req_tres, "mem", zero_is_missing=True) or None
 
     @property
     def mem_limit_bytes(self) -> int | None:
@@ -862,11 +877,17 @@ def _tres_float(tres: str, key: str) -> float | None:
     return None
 
 
-def _tres_bytes(tres: str, key: str) -> int | None:
+def _tres_bytes(tres: str, key: str, zero_is_missing: bool = False) -> int | None:
     """Byte quantity out of a TRES string, honouring unit suffixes.
 
-    Returns None for zero: a 0-byte memory ceiling does not exist, and
-    conflating "not recorded" with "zero" invents overruns.
+    ``zero_is_missing`` for a *ceiling*: a 0-byte memory limit does not exist, so
+    reading one means the field was not recorded, and conflating the two invents
+    overruns. It is off by default because for a *measurement* the opposite holds
+    -- a step that read nothing really did read 0 bytes. Applying the ceiling rule
+    to every caller made `read_bytes` discard an authoritative ``fs/disk=0`` and
+    fall through to its own documented fallback, so a job that provably moved no
+    data was rendered as `read 500.0 GiB` with a filesystem-pacing finding
+    attached to it.
     """
     if not tres:
         return None
@@ -876,5 +897,8 @@ def _tres_bytes(tres: str, key: str) -> int | None:
         name, _, value = field.partition("=")
         if name.strip() != key:
             continue
-        return parse_bytes(value.strip()) or None
+        parsed = parse_bytes(value.strip())
+        if parsed is None:
+            return None
+        return None if (zero_is_missing and not parsed) else parsed
     return None

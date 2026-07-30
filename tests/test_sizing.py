@@ -25,6 +25,61 @@ def workload(name):
     return [j for j in history() if j.name == name]
 
 
+def _timeout_run(job_id, cpu_seconds, day, limit="01:00:00"):
+    """A run cut off at its limit, having used `cpu_seconds` of CPU.
+
+    Under 10s of CPU is what `looks_like_noop` calls a hang; near the whole limit is
+    a run that genuinely needed more wall clock.
+    """
+    return [
+        row(
+            JobID=job_id,
+            JobName="trainer",
+            State="TIMEOUT",
+            ExitCode="0:0",
+            Submit="%sT01:00:00" % day,
+            Start="%sT01:00:01" % day,
+            End="%sT02:00:05" % day,
+            ElapsedRaw="3605",
+            Elapsed="01:00:05",
+            Timelimit=limit,
+            ReqCPUS="1",
+            AllocTRES="cpu=1,mem=8G,node=1",
+            NodeList="n1",
+            NTasks="1",
+            TotalCPU="%d:%02d" % (int(cpu_seconds) // 60, int(cpu_seconds) % 60),
+            CPUTime="01:00:05",
+        )
+    ]
+
+
+def _cpu_run(job_id, cpus, util, day):
+    """A completed run of `cpus` cores per task, busy for `util` of its wall clock."""
+    elapsed = 3600
+    total_cpu = elapsed * cpus * util
+    tres = "cpu=%d,mem=8G,node=1" % cpus
+    return [
+        row(
+            JobID=job_id,
+            JobName="trainer",
+            State="COMPLETED",
+            ExitCode="0:0",
+            Submit="%sT01:00:00" % day,
+            Start="%sT01:00:01" % day,
+            End="%sT02:00:01" % day,
+            ElapsedRaw=str(elapsed),
+            Elapsed="01:00:00",
+            Timelimit="04:00:00",
+            ReqCPUS=str(cpus),
+            AllocTRES=tres,
+            NodeList="n1",
+            NTasks="1",
+            TotalCPU="%d:%02d" % (int(total_cpu) // 60, int(total_cpu) % 60),
+            CPUTime="%02d:00:00" % cpus,
+        )
+    ]
+
+
 def _mem_run(job_id, ceiling, state, day, peak=None):
     """One allocation row, plus the batch step that carries MaxRSS when there is one.
 
@@ -375,9 +430,15 @@ class TestRequestedIsWhatTheNextRunWillAsk:
         assert advice.requested == "17.0 GiB", advice.requested
 
     def test_cpu_requested_is_the_last_count_not_the_largest(self):
-        """`requested` is also the denominator of the cpu basis text, so a stale
-        figure there read "used 1.2 of 64 cores per task" about a script that had
-        already come down to 8."""
+        """A stale figure read "used 1.2 of 64 cores per task" about a script that
+        had already come down to 8.
+
+        `requested` is the last run's ask, and it reaches the screen as "(from X)".
+        It is no longer the denominator of the basis sentence: that has to be the
+        ceiling the busiest run itself had, or the two halves come from different
+        runs and the sentence describes neither. See
+        TestTheBasisDescribesOneRun.
+        """
         jobs = sorted(workload("midtrain"), key=lambda j: j.submit or "")
         wide = jobs[0]._replace(
             job_id="8600",
@@ -387,7 +448,38 @@ class TestRequestedIsWhatTheNextRunWillAsk:
         )
         advice = cpu_advice([wide] + jobs[1:])
         assert advice.requested != "64"
-        assert " of %s cores per task" % advice.requested in advice.basis
+
+
+class TestTheBasisDescribesOneRun:
+    """The busiest run's usage, against that same run's own ceiling.
+
+    Pairing the peak with `_latest`'s figure printed "the busiest run used 12.0 of 2
+    cores per task" -- six times its own allocation, which cannot happen. Both
+    numbers were right; they came from different runs.
+    """
+
+    def _mixed_history(self):
+        """One old wide run that did the work, three recent narrow ones."""
+        jobs = _cpu_run("7000", cpus=16, util=0.75, day="2026-05-01")
+        for index in range(3):
+            jobs += _cpu_run("80%d" % index, cpus=2, util=0.25, day="2026-07-%02d" % (index + 1))
+        return parse(make_text(*jobs))
+
+    def test_the_denominator_is_the_busiest_runs_own_ceiling(self):
+        advice = cpu_advice(self._mixed_history())
+        assert "of 16 cores per task" in advice.basis, advice.basis
+
+    def test_the_latest_ask_is_still_what_requested_reports(self):
+        """The fix must not walk back issues.md #2: "from X" is the current ask."""
+        advice = cpu_advice(self._mixed_history())
+        assert advice.requested == "2", advice.requested
+
+    def test_the_basis_never_claims_more_cores_than_it_names(self):
+        advice = cpu_advice(self._mixed_history())
+        used, _, ceiling = advice.basis.partition(" of ")
+        used_cores = float(used.rsplit(" ", 1)[-1])
+        named = float(ceiling.split()[0])
+        assert used_cores <= named, advice.basis
 
 
 class TestRecommendAndPaste:
@@ -598,3 +690,43 @@ class TestTheBasisIsTheEvidenceAndNothingElse:
         assert _cores_text(0.04) == "under 0.05"
         assert _cores_text(0.0) == "0"
         assert _cores_text(1.1) == "1.1"
+
+
+class TestTheHangVetoDoesNotSpeakForEveryTimeout:
+    """The veto stands; it may not describe runs it did not measure.
+
+    Its threshold is half, so four hangs among eight timeouts fired it -- and
+    "These runs were blocked, not slow" was then asserted of the other four too:
+    runs that burned nearly their whole limit doing real work. `looks_like_noop`
+    needs CPU under 10s, so those are never hangs by this module's own definition.
+    """
+
+    def _mixed(self):
+        """4 true hangs + 4 compute-bound timeouts + 12 completed runs."""
+        rows = []
+        for index in range(4):
+            rows += _timeout_run("10%d" % index, cpu_seconds=0.5, day="2026-06-%02d" % (index + 1))
+        for index in range(4):
+            rows += _timeout_run("20%d" % index, cpu_seconds=3590, day="2026-06-1%d" % index)
+        for index in range(12):
+            rows += _cpu_run("30%d" % index, cpus=1, util=0.9, day="2026-07-%02d" % (index + 1))
+        return parse(make_text(*rows))
+
+    def test_the_veto_still_withholds_a_number(self):
+        advice = walltime_advice(self._mixed())
+        assert advice.verdict == "unknown"
+        assert advice.suggestion == ""
+
+    def test_the_basis_names_the_split_instead_of_generalising(self):
+        advice = walltime_advice(self._mixed())
+        assert "4 of 8 timed-out runs" in advice.basis, advice.basis
+
+    def test_what_the_computing_timeouts_proved_is_not_thrown_away(self):
+        advice = walltime_advice(self._mixed())
+        assert "The other 4 did compute" in advice.caution, advice.caution
+        assert "01:00:00" in advice.caution, advice.caution
+
+    def test_an_all_hang_workload_still_reads_as_before(self):
+        advice = walltime_advice(workload("cot-exp"))
+        assert advice.verdict == "unknown"
+        assert "blocked, not slow" in advice.basis

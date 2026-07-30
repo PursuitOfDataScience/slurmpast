@@ -95,7 +95,17 @@ def expand_pattern(pattern, job):
     array_master, _, array_task = raw.partition("_")
     # For an array element sacct shows `123_4` in JobID while `%j` is that
     # element's own allocation number, which is what JobIDRaw carries.
-    own_id = (job.job_id_raw or raw) if array_task else raw
+    #
+    # A heterogeneous component needs exactly the same substitution and was not
+    # getting it: sacct displays `500+1` for one, JobIDRaw carries the plain `501`,
+    # and gating on `array_task` alone sent the display form through, expanding
+    # `slurm-%j.err` to `slurm-500+1.err`. `%j` is a job number, so Slurm never
+    # wrote a `+` into that name and the recorded path could not match anything --
+    # for a job whose output location was known exactly. Asking whether JobIDRaw
+    # says something different covers both spellings without naming either.
+    own_id = raw
+    if job.job_id_raw and str(job.job_id_raw) != raw:
+        own_id = str(job.job_id_raw)
     first_node = ""
     if job.node_list:
         from .nodes import expand_nodelist
@@ -378,10 +388,20 @@ class Scan:
         is more than a million ``stat`` calls for questions one ``listdir`` per
         directory already answers. Only a name the listing cannot speak for (a
         recorded path with no log suffix) is stat'd, and that answer is cached too.
+
+        The listing settles *absence*, which is what those million calls were
+        asking about, but it cannot settle presence: a name appears in it whether or
+        not it resolves. A dangling symlink -- routine once a scratch purge has been
+        through -- was therefore reported as a confirmed log with ``inferred=False``,
+        `read_tail` returned nothing from it, and the readable ``.out`` sitting
+        beside it was never tried, so the report named a log path and said "no log
+        was found" a few lines later. Confirming only the names the listing says are
+        there costs one cached stat per hit rather than per probe, which leaves the
+        reason for the fast path intact.
         """
         directory, name = os.path.split(path)
-        if name.endswith(_LOG_SUFFIXES):
-            return name in set(self.entries(directory))
+        if name.endswith(_LOG_SUFFIXES) and name not in set(self.entries(directory)):
+            return False
         return self.mtime(path) is not None
 
     def mtime(self, path):
@@ -416,10 +436,18 @@ def job_identifiers(job):
     allocation number, so both spellings have to be recognised -- and the array
     master's plain ``60`` last, since it is shared with every sibling element and so
     is the weakest of the three.
+
+    That third one was missing. ``base_job_id`` strips ``.step`` and ``+het`` but
+    not ``_task``, so asked for the master of ``60_4`` it returned ``60_4`` unchanged
+    -- a duplicate of ``raw`` that the check below dropped, leaving two identifiers
+    where the docstring promised three. An array submitted with
+    ``--output=%x-%A.out``, which writes one shared file per array and no ``%a``,
+    was reported as having no log at all while ``train-60.out`` sat in the directory.
     """
     raw = str(job.job_id)
     out = [raw]
-    for ident in (job.job_id_raw, base_job_id(raw)):
+    array_master = base_job_id(raw).split("_")[0]
+    for ident in (job.job_id_raw, base_job_id(raw), array_master):
         if ident and ident not in out:
             out.append(str(ident))
     return out

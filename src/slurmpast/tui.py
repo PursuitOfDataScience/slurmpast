@@ -44,7 +44,7 @@ from .index import (
     sort_label,
 )
 from .logs import assign_logs, load_for, read_tail
-from .nodes import MIN_SAMPLES, compress_nodelist, node_table, suggest_exclude
+from .nodes import MIN_SAMPLES, compress_nodelist, excluded_tail, node_table, suggest_exclude
 
 BASE_CSS = """
 Screen { background: $surface; align-horizontal: center; }
@@ -1559,6 +1559,17 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
                 "reliability, and that is your call.\n",
                 style=theme.FAINT,
             )
+            # Same disclosure as the plain report: the line is capped at 8, so when
+            # more nodes scored worse it has to say so rather than read complete.
+            left_out = excluded_tail(table_data)
+            if left_out:
+                for line in render.wrap(
+                    "%d further node%s scored worse too, left off the line: excluding this "
+                    "many trades away more of the partition than a paste-ready suggestion "
+                    "should." % (left_out, "" if left_out == 1 else "s"),
+                    max(40, self.size.width - 8),
+                ):
+                    note.append("    %s\n" % line, style=theme.FAINT)
         else:
             note.append(
                 "\n  no node is worse than the rest; nothing to exclude.\n",
@@ -1681,12 +1692,22 @@ class SlurmpastApp(App[Any]):
         self.run_worker(self._load, thread=True, exclusive=True, name="load")
 
     def _load(self) -> None:
+        # Building the history is inside the guard, not after it. Textual's
+        # `run_worker` defaults to `exit_on_error=True`, so anything escaping here
+        # reaches `App._handle_exception`, which "always results in the app
+        # exiting" -- the dashboard died with a raw traceback instead of taking
+        # `_loaded`'s error path, and `load_error` was never even set. That is the
+        # one promise the except clause below makes out loud.
+        #
+        # `exit_on_error=False` on the worker would be the wrong fix: it only
+        # suppresses the crash, and since nothing else calls `_loaded` the UI would
+        # sit on "loading…" for ever, which is worse than exiting.
         try:
             jobs = self._loader(self._since) if self._can_requery else self._loader()
+            history = History(jobs, window=self.window)
         except Exception as exc:  # surfaced in the UI, never swallowed
             self.call_from_thread(self._loaded, None, str(exc))
             return
-        history = History(jobs, window=self.window)
         self.call_from_thread(self._loaded, history, None)
 
     def _loaded(self, history: History | None, error: str | None) -> None:
@@ -1716,7 +1737,14 @@ class SlurmpastApp(App[Any]):
             return
         try:
             resolved = assign_logs(history.usable_jobs, extra_dirs=self.log_dirs)
-        except OSError:
+        except Exception:
+            # `except OSError` did not deliver the guarantee this comment makes: any
+            # other exception escaped the worker and, per `exit_on_error=True`, took
+            # the whole dashboard down -- and a log search is the most speculative
+            # thing this tool does, walking directories and expanding filename
+            # patterns from user-supplied strings. Logs are an enhancement to a
+            # screen that is already useful without them, so failing to find them
+            # costs the reader nothing.
             return  # a log search must never take the dashboard down with it
         # Only if the history has not been replaced under us by a re-query.
         if self.history is history:

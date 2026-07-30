@@ -270,3 +270,44 @@ class TestShortJobsAreNotJudged:
         """Suppressing utilization noise must not suppress the actual cause."""
         brief_oom = healthy_job._replace(state="OUT_OF_MEMORY", elapsed=20.0)
         assert "host-oom" in codes(diagnose(brief_oom))
+
+
+class TestAStateThatAlreadyExplainsTheMissingCpu:
+    """ "Find the blocking call" is advice about the user's own code.
+
+    It is only honest when nothing else accounts for a near-zero CPU total. For
+    three states something does, and the noop rule was talking over all of them:
+    an OOM-killed job got "raise --mem" and "this is not a resource problem" as
+    co-equal CRITICAL findings, and NODE_FAIL and PREEMPTED got sent to debug a
+    hang that never happened. TIMEOUT was already handled; these three were not.
+    """
+
+    def _stalled(self, healthy_job, state):
+        """Long wall clock, no CPU to show for it -- the shape looks_like_noop wants."""
+        return healthy_job._replace(
+            state=state,
+            elapsed=1800.0,
+            steps=tuple(s._replace(total_cpu=0.0) for s in healthy_job.steps),
+        )
+
+    def test_an_oom_kill_is_not_also_a_hang(self, healthy_job):
+        found = codes(diagnose(self._stalled(healthy_job, "OUT_OF_MEMORY")))
+        assert "host-oom" in found
+        assert "noop-allocation" not in found
+
+    def test_a_dead_node_is_named_rather_than_blamed_on_the_job(self, healthy_job):
+        verdict = diagnose(self._stalled(healthy_job, "NODE_FAIL"))
+        assert "node-failed" in codes(verdict)
+        assert "noop-allocation" not in codes(verdict)
+        finding = next(f for f in verdict.findings if f.code == "node-failed")
+        assert "missing data" in finding.evidence
+        assert "Not your code" in finding.action
+
+    def test_preemption_is_named_rather_than_blamed_on_the_job(self, healthy_job):
+        verdict = diagnose(self._stalled(healthy_job, "PREEMPTED"))
+        assert "preempted" in codes(verdict)
+        assert "noop-allocation" not in codes(verdict)
+
+    def test_a_genuine_hang_still_reports_one(self, healthy_job):
+        """The suppression is per-state, not a hole in the rule."""
+        assert "noop-allocation" in codes(diagnose(self._stalled(healthy_job, "FAILED")))

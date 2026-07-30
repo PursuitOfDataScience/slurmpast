@@ -179,6 +179,27 @@ def walltime_advice(jobs) -> Advice:
         and len(hung) >= VETO_MIN_SHARE * len(jobs)
     )
     if hangs_dominate:
+        # The veto stands -- while hangs dominate, a longer limit mostly buys a
+        # longer hang -- but it may not speak for every timeout in the group. The
+        # threshold is half, so four hangs among eight timeouts fired it, and
+        # "These runs were blocked, not slow" was then asserted of the other four
+        # as well: runs that had burned 29:50 of a 30:00 limit doing real work.
+        # `looks_like_noop` needs CPU under 10s, so those are never hangs by this
+        # module's own definition. Name the split, and keep what they proved.
+        computing = [j for j in timeouts if not looks_like_noop(j)]
+        basis = (
+            "%d of %d timed-out run%s consumed almost no CPU before hitting the wall: "
+            "blocked, not slow -- a longer limit buys a longer hang."
+            % (len(hung), len(timeouts), "" if len(timeouts) == 1 else "s")
+        )
+        caution = "Fix the blocking call before changing --time."
+        computing_floor = max((j.timelimit for j in computing if j.timelimit), default=0)
+        if computing_floor:
+            caution += (
+                "  The other %d did compute, and were cut off at %s -- so once the blocking "
+                "call is fixed, the limit has to be at least that."
+                % (len(computing), format_duration(computing_floor))
+            )
         return Advice(
             flag="--time",
             verdict="unknown",
@@ -186,8 +207,8 @@ def walltime_advice(jobs) -> Advice:
             observed="%d run%s hit the wall having consumed almost no CPU"
             % (len(hung), "" if len(hung) == 1 else "s"),
             suggestion="",
-            basis="These runs were blocked, not slow -- a longer limit buys a longer hang.",
-            caution="Fix the blocking call before changing --time.",
+            basis=basis,
+            caution=caution,
         )
 
     if len(completed) < MIN_RUNS:
@@ -429,8 +450,14 @@ def cpu_advice(jobs) -> Advice:
             basis="Needs at least %d before core use can be inferred." % MIN_RUNS,
         )
 
-    effective = [j.cpu_utilization * j.cpus_per_task for j in usable]
-    peak = max(effective)
+    # The busiest run, kept rather than just its number, because the basis sentence
+    # has to name the ceiling that run itself was measured against. Pairing its
+    # usage with `requested` -- the LAST run's ceiling -- printed "the busiest run
+    # used 12.0 of 2 cores per task" for a group whose oldest run asked for 16 and
+    # whose recent ones ask for 2: a run using six times its own allocation, which
+    # cannot happen. Both numbers were right; they came from different runs.
+    busiest = max(usable, key=lambda j: j.cpu_utilization * j.cpus_per_task)
+    peak = busiest.cpu_utilization * busiest.cpus_per_task
     target = max(1, int(math.ceil(peak * CPU_MARGIN)))
 
     if current is None:
@@ -465,7 +492,13 @@ def cpu_advice(jobs) -> Advice:
         observed="%.1f %s busy per task at peak across %d runs"
         % (peak, per_task_label, len(usable)),
         suggestion=str(target) if verdict != "keep" else "",
-        basis="the busiest run used %s of %s cores per task." % (_cores_text(peak), requested),
+        # Against the ceiling that run itself had, which is not necessarily the one
+        # the last run asked for. `requested` is deliberately the latest ask (see
+        # _latest) and it is already on screen as "(from X)"; borrowing it here as
+        # the denominator too produced "used 12.0 of 2 cores per task", a run using
+        # six times its own allocation. One sentence, one run.
+        basis="the busiest run used %s of %s cores per task."
+        % (_cores_text(peak), "%g" % busiest.cpus_per_task),
         caution=caution,
     )
 

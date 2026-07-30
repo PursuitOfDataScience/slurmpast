@@ -51,6 +51,11 @@ STATE_HEALTH = {
     "BOOT_FAIL": "crit",
     "DEADLINE": "crit",
     "CANCELLED": "none",
+    # Reclaimed for higher-priority work, so like CANCELLED this is not the job's
+    # own verdict -- but unlike CANCELLED it was not anybody's choice, and it left
+    # real compute unfinished. "warn" rather than falling through to no grade at
+    # all, which is how it came to read as unremarkable.
+    "PREEMPTED": "warn",
     "RUNNING": "warn",
     "PENDING": "none",
 }

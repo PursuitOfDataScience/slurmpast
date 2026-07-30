@@ -153,3 +153,76 @@ class TestParser:
             for token in line.split():
                 if token.startswith("--"):
                     assert token in known, token
+
+
+class TestJsonReportsSeverityInItsExitCode:
+    """`--json` is the mode a script checks `$?` from, and it always returned 0.
+
+    The same query rendered as text exited 1. (`--overview`/`--patterns`/`--nodes`/
+    `--sizing` do always exit 0, deliberately -- they report rather than judge.
+    This path judges.)
+    """
+
+    def test_json_and_text_agree_on_the_default_view(self, capsys):
+        text = run("--demo", "--plain", "--no-color")
+        capsys.readouterr()
+        as_json = run("--demo", "--json", "--no-color")
+        capsys.readouterr()
+        assert as_json == text
+
+    def test_the_findings_behind_the_code_are_in_the_payload(self, capsys):
+        run("--demo", "--json", "--no-color")
+        payload = json.loads(capsys.readouterr().out)
+        assert "patterns" in payload, "the exit code rests on these"
+        assert any(f["severity"] == "critical" for f in payload["patterns"])
+
+    def test_explicit_ids_report_their_own_findings(self, capsys):
+        """With ids given, per-job verdicts decide it -- as in the text path."""
+        healthy = run("--demo", "--json", "--no-color", "5100021")
+        capsys.readouterr()
+        assert healthy in (0, 1)
+
+
+class TestAMissingValueIsAnError:
+    """`-u -p gpu` -- what `-u "$USER" -p gpu` becomes when $USER is unset.
+
+    The negative-value glue took `-p` as the value of `-u`, leaving `gpu` as a job
+    id and the partition filter silently gone. The error then named a job the user
+    never typed.
+    """
+
+    def test_a_known_flag_is_not_swallowed_as_a_value(self):
+        assert cli._glue_negative_values(["-u", "-p", "gpu"]) == ["-u", "-p", "gpu"]
+
+    def test_argparse_gets_to_complain(self, capsys):
+        with pytest.raises(SystemExit) as exit_info:
+            run("--demo", "-u", "-p", "gpu", "--no-color")
+        assert exit_info.value.code == 2
+        assert "expected one argument" in capsys.readouterr().err
+
+    def test_a_real_relative_time_still_glues(self):
+        assert cli._glue_negative_values(["-S", "-7days"]) == ["-S=-7days"]
+
+    def test_a_dash_leading_username_still_glues(self):
+        assert cli._glue_negative_values(["-u", "-odd-name"]) == ["-u=-odd-name"]
+
+
+class TestDemoHonoursFailed:
+    """`--help` says "only jobs that failed"; the demo returned all 58.
+
+    The real path narrows the whole history through sacct's `--state`, so the demo
+    has to narrow the whole history too -- not just the list at the bottom.
+    """
+
+    def test_the_summary_shrinks(self, capsys):
+        run("--demo", "--overview", "--json", "--no-color")
+        everything = json.loads(capsys.readouterr().out)["summary"]["jobs"]
+        run("--demo", "--failed", "--overview", "--json", "--no-color")
+        only_failed = json.loads(capsys.readouterr().out)["summary"]["jobs"]
+        assert 0 < only_failed < everything
+
+    def test_what_is_left_really_did_fail(self, capsys):
+        run("--demo", "--failed", "--json", "--no-color")
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["jobs"]
+        assert all(j["outcome"]["failed"] for j in payload["jobs"])

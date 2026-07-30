@@ -891,12 +891,43 @@ class TestTheScanAnswersFromOneListdir:
         base.update(kw)
         return parse(row(**base))[0]
 
-    def test_a_log_suffixed_name_is_answered_without_a_stat(self, tmp_path, monkeypatch):
+    def test_a_missing_log_suffixed_name_is_answered_without_a_stat(self, tmp_path, monkeypatch):
+        """The listing settles absence, which is where the million calls went.
+
+        ~170 spellings are probed per job and nearly all of them miss, so it is the
+        misses that have to stay free. This asserted that a *hit* skipped the stat
+        too, which is what let a dangling symlink count as a confirmed log: a name
+        is in the listing whether or not it resolves.
+        """
         (tmp_path / "slurm-60.out").write_text("out\n")
         scan = logs.Scan()
         monkeypatch.setattr(os.path, "isfile", lambda p: pytest.fail("should not stat"))
-        assert scan.exists(str(tmp_path / "slurm-60.out")) is True
         assert scan.exists(str(tmp_path / "slurm-99.out")) is False
+
+    def test_a_hit_is_confirmed_and_the_stat_is_cached(self, tmp_path, monkeypatch):
+        """One stat per hit, not per probe -- and only the first time it is asked."""
+        (tmp_path / "slurm-60.out").write_text("out\n")
+        scan = logs.Scan()
+        assert scan.exists(str(tmp_path / "slurm-60.out")) is True
+        calls = []
+        real = os.path.isfile
+        monkeypatch.setattr(os.path, "isfile", lambda p: calls.append(p) or real(p))
+        for _ in range(5):
+            assert scan.exists(str(tmp_path / "slurm-60.out")) is True
+        assert calls == [], "the confirmed answer should come from the cache"
+
+    def test_a_dangling_symlink_is_not_a_log(self, tmp_path):
+        """A purged scratch target leaves the name in the listing but nothing behind it.
+
+        Reported as a certain match, it shadowed the readable file beside it: the
+        report named a log path and then said no log was found to explain the exit.
+        """
+        (tmp_path / "slurm-60.err").symlink_to(tmp_path / "gone.err")
+        (tmp_path / "slurm-60.out").write_text("the real one\n")
+        job = self._job(tmp_path, StdErr=str(tmp_path / "slurm-60.err"))
+        assert logs.Scan().exists(str(tmp_path / "slurm-60.err")) is False
+        assert logs.find_log_by_name(job) == str(tmp_path / "slurm-60.out")
+        assert logs.find_log(job) == str(tmp_path / "slurm-60.out")
 
     def test_a_recorded_path_with_no_log_suffix_still_resolves(self, tmp_path):
         """``--output=/scratch/me/mylog`` has no suffix, so the directory listing
@@ -1410,3 +1441,81 @@ class TestTresParsingIsExact:
         assert model._tres_float("gres/gpuutil=87.5", "gres/gpuutil") == 87.5
         assert model._tres_float("gres/gpuutil=nan-ish", "gres/gpuutil") is None
         assert model._tres_float("", "gres/gpuutil") is None
+
+
+class TestHeterogeneousJobFilenames:
+    """`%j` is a job number, so Slurm never wrote a `+` into a filename.
+
+    sacct displays `500+1` for a heterogeneous component while JobIDRaw carries the
+    plain allocation number. Consulting JobIDRaw only for array tasks sent the
+    display form through, so the recorded path expanded to `slurm-500+1.err` and
+    could not match anything -- for a job whose output location was known exactly.
+    """
+
+    def _het(self, tmp_path, pattern):
+        return parse(
+            row(
+                JobID="500+1",
+                JobIDRaw="501",
+                JobName="het",
+                State="FAILED",
+                ElapsedRaw="60",
+                WorkDir=str(tmp_path),
+                StdErr=pattern,
+            )
+        )[0]
+
+    def test_the_plain_allocation_number_is_substituted(self, tmp_path):
+        job = self._het(tmp_path, str(tmp_path / "slurm-%j.err"))
+        assert logs.expand_pattern(job.std_err, job) == str(tmp_path / "slurm-501.err")
+
+    def test_the_recorded_path_now_matches_the_file_on_disk(self, tmp_path):
+        (tmp_path / "slurm-501.err").write_text("boom\n")
+        job = self._het(tmp_path, str(tmp_path / "slurm-%j.err"))
+        assert logs.find_log_by_name(job) == str(tmp_path / "slurm-501.err")
+
+    def test_an_ordinary_job_is_unaffected(self, tmp_path):
+        job = parse(
+            row(
+                JobID="500",
+                JobIDRaw="500",
+                JobName="plain",
+                State="FAILED",
+                ElapsedRaw="60",
+                WorkDir=str(tmp_path),
+                StdErr=str(tmp_path / "slurm-%j.err"),
+            )
+        )[0]
+        assert logs.expand_pattern(job.std_err, job) == str(tmp_path / "slurm-500.err")
+
+
+class TestTheArrayMasterIdIsOfferedLast:
+    """`--output=%x-%A.out` writes one shared file per array and no `%a`.
+
+    `job_identifiers`' docstring promises the master's bare `60` as a third,
+    weakest identifier, but `base_job_id` strips `.step` and `+het` and not
+    `_task`, so it returned `60_4` unchanged -- a duplicate that got dropped.
+    """
+
+    def _element(self, tmp_path):
+        return parse(
+            row(
+                JobID="60_4",
+                JobIDRaw="73",
+                JobName="train",
+                State="FAILED",
+                ElapsedRaw="60",
+                WorkDir=str(tmp_path),
+            )
+        )[0]
+
+    def test_all_three_identifiers_are_offered(self, tmp_path):
+        assert logs.job_identifiers(self._element(tmp_path)) == ["60_4", "73", "60"]
+
+    def test_a_shared_array_log_is_found(self, tmp_path):
+        (tmp_path / "train-60.out").write_text("shared\n")
+        assert logs.find_log_by_id(self._element(tmp_path)) == str(tmp_path / "train-60.out")
+
+    def test_a_plain_job_offers_no_spurious_third(self, tmp_path):
+        job = parse(row(JobID="61", JobIDRaw="61", JobName="t", State="FAILED", ElapsedRaw="60"))[0]
+        assert logs.job_identifiers(job) == ["61"]

@@ -1182,3 +1182,47 @@ class TestTheAdviceBasisIsNotCutOff:
                 continue
             # The last few words are what a first-line slice threw away.
             assert advice.basis.rstrip(".").split()[-1] in body, advice.basis
+
+
+class TestNothingInTheLoadWorkerTakesTheAppDown:
+    """The except clause promises errors are "surfaced in the UI, never swallowed".
+
+    `History(...)` was built after it, and Textual's `run_worker` defaults to
+    `exit_on_error=True` -- so anything raised there reached
+    `App._handle_exception`, which always exits, and the dashboard died with a raw
+    traceback while `load_error` stayed None. `exit_on_error=False` would be the
+    wrong fix: nothing else calls `_loaded`, so the UI would sit on "loading…"
+    for ever.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_failure_building_the_history_is_reported(self, monkeypatch, history_jobs):
+        def boom(*args, **kwargs):
+            raise ValueError("grouping exploded")
+
+        monkeypatch.setattr(tui, "History", boom)
+        app = make_app(history_jobs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+        assert app.load_error is not None
+        assert "grouping exploded" in app.load_error
+
+    @pytest.mark.asyncio
+    async def test_a_failure_finding_logs_leaves_the_dashboard_up(self, monkeypatch, history_jobs):
+        """`except OSError` did not deliver its own comment's guarantee.
+
+        A log search walks directories and expands filename patterns from
+        user-supplied strings; it is the most speculative thing here, and logs are
+        an enhancement to a screen that is useful without them.
+        """
+
+        def boom(*args, **kwargs):
+            raise ValueError("log walk exploded")
+
+        monkeypatch.setattr(tui, "assign_logs", boom)
+        app = make_app(history_jobs)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.history is not None
+            assert isinstance(app.screen, tui.OverviewScreen)
+        assert app.load_error is None

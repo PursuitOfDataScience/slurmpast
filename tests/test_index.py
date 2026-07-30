@@ -289,3 +289,41 @@ class TestScale:
         names = ["work-" + a for a in string.ascii_lowercase]
         jobs = [cot_exp._replace(job_id=str(i), name=names[i % len(names)]) for i in range(6000)]
         assert len(filter_jobs(jobs, "all", "work-c")) > 0
+
+
+class TestFailuresSortCountsEachRunOnce:
+    """`failed + noop` double-counts, which is why `problems` exists.
+
+    A hung TIMEOUT is both failed and a noop, so summing them ranked a workload
+    with 5 hung timeouts above one with 8 genuine OOM kills under a sort the UI
+    calls "failed runs". `GroupStats.problems` is already the de-duplicated union
+    and is already the number the FLAGGED column shows.
+    """
+
+    def test_real_failures_outrank_double_counted_hangs(self, repeat_timeouts, oom_series):
+        hangs = build_groups(repeat_timeouts)[0]
+        assert hangs.failed and hangs.noop, "fixture must be both to be worth testing"
+        ordered = sort_groups(build_groups(list(repeat_timeouts) + list(oom_series)), "failures")
+        by_name = {g.name: g for g in ordered}
+        assert set(by_name) == {"cot-exp", "rc-tok-github_code"}
+        assert ordered[0].problems >= ordered[1].problems
+        assert ordered[0].problems == max(g.problems for g in ordered)
+
+    def test_the_key_is_the_union_not_the_sum(self, repeat_timeouts):
+        group = build_groups(repeat_timeouts)[0]
+        assert group.problems < group.failed + group.noop, "no overlap, nothing to check"
+
+
+class TestBuildGroupsWalksItsInputTwice:
+    def test_a_one_shot_iterator_still_counts_the_excluded(self, stale_job, healthy_job):
+        """`Iterable` is what the signature accepts, and it was silently wrong.
+
+        The first pass exhausted the iterator, so the second -- the one that counts
+        open-ended records per workload -- saw nothing and reported `excluded=0`,
+        quietly undoing the guarantee it exists to provide.
+        """
+        jobs = [healthy_job, stale_job._replace(name=healthy_job.name)]
+        from_list = build_groups(jobs)
+        from_iterator = build_groups(iter(jobs))
+        assert [g.excluded for g in from_iterator] == [g.excluded for g in from_list]
+        assert sum(g.excluded for g in from_iterator) == 1

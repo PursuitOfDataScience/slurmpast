@@ -66,12 +66,24 @@ def group_key(job):
     ``node-test`` four different things -- so the shape of the request is folded
     in. Resource *magnitudes* are deliberately excluded: raising --mem must not
     fork the history you are trying to learn from.
+
+    The owner is part of that identity. ``sacct -u`` takes a comma-separated list
+    and ``--allusers`` spans the cluster, so a multi-user query is one flag away --
+    and without the user in the key, two people's unrelated ``run.sh`` on one
+    partition became a single fabricated workload. That is not a cosmetic merge:
+    the pattern detector then reported "18 of 18 runs of run.sh failed; stop
+    resubmitting, the failure is deterministic" about a workload nobody ran
+    eighteen times, and nothing in the output names a user for the reader to catch
+    it. Last in the tuple because ``key[0..2]`` are read positionally as name,
+    partition and kind. For the single-user query that is the default, the value is
+    constant and nothing regroups.
     """
     gpus = job.gpu_count
     return (
         normalize_name(job.name),
         job.partition or "?",
         "gpu" if gpus else "cpu",
+        job.user or "?",
     )
 
 
@@ -219,11 +231,21 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
 
         # Did a later run succeed at a value that had already OOM'd? That proves
         # --mem was never the deciding variable.
-        succeeded = [j for j in members if j.completed and j.mem_limit_bytes is not None]
+        #
+        # Accumulated while walking forward, which is what makes "already" true.
+        # Testing against the finished set of every OOM'd value ignored order, so
+        # the EARLIEST run in a group -- one that completed before anything had
+        # OOM'd at all -- was reported as having "then COMPLETED at a value that
+        # had already OOM'd". That inverts the story: the real history was a run
+        # that worked and a request that degraded afterwards. `members` is already
+        # sorted by numeric_job_id above, which is submission order.
         contradiction = None
-        failed_values = set(requests)
-        for job in succeeded:
-            if job.mem_limit_bytes in failed_values:
+        oomed_so_far: set = set()
+        for job in members:
+            if job.base_state == "OUT_OF_MEMORY":
+                if job.mem_limit_bytes is not None:
+                    oomed_so_far.add(job.mem_limit_bytes)
+            elif job.completed and job.mem_limit_bytes in oomed_so_far:
                 contradiction = job
                 break
 

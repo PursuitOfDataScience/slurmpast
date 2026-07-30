@@ -669,3 +669,54 @@ class TestFalsePositivesFoundOnRealData:
 
     def test_sustained_faulting_still_flagged(self):
         assert "paging" in codes(build(batch={"MaxPages": "500000"}))
+
+
+class TestAnExplicitZeroIsAMeasurement:
+    """`TRESUsageInTot` is authoritative, including when it says nothing was read.
+
+    `_tres_bytes` turned every 0 into None so the documented fallback took over,
+    and a job that provably moved no data was rendered from a stale `MaxDiskRead`
+    -- complete with a filesystem-pacing finding about I/O it never did. The
+    None-for-zero rule is right for a *ceiling* and wrong for a measurement.
+    """
+
+    def test_zero_bytes_read_is_reported_as_zero(self):
+        job = build(
+            batch={"TRESUsageInTot": "cpu=14400,fs/disk=0", "MaxDiskRead": "500G"},
+        )
+        assert job.read_bytes == 0
+
+    def test_an_absent_field_still_falls_back(self):
+        """Only an explicit zero changes; "not recorded" must still defer."""
+        job = build(batch={"TRESUsageInTot": "cpu=14400", "MaxDiskRead": "500G"})
+        assert job.read_bytes == 500 * 1024**3
+
+    def test_a_zero_memory_ceiling_is_still_treated_as_unrecorded(self):
+        """The rule that motivated None-for-zero: a 0-byte limit does not exist."""
+        job = build(alloc={"AllocTRES": "billing=8,cpu=8,mem=0,node=1", "ReqMem": "64Gn"})
+        assert job.mem_limit_bytes == 64 * 1024**3
+
+
+class TestDeadlineIsAFailure:
+    """Killed for exceeding a time it was given, exactly as TIMEOUT is.
+
+    Left out of `Job.failed`, a DEADLINE run counted as neither failed nor
+    completed: it dropped out of the failure count, out of `problems`, and out of
+    `fail_rate`'s denominator, so five COMPLETED beside five DEADLINE reported a 0%
+    failure rate. `theme.STATE_HEALTH` graded it "crit" the whole time.
+    """
+
+    def test_a_deadline_run_counts_as_failed(self):
+        job = build(alloc={"State": "DEADLINE"})
+        assert job.failed is True
+        assert job.completed is False
+        assert job.cancelled is False
+
+    def test_it_reaches_the_failure_rate(self):
+        from slurmpast.index import build_groups
+
+        jobs = [build(alloc={"JobID": "%d" % (700 + i)}) for i in range(5)]
+        jobs += [build(alloc={"JobID": "%d" % (800 + i), "State": "DEADLINE"}) for i in range(5)]
+        group = build_groups(jobs)[0]
+        assert group.failed == 5
+        assert group.failure_rate == 0.5

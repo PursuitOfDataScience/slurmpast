@@ -40,7 +40,7 @@ import math
 import re
 
 from .diagnose import looks_like_noop
-from .patterns import usable
+from .patterns import normalize_name, usable
 
 MIN_SAMPLES = 10
 Z = 1.96  # 95%, and the interval the table displays stays a plain 95% interval
@@ -269,10 +269,18 @@ def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
 
     ``workload`` restricts to one group key's job name, which is how the
     confound is controlled. ``metric`` is ``failure`` or ``hang``.
+
+    Matched against the *normalised* name, the same fold the rest of the tool groups
+    work by. Raw-name equality fragmented a parameter sweep into one stratum per
+    arm -- ``s1e20``, ``s2e47``, ``s3e83`` are one piece of work and 1,624 distinct
+    strings -- and a fragment is too small to test: every node fell under
+    MIN_SAMPLES, so a node failing 27 of 30 placements produced an empty table. The
+    module's own reason for existing is holding the workload fixed, and this is what
+    "the same workload" means everywhere else in the codebase.
     """
     records = usable(jobs)
     if workload:
-        records = [j for j in records if j.name == workload]
+        records = [j for j in records if normalize_name(j.name) == normalize_name(workload)]
 
     predicate = looks_like_noop if metric == "hang" else _bad
 
@@ -408,11 +416,17 @@ def dominant_workload(jobs, metric=None):
     elif metric:
         predicate = _bad
 
+    # Counted by normalised name, matching what node_table then filters on. Counting
+    # raw names let a workload with one constant name outrank a parameter sweep many
+    # times its size -- 120 runs of `routine-check` beating 200 runs spread over 200
+    # distinct strings -- so the screen controlled on the wrong stratum and never
+    # tested the sweep's genuinely bad node at all.
     counts, events = {}, {}
     for job in records:
-        counts[job.name] = counts.get(job.name, 0) + 1
+        name = normalize_name(job.name)
+        counts[name] = counts.get(name, 0) + 1
         if predicate is not None and predicate(job):
-            events[job.name] = events.get(job.name, 0) + 1
+            events[name] = events.get(name, 0) + 1
     if events:
         # Most events first, then most runs -- both feed the statistical power to
         # tell one node apart from another.
@@ -429,6 +443,18 @@ def suggest_exclude(table, limit=8):
     """
     bad = [r["node"] for r in table["rows"] if r["verdict"] == "worse"]
     return bad[:limit]
+
+
+def excluded_tail(table, limit=8):
+    """How many "worse" nodes :func:`suggest_exclude` left out of its line.
+
+    The cap is deliberate -- excluding a dozen nodes trades away enough of the
+    partition to make a job unschedulable -- but it was silent, so a paste-ready
+    ``--exclude`` read as the complete answer while the table directly above it
+    showed four more rows with the same verdict and comparable evidence. Everything
+    else here names its tail; this was the one that did not.
+    """
+    return max(0, sum(1 for r in table["rows"] if r["verdict"] == "worse") - limit)
 
 
 def compress_nodelist(nodes):

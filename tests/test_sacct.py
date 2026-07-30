@@ -173,7 +173,28 @@ class TestParserRobustness:
         assert len(parse(text)) == 1
 
     def test_short_rows_do_not_crash(self):
-        assert parse("79|z|COMPLETED") == parse("79|z|COMPLETED")
+        """A row with fewer columns than the field list defaults the rest.
+
+        This was `assert parse(text) == parse(text)` -- a call compared with itself,
+        which can only fail if `parse` raises. It is the only test that feeds a row
+        shorter than `_FIELDS`, so `get`'s bounds check had nothing holding it:
+        turning `return ""` into a wraparound read (`row[pos % len(row)]`) corrupted
+        every field past the row's end and the whole suite still passed.
+
+        The three columns present are JobID, JobIDRaw and JobName, in that order.
+        """
+        jobs = parse("79|z|COMPLETED")
+        assert len(jobs) == 1
+        job = jobs[0]
+        assert (job.job_id, job.job_id_raw, job.name) == ("79", "z", "COMPLETED")
+        # Past the row's own end: defaulted, not read from a column that is not there.
+        assert job.state == ""
+        assert job.user == ""
+        assert job.node_list == ""
+        assert job.elapsed is None
+        assert job.timelimit is None
+        assert job.max_rss is None
+        assert job.steps == ()
 
     def test_a_field_list_without_jobid_reports_rather_than_crashing(self):
         """Every row is keyed by JobID. Without it this raised a bare KeyError
@@ -302,3 +323,47 @@ class TestStateFilterNeedsEndTime:
     def test_multiple_states_joined(self):
         args = self._captured(user="u", since="-1days", states=["FAILED", "TIMEOUT"])
         assert args[args.index("--state") + 1] == "FAILED,TIMEOUT"
+
+
+class TestSentinelsAreNotNames:
+    """The sentinel table is a claim about a measurement, not about a name.
+
+    `Reason` really does read "none", `Timelimit` really does read "UNLIMITED",
+    `End` really does read "Unknown". But nothing stops a job being *named* `None`
+    -- which is what an f-string over an unset variable produces -- or a partition
+    being called `unknown`. Blanking those threw away the only thing identifying
+    the record, and since `job.name` feeds `patterns.group_key`, such a job stopped
+    being itself and joined the bucket of jobs that never had a name.
+    """
+
+    def test_a_job_really_named_none_keeps_its_name(self):
+        job = parse(row(JobID="1", JobName="None", State="COMPLETED", ExitCode="0:0"))[0]
+        assert job.name == "None"
+
+    def test_a_partition_really_called_unknown_keeps_its_name(self):
+        job = parse(
+            row(JobID="1", JobName="w", Partition="unknown", State="COMPLETED", ExitCode="0:0")
+        )[0]
+        assert job.partition == "unknown"
+
+    def test_two_such_jobs_do_not_collide_with_the_unnamed(self):
+        from slurmpast.patterns import group_key
+
+        named = parse(row(JobID="1", JobName="None", State="COMPLETED", ExitCode="0:0"))[0]
+        blank = parse(row(JobID="2", JobName="", State="COMPLETED", ExitCode="0:0"))[0]
+        assert group_key(named) != group_key(blank)
+
+    def test_a_real_sentinel_is_still_blanked(self):
+        """Where sacct genuinely speaks for itself, nothing changes."""
+        job = parse(
+            row(
+                JobID="1",
+                JobName="w",
+                State="COMPLETED",
+                ExitCode="0:0",
+                Timelimit="UNLIMITED",
+                End="Unknown",
+            )
+        )[0]
+        assert job.timelimit is None
+        assert not job.end

@@ -6,6 +6,8 @@ from slurmpast.patterns import (
     group_key,
     summarize,
 )
+from slurmpast.sacct import parse
+from tests.conftest import make_text, row
 
 
 def codes(findings):
@@ -55,8 +57,13 @@ class TestRepeatFailure:
         assert find_repeat_failures(jobs) == []
 
     def test_mostly_successful_group_not_flagged(self, healthy_job, cot_exp):
-        jobs = [healthy_job._replace(job_id=str(i), name="mix") for i in range(30)]
-        jobs += [cot_exp._replace(job_id="x%d" % i, name="mix") for i in range(5)]
+        # One owner throughout: `group_key` includes the user, and these two
+        # fixtures happen to differ there (`youzhi` against an unrecorded ""), which
+        # would split the 30 successes away from the 5 failures and leave a group
+        # that IS all-failing. The subject here is the success ratio, so the owner
+        # is held constant rather than left to the fixtures to decide.
+        jobs = [healthy_job._replace(job_id=str(i), name="mix", user="me") for i in range(30)]
+        jobs += [cot_exp._replace(job_id="x%d" % i, name="mix", user="me") for i in range(5)]
         assert find_repeat_failures(jobs) == []
 
     def test_open_ended_records_excluded(self, stale_job):
@@ -292,3 +299,79 @@ class TestMemorySearchUsesTheRealLimit:
         ]
         assert "COMPLETED at" in finding.evidence
         assert "not the deciding variable" in finding.action
+
+
+class TestOneWorkloadIsOnePersonsWork:
+    """`group_key` had no user in it, and `sacct -u` takes a list.
+
+    Two people's unrelated `run.sh` on one partition became a single fabricated
+    workload, and the detector then reported "18 of 18 runs failed; stop
+    resubmitting, the failure is deterministic" about something nobody ran
+    eighteen times. Nothing in the output names a user, so there was no way to see
+    the merge from the screen.
+    """
+
+    def test_two_users_are_not_one_workload(self, cot_exp):
+        alice = [cot_exp._replace(job_id="a%d" % i, name="run.sh", user="alice") for i in range(6)]
+        bob = [cot_exp._replace(job_id="b%d" % i, name="run.sh", user="bob") for i in range(6)]
+        assert len({group_key(j) for j in alice + bob}) == 2
+
+    def test_one_user_still_groups_as_before(self, cot_exp):
+        runs = [cot_exp._replace(job_id=str(i), name="run.sh", user="alice") for i in range(6)]
+        assert len({group_key(j) for j in runs}) == 1
+
+    def test_the_name_is_still_the_first_element(self, cot_exp):
+        """Callers read key[0..2] positionally, so the user goes last."""
+        assert group_key(cot_exp._replace(name="s1e20"))[0] == "s#e#"
+
+
+class TestAlreadyOomdMeansAlready:
+    """The contradiction sentence makes a checkable claim about time.
+
+    It was tested against the finished set of every OOM'd value, with no regard to
+    order, so the EARLIEST run in a group -- one that completed before anything had
+    OOM'd at all -- was reported as having "then COMPLETED at a value that had
+    already OOM'd". The real history was the opposite: a run that worked, and a
+    request that degraded afterwards.
+    """
+
+    def _history(self, completed_first):
+        """Four runs: one COMPLETED at 32G, three OOM at 48G/32G/64G."""
+
+        def spec(job_id, mem, state):
+            return row(
+                JobID=job_id,
+                JobName="bisect",
+                Partition="test",
+                User="me",
+                State=state,
+                ExitCode="0:125" if state == "OUT_OF_MEMORY" else "0:0",
+                Submit="2026-03-01T00:00:00",
+                Start="2026-03-01T01:00:00",
+                End="2026-03-01T02:00:00",
+                ElapsedRaw="3600",
+                Elapsed="01:00:00",
+                Timelimit="04:00:00",
+                ReqCPUS="4",
+                AllocTRES="cpu=4,mem=%s,node=1" % mem,
+                NodeList="n1",
+                NTasks="1",
+            )
+
+        ooms = [
+            ("2", "48G", "OUT_OF_MEMORY"),
+            ("3", "32G", "OUT_OF_MEMORY"),
+            ("4", "64G", "OUT_OF_MEMORY"),
+        ]
+        win = ("1" if completed_first else "5", "32G", "COMPLETED")
+        specs = [win] + ooms if completed_first else ooms + [win]
+        return parse(make_text(*[spec(*s) for s in specs]))
+
+    def test_a_success_before_every_oom_is_not_called_a_contradiction(self):
+        findings = find_memory_search(self._history(completed_first=True))
+        assert findings, "the bisection itself should still be reported"
+        assert "already OOM'd" not in findings[0].evidence, findings[0].evidence
+
+    def test_a_success_after_an_oom_at_the_same_value_still_is(self):
+        findings = find_memory_search(self._history(completed_first=False))
+        assert "already OOM'd" in findings[0].evidence, findings[0].evidence

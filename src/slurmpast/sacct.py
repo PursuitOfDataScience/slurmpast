@@ -145,6 +145,28 @@ _OPTIONAL = frozenset(
 # by field and by release.
 _UNSET = frozenset(["", "unknown", "none", "n/a", "unlimited", "(null)", "partition_limit"])
 
+# Fields whose value a *person* chose, where those same words are ordinary text
+# rather than sacct speaking for itself. `Reason` really does read "none" on every
+# clean job, `Timelimit` really does read "UNLIMITED", `End` really does read
+# "Unknown" -- but nothing stops a job being named `None`, which is what an
+# f-string over an unset variable produces, or a partition being called `unknown`.
+# Blanking those threw away the only thing identifying the record: `job.name` feeds
+# `patterns.group_key`, so such a job stopped being itself and joined the bucket of
+# jobs that never had a name at all. A sentinel is a claim about a measurement, and
+# these are not measurements.
+# fmt: off
+_FREE_TEXT = frozenset(
+    [
+        "jobname", "partition", "account", "user", "group", "qos", "comment",
+        "admincomment", "reservation", "wckey", "cluster", "workdir", "submitline",
+        "constraints", "stdout", "stderr",
+    ]
+)
+# NodeList is deliberately absent: the scheduler writes it, not a person, so a
+# sentinel there is sacct speaking -- and it feeds `nodes.expand_nodelist`, which
+# should not be handed "(null)" to parse.
+# fmt: on
+
 # Separator asked of sacct instead of the default ``|``, which occurs inside real
 # values (see trap 7). ASCII unit separator: legal in ``--delimiter``, and not
 # something a shell can hand to ``--constraint`` or ``--job-name``.
@@ -327,8 +349,16 @@ def _field_index(fields):
     return index
 
 
-def _clean(value):
+def _clean(value, field=None):
+    """Strip, and blank the words sacct prints in place of a measurement.
+
+    ``field`` exempts the free-text ones -- see :data:`_FREE_TEXT`. Optional so the
+    numeric helpers can go on calling this without naming a field: for them the
+    sentinel table is exactly right, since a number is never a name.
+    """
     value = (value or "").strip()
+    if field is not None and field.lower() in _FREE_TEXT:
+        return value
     return "" if value.lower() in _UNSET else value
 
 
@@ -398,7 +428,7 @@ def parse(text, fields=None, delimiter="|"):
         pos = index.get(name.lower())
         if pos is None or pos >= len(row):
             return ""
-        return _clean(row[pos])
+        return _clean(row[pos], field=name)
 
     allocations = {}
     order = []

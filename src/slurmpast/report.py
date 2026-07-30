@@ -13,12 +13,13 @@ import sys
 
 from .diagnose import diagnose
 from .duration import format_bytes, format_duration, format_percent
-from .index import GPU_CORE_EQUIVALENT, History, sort_groups
+from .index import GPU_CORE_EQUIVALENT, SORTS, History, sort_groups, sort_label
 from .model import severity_rank
 from .nodes import (
     MIN_SAMPLES,
     compress_nodelist,
     dominant_workload,
+    excluded_tail,
     node_table,
     suggest_exclude,
 )
@@ -60,7 +61,15 @@ _STATE_COLOR = {
     "TIMEOUT": "red",
     "OUT_OF_MEMORY": "red",
     "NODE_FAIL": "red",
+    "BOOT_FAIL": "red",
+    # Killed for exceeding a time it was given, exactly as TIMEOUT is.
+    "DEADLINE": "red",
     "CANCELLED": "yellow",
+    # Neither red nor absent: the scheduler took the allocation back, so the run is
+    # over without the job having done anything wrong. Falling through to the
+    # default rendered it as unremarkable next to a red finding blaming the user's
+    # own code for the CPU time preemption cost them.
+    "PREEMPTED": "yellow",
 }
 
 
@@ -340,7 +349,21 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
     # shorter. The dashboard puts the same two facts under `?`.
     notes = []
     if has_gpu:
-        notes.append("ordered by compute used (1 GPU-hour = %d CPU-hours)" % GPU_CORE_EQUIVALENT)
+        # "ordered by compute used" was appended whenever any workload had GPU
+        # hours, without ever consulting `sort` -- so under `--sort name` it sat
+        # above an alphabetical table and simply misdescribed it. The exchange rate
+        # is load-bearing either way (a row with fewer CPU-hours outranking one with
+        # more looks arbitrary without it), so under another sort the rate is kept
+        # and only the ordering claim is corrected. The dashboard has always got
+        # this right: tui.py appends "by <mode>" only when the mode is not the
+        # default.
+        if sort == SORTS[0][0]:
+            claim = "ordered by compute used"
+        else:
+            claim = "ordered by %s" % sort_label(sort)
+        notes.append("%s (1 GPU-hour = %d CPU-hours)" % (claim, GPU_CORE_EQUIVALENT))
+    elif sort != SORTS[0][0]:
+        notes.append("ordered by %s" % sort_label(sort))
     if any("#" in g.label for g in shown):
         notes.append('"#" stands for a name\'s digits')
     # RUNS, COMPLETED and FLAGGED read as a partition of the same runs and are not:
@@ -538,6 +561,16 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
                 "grey",
             )
         )
+        # The line is capped, so it has to say when it is not the whole list.
+        left_out = excluded_tail(table)
+        if left_out:
+            for line in wrap(
+                "%d further node%s scored worse too, left off the line: excluding this many "
+                "trades away more of the partition than a paste-ready suggestion should."
+                % (left_out, "" if left_out == 1 else "s"),
+                _prose_width(4),
+            ):
+                out.append("    " + style(line, "grey"))
     else:
         out.append(style("  no node is worse than the rest; nothing to exclude.", "grey"))
     # Said whenever an interval on screen disagrees with the verdict beside it.

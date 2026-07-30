@@ -17,7 +17,7 @@ from . import report
 from ._version import __version__
 from .diagnose import diagnose
 from .duration import humanize_window
-from .index import History, filter_jobs
+from .index import History, filter_jobs, sort_groups
 from .logs import assign_logs, read_tail
 from .model import severity_rank
 from .nodes import note_for_allocation
@@ -127,6 +127,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 _VALUE_OPTS = ("-S", "--since", "-E", "--until", "-u", "--user", "-p", "--partition")
 
+
+def _known_option_strings():
+    """Every flag the parser accepts, asked of the parser rather than listed again.
+
+    A second hand-maintained list would drift the moment a flag is added, and the
+    drift would be silent -- which is the shape of the bug this guards.
+    """
+    known = set()
+    for action in build_parser()._actions:
+        known.update(action.option_strings)
+    return known
+
+
 # sacct's relative time syntax is `now-7days`. A bare `-7days` is REJECTED
 # outright ("Invalid time specification"), but it is the obvious thing to type
 # and what this tool's own help used to advertise -- so accept it and rewrite.
@@ -149,13 +162,22 @@ def _glue_negative_values(argv):
     sacct's own relative-time syntax starts with a dash, so that is what people
     type; argparse would treat it as an unknown option and exit 2 on the most
     natural spelling of the most common flag.
+
+    A token that is itself an option is never a value. Only ``--`` was excluded, so
+    a short flag got swallowed: ``slurmpast -u -p gpu`` -- which is what
+    ``-u "$USER" -p gpu`` becomes when ``$USER`` is unset -- was rewritten to
+    ``-u=-p gpu``, parsed as ``user="-p"`` with ``gpu`` as a job id, and reported
+    "no job matches: gpu". The partition filter had silently vanished, and the error
+    named something the user never typed. Argparse's own "expected one argument" is
+    the right answer, so this now steps aside and lets it happen.
     """
+    known = _known_option_strings()
     out, index = [], 0
     while index < len(argv):
         token = argv[index]
         if token in _VALUE_OPTS and index + 1 < len(argv):
             value = argv[index + 1]
-            if value.startswith("-") and not value.startswith("--"):
+            if value.startswith("-") and not value.startswith("--") and value not in known:
                 out.append("%s=%s" % (token, value))
                 index += 2
                 continue
@@ -208,6 +230,13 @@ def _load(args, sacct):
             if not picked:
                 raise SacctError("no demo job matches: %s" % ", ".join(args.job_ids))
             return picked
+        if args.failed:
+            # `--failed` narrows the real query through sacct's `--state`, so it
+            # narrows the whole history, not just the job list at the bottom. The
+            # demo ignored it entirely and returned all 58 records, which made
+            # `--help`'s "only jobs that failed" false in exactly the place someone
+            # tries the flag first.
+            return [j for j in jobs if j.failed]
         return jobs
     runner = getattr(sacct, "_run", None)
     if args.job_ids:
@@ -217,7 +246,14 @@ def _load(args, sacct):
         return _mark_open_records(jobs, runner=runner, user=args.user)
 
     user = args.user or getpass.getuser()
-    states = ["FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL"] if args.failed else None
+    # DEADLINE alongside the rest: `Job.failed` counts it, so leaving it out here
+    # meant `--failed` quietly excluded a state the tool calls a failure everywhere
+    # else.
+    states = (
+        ["FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "BOOT_FAIL", "DEADLINE"]
+        if args.failed
+        else None
+    )
     jobs = sacct.history(
         user=user, since=args.since, until=args.until, states=states, partition=args.partition
     )
@@ -606,7 +642,12 @@ def main(argv=None) -> int:
                                 "severity": g.severity,
                                 "last_seen": g.last_seen,
                             }
-                            for g in history.groups
+                            # Through the same sort the table uses. Iterating
+                            # `history.groups` raw meant `--sort name` and `--sort
+                            # cost` returned byte-identical JSON while the plain
+                            # text visibly reordered -- a script asking for one
+                            # order silently got the other.
+                            for g in sort_groups(history.groups, args.sort)
                         ],
                     },
                     indent=2,
@@ -619,27 +660,38 @@ def main(argv=None) -> int:
     # Per-job. Explicit ids get full detail; a bare --plain/--failed gets a list
     # plus the overview, because 6,574 full post-mortems is not an answer.
     if args.job_ids:
-        targets = jobs
+        matches = jobs
     else:
-        targets = filter_jobs(history.usable_jobs, "failed" if args.failed else "problem")
-        targets.sort(key=lambda j: (j.start or j.submit or "", j.job_id), reverse=True)
-        targets = targets[: args.limit]
+        matches = filter_jobs(history.usable_jobs, "failed" if args.failed else "problem")
+        matches.sort(key=lambda j: (j.start or j.submit or "", j.job_id), reverse=True)
+    # Truncated for the work that costs something per job -- resolving logs and
+    # diagnosing. `matches` stays whole so the renderer can say what it left out.
+    targets = matches[: args.limit]
 
     if args.json:
         payload = []
         resolved = _logs_for_all(targets, args)
+        json_critical = False
         for job in targets:
             log_path, log_text, _inferred = resolved[job.job_id]
             verdict = diagnose(job, log_text=log_text, node_note=_node_note(job, history))
             payload.append(_job_json(job, log_path, verdict))
-        print(
-            json.dumps(
-                {"slurmpast": __version__, "summary": history.stats, "jobs": payload},
-                indent=2,
-                default=str,
-            )
-        )
-        return 0
+            json_critical |= any(f.severity == "critical" for f in verdict.findings)
+        body = {"slurmpast": __version__, "summary": history.stats, "jobs": payload}
+        if not args.job_ids:
+            # The cross-run findings decide the exit code on this path, exactly as
+            # they do for the text rendering below, so they have to be in the
+            # payload: an exit code pointing at data the caller cannot see is worse
+            # than no exit code. The --overview JSON has always carried them.
+            body["patterns"] = [f._asdict() for f in history.patterns]
+            json_critical = any(f.severity == "critical" for f in history.patterns)
+        print(json.dumps(body, indent=2, default=str))
+        # `--json` used to `return 0` unconditionally, so the one mode a script
+        # actually checks `$?` from was the one that never reported severity, while
+        # the same query rendered as text exited 1. (The --overview/--patterns/
+        # --nodes/--sizing views do always exit 0, deliberately and by test -- they
+        # report rather than judge. This path judges.)
+        return 1 if json_critical else 0
 
     worst_critical = False
     if args.job_ids:
@@ -660,8 +712,12 @@ def main(argv=None) -> int:
             worst_critical |= any(f.severity == "critical" for f in verdict.findings)
     else:
         print(report.render_overview(history, style=style, limit=args.limit, sort=args.sort))
-        if targets:
-            print(report.render_list(targets, style=style, limit=args.limit))
+        if matches:
+            # The whole list, sliced by the renderer. Pre-slicing it here made
+            # `render_list`'s own "… N more (raise --limit)" line unreachable, so
+            # `-n 5` showed 5 of 28 problem jobs and said nothing about the other
+            # 23 -- while the workload table directly above it named its own tail.
+            print(report.render_list(matches, style=style, limit=args.limit))
             print("")
         print(report.render_patterns(history, style=style))
         worst_critical = any(f.severity == "critical" for f in history.patterns)
