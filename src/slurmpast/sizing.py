@@ -35,6 +35,7 @@ from typing import NamedTuple
 
 from .diagnose import looks_like_noop
 from .duration import format_bytes, format_duration
+from .patterns import numeric_job_id
 from .site import maxrss_caveat
 
 # Below this many usable observations there is no distribution to reason about.
@@ -71,16 +72,6 @@ class Advice(NamedTuple):
         return self.verdict in ("raise", "lower") and bool(self.suggestion)
 
 
-def _job_ordinal(job):
-    """The numeric part of a job id, for ordering records with no usable stamp."""
-    digits = ""
-    for ch in job.job_id or "":
-        if not ch.isdigit():
-            break
-        digits += ch
-    return int(digits) if digits else 0
-
-
 def _latest(jobs, attribute):
     """``attribute`` on the most recently run job that has one, or ``None``.
 
@@ -99,12 +90,14 @@ def _latest(jobs, attribute):
 
     Ordered by ``start or submit``, matching :func:`index._stamp`, so this agrees
     with the ordering the rest of the tool already presents a workload in. Ties and
-    missing stamps fall back to the job id, which is monotonic per cluster.
+    missing stamps fall back to ``patterns.numeric_job_id``, which is monotonic per
+    cluster and orders array elements correctly -- ``123_4`` before ``123_5``, which
+    reading the leading digits alone does not.
     """
     stamped = [j for j in jobs if getattr(j, attribute, None)]
     if not stamped:
         return None
-    newest = max(stamped, key=lambda j: (j.start or j.submit or "", _job_ordinal(j)))
+    newest = max(stamped, key=lambda j: (j.start or j.submit or "", numeric_job_id(j)))
     return getattr(newest, attribute)
 
 

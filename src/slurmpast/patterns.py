@@ -75,8 +75,14 @@ def group_key(job):
     )
 
 
-def _numeric_job_id(job):
-    """Sort key that orders by submission, tolerating ``123_4`` array ids."""
+def numeric_job_id(job):
+    """Sort key that orders by submission, tolerating ``123_4`` array ids.
+
+    Shared rather than private: :mod:`slurmpast.sizing` needs the same ordering to
+    break a tie between records with no usable timestamp, and a second copy there
+    got array elements wrong -- reading the leading digits alone makes ``123_4``
+    and ``123_5`` compare equal.
+    """
     raw = job.job_id.split("+")[0]
     base, _, task = raw.partition("_")
     try:
@@ -194,7 +200,7 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
 
     findings = []
     for key, members in groups.items():
-        members.sort(key=_numeric_job_id)
+        members.sort(key=numeric_job_id)
         ooms = [j for j in members if j.base_state == "OUT_OF_MEMORY"]
         if len(ooms) < min_oom:
             continue
