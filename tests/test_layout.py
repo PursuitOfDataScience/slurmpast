@@ -256,11 +256,22 @@ class TestPlainOutputFitsATerminal:
         )
 
         h = History(history(), window="last 7 days (2026-07-21 to now)")
+        # A node name no fixed width survives. The demo's are 12 characters, which
+        # is what let `render_nodes` keep a hand-rolled "%-16s" through two audits;
+        # real clusters run to `queue1-dy-c5xlarge-1` and longer.
+        wide = History(
+            [
+                j._replace(node_list=j.node_list.replace("midway3-", "gpu-compute-node-a100-"))
+                for j in history()
+            ],
+            window="last 7 days (2026-07-21 to now)",
+        )
         return {
             "overview": render_overview(h, style=style),
             "list": render_list(list(h.jobs), style=style),
             "patterns": render_patterns(h, style=style),
             "nodes": render_nodes(h, style=style),
+            "nodes-long-names": render_nodes(wide, style=style),
             "sizing": render_sizing(h, style=style),
         }
 
@@ -280,12 +291,18 @@ class TestPlainOutputFitsATerminal:
 
     @pytest.mark.parametrize("columns", ["80", "100", "120"])
     def test_no_table_row_overruns_the_terminal(self, monkeypatch, columns):
+        """Every view that draws a table, not a chosen two.
+
+        This asserted over `("overview", "list")` while `_views` built five, so the
+        node table -- the one still hand-formatted at fixed widths -- was exempt from
+        the invariant it was breaking, and the sibling rule test iterating all five
+        never caught it because a rule is drawn from the widest *row*.
+        """
         from slurmpast.report import Style
 
         monkeypatch.setenv("COLUMNS", columns)
-        views = self._views(Style(enabled=False))
-        for name in ("overview", "list"):
-            for line in self._table_lines(views[name]):
+        for name, text in self._views(Style(enabled=False)).items():
+            for line in self._table_lines(text):
                 assert len(line) <= int(columns), "%s: %d > %s -- %r" % (
                     name,
                     len(line),
@@ -478,3 +495,122 @@ class TestTheOverviewCaptionDescribesTheTableBelowIt:
         """It is load-bearing: without it a row outranking another looks arbitrary."""
         for sort in ("cost", "name", "recent"):
             assert "GPU-hour" in self._caption(sort)
+
+
+class TestTruncationSaysSoInATable:
+    """`value[:width]` with no marker. A job name stays recognisable truncated; a
+    hostlist does not -- `midway3-[0600-0607,0611]` came out as `midway3-[0600`,
+    and at a 12-cell column `midway3-0600,midway3-0611` came out as a complete,
+    valid, real `midway3-0600` for a job that ran on two nodes. Every other
+    truncation in this codebase announces itself.
+    """
+
+    LAYOUT = [("NODE", 12)]
+
+    def test_a_cut_value_is_marked(self):
+        from slurmpast.render import text_table
+
+        row = text_table(self.LAYOUT, [{"NODE": "midway3-0600,midway3-0611"}])[-1]
+        assert row.strip().endswith("…")
+        assert row.strip() != "midway3-0600", "a wrong answer that looks right"
+
+    def test_a_value_that_fits_is_untouched(self):
+        from slurmpast.render import text_table
+
+        assert text_table(self.LAYOUT, [{"NODE": "midway3-0600"}])[-1].strip() == "midway3-0600"
+
+    def test_the_marker_never_widens_the_cell(self):
+        from slurmpast.render import clip
+
+        for width in range(1, 30):
+            assert len(clip("midway3-[0600-0607,0611]", width)) <= width
+
+
+class TestTheNodeTableGoesThroughTheSharedSpec:
+    """It was the one plain table still hand-formatted at `"  %-16s %9s %10s %20s"`.
+    `render.NODE_COLUMNS` was declared for it -- "so this table drops columns,
+    tracks the terminal and spends the leftover exactly as the other two do" -- and
+    only the dashboard ever used it. So any node name past 16 characters pushed
+    every following column right, on the row the reader came for, and the table read
+    byte-identically at 60 columns and at 200.
+    """
+
+    LONG = "gpu-compute-node-a100-0001"
+    SHORT = "cn2"
+
+    @classmethod
+    def _table(cls, style):
+        from slurmpast.index import History
+        from slurmpast.model import Job, Step
+        from slurmpast.report import render_nodes
+
+        jobs = []
+        for index, node in enumerate((cls.LONG, cls.SHORT)):
+            for run in range(14):
+                jid = 100 * index + run
+                jobs.append(
+                    Job(
+                        job_id=str(9000 + jid),
+                        name="sweep",
+                        state="FAILED" if (node is cls.LONG and run < 10) else "COMPLETED",
+                        start="2026-07-%02dT01:00:00" % (run + 1),
+                        end="2026-07-%02dT02:00:00" % (run + 1),
+                        elapsed=3600.0,
+                        timelimit=7200.0,
+                        alloc_cpus=8,
+                        nnodes=1,
+                        alloc_tres="cpu=8,mem=64G,node=1",
+                        node_list=node,
+                        steps=(Step(step_id="%d.batch" % (9000 + jid), total_cpu=3000.0),),
+                    )
+                )
+        return render_nodes(History(jobs, window="t"), metric="failure", style=style)
+
+    def _rows(self, text):
+        """The two node rows, and not the `--exclude=` line that names one of them.
+
+        Matched on a prefix short enough to survive the column being narrowed: on a
+        cramped terminal the long name is legitimately clipped to `gpu-compute-…`.
+        """
+        return [
+            line
+            for line in text.splitlines()
+            if line.startswith("  gpu-compute") or line.startswith("  " + self.SHORT)
+        ]
+
+    @pytest.mark.parametrize("columns", ["80", "100", "140"])
+    def test_the_verdict_column_starts_in_one_place(self, monkeypatch, columns):
+        from slurmpast.report import Style
+
+        monkeypatch.setenv("COLUMNS", columns)
+        rows = self._rows(self._table(Style(enabled=False)))
+        assert len(rows) == 2, rows
+        starts = set()
+        for line in rows:
+            stripped = line.rstrip()
+            for word in ("inconclusive", "better", "worse"):
+                if stripped.endswith(word):
+                    starts.add(len(stripped) - len(word))
+                    break
+            else:
+                raise AssertionError("no verdict on %r" % line)
+        assert len(starts) == 1, "a long name shifted the verdict column: %s" % sorted(starts)
+
+    def test_it_tracks_the_terminal(self, monkeypatch):
+        from slurmpast.report import Style
+
+        widths = []
+        for columns in ("70", "100", "160"):
+            monkeypatch.setenv("COLUMNS", columns)
+            widths.append(max(len(line) for line in self._rows(self._table(Style(enabled=False)))))
+        assert len(set(widths)) > 1, "identical at every width -- not fitted at all"
+        assert widths == sorted(widths)
+
+    @pytest.mark.parametrize("columns", ["60", "70", "80"])
+    def test_a_narrow_terminal_drops_a_column_rather_than_overrunning(self, monkeypatch, columns):
+        from slurmpast.report import Style
+
+        monkeypatch.setenv("COLUMNS", columns)
+        text = self._table(Style(enabled=False))
+        for line in self._rows(text):
+            assert len(line) <= int(columns), "%d > %s -- %r" % (len(line), columns, line)

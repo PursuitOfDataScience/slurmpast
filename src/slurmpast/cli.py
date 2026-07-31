@@ -225,18 +225,35 @@ def _load(args, sacct):
         if args.job_ids:
             # Honour the id rather than silently ignoring it and printing all 58
             # synthetic post-mortems, which is what `--demo <jobid>` used to do.
+            # Nothing else applies here, matching the real path: `-j` goes straight
+            # to sacct and ignores the window and the filters too.
             wanted = {str(j) for j in args.job_ids}
             picked = [j for j in jobs if j.job_id in wanted]
             if not picked:
                 raise SacctError("no demo job matches: %s" % ", ".join(args.job_ids))
             return picked
+        # Every narrowing flag the real path applies, applied here too. `--failed`
+        # was fixed on its own once, for the reason that ignoring it "made
+        # `--help`'s 'only jobs that failed' false in exactly the place someone
+        # tries the flag first" -- and `-p` and `-u` sat in the same position,
+        # unfixed. Every synthetic job is partition `test`, user `youzhi`, so
+        # `--demo -p gpu` matched nothing and printed all 58 records anyway, exiting
+        # 0 where the real path raises and exits 2.
+        asked = []
+        if args.partition:
+            jobs = [j for j in jobs if j.partition == args.partition]
+            asked.append("partition %s" % args.partition)
+        if args.user:
+            wanted_users = {u.strip() for u in args.user.split(",") if u.strip()}
+            jobs = [j for j in jobs if j.user in wanted_users]
+            asked.append("user %s" % args.user)
         if args.failed:
             # `--failed` narrows the real query through sacct's `--state`, so it
-            # narrows the whole history, not just the job list at the bottom. The
-            # demo ignored it entirely and returned all 58 records, which made
-            # `--help`'s "only jobs that failed" false in exactly the place someone
-            # tries the flag first.
-            return [j for j in jobs if j.failed]
+            # narrows the whole history, not just the job list at the bottom.
+            jobs = [j for j in jobs if j.failed]
+            asked.append("--failed")
+        if not jobs:
+            raise SacctError("no demo jobs match %s" % " and ".join(asked))
         return jobs
     runner = getattr(sacct, "_run", None)
     if args.job_ids:
@@ -489,6 +506,17 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(_glue_negative_values(raw))
     args.since = normalize_time_spec(args.since)
     args.until = normalize_time_spec(args.until)
+    if args.demo:
+        # A synthetic job wrote no log, so anything the search turns up is a real
+        # file belonging to a real run on this machine -- and its text feeds
+        # `diagnose`, which then reports a stranger's NCCL fault or import error as
+        # a finding on a fabricated job. Measured here: 39 of the 58 demo jobs were
+        # handed a file out of the user's own work directory, four of them changing
+        # the verdict, and a traceback dropped in the current directory turned up
+        # under "GPU ran out of memory" on job 5100002. It also made `--demo`
+        # machine-dependent again, which is the exact thing DEMO_SITE was added to
+        # stop: the demo has to render the same on a login node and a laptop.
+        args.no_logs = True
     style = report.Style(enabled=False if args.no_color else None)
     sacct = Sacct()
 
@@ -587,14 +615,18 @@ def main(argv=None) -> int:
                                 "runs": g.total,
                                 "advice": [a._asdict() for a in recommend(g.jobs)],
                             }
-                            for g in history.groups
+                            # Through the same sort the text view now uses, for the
+                            # reason `--overview --json` already goes through it: a
+                            # script asking for one order must not silently get
+                            # another.
+                            for g in sort_groups(history.groups, args.sort)
                         ],
                     },
                     indent=2,
                 )
             )
         else:
-            print(report.render_sizing(history, style=style, limit=args.limit))
+            print(report.render_sizing(history, style=style, limit=args.limit, sort=args.sort))
         return 0
 
     if args.patterns:

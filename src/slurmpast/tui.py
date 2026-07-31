@@ -225,6 +225,26 @@ _MAX_PATH_WIDTH = 62
 _DEFAULT_TABLE_WIDTH = 96
 _MIN_TABLE_WIDTH = 40
 _SCROLLBAR = 2
+# Below this a wrapped sentence stops being a sentence, so narrower terminals get
+# an overrun rather than one word per line.
+_MIN_PROSE_WIDTH = 32
+
+
+def _prose_width(screen, indent: int) -> int:
+    """Wrap width for indented prose on ``screen``, from the terminal there is.
+
+    The plain renderer solved this and said why (``report._prose_width``): "These
+    were hardcoded at 72, 82 and 84, so a finding hard-broke mid-sentence two thirds
+    of the way across a wide terminal and overran a narrow one." The dashboard kept
+    the constants -- findings wrapped at 86 and actions at 82 under an 8-cell indent,
+    up to 94 cells whatever the terminal was -- so below ~96 columns Textual
+    re-wrapped the already-wrapped text and the orphan landed at column 0, with the
+    indent that separates evidence from its heading gone. ``JobScreen._path_budget``
+    already measures the terminal for paths on the same screen; this is the same
+    measurement for the prose beside them.
+    """
+    width = screen.size.width or screen.app.size.width or _DEFAULT_TABLE_WIDTH
+    return max(_MIN_PROSE_WIDTH, width - indent - _SCROLLBAR)
 
 
 def _sync_columns(table: DataTable, spec, current, content=None, available=None):
@@ -1122,7 +1142,15 @@ class WorkloadScreen(JobListScreen):
             banner.append_text(render.severity_chip(worst.severity))
             banner.append("  ")
             banner.append(worst.title, style="bold %s" % theme.INK)
-            banner.append("\n  " + " ".join(render.wrap(worst.evidence, 100)), style=theme.DIM)
+            # One append per wrapped line, so every line gets the two-space indent.
+            # This was `" ".join(render.wrap(evidence, 100))`, which puts the wrapped
+            # lines straight back together -- the width argument did nothing at all,
+            # the evidence went out as one 138-cell line at every terminal size, and
+            # only the first of Textual's soft-wrapped lines kept the indent. The
+            # advice block directly below has wrapped to the real width since round
+            # two; this half was missed.
+            for line in render.wrap(worst.evidence, _prose_width(self, 4)):
+                banner.append("\n  " + line, style=theme.DIM)
 
         # The point of reading finished jobs: what the next one should ask for.
         from .sizing import recommend
@@ -1300,8 +1328,17 @@ class JobScreen(ClipboardMixin, Screen[Any]):
                 body.append("%-*s" % (pad, value) if pad else value, style=style)
 
             # Two pairs per line where both values are short: one row per line
-            # used about 40 of 120 columns and ran the screen off the bottom.
-            for group in render.pair_rows(rows):
+            # used about 40 of 120 columns and ran the screen off the bottom. One
+            # per line once the terminal cannot hold two, which is the threshold
+            # `report` has always applied and this screen never did -- below it a
+            # paired row soft-wraps and loses the label/value alignment that made
+            # pairing worth doing.
+            paired = (
+                render.PAIR_VALUE_WIDTH
+                if (self.size.width or _DEFAULT_TABLE_WIDTH) >= render.PAIRED_LINE_WIDTH
+                else 0
+            )
+            for group in render.pair_rows(rows, max_value=paired):
                 first = group[0]
                 if len(group) == 2:
                     second = group[1]
@@ -1344,10 +1381,14 @@ class JobScreen(ClipboardMixin, Screen[Any]):
             body.append("  ")
             body.append_text(render.severity_chip(finding.severity))
             body.append("  %s\n" % finding.title, style="bold %s" % theme.INK)
-            for line in render.wrap(finding.evidence, 86):
+            # Measured against the terminal, not the old fixed 86 / 82. See
+            # _prose_width: 8 cells of indent over an 86-cell wrap is 94, so below
+            # ~96 columns every finding was hard-wrapped and then soft-wrapped
+            # again, dropping its tail to column 0.
+            for line in render.wrap(finding.evidence, _prose_width(self, 8)):
                 body.append("        %s\n" % line, style=theme.DIM)
             if finding.action:
-                for index, line in enumerate(render.wrap(finding.action, 82)):
+                for index, line in enumerate(render.wrap(finding.action, _prose_width(self, 10))):
                     body.append(
                         "        %s%s\n" % ("→ " if index == 0 else "  ", line),
                         style=theme.ACCENT if index == 0 else theme.DIM,
@@ -1414,10 +1455,11 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
             body.append("  ")
             body.append_text(render.severity_chip(finding.severity))
             body.append("  %s\n" % finding.title, style="bold %s" % theme.INK)
-            for line in render.wrap(finding.evidence, 86):
+            # From the terminal, as on the job screen. See _prose_width.
+            for line in render.wrap(finding.evidence, _prose_width(self, 8)):
                 body.append("        %s\n" % line, style=theme.DIM)
             if finding.action:
-                for index, line in enumerate(render.wrap(finding.action, 82)):
+                for index, line in enumerate(render.wrap(finding.action, _prose_width(self, 10))):
                     body.append(
                         "        %s%s\n" % ("→ " if index == 0 else "  ", line),
                         style=theme.ACCENT if index == 0 else theme.DIM,
@@ -1446,6 +1488,10 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
         super().__init__()
         self._layout: list[tuple[str, int]] = []
         # Retained so tests and callers read what was composed, never the widget.
+        # `Static.renderable` exists in textual 0.89 and not in 8.x, and both are
+        # supported here -- so anything that has to read a screen's text reads it
+        # from the screen, as OverviewScreen and JobListScreen already do.
+        self.summary_text = Text()
         self.exclude_text = Text()
 
     def compose(self) -> ComposeResult:
@@ -1493,17 +1539,20 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
                 "campaign looks cursed\n",
                 style=theme.HEALTH_COLOR["warn"],
             )
+        skipped = table_data["skipped_nodes"]
         summary.append(
             "  baseline %s over %d placements%s\n"
             % (
                 format_percent(table_data["baseline"]),
                 table_data["trials"],
-                "; %d nodes below sample threshold omitted" % table_data["skipped_nodes"]
-                if table_data["skipped_nodes"]
+                "; %d node%s below sample threshold omitted"
+                % (skipped, "" if skipped == 1 else "s")
+                if skipped
                 else "",
             ),
             style=theme.FAINT,
         )
+        self.summary_text = summary
         self.query_one("#summary", Static).update(summary)
 
         table = self.query_one("#nodes", DataTable)

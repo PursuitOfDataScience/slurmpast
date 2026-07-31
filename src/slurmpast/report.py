@@ -26,9 +26,11 @@ from .nodes import (
 from .render import (
     HOURS_PAIR_LABEL,
     JOB_COLUMNS,
+    NODE_COLUMNS,
     OVERVIEW_COLUMNS,
     PAIR_LABEL_WIDTH,
     PAIR_VALUE_WIDTH,
+    PAIRED_LINE_WIDTH,
     STEP_COLUMNS,
     cores_text,
     cpu_only_columns,
@@ -133,17 +135,14 @@ def _plain_layout(spec, content=None, indent=_PLAIN_INDENT):
     return fit_columns(spec, _plain_width() - len(indent), padding=_PLAIN_GAP, content=content)
 
 
-# Two label/value pairs, four cells of indent and two between them.
-_PAIRED_LINE_WIDTH = 4 + 2 * (PAIR_LABEL_WIDTH + 1 + PAIR_VALUE_WIDTH) + 2
-
-
 def _pair_value_width():
     """``PAIR_VALUE_WIDTH``, or 0 to force one pair per line on a narrow terminal.
 
     pair_rows treats any value longer than this as needing its own line, so zero
-    unpairs everything.
+    unpairs everything. The threshold lives in ``render`` now, because the dashboard
+    draws the same block and was not applying it.
     """
-    return PAIR_VALUE_WIDTH if _plain_width() >= _PAIRED_LINE_WIDTH else 0
+    return PAIR_VALUE_WIDTH if _plain_width() >= PAIRED_LINE_WIDTH else 0
 
 
 class Style:
@@ -413,7 +412,12 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
             }
         )
     out.extend(text_table(layout, rows, style=style))
-    tail = history.tail_summary(limit)
+    # Handed the list that was actually sliced. Left to slice `history.groups`
+    # itself, this line described the cost-ranked tail under every sort: at
+    # `--sort name -n 3` on the demo it said "23 runs holding 10.9% of the compute"
+    # about a hidden set of 30 runs holding 86.4%. The caption above the table was
+    # corrected for this once already; the footer below it was not.
+    tail = history.tail_summary(limit, ordered=groups)
     if tail:
         out.append(style("  … " + tail, "grey"))
     out.append("")
@@ -508,13 +512,14 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
                 "yellow",
             )
         )
+    skipped = table["skipped_nodes"]
     out.append(
         "  baseline %s over %d placements%s"
         % (
             format_percent(table["baseline"]),
             table["trials"],
-            "; %d nodes below threshold omitted" % table["skipped_nodes"]
-            if table["skipped_nodes"]
+            "; %d node%s below threshold omitted" % (skipped, "" if skipped == 1 else "s")
+            if skipped
             else "",
         )
     )
@@ -532,24 +537,44 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
     if not table["rows"]:
         out.append(
             "  No node reached the %d placements a comparison needs — %d seen, all below it. "
-            "A wider --since window is what fixes this." % (MIN_SAMPLES, table["skipped_nodes"])
+            "A wider --since window is what fixes this." % (MIN_SAMPLES, skipped)
         )
         out.append("")
         return "\n".join(_titled("node reliability (%s rate)" % metric, out, style))
     tested = table["tested_nodes"]
-    out.append("  %-16s %9s %10s %20s  %s" % ("NODE", "N", "RATE", "95% CI", "VERDICT"))
-    for row in table["rows"]:
-        colour = {"worse": "red", "better": "green"}.get(row["verdict"])
-        out.append(
-            "  %-16s %9s %10s %20s  %s"
-            % (
-                row["node"],
-                "%d/%d" % (row["bad"], row["trials"]),
-                "%.1f%%" % (100 * row["rate"]),
-                "%.1f - %.1f%%" % (100 * row["ci_low"], 100 * row["ci_high"]),
-                style(row["verdict"], colour) if colour else row["verdict"],
-            )
+    # Through the shared spec, like the other three plain tables. This one was
+    # hand-formatted at `"  %-16s %9s %10s %20s  %s"`, so it was the only table here
+    # that neither tracked the terminal nor dropped a column -- byte-identical at 60
+    # and 200 columns, and overrunning an 80-column one outright -- and any node name
+    # past 16 characters (`gpu-compute-node-a100-0001`, `queue1-dy-c5xlarge-1`) shoved
+    # every following column out of line, on the row the reader came for.
+    # render.NODE_COLUMNS was declared for exactly this and only the dashboard used
+    # it, which is the drift render.py exists to prevent.
+    layout = _plain_layout(
+        NODE_COLUMNS,
+        content={"NODE": max(len(r["node"]) for r in table["rows"])},
+    )
+    out.extend(
+        text_table(
+            layout,
+            [
+                {
+                    "NODE": row["node"],
+                    "N": "%d/%d" % (row["bad"], row["trials"]),
+                    "RATE": "%.1f%%" % (100 * row["rate"]),
+                    "95% CI": "%.1f - %.1f%%" % (100 * row["ci_low"], 100 * row["ci_high"]),
+                    "VERDICT": (
+                        row["verdict"],
+                        {"worse": "red", "better": "green"}.get(row["verdict"]),
+                    )
+                    if row["verdict"] in ("worse", "better")
+                    else row["verdict"],
+                }
+                for row in table["rows"]
+            ],
+            style=style,
         )
+    )
     out.append("")
     excl = compress_nodelist(suggest_exclude(table))
     if excl:
@@ -586,17 +611,21 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
     return "\n".join(_titled("node reliability (%s rate)" % metric, out, style))
 
 
-def render_sizing(history, style=None, limit=12):
+def render_sizing(history, style=None, limit=12, sort="cost"):
     """Per-workload guidance for the next submission."""
     style = style or Style()
-    out = [
-        style("  " + line, "grey")
-        for line in wrap(
-            "From how each workload actually ran. Over-requesting narrows which nodes "
-            "can host it; under-requesting kills the run.",
-            _prose_width(2),
-        )
-    ]
+    intro = (
+        "From how each workload actually ran. Over-requesting narrows which nodes "
+        "can host it; under-requesting kills the run."
+    )
+    out = [style("  " + line, "grey") for line in wrap(intro, _prose_width(2))]
+    # Named only when it is not the default, as on the overview. This list is
+    # truncated and, until now, always in cost order -- so `--sort rate`, the
+    # obvious remedy for the very problem the tail note below describes ("the
+    # workload most worth re-sizing can sit at position 13"), was accepted and
+    # silently discarded, in text and in --json alike.
+    if sort != SORTS[0][0]:
+        out.append(style("  ordered by %s" % sort_label(sort), "grey"))
     out.append("")
     shown = 0
     # Groups with advice that the limit cut off, and the runs behind them. Counted
@@ -608,7 +637,7 @@ def render_sizing(history, style=None, limit=12):
     # *with actionable advice*, which is not a prefix of history.groups.
     hidden_groups = 0
     hidden_runs = 0
-    for group in history.groups:
+    for group in sort_groups(history.groups, sort):
         advice = recommend(group.jobs)
         if not advice:
             continue

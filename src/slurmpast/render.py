@@ -266,6 +266,25 @@ def _uncoloured(text: str, *_names: str) -> str:
     return text
 
 
+def clip(value: str, width: int) -> str:
+    """``value`` in ``width`` cells, saying so when it did not fit.
+
+    A bare ``value[:width]`` is fine for a job name, which stays recognisable
+    truncated, and wrong for anything with syntax. ``midway3-[0600-0607,0611]`` came
+    out as ``midway3-[0600`` -- and at a column width of 12,
+    ``midway3-0600,midway3-0611`` came out as ``midway3-0600``: a complete, valid,
+    real node name for a job that ran on two, with nothing on screen to say a second
+    was dropped. Truncating the column is deliberate (see :class:`Column`); doing it
+    without a marker was not, and every other truncation in this codebase announces
+    itself -- ``... N more``, ``excluded_tail``, ``tui._elide``.
+    """
+    if len(value) <= width:
+        return value
+    if width <= 1:
+        return value[:width]
+    return value[: width - 1] + "…"
+
+
 def text_table(layout, rows, style=None, indent: str = "  ", gap: int = 1):
     """A fit_columns layout drawn as plain text: header, rule, rows.
 
@@ -284,7 +303,7 @@ def text_table(layout, rows, style=None, indent: str = "  ", gap: int = 1):
 
     def cell(label: str, width: int, value: str, colour=None) -> tuple[str, str]:
         align = _COLUMN_ALIGN.get(label, "left")
-        padded = ("%*s" if align == "right" else "%-*s") % (width, value[:width])
+        padded = ("%*s" if align == "right" else "%-*s") % (width, clip(value, width))
         return (style(padded, colour) if colour else padded), padded
 
     def line(cells) -> tuple[str, int]:
@@ -327,6 +346,11 @@ def register_alignment(*specs) -> None:
 # own line rather than being truncated or wrapped mid-pair.
 PAIR_LABEL_WIDTH = 16
 PAIR_VALUE_WIDTH = 30
+# What a line holding two pairs costs: four cells of indent and two between them.
+# Below it, pair one per line -- a paired row that wraps loses the label/value
+# alignment that made pairing readable. Shared, because both front ends draw this
+# block and only the plain one was checking.
+PAIRED_LINE_WIDTH = 4 + 2 * (PAIR_LABEL_WIDTH + 1 + PAIR_VALUE_WIDTH) + 2
 
 
 def pair_rows(rows, max_value: int = PAIR_VALUE_WIDTH):

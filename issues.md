@@ -1,233 +1,326 @@
 # slurmpast — audit and resolution
 
-> **Second round, 2026-07-30, at `92a88e6`.** The modules the first round left
-> unaudited — `tui.py`, `render.py`, `sacct.py`, `logs.py`, `cli.py`, `report.py` —
-> were covered this time, by an independent review panel rather than one reader.
-> See [Round two](#round-two-2026-07-30) at the end. Everything above it is the
-> first round and is unchanged.
+> **Round three, 2026-07-31, from `7f32b1a`.** Thirteen defects found, thirteen
+> upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
+> was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
+> and its control. `ruff`, `ruff format` and `mypy` clean.
 
-**Audited:** 2026-07-29 at `d656765`. **Resolved:** 2026-07-29 at `7b7da8c`.
+## Rounds one and two — verified closed before anything new was looked for
 
-Two defects were found by measurement and both are fixed. One item flagged as a
-possible third was measured afterwards and is not a defect. One is a documented
-design choice, left alone.
+Every fix from the first two rounds is present at the site issues.md named for
+it, checked by reading the code rather than by trusting the entry:
 
-**Audit scope, stated up front so this is not read as a clean bill of health.**
-`nodes.py` and `sizing.py` were read closely and simulated against the real code;
-`patterns.py`, `diagnose.py`, `index.py` and `model.py` were skimmed. `tui.py`,
-`render.py`, `sacct.py`, `logs.py` and `cli.py` were **not** audited in any depth.
-The sacct/data layer appears well covered already — `docs/details.md` documents
-seven parsing traps, each with a named regression test.
+`nodes.node_p_value` / `_bh_reject` (1) · `sizing._latest` (2) ·
+`sizing._memory_verdict` (5) · `model.Job.failed` carrying DEADLINE (6) ·
+`model._tres_bytes(zero_is_missing=)` (7) · `index._SORT_KEYS["failures"]` on
+`problems` (8) · `index.build_groups` materialising its input (9) ·
+`diagnose._NOOP_ALREADY_EXPLAINED` (10) · `logs.Scan.exists` confirming a hit
+(11) · `logs.expand_pattern`'s `own_id` (12) · `logs.job_identifiers`' array
+master (13) · `patterns.group_key` carrying the user (14) ·
+`patterns.find_memory_search`'s forward walk (15) · `sacct._FREE_TEXT` (16) ·
+the hang veto's computing/hung split (17) · `sizing.cpu_advice`'s `busiest`
+(18) · `cli.main` handing `render_list` the whole list (19) ·
+`--overview --json` through `sort_groups` (20) · `render_overview`'s ordering
+claim (21) · `--json`'s exit code (22) · `cli._glue_negative_values` (23) ·
+`--demo --failed` (24) · `nodes` folding names before it strata (25) ·
+`nodes.excluded_tail` (26) · `tui._load`'s guard around `History` (27).
 
-| # | Problem | Status |
-|---|---|---|
-| 1 | The node table ran a test per node and corrected for none of them | **fixed** |
-| 2 | `requested` was the largest limit in the window, not the next run's | **fixed** |
-| 3 | `dominant_workload` selects on the outcome | measured, not a defect |
-| 4 | Walltime sized from the longest completed run | by design, unchanged |
+Items 3 and 4 were decided "not a defect" and "by design"; both are unchanged
+and both still read correctly. Nothing from those rounds regressed.
 
----
-
-## 1. The node table ran many tests and corrected for none of them
-
-`node_table()` asked, for each node with ≥ `MIN_SAMPLES` placements, whether its
-Wilson interval sat above the rate on every *other* node, at `Z = 1.96`. Each test
-was right in isolation. Twenty run together and about one trips by chance — and
-`suggest_exclude()` passed whatever tripped to the user as a paste-ready
-`--exclude` string. This was the one output a user acts on directly.
-
-**Measured, not estimated.** Null simulation against the real `node_table` /
-`suggest_exclude`, every node given the identical true failure rate so any flag is
-a false positive by construction. 30 jobs/node, p = 0.20:
-
-| nodes in the table | before | after |
-|---|---|---|
-| 10 | 36.5% | 2.7% |
-| 20 | **54.8%** | 2.8% |
-| 40 | **77.8%** | 2.4% |
-
-The error rate climbing with the size of the table is the signature of the defect:
-it was a function of how many tests were run, not of the evidence. What matters
-about the corrected column is not that it is smaller but that it is **flat**.
-
-**Fix.** One-sided Fisher exact p-value per row against the existing leave-one-out
-comparison, Benjamini–Hochberg adjusted across the rows of the table, in
-`nodes.py:node_p_value` / `_bh_reject`. Raising `Z` to 2.576 was rejected as an
-alternative: it only slows the growth (13.5% / 21.3% / 33.8% across the same three
-sizes), because a wider interval treats the symptom and the cause is the number of
-tests.
-
-Fisher rather than a binomial tail against the leave-one-out rate, because that
-rate is *estimated*. Against an estimated 0% a binomial test scores one bad run at
-exactly p = 0, which no correction can ever withhold; Fisher conditions on the
-margins and leaves it borderline, so the size of the table still gets a say. The
-implementation agrees with `scipy.stats.fisher_exact` to 1.4e-12 relative error
-over 4,000 random tables in both tails.
-
-**Cost.** Power against one truly bad node (0.55 against 0.20 elsewhere, 20
-nodes): 63% at 20 placements per node, 87% at 30, 98% at 50. Concentrated where
-evidence is thin, which is where the module already said it wanted to hold back.
-The recorded headline signal — `midway3-0385` at 19/36 against 12/218 — is
-untouched, and still lands buried among 39 innocent nodes.
-
-**Consequence for the display.** The table shows the interval the verdict no
-longer rests on alone, so a row can read `inconclusive` beside a CI clear of the
-baseline. Both front ends now say why (`render.held_back_note`), phrased as "an
-interval alone is not enough when this many nodes were tested" rather than as a
-claim that those particular intervals are chance — one of them may be the
-genuinely bad node the correction cost us.
-
-## 2. "Requested" was the largest limit in the window
-
-`walltime_advice()` took `max()` over every `Timelimit` in the window as both the
-`requested` figure shown and the `current` value the raise/lower/keep verdict was
-measured against. `memory_advice()` and `cpu_advice()` did the same. It is rendered
-as "raise to X (from Y)", so Y has to be the value the script currently holds.
-
-This collided with a deliberate decision. `patterns.group_key()` excludes resource
-magnitudes — *"raising `--mem` must not fork the history you are trying to learn
-from"* — which is the right call and guarantees a group spans every limit the user
-has tried. `max()` reached back across exactly the history the grouping exists to
-unify.
-
-**Worse than first reported.** The original note called this "misleading display,
-not dangerous", on the grounds that `target` never derives from `current`. The
-*number* is indeed sound, but the verdict computed against `current` is not:
-
-```
-midtrain, longest run 01:52:49, so the right answer is "raise to 02:30:00"
-
- 2 stale runs @08:00:00 + 20 recent @00:40:00   before: requested 08:00:00, LOWER
- 1 stale run  @02:30:00 + 13 recent @00:40:00   before: requested 02:30:00, KEEP
-                                                        → and keep suppresses the
-                                                          suggestion, so the tool
-                                                          emitted nothing at all
-```
-
-The first inverts the instruction. The second silences it: a single stale run near
-the target made the verdict `keep`, and `keep` withholds the suggestion, so the
-tool said nothing about a 40-minute limit that every recent run needed 01:52:49 to
-finish. Both now report `requested 00:40:00` and `raise to 02:30:00`.
-
-On the recorded `rc-tok-github_code` history the memory figure was **48.0 GiB** —
-a *cancelled* run five submissions back — against the 17 GiB the script actually
-asked for.
-
-**Fix.** `sizing._latest` takes the limit from the most recent run, ordered by
-`start or submit` to match `index._stamp`. Timeout and OOM **floors** still use
-`max()`, and that is still right: a floor is a claim about the requirement, which
-no later, smaller request retracts.
-
-## 3. `dominant_workload` selects on the outcome — measured, not a defect
-
-`dominant_workload()` picks the job name with the most failure *events* rather than
-the most runs, so the node screen has something to say. Choosing the densest-failure
-stratum and then testing every node in it reads like it should push the same way as
-problem 1. Measured once problem 1 was fixed, it does not, and the reason is
-structural: the Fisher test **conditions on** the total number of failures in the
-table, and that total is precisely what this function selects on. Selecting on a
-statistic the test conditions away cannot bias it.
-
-Paired against a workload chosen at random on the same 3,000 simulated histories,
-all nodes null within each workload: 3.73% against 3.03% at 10 nodes, 3.17% against
-2.97% at 20 (SE ~0.35%). At most a fraction of a point, and under the 5% target
-either way. No change made.
-
-## 4. Sizing from the longest completed run — by design
-
-`walltime_advice` sizes from `max(elapsed) × 1.25`, not p95, and the code explains
-why at length: p95 told the `software` workload to "lower to 03:00:00" on the same
-screen that showed "longest 07:57:12", which would have timed out its slowest runs
-by design. That reasoning is sound and the choice is right. Two consequences to be
-aware of rather than fix — one atypically long run inflates the recommendation for
-the rest of the window, and a workload whose runtime is *growing* gets a lagging
-estimate. Neither is worth changing without evidence that it bites in practice.
+**Two of them turn out to have been fixed only on one side**, which is the
+strongest pattern in this round. #21 corrected the *caption* above the workload
+table for `--sort` and left the *footer* below it wrong (new #2). #24 fixed
+`--demo --failed` and left `--demo -p` / `--demo -u` in the same state for the
+same stated reason (new #8). Round two named this shape itself — "#5 is
+issues.md #2 in the one branch that fix did not reach" — and it recurred twice.
 
 ---
 
-## Round two, 2026-07-30
+## Method
 
-**Method.** Twenty-three candidate defects were raised by independent readers, one
-per module or cross-cutting lens, and each was then put to a panel of three further
-readers who judged it separately — one asked to verify, one briefed to *refute*, one
-asked only whether any user-visible output was actually wrong. A candidate had to
-carry a majority of its panel to count as a defect. Every panellist worked from the
-running code, not from the claim: the ones that survived were reproduced end to end,
-and the ones that did not were dropped on evidence.
+Every module read in full, including `render.py`, which neither previous round
+finished. Thirteen candidates were raised and each was reproduced by running the
+code before being written down. All thirteen then went to **three independent
+reviewers**, working from the running code, told to default to NOT-A-DEFECT on
+thin evidence and to weigh the codebase's own documented intent.
 
-That procedure earned its keep. **Seven of the twenty-three were rejected**, four of
-them unanimously, and several were plausible enough on paper that a single reader
-would likely have "fixed" them.
+**The panel returned 13/13 DEFECT, unanimous.** No candidate drew a 1-of-3 split,
+so no second round of evaluation was needed. That is a weaker result for the
+procedure than round two's (which rejected 7 of 23) and it is worth saying why
+rather than claiming a clean sweep: this round's candidates were all reproduced
+end-to-end before being listed, where round two's were raised from reading. The
+panel's value here was in the **corrections** it made, not the rejections —
 
-**Scope this time.** `sacct.py`, `logs.py`, `cli.py`, `report.py`, `tui.py`,
-`theme.py`, `model.py`, `index.py`, `patterns.py`, `diagnose.py`, `nodes.py`,
-`sizing.py`, and the test suite itself. `render.py` was the one module whose reader
-did not finish, so its width and truncation arithmetic remains as unexamined as it
-was before — the tests around it (`test_layout.py`, `test_readability.py`) are the
-only thing speaking for it.
+* **#5 was overstated.** Textual soft-wraps, so nothing clipped. The real harm is
+  an inert width argument and a hanging indent lost on continuation lines. Two of
+  three reviewers flagged this independently, and one warned the naive fix
+  (dropping the `join`, keeping the `100`) would have introduced #10 there.
+* **#11 was understated.** `read_bytes` also iterates `self.steps` rather than
+  `work_steps`, so `.extern` pollution — the artefact `_from_steps` documents and
+  excludes — reaches the I/O figures. Two of three reproduced it; a job whose
+  extern step claimed 500 GiB against 1 GiB of real work reported 500. Fixed with
+  #11, since it survives the `max`→`sum` change.
+* **#6's worst case is worse than described.** At a 12-cell column
+  `midway3-0600,midway3-0611` truncates to `midway3-0600` — not a visibly broken
+  string but a **complete, valid, real node name** for a job that ran on two.
+* **#9's payoff is smaller than claimed.** 2.2–5.9× on the function, ~4% of the
+  whole log pass end-to-end, and unmeasurable on a small log directory.
 
-### Fixed
+One reviewer also found a **test-coverage gap** that let #4 survive two audits;
+it is fixed below. All three confirmed the repo was untouched during review.
 
-| # | Problem | Where |
-|---|---|---|
-| 5 | An OOM floor was announced as "raise" beside a number *below* the current request | `sizing.memory_advice` |
-| 6 | `DEADLINE` counted as neither failed nor completed, so it left the failure rate entirely | `model.Job.failed` |
-| 7 | An explicit `fs/disk=0` was discarded as "unrecorded", so a stale fallback reported I/O that never happened | `model._tres_bytes` |
-| 8 | The "failed runs" sort summed `failed + noop`, double-counting every hung timeout | `index._SORT_KEYS` |
-| 9 | `build_groups` walked a one-shot iterator twice and silently reported `excluded=0` | `index.build_groups` |
-| 10 | "Find the blocking call" was told to OOM-killed, NODE_FAIL and PREEMPTED jobs, over the top of the real cause | `diagnose._cpu_rules` |
-| 11 | A dangling symlink counted as a confirmed log and shadowed the readable file beside it | `logs.Scan.exists` |
-| 12 | `%j` expanded to `500+1` for a heterogeneous component, a filename Slurm never writes | `logs.expand_pattern` |
-| 13 | The array master's bare id was promised as a third identifier and never produced | `logs.job_identifiers` |
-| 14 | Two users' identically-named scripts merged into one fabricated workload | `patterns.group_key` |
-| 15 | A run that finished *before* any OOM was reported as having succeeded "at a value that had already OOM'd" | `patterns.find_memory_search` |
-| 16 | A job genuinely named `None` — an f-string over an unset variable — had its name blanked | `sacct._clean` |
-| 17 | The hang veto asserted "blocked, not slow" of timeouts that burned nearly their whole limit | `sizing.walltime_advice` |
-| 18 | "the busiest run used 12.0 of 2 cores per task": numerator and denominator from different runs | `sizing.cpu_advice` |
-| 19 | The job list hid jobs in silence; its own "N more" line was unreachable | `cli.main` / `report.render_list` |
-| 20 | `--overview --json` ignored `--sort` while the text view honoured it | `cli.main` |
-| 21 | "ordered by compute used" was printed above an alphabetically-sorted table | `report.render_overview` |
-| 22 | `--json` always exited 0, so the one mode a script checks `$?` from never reported severity | `cli.main` |
-| 23 | `-u -p gpu` silently parsed as `user="-p"` with `gpu` as a job id | `cli._glue_negative_values` |
-| 24 | `--demo --failed` returned the whole synthetic history | `cli._load` |
-| 25 | `--nodes` keyed a workload by raw job name, so a parameter sweep fragmented below MIN_SAMPLES and its bad node went untested | `nodes.dominant_workload` / `node_table` |
-| 26 | The paste-ready `--exclude` capped at 8 nodes without saying so | `nodes.suggest_exclude` |
-| 27 | An exception building the history escaped a Textual worker and killed the dashboard | `tui._load` |
+---
 
-Numbers 5, 8, 14, 15, 17, 18 and 22 are all one shape: **a figure measured against
-something other than what it was presented as.** Number 5 is issues.md #2 in the one
-branch that fix did not reach, and the pattern for getting it right was already in
-the file — `walltime_advice` folds its TIMEOUT floor into the same target everything
-else is judged against instead of short-circuiting past the comparison.
+## Fixed
 
-Two items were found where a *test* was the problem. `test_short_rows_do_not_crash`
-was `assert parse(text) == parse(text)` — a call compared with itself, which can only
-fail if `parse` raises — and it is the only test feeding a row shorter than the field
-list, so `get`'s bounds check had nothing holding it: turning it into a wraparound
-read corrupted every field past the row's end and the suite stayed green. Its panel
-did not survive the session, so it is fixed on the strength of a reproduced mutation
-rather than a vote, and recorded here as such. `test_a_log_suffixed_name_is_answered
-_without_a_stat` asserted that a *hit* skipped its stat, which is precisely what let
-number 11 through; it now pins the sharper contract — misses stay free, hits are
-confirmed once and cached.
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | A hung run's `--time` became the walltime floor for the whole workload | `sizing.walltime_advice` | `TestAHungRunIsNotEvidenceOfNeedingMoreTime` |
+| 2 | "… N more workloads" described the cost-ranked tail whatever `--sort` said | `index.tail_summary` | `TestTheTruncationNoteDescribesWhatWasTruncated` |
+| 3 | `--demo` attached real log files off the local disk to synthetic jobs | `cli.main` | `TestTheDemoStaysSynthetic` |
+| 4 | The plain node table hardcoded its widths and ignored the shared spec | `report.render_nodes` | `TestTheNodeTableGoesThroughTheSharedSpec` |
+| 5 | `" ".join(wrap(...))` made the workload banner's wrap a no-op | `tui.WorkloadScreen` | `TestTheWorkloadBannerWrapsAtAll` |
+| 6 | A truncated node list read as a shorter, real, wrong node | `render.text_table` | `TestTruncationSaysSoInATable` |
+| 7 | `--sizing` accepted `--sort` and discarded it | `cli.main` / `report.render_sizing` | `TestSizingHonoursTheSort` |
+| 8 | `--demo` ignored `-p` and `-u` | `cli._load` | `TestTheDemoHonoursEveryNarrowingFlag` |
+| 9 | The log scan rebuilt a membership set on every probe | `logs.Scan.exists` | `TestTheListingIsIndexedOnceNotPerProbe` |
+| 10 | Dashboard findings wrapped to a fixed 86 cells | `tui.JobScreen` / `PatternsScreen` | `TestTheDashboardWrapsToTheTerminalItIsOn` |
+| 11 | Disk I/O took the max across steps where CPU sums — and read `.extern` | `model.Job.read_bytes` / `write_bytes` | `TestDiskTotalsSumTheStepsThatMovedTheData` |
+| 12 | `--sort recent` broke ties Z→A while every other sort broke them A→Z | `index.sort_groups` | `TestSortTieBreaksRunTheSameWayInEveryMode` |
+| 13 | "1 nodes below threshold omitted" | `report` / `tui` | `TestCountsAreSpelledForTheirNumber` |
+| — | A layout test built five views and asserted over two, exempting #4 | `tests/test_layout.py` | *(the test itself)* |
 
-### Rejected
+### 1. The walltime floor now comes from the timeouts that computed
 
-| Claim | Why not |
-|---|---|
-| `parse()` drops one of two jobs sharing a reused job id | Unreachable: `sacct` shows only the most recent job per id unless `-D` is passed, which slurmpast never does. Verified against real requeued jobs on Slurm 20.11.8 — the duplicate is collapsed before `parse` sees it. **3-0.** |
-| `cpus_per_task` assumes one task per node when `NTasks` is blank | A documented best-effort default with a named regression test, and no better signal exists across Slurm versions. Dividing by the node count beats not dividing at all. **1-2.** |
-| `host-oom` and `cuda-oom` firing together contradict each other | They describe two different memory pools, either of which can genuinely be exhausted on one multi-rank job, and `cuda-oom`'s text disambiguates rather than negating. **1-2.** |
-| `normalize_name` should fold hex/uuid run-ids, not just digit runs | The docstring considered folding beyond digits and rejected it, with a worked example and a regression test. Over-collapsing blames one workload for another's failures. **1-2.** |
-| `sacct._run`'s subprocess-failure paths are untested | Panel lost to the session limit; the missing-binary half is already covered end to end by CI's `no-slurm` job. Left open rather than counted either way. |
-| `cli.py`'s dashboard-reload closure is untested | Same panel. The behaviour itself is tested in `test_tui.py` against a loader stub. |
+`floor = max(...)` ran over every TIMEOUT. `hangs_dominate` needs three hangs AND
+half the timeouts AND a fifth of the workload, so a *minority* of hangs never
+reached the veto and set the floor unopposed — breaking rule 2 of the module's own
+header, with the split it needed already computed fifty lines above.
 
-The two "untested path" items are the only candidates this round that were neither
-fixed nor decided. Naming them beats implying the sweep was complete.
+`computing = [j for j in timeouts if not looks_like_noop(j)]` is now hoisted to the
+top of the function and used by both the veto and the floor. Reproduced before and
+after, on ten completed runs of an hour, six real timeouts at a 2-hour limit, and
+two hung runs carrying a stale 24-hour one:
 
-**Consequence for the numbers.** Fixing 6 changes what `failure_rate` reports for any
-workload containing a DEADLINE run — upward, correctly. Fixing 14 splits workloads
-that a multi-user query previously merged, so `-u alice,bob` now yields more groups
-than before. Fixing 25 changes which workload the node screen controls on for any
-history whose names carry digits, which is most of them; the recorded headline result
-is untouched, because `node-evaluation` has no digits to fold.
+```
+before  raise to 1-06:00:00   basis: longest of 10 completed runs took 01:00:00.
+after   raise to 02:30:00     basis: longest of 10 completed runs took 01:00:00.
+```
+
+A 12× over-request, gone, and the basis and the number now agree. The caution was
+counting the same set: it said "8 runs timed out, so the requirement is at least
+the limit that cut them off" of two runs that provably never computed. It now reads
+"6 runs timed out while computing … 2 further timeouts consumed almost no CPU and
+are left out of that floor". The existing test pinning `max()` for the floor
+(`test_a_timeout_floor_is_still_taken_from_the_largest`) uses a computing timeout
+and is untouched, which is the control that matters.
+
+### 2. The truncation note is told which list was sliced
+
+`tail_summary(shown, ordered=None)` now takes the ordered list the caller actually
+cut, instead of slicing `self.groups` behind its back. Measured on the demo at
+`-n 3`:
+
+```
+             before                          after
+--sort cost  23 runs / 10.9%   (correct)     23 runs / 10.9%
+--sort name  23 runs / 10.9%                 30 runs / 86.4%
+--sort rate  23 runs / 10.9%                 27 runs / 88.6%
+```
+
+The 86.4% and 88.6% were independently computed by two reviewers before the fix and
+match. The old line told a reader that the hidden bulk of their history was a
+negligible remainder — worse than silent truncation, which is the one thing this
+line exists to prevent.
+
+### 3. `--demo` no longer touches the filesystem for logs
+
+A synthetic job wrote no log, so anything a search turns up is a real file
+belonging to a real run — and its text feeds `diagnose`. Measured: **39 of 58** demo
+jobs were handed a file out of the user's own work directory, and four gained
+findings (`nccl`, `import-error`) read out of somebody else's training run. One
+reviewer went further and dropped a fabricated traceback into the current
+directory, which produced "GPU ran out of memory" and a verbatim traceback on
+synthetic job 5100002.
+
+`cli.main` now sets `args.no_logs = True` under `--demo`. That is not a workaround:
+for synthetic records it is the *correct* answer, since no log exists to find. It
+also restores what `DEMO_SITE` was added for — the demo renders identically on a
+login node and a laptop.
+
+### 4. The plain node table goes through `render.NODE_COLUMNS`
+
+It was the one plain table still hand-formatted at `"  %-16s %9s %10s %20s  %s"`,
+while the spec written for it sat unused and the dashboard used it. Now it goes
+through `_plain_layout` + `text_table` like the other three:
+
+```
+before, any width          after, COLUMNS=80              after, COLUMNS=140
+NODE          N   RATE     NODE               N   RATE    NODE                   N   RATE
+gpu-compute-node-a100-0001     10/14          gpu-compute-node-a100…  10/14      gpu-compute-node-a100-0001  10/14
+cn2       0/14                 cn2             0/14                   cn2         0/14
+   (every column shifted 10 cells)      (aligned, 72 cells)      (aligned, name in full, 76 cells)
+```
+
+It drops columns on a narrow terminal, grows the name column on a wide one, and
+lines up whatever the names are.
+
+### 5. The workload banner wraps for real
+
+`" ".join(render.wrap(evidence, 100))` puts the wrapped lines straight back
+together — the width was dead code, and the evidence went out as one 138-cell line
+at every terminal size. Now one `append` per wrapped line, each carrying the
+two-space indent, at `_prose_width(self, 4)`. On an 80-column dashboard:
+
+```
+before  138 | 18 of 20 runs of cot-exp in test failed; 18 were TIMEOUT. Every one used the same …
+after    74 |   18 of 20 runs of cot-exp in test failed; 18 were TIMEOUT. Every one used
+         65 |   the same --time=00:30:00. 9 GPU-hours consumed by the failures.
+```
+
+Taking the panel's warning: the fix is a width-aware wrap, not merely dropping the
+`join`, which would have reproduced #10 here.
+
+### 6. A cut cell says it was cut
+
+`render.clip` replaces the bare `value[:width]`, marking a truncated cell with `…`.
+The case that made this worth doing is not the visibly-broken one:
+
+```
+node_list = midway3-0600,midway3-0611     column width 12
+before    midway3-0600      a complete, valid, real name — for a job that ran on two
+after     midway3-0600…
+```
+
+Truncating the column stays deliberate, as `Column`'s docstring says; doing it
+without a marker was not, and every other truncation here announces itself.
+
+### 7 & 8. Two flags that were accepted and thrown away
+
+`render_sizing` takes a `sort` and iterates `sort_groups(...)`; the `--sizing
+--json` branch does the same, so text and JSON cannot disagree. A non-default order
+is now named on screen (`ordered by failure rate`), as the overview does — the
+screen never said what order it was in, and its own note warns that "the workload
+most worth re-sizing can sit at position 13", for which `--sort rate` is the
+remedy.
+
+`cli._load`'s demo branch applies `-p`, `-u` and `--failed`, and raises when
+nothing matches. `--demo -p gpu` exited 0 printing all 58 records; it now exits 2
+with "no demo jobs match partition gpu", matching the real path. An explicit job id
+still bypasses the filters, as `-j` does against sacct.
+
+### 9. The listing is indexed once, not per probe
+
+`Scan._names_in` caches the membership set beside the listing `entries` already
+caches. The set was being rebuilt on each of ~84 probes per job, so the test this
+class exists to make constant-time was linear in the directory:
+
+```
+                 before        after
+ 1,000 files     2.7 us       0.4 us  per probe
+13,000 files    16.6 us       0.9 us  per probe   (flat, as it should be)
+```
+
+Honest about scale, per the panel: unmeasurable on a small log directory, ~4% of
+the whole log pass end-to-end, and worth it because it is three lines in the one
+function whose entire docstring is a performance argument.
+
+### 10. The dashboard measures the terminal, like the plain renderer does
+
+New `tui._prose_width(screen, indent)`, used by `JobScreen` and `PatternsScreen` in
+place of the fixed 86 and 82. `report._prose_width` had already solved this and
+said why; `JobScreen._path_budget` had already solved it for paths on the same
+screen.
+
+```
+terminal  70 -> widest line 67    (was 94, soft-wrapped to column 0)
+terminal  80 -> widest line 78    (was 94)
+terminal 120 -> widest line 118   (was 94 — refusing the room it had)
+```
+
+The narrow-terminal pair layout goes with it: `JobScreen` now passes
+`render.PAIRED_LINE_WIDTH`-aware `max_value` to `pair_rows`, the threshold
+`report` has applied all along. That was raised by one reviewer only, so it is
+recorded as a partial fix — see **Open** below.
+
+### 11. Disk I/O sums the steps that moved the data
+
+`Job._io_from_steps` sums `read_bytes` / `write_bytes` over `work_steps`, for the
+same reason `_from_steps` sums CPU, and against the same rejected alternative in
+its own words: "Falling back to the largest step was wrong too: it drops every step
+but one." Four `srun` steps each reading 30 GiB and writing 10:
+
+```
+              before        after      truth
+read           30.0 GiB    120.0 GiB   120.0 GiB
+write          10.0 GiB     40.0 GiB    40.0 GiB
+io_rate      11.4 MiB/s   45.5 MiB/s
+```
+
+`io-heavy` was suppressed by this: four steps of 120 GiB in an hour is 136 MiB/s
+against a 100 MiB/s threshold, reported as 34, so the finding whose whole purpose
+is to say when the filesystem set the pace stayed silent. It now fires.
+
+The panel's addition is folded in: `work_steps`, not `steps`, so a polluted
+`.extern` claiming 500 GiB against 1 GiB of real work reports 1. Where **no** work
+step recorded anything, extern is the only reading there is and the old `max`
+stands as a fallback — the same shape `total_cpu` uses. The caveat both reviewers
+raised is documented at the property: `TRESUsage*Tot` is a per-step total and sums
+exactly, while the `MaxDiskRead` fallback beneath it is a per-task maximum and does
+not — summing those still under-reports a multi-task step, by less than `max`,
+which discarded every step but one.
+
+### 12 & 13. Two small ones
+
+`sort_groups` runs two stable passes for a descending mode instead of
+`reverse=True`, which reversed the tie-break along with the primary. `recent` now
+gives newest-first, then A→Z, like every other sort. And both node screens
+pluralise: "1 node below threshold omitted".
+
+### The test that let #4 through
+
+`test_no_table_row_overruns_the_terminal` built five views in its helper and then
+asserted over `("overview", "list")` — so the node table was exempt from the
+invariant it was breaking, while the sibling rule test iterated all five and could
+not catch it (a rule is drawn from the widest *row*). It now iterates every view,
+and the helper carries a `nodes-long-names` view whose node names are 26
+characters, because the demo's are 12 and that is what let a fixed `%-16s` survive
+two audits.
+
+This is the third round in which a *test* was the problem — after
+`test_short_rows_do_not_crash` (a call compared with itself) and
+`test_a_log_suffixed_name_is_answered_without_a_stat` (which asserted the very
+behaviour that caused defect #11 of round two). Worth naming as a pattern: this
+suite's failures are not missing tests but tests that assert less than they
+appear to.
+
+---
+
+## Open
+
+Two things are deliberately not fixed, named rather than left implied.
+
+**The job screen's gauges and detail rows below ~96 columns.** One reviewer
+reproduced `JobScreen`'s `resource_rows` gauges (fixed at 18 cells plus label and
+detail) and its pair rows soft-wrapping to column 0 at a 60-column terminal. The
+pair-row half shares a mechanism with #10 and was fixed with it. The gauge half
+needs a width-adaptive bar and is a real change to the row idiom this tool shares
+with slurmwatch, so it wants its own decision, not a drive-by. It was raised by one
+reviewer of three and never put to a second panel.
+
+**`--demo` still ignores `-S` and `-E`.** Unlike `-p` and `-u`, the window is not
+silently discarded: the screen says "synthetic demo data" instead of a date range,
+so the output does not claim a filter it did not apply. Left alone.
+
+---
+
+## Consequence for the numbers
+
+Fixing 1 lowers `--time` advice for any workload holding a hung timeout at a
+larger limit than its real ones. Fixing 11 raises `read_bytes`, `write_bytes`,
+`io_bytes` and `io_rate` for any multi-step job — most `sbatch` scripts with more
+than one `srun` — and will make `io-heavy` fire where it previously did not; it
+also *lowers* them for any job whose `.extern` was over-reporting. Fixing 12
+reorders same-day groups under `--sort recent`. The rest change presentation, exit
+codes, or how long a log scan takes.

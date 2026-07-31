@@ -720,3 +720,90 @@ class TestDeadlineIsAFailure:
         group = build_groups(jobs)[0]
         assert group.failed == 5
         assert group.failure_rate == 0.5
+
+
+class TestDiskTotalsSumTheStepsThatMovedTheData:
+    """`_from_steps` sums CPU because "Slurm's steps are disjoint sets of processes
+    ... no process is counted twice", and rejects the alternative in the same
+    breath: "Falling back to the largest step was wrong too: it drops every step but
+    one." Read and write bytes did exactly that. Four `srun` steps each reading
+    30 GiB reported 30 GiB, `io_rate` came out at a quarter of the truth, and
+    `io-heavy` -- whose whole purpose is to say when the filesystem set the pace --
+    stayed silent at a real 136 MiB/s against its 100 MiB/s threshold.
+    """
+
+    GIB = 1024**3
+
+    @classmethod
+    def _pipeline(cls, steps=4, read_gib=30, write_gib=10, elapsed=3600, extern_gib=None):
+        rows = [
+            row(
+                JobID="960",
+                JobName="pipeline",
+                State="COMPLETED",
+                ExitCode="0:0",
+                Start="2026-01-01T00:00:00",
+                End="2026-01-01T01:00:00",
+                ElapsedRaw=str(elapsed),
+                AllocTRES="cpu=8,mem=64G,node=1",
+                AllocCPUS="8",
+                NNodes="1",
+                NodeList="n1",
+            ),
+            row(JobID="960.batch", JobName="batch", State="COMPLETED", TotalCPU="00:10"),
+        ]
+        if extern_gib is not None:
+            rows.append(
+                row(
+                    JobID="960.extern",
+                    JobName="extern",
+                    State="COMPLETED",
+                    TRESUsageInTot="fs/disk=%d" % (extern_gib * cls.GIB),
+                )
+            )
+        for index in range(steps):
+            rows.append(
+                row(
+                    JobID="960.%d" % index,
+                    JobName="step",
+                    State="COMPLETED",
+                    TotalCPU="10:00",
+                    TRESUsageInTot="fs/disk=%d" % (read_gib * cls.GIB),
+                    TRESUsageOutTot="fs/disk=%d" % (write_gib * cls.GIB),
+                )
+            )
+        return parse("\n".join(rows))[0]
+
+    def test_four_steps_report_four_steps_worth(self):
+        job = self._pipeline()
+        assert job.read_bytes == 4 * 30 * self.GIB
+        assert job.write_bytes == 4 * 10 * self.GIB
+        assert job.io_bytes == 4 * 40 * self.GIB
+
+    def test_one_step_is_unchanged(self):
+        """The single-`srun` job that is most of a real history reads the same as
+        it always did -- a sum over one step is that step."""
+        job = self._pipeline(steps=1)
+        assert job.read_bytes == 30 * self.GIB
+
+    def test_the_rate_and_the_finding_follow(self):
+        """Four steps of 120 GiB in an hour is 136 MiB/s sustained, past
+        IO_RATE_LOUD. Reported as one step's 34 MiB/s, `io-heavy` never fired --
+        the finding whose entire purpose is to say when the filesystem, not the
+        GPU, set the pace."""
+        job = self._pipeline(read_gib=120, write_gib=0, elapsed=3600)
+        assert job.io_rate == pytest.approx(4 * 120 * self.GIB / 3600.0)
+        assert job.io_rate > 100 * 1024**2
+        assert "io-heavy" in codes(job)
+
+    def test_extern_cannot_speak_for_the_job(self):
+        """The same artefact `_from_steps` documents in CPU: a job whose extern step
+        claims 500 GiB against 1 GiB of real work was reporting 500."""
+        job = self._pipeline(steps=1, read_gib=1, extern_gib=500)
+        assert job.read_bytes == 1 * self.GIB
+
+    def test_extern_is_still_the_answer_when_it_is_the_only_one(self):
+        """Reporting nothing would be the bigger loss -- the same fallback shape
+        `total_cpu` uses when no work step recorded a figure."""
+        job = self._pipeline(steps=0, extern_gib=2)
+        assert job.read_bytes == 2 * self.GIB

@@ -327,3 +327,91 @@ class TestBuildGroupsWalksItsInputTwice:
         from_iterator = build_groups(iter(jobs))
         assert [g.excluded for g in from_iterator] == [g.excluded for g in from_list]
         assert sum(g.excluded for g in from_iterator) == 1
+
+
+class TestTheTruncationNoteDescribesWhatWasTruncated:
+    """`tail_summary` sliced `self.groups` -- always cost order -- while its caller
+    sliced a sorted copy. So under any non-default `--sort` the note described a
+    different set of workloads than the ones actually hidden, and described the
+    hidden bulk of the history as a negligible remainder: 30 runs holding 86.4% of
+    the compute, reported as 23 runs holding 10.9%. The line exists so truncation is
+    never silent; wrong is worse than silent, because it reassures.
+    """
+
+    @staticmethod
+    def _history():
+        from slurmpast.demo import history
+
+        return History(history(), window="demo")
+
+    def test_the_default_order_is_unchanged(self):
+        history = self._history()
+        assert history.tail_summary(3, ordered=sort_groups(history.groups, "cost")) == (
+            history.tail_summary(3)
+        )
+
+    @pytest.mark.parametrize("mode", ["name", "rate", "runs", "recent", "failures"])
+    def test_every_order_gets_its_own_tail(self, mode):
+        history = self._history()
+        ordered = sort_groups(history.groups, mode)
+        note = history.tail_summary(3, ordered=ordered)
+        hidden = ordered[3:]
+        assert "%d more workloads" % len(hidden) in note
+        assert "(%d runs)" % sum(g.total for g in hidden) in note
+        share = 100.0 * sum(g.cost for g in hidden) / sum(g.cost for g in history.groups)
+        assert "%.1f%%" % share in note
+
+    def test_a_non_default_order_really_does_differ(self):
+        """Guards the test above from passing vacuously on a history where every
+        order happens to hide the same workloads."""
+        history = self._history()
+        by_cost = history.tail_summary(3, ordered=sort_groups(history.groups, "cost"))
+        by_name = history.tail_summary(3, ordered=sort_groups(history.groups, "name"))
+        assert by_cost != by_name
+
+
+class TestSortTieBreaksRunTheSameWayInEveryMode:
+    """`reverse=True` reverses the whole key tuple, tie-break included. Every other
+    mode negates its primary inside the key and so leaves names A-Z; `recent` cannot
+    negate a timestamp string, inherited the flip, and ordered same-day workloads
+    Z-A. Sharing a date is the ordinary case for the one sort keyed on a date."""
+
+    @staticmethod
+    def _tied(names, stamp="2026-07-20T00:00:00"):
+        from slurmpast.index import GroupStats
+
+        return [
+            GroupStats(
+                key=(name, "p", "cpu", "u"),
+                name=name,
+                partition="p",
+                kind="cpu",
+                distinct_names=1,
+                excluded=0,
+                jobs=(),
+                total=1,
+                completed=1,
+                failed=0,
+                cancelled=0,
+                noop=0,
+                problems=0,
+                gpu_hours=0.0,
+                core_hours=1.0,
+                wasted_gpu_hours=0.0,
+                first_seen=stamp,
+                last_seen=stamp,
+            )
+            for name in names
+        ]
+
+    # The three keys that carry a name to break ties with. `cost`, `failures` and
+    # `rate` break theirs on another number and leave equal rows in input order,
+    # which is a different question from this one.
+    @pytest.mark.parametrize("mode", ["recent", "runs", "name"])
+    def test_ties_are_alphabetical(self, mode):
+        groups = self._tied(["charlie", "alpha", "bravo"])
+        assert [g.name for g in sort_groups(groups, mode)] == ["alpha", "bravo", "charlie"]
+
+    def test_recent_still_puts_the_newest_first(self):
+        groups = self._tied(["alpha", "bravo"]) + self._tied(["zulu"], "2026-07-25T00:00:00")
+        assert [g.name for g in sort_groups(groups, "recent")] == ["zulu", "alpha", "bravo"]

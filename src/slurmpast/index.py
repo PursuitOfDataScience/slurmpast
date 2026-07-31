@@ -248,7 +248,18 @@ _DESCENDING = frozenset(["recent"])
 
 def sort_groups(groups: Sequence[GroupStats], mode: str) -> list[GroupStats]:
     key = _SORT_KEYS.get(mode, _SORT_KEYS["cost"])
-    return sorted(groups, key=key, reverse=mode in _DESCENDING)
+    if mode not in _DESCENDING:
+        return sorted(groups, key=key)
+    # Two stable passes rather than `reverse=True`, which reverses the WHOLE key
+    # tuple -- the tie-break along with the primary. Every other mode spells its
+    # direction into the key (`-g.cost`, `-g.problems`) and so leaves names A-Z;
+    # `recent` cannot negate a timestamp string, inherited the flip, and ordered
+    # workloads sharing a date Z-A. Sharing a date is the ordinary case for the one
+    # sort keyed on one: in the demo history alone, cot-exp and rc-tok-github_code
+    # share a last_seen. Sorting by the tie-break first and then stably by the
+    # primary gives the intended "newest first, then A-Z".
+    ordered = sorted(groups, key=lambda g: key(g)[1:])
+    return sorted(ordered, key=lambda g: key(g)[0], reverse=True)
 
 
 def next_sort(mode: str) -> str:
@@ -465,17 +476,25 @@ class History:
             return (idle, total)
         return None
 
-    def tail_summary(self, shown: int) -> str:
+    def tail_summary(self, shown: int, ordered: Sequence[GroupStats] | None = None) -> str:
         """What sits below the fold, so truncation is never silent.
 
         The top 20 workloads carry 93.4% of all weighted resource on a real
         history, so a truncated list is the right default -- but a reader who
         cannot see what was dropped has no way to know that.
+
+        ``ordered`` is the list the caller actually sliced. It has to be passed,
+        because the caller sorts and this does not: slicing ``self.groups`` -- always
+        cost order -- described the cost-ranked tail whatever ``--sort`` was in
+        force. Under ``--sort name -n 3`` the demo history hides 30 runs holding
+        86.4% of the compute and this line said "23 runs holding 10.9%", which is
+        worse than silent truncation: it is a reassurance, and it is wrong.
         """
-        hidden = self.groups[shown:]
+        groups = list(ordered) if ordered is not None else self.groups
+        hidden = groups[shown:]
         if not hidden:
             return ""
-        total = sum(g.cost for g in self.groups) or 1.0
+        total = sum(g.cost for g in groups) or 1.0
         share = sum(g.cost for g in hidden) / total
         runs = sum(g.total for g in hidden)
         # "of the resource" matched nothing the reader had been told; the ordering

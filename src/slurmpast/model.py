@@ -699,15 +699,52 @@ class Job(NamedTuple):
 
     # -------------------------------------------------------------------- disk
 
+    def _io_from_steps(self, attribute: str) -> int | None:
+        """Bytes the job moved: summed over work steps, ``.extern`` excluded.
+
+        A **sum**, for the same reason :meth:`_from_steps` sums CPU -- Slurm's steps
+        are disjoint sets of processes, so a script whose work is four ``srun``
+        lines really did read four steps' worth of data and no byte is counted
+        twice. ``max()`` reported one step's figure as the whole job's: four steps
+        each reading 30 GiB came out as 30 GiB, :attr:`io_rate` came out at a
+        quarter of the truth, and ``io-heavy`` -- whose entire purpose is to say
+        when the filesystem rather than the GPU set the pace -- stayed silent at a
+        real 136 MiB/s against a 100 MiB/s threshold. It is the same mistake
+        :meth:`_from_steps` already names and rejects: "Falling back to the largest
+        step was wrong too: it drops every step but one." Read and write are the
+        only cumulative counters here; ``max`` is right for :attr:`max_rss` and
+        :attr:`max_pages` because those are peaks.
+
+        ``.extern`` excluded, as in the CPU numerator and for the same measured
+        reason -- it is where jobacct_gather's accounting goes wrong, and a job
+        whose extern step claimed 500 GiB against 1 GiB of real work reported 500.
+        Where no work step recorded anything, extern is the only reading there is
+        and reporting nothing would be the bigger loss, so the old ``max`` stands
+        as the fallback.
+
+        The fallback inside :attr:`Step.read_bytes` is the caveat worth stating.
+        ``TRESUsageInTot`` is a per-step total and sums exactly; ``MaxDiskRead``
+        beneath it is a per-task maximum and does not, so on a multi-task step
+        served only by that field the sum still under-reports -- by less than
+        ``max()``, which discarded every step but one.
+        """
+        values = [
+            value
+            for value in (getattr(step, attribute) for step in self.work_steps)
+            if value is not None
+        ]
+        if values:
+            return sum(values)
+        spare = [getattr(s, attribute) for s in self.steps if getattr(s, attribute) is not None]
+        return max(spare) if spare else None
+
     @property
     def read_bytes(self) -> int | None:
-        values = [s.read_bytes for s in self.steps if s.read_bytes is not None]
-        return max(values) if values else None
+        return self._io_from_steps("read_bytes")
 
     @property
     def write_bytes(self) -> int | None:
-        values = [s.write_bytes for s in self.steps if s.write_bytes is not None]
-        return max(values) if values else None
+        return self._io_from_steps("write_bytes")
 
     @property
     def io_bytes(self) -> int | None:

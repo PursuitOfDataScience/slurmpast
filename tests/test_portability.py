@@ -1519,3 +1519,66 @@ class TestTheArrayMasterIdIsOfferedLast:
     def test_a_plain_job_offers_no_spurious_third(self, tmp_path):
         job = parse(row(JobID="61", JobIDRaw="61", JobName="t", State="FAILED", ElapsedRaw="60"))[0]
         assert logs.job_identifiers(job) == ["61"]
+
+
+class TestTheListingIsIndexedOnceNotPerProbe:
+    """The fast path had an O(n) test inside it.
+
+    ``exists`` asked ``name not in set(self.entries(directory))``. The listing was
+    cached; the *set built from it* was not, so the membership test this class
+    exists to make constant-time was linear in the directory instead -- ~84 times
+    per job. Measured against a 13,000-file log directory: 16.6 us per probe against
+    2.8 cached, which over the 6,600-job history the class docstring cites is about
+    9 s of pure rebuilding behind an interactive keypress. ``by_digits`` already
+    caches its derived index per directory; this was the one that did not.
+    """
+
+    def test_one_listdir_and_one_index_per_directory(self, tmp_path, monkeypatch):
+        for index in range(50):
+            (tmp_path / ("run-%03d.out" % index)).write_text("x\n")
+        scan = logs.Scan()
+        listings = []
+        real = os.listdir
+        monkeypatch.setattr(os, "listdir", lambda p: listings.append(p) or real(p))
+        for index in range(200):
+            scan.exists(str(tmp_path / ("slurm-%d.out" % index)))
+        assert len(listings) == 1, "the listing itself was already cached"
+        # And the index derived from it, which is the part that was not.
+        assert list(scan._names) == [str(tmp_path)]
+
+    def test_the_answers_are_the_same_ones(self, tmp_path):
+        """A cache is only worth having if it cannot change what is reported."""
+        (tmp_path / "slurm-60.out").write_text("out\n")
+        scan = logs.Scan()
+        assert scan.exists(str(tmp_path / "slurm-60.out")) is True
+        assert scan.exists(str(tmp_path / "slurm-61.out")) is False
+        assert scan.exists(str(tmp_path / "slurm-60.out")) is True
+
+    def test_the_cost_does_not_grow_with_the_directory(self, tmp_path, monkeypatch):
+        """The invariant behind the measurement, counted rather than timed so a
+        loaded machine cannot make it flaky: probing a 2,000-name directory builds
+        the same one index a 50-name one does."""
+        built = []
+        monkeypatch.setattr(logs.Scan, "_names_in", _counting_names_in(built))
+        for size in (50, 2000):
+            directory = tmp_path / str(size)
+            directory.mkdir()
+            for index in range(size):
+                (directory / ("run-%05d.out" % index)).write_text("x\n")
+            scan = logs.Scan()
+            before = len(built)
+            for index in range(100):
+                scan.exists(str(directory / ("slurm-%d.out" % index)))
+            assert len(built) - before == 1, "one set per directory, whatever its size"
+
+
+def _counting_names_in(log):
+    """`Scan._names_in`, recording each directory whose set it actually builds."""
+    original = logs.Scan._names_in
+
+    def counted(self, directory):
+        if directory not in self._names:
+            log.append(directory)
+        return original(self, directory)
+
+    return counted

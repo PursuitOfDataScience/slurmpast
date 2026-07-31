@@ -167,6 +167,9 @@ def walltime_advice(jobs) -> Advice:
     completed = [j for j in jobs if j.completed and j.elapsed and not looks_like_noop(j)]
     timeouts = [j for j in jobs if j.base_state == "TIMEOUT"]
     hung = [j for j in timeouts if looks_like_noop(j)]
+    # The split every claim about a timeout has to be made against, so it is made
+    # once, here, rather than inside the one branch that used to need it.
+    computing = [j for j in timeouts if not looks_like_noop(j)]
     # The limit the last run asked for, not the largest in the window. See _latest.
     current = _latest(jobs, "timelimit")
     requested = format_duration(current) if current else "n/a"
@@ -186,7 +189,6 @@ def walltime_advice(jobs) -> Advice:
         # as well: runs that had burned 29:50 of a 30:00 limit doing real work.
         # `looks_like_noop` needs CPU under 10s, so those are never hangs by this
         # module's own definition. Name the split, and keep what they proved.
-        computing = [j for j in timeouts if not looks_like_noop(j)]
         basis = (
             "%d of %d timed-out run%s consumed almost no CPU before hitting the wall: "
             "blocked, not slow -- a longer limit buys a longer hang."
@@ -235,11 +237,20 @@ def walltime_advice(jobs) -> Advice:
     # here. p95 stays in the basis as the shape of the distribution.
     target = _round_walltime(longest * WALLTIME_MARGIN)
 
-    # Any timeout means the true requirement is above the limit that truncated
-    # it, so the floor is that limit -- never below. Still max(), and still right:
-    # a floor is a claim about the requirement, which no later run retracts, unlike
-    # a claim about what the script currently says.
-    floor = max((j.timelimit for j in timeouts if j.timelimit), default=0)
+    # A timeout that was COMPUTING means the true requirement is above the limit
+    # that truncated it, so the floor is that limit -- never below. Still max(),
+    # and still right: a floor is a claim about the requirement, which no later run
+    # retracts, unlike a claim about what the script currently says.
+    #
+    # Hung runs are excluded, which is this module's own rule 2: a hang's Elapsed
+    # measures how long it waited, not how long the work takes, so a longer limit
+    # buys a longer hang. The veto above makes that split when hangs dominate -- but
+    # a MINORITY of hangs never reaches the veto, and used to set this floor
+    # unopposed. Two hung runs carrying a stale `--time=24:00:00` turned "raise to
+    # 02:30:00" into "raise to 1-06:00:00" for a workload whose longest completed
+    # run took an hour: a 12x over-request, printed above a basis line still
+    # reading "longest of 10 completed runs took 01:00:00".
+    floor = max((j.timelimit for j in computing if j.timelimit), default=0)
     if floor:
         target = max(target, _round_walltime(floor * WALLTIME_MARGIN))
 
@@ -266,12 +277,27 @@ def walltime_advice(jobs) -> Advice:
         format_duration(longest),
         spread,
     )
+    # Counted over the runs the floor was actually taken from. Saying "8 runs timed
+    # out, so the requirement is at least the limit that cut them off" of a set that
+    # included two hangs asserted of them the one thing this module says a hang
+    # never shows.
     caution = ""
-    if timeouts:
+    if computing:
         caution = (
-            "%d run%s timed out, so the requirement is at least the limit that cut "
-            "them off -- this is a floor, not a fit."
-            % (len(timeouts), "" if len(timeouts) == 1 else "s")
+            "%d run%s timed out while computing, so the requirement is at least the "
+            "limit that cut them off -- this is a floor, not a fit."
+            % (len(computing), "" if len(computing) == 1 else "s")
+        )
+    if hung:
+        caution += (
+            "%s%d further timeout%s consumed almost no CPU and %s left out of that "
+            "floor: a run that hung says nothing about how long the work takes."
+            % (
+                "  " if caution else "",
+                len(hung),
+                "" if len(hung) == 1 else "s",
+                "is" if len(hung) == 1 else "are",
+            )
         )
 
     if current is None or target > current * (1 + MIN_RELATIVE_CHANGE):

@@ -730,3 +730,66 @@ class TestTheHangVetoDoesNotSpeakForEveryTimeout:
         advice = walltime_advice(workload("cot-exp"))
         assert advice.verdict == "unknown"
         assert "blocked, not slow" in advice.basis
+
+
+class TestAHungRunIsNotEvidenceOfNeedingMoreTime:
+    """Rule 2 of the module header, applied to the floor and not only to the veto.
+
+    `hangs_dominate` needs three hangs AND half the timeouts AND a fifth of the
+    workload, so a *minority* of hangs never reaches it -- and the TIMEOUT floor
+    below took `max()` over every timeout regardless. Two hung runs carrying a
+    stale `--time=24:00:00` turned "raise to 02:30:00" into "raise to 1-06:00:00"
+    for a workload whose longest completed run took an hour: a 12x over-request,
+    printed above a basis line still reading "longest ... took 01:00:00".
+    """
+
+    @staticmethod
+    def _history(hangs=2):
+        rows = []
+        for index in range(10):
+            rows += _cpu_run("9100%d" % index, 1, 0.95, "2026-05-%02d" % (index + 1))
+        for index in range(6):
+            rows += _timeout_run(
+                "9200%d" % index, 3500, "2026-05-%02d" % (index + 11), limit="02:00:00"
+            )
+        # Oldest, so they cannot move `requested` -- only the floor.
+        for index in range(hangs):
+            rows += _timeout_run(
+                "9300%d" % index, 0, "2026-04-%02d" % (index + 1), limit="24:00:00"
+            )
+        return parse(make_text(*rows))
+
+    def test_the_floor_comes_from_the_timeouts_that_computed(self):
+        advice = walltime_advice(self._history())
+        assert advice.verdict == "raise"
+        assert advice.suggestion == "02:30:00", "the 02:00:00 limit that cut real work off"
+
+    def test_the_hangs_change_nothing(self):
+        """The control: the same history without them has to give the same answer."""
+        assert (
+            walltime_advice(self._history(hangs=0)).suggestion
+            == walltime_advice(self._history(hangs=2)).suggestion
+        )
+
+    def test_a_hang_never_reaches_the_paste_ready_line(self):
+        jobs = self._history()
+        assert "#SBATCH --time=02:30:00" in sbatch_lines(recommend(jobs))
+
+    def test_the_caution_counts_only_what_the_floor_rests_on(self):
+        """It said "8 runs timed out, so the requirement is at least the limit that
+        cut them off" of a set holding two runs that never computed -- asserting of
+        them the one thing this module says a hang can never show."""
+        caution = walltime_advice(self._history()).caution
+        assert "6 runs timed out while computing" in caution
+        assert "2 further timeouts consumed almost no CPU" in caution
+
+    def test_the_veto_still_fires_when_hangs_dominate(self):
+        """The other side of the split: this must not have been swept up in the fix."""
+        rows = []
+        for index in range(6):
+            rows += _timeout_run("9400%d" % index, 0, "2026-06-%02d" % (index + 1))
+        for index in range(2):
+            rows += _timeout_run("9500%d" % index, 3500, "2026-06-%02d" % (index + 11))
+        advice = walltime_advice(parse(make_text(*rows)))
+        assert advice.verdict == "unknown"
+        assert "blocked, not slow" in advice.basis

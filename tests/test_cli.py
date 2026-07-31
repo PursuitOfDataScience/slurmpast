@@ -226,3 +226,89 @@ class TestDemoHonoursFailed:
         payload = json.loads(capsys.readouterr().out)
         assert payload["jobs"]
         assert all(j["outcome"]["failed"] for j in payload["jobs"])
+
+
+class TestTheDemoStaysSynthetic:
+    """A synthetic job wrote no log, so anything a log search turns up is a real
+    file belonging to a real run on this machine -- and its text feeds `diagnose`.
+    Measured before the fix: 39 of the 58 demo jobs were handed a file out of the
+    user's own work directory, four of them gaining findings (`nccl`,
+    `import-error`) read out of somebody else's training run. It also made `--demo`
+    machine-dependent again, which is what `demo.DEMO_SITE` exists to prevent.
+    """
+
+    def test_no_log_is_ever_attached(self, capsys, tmp_path, monkeypatch):
+        decoy = tmp_path / "slurm-5100002.out"
+        decoy.write_text(
+            "Traceback (most recent call last):\n"
+            "  File 'train.py', line 1\n"
+            "torch.cuda.OutOfMemoryError: CUDA out of memory\n"
+        )
+        monkeypatch.chdir(tmp_path)
+        run("--demo", "5100002", "--json", "--no-color")
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["jobs"][0]["log"] is None
+        codes = {f["code"] for f in payload["jobs"][0]["findings"]}
+        assert not codes & {"cuda-oom", "traceback", "import-error", "nccl"}
+
+    def test_the_whole_demo_history_reads_no_logs(self, capsys, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        run("--demo", "--json", "--no-color")
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["jobs"]
+        assert all(job["log"] is None for job in payload["jobs"])
+
+
+class TestTheDemoHonoursEveryNarrowingFlag:
+    """`--failed` was fixed on its own once, because ignoring it "made `--help`'s
+    'only jobs that failed' false in exactly the place someone tries the flag
+    first". `-p` and `-u` sat in the same position and were not. Every synthetic job
+    is partition `test`, user `youzhi`, so both should match nothing.
+    """
+
+    @pytest.mark.parametrize("argv", [("-p", "gpu"), ("-u", "nobody")])
+    def test_a_filter_that_matches_nothing_says_so(self, argv, capsys):
+        assert run("--demo", *argv, "--overview", "--no-color") == 2
+        assert "no demo jobs match" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("argv", [("-p", "test"), ("-u", "youzhi")])
+    def test_a_filter_that_matches_everything_changes_nothing(self, argv, capsys):
+        run("--demo", "--overview", "--json", "--no-color")
+        everything = json.loads(capsys.readouterr().out)["summary"]["jobs"]
+        run("--demo", *argv, "--overview", "--json", "--no-color")
+        assert json.loads(capsys.readouterr().out)["summary"]["jobs"] == everything
+
+    def test_an_explicit_job_id_still_ignores_the_filters(self, capsys):
+        """Matching the real path, where `-j` goes straight to sacct and the window
+        and filters do not apply either. (Exit 1, not 2: the job is found and has a
+        critical finding, which is what `--json` reports through `$?`.)"""
+        assert run("--demo", "5100001", "-p", "gpu", "--json", "--no-color") != 2
+        assert json.loads(capsys.readouterr().out)["jobs"][0]["identity"]["job_id"] == "5100001"
+
+
+class TestSizingHonoursTheSort:
+    """`--sort` is documented as "workload ordering" with no exception, and
+    `--sizing` is a workload-ordered, truncated list -- whose own note says "the
+    workload most worth re-sizing can sit at position 13". `--sort rate` is the
+    remedy for exactly that, and both the text and the JSON discarded it."""
+
+    def test_the_json_order_follows_the_flag(self, capsys):
+        run("--demo", "--sizing", "--json", "--no-color")
+        by_cost = [w["name"] for w in json.loads(capsys.readouterr().out)["workloads"]]
+        run("--demo", "--sizing", "--json", "--sort", "name", "--no-color")
+        by_name = [w["name"] for w in json.loads(capsys.readouterr().out)["workloads"]]
+        assert by_name == sorted(by_name)
+        assert by_name != by_cost
+
+    def test_the_text_order_follows_the_flag(self, capsys):
+        run("--demo", "--sizing", "--no-color")
+        by_cost = capsys.readouterr().out
+        run("--demo", "--sizing", "--sort", "rate", "--no-color")
+        by_rate = capsys.readouterr().out
+        assert by_cost != by_rate
+
+    def test_a_non_default_order_is_named_on_screen(self, capsys):
+        run("--demo", "--sizing", "--sort", "rate", "--no-color")
+        assert "ordered by failure rate" in capsys.readouterr().out
+        run("--demo", "--sizing", "--no-color")
+        assert "ordered by" not in capsys.readouterr().out

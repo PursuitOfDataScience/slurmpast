@@ -961,3 +961,148 @@ class TestTheMemorySectionOnlySaysThingsWorthSaying:
         assert payload["memory"]["virtual_bytes"] == 2068502792 * 1024
         assert payload["memory"]["virtual_to_resident"] is not None
         assert payload["memory"]["peak_node"] == "midway3-0372"
+
+
+class TestTheDashboardWrapsToTheTerminalItIsOn:
+    """`report._prose_width` fixed this for the plain output and said why -- "These
+    were hardcoded at 72, 82 and 84, so a finding hard-broke mid-sentence two thirds
+    of the way across a wide terminal and overran a narrow one." The dashboard kept
+    the constants: findings at 86, actions at 82, under an 8-cell indent, so below
+    ~96 columns Textual re-wrapped the already-wrapped text and dropped the orphan
+    to column 0 with no indent at all.
+    """
+
+    @staticmethod
+    async def _open_cot_exp(pilot, app):
+        index = [g.label for g in app.screen._rows].index("cot-exp") + 1
+        await pilot.press(str(index))
+        await pilot.pause()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("width", [70, 80, 120])
+    async def test_findings_fit_the_screen(self, width, monkeypatch):
+        from textual.widgets import Static
+
+        seen = {}
+        original = Static.update
+
+        def spy(self, renderable="", *args, **kwargs):
+            if getattr(self, "id", None) == "body":
+                seen["body"] = getattr(renderable, "plain", str(renderable))
+            return original(self, renderable, *args, **kwargs)
+
+        monkeypatch.setattr(Static, "update", spy)
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(width, 44)) as pilot:
+            await pilot.pause()
+            await self._open_cot_exp(pilot, app)
+            for keys in (("p",), ("escape", "enter")):
+                for key in keys:
+                    await pilot.press(key)
+                    await pilot.pause()
+                widest = max(len(line) for line in seen["body"].splitlines())
+                assert widest <= width, "%d cells on a %d-cell screen" % (widest, width)
+
+    @pytest.mark.asyncio
+    async def test_a_wide_terminal_is_actually_used(self, monkeypatch):
+        """The other half: a fixed 86 also refused the room a wide terminal has."""
+        from textual.widgets import Static
+
+        seen = {}
+        original = Static.update
+
+        def spy(self, renderable="", *args, **kwargs):
+            if getattr(self, "id", None) == "body":
+                seen["body"] = getattr(renderable, "plain", str(renderable))
+            return original(self, renderable, *args, **kwargs)
+
+        monkeypatch.setattr(Static, "update", spy)
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(150, 44)) as pilot:
+            await pilot.pause()
+            await self._open_cot_exp(pilot, app)
+            await pilot.press("p")
+            await pilot.pause()
+            assert max(len(line) for line in seen["body"].splitlines()) > 100
+
+
+class TestTheWorkloadBannerWrapsAtAll:
+    """`" ".join(render.wrap(evidence, 100))` puts the wrapped lines straight back
+    together, so the width argument did nothing whatever: the evidence went out as
+    one 138-cell line at every terminal size, and only the first of Textual's
+    soft-wrapped lines kept the two-space indent the `"\\n  "` prefix intends. The
+    advice block nineteen lines below has wrapped to the real width since the last
+    audit; this half was missed.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("width", [70, 80, 120])
+    async def test_no_line_exceeds_the_terminal(self, width):
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(width, 44)) as pilot:
+            await pilot.pause()
+            index = [g.label for g in app.screen._rows].index("cot-exp") + 1
+            await pilot.press(str(index))
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            lines = app.screen.summary_text.plain.splitlines()
+            assert len(lines) > 2, "no finding banner to check"
+            for line in lines:
+                assert len(line) <= width, "%d cells on a %d-cell screen: %r" % (
+                    len(line),
+                    width,
+                    line,
+                )
+
+    @pytest.mark.asyncio
+    async def test_every_continuation_keeps_the_indent(self):
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(80, 44)) as pilot:
+            await pilot.pause()
+            index = [g.label for g in app.screen._rows].index("cot-exp") + 1
+            await pilot.press(str(index))
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            evidence = [
+                line
+                for line in app.screen.summary_text.plain.splitlines()
+                if line.startswith("  ") and "runs of cot-exp" not in line and line.strip()
+            ]
+            assert evidence, "the evidence did not wrap, so there is nothing to check"
+            assert all(line.startswith("  ") for line in evidence)
+
+
+class TestCountsAreSpelledForTheirNumber:
+    """The two counts that were not. Everything else in this codebase carries the
+    `"" if n == 1 else "s"` idiom -- including, in `render_nodes`, twenty-four lines
+    below the offender."""
+
+    @staticmethod
+    def _nodes_line(text):
+        for line in text.splitlines():
+            if "below" in line and "omitted" in line:
+                return line
+        return ""
+
+    def test_the_plain_node_screen(self):
+        from slurmpast.report import Style, render_nodes
+
+        line = self._nodes_line(render_nodes(History(history()), style=Style(enabled=False)))
+        assert "1 node below" in line, line
+        assert "1 nodes" not in line
+
+    @pytest.mark.asyncio
+    async def test_the_dashboard_node_screen(self):
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(120, 44)) as pilot:
+            await pilot.pause()
+            await pilot.press("n")
+            await pilot.pause()
+            # From the screen, not the widget: `Static.renderable` exists in
+            # textual 0.89 and not in 8.x, and CI runs both.
+            text = app.screen.summary_text.plain
+        line = self._nodes_line(text)
+        assert "1 node below" in line, line
+        assert "1 nodes" not in line
