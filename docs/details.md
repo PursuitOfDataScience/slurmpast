@@ -36,7 +36,8 @@ these is a regression test in `tests/test_portability.py`:
 | **`gres/gpuutil`** is gathered wherever `gres.conf` sets `AutoDetect=nvml` | real GPU utilization and peak HBM where recorded — and the idle-GPU finding becomes a measurement instead of an inference from host CPU |
 | **`JobAcctGatherType`** decides what MaxRSS *is* | `jobacct_gather/cgroup` gives a genuine high-water mark, so the "double-counts shared pages" warning is withheld there rather than repeated |
 | **`StdOut`/`StdErr`** exist from Slurm 21.08 | used, with `%j`/`%A`/`%a`/`%x`/`%N` expanded, before falling back to guessing a filename |
-| **`--me`** needs Slurm 20.02 | falls back to `-u <you>`, not to an unfiltered `squeue` over the whole cluster |
+| **`--me`** needs Slurm 20.02 | falls back to `-u <you>`, not to an unfiltered `squeue` over the whole cluster — and is only asked when the account being reconciled *is* yours, so `-u alice` does not check alice's records against your queue |
+| **`PrivateData=jobs`** hides other accounts | `-u alice` and `--all-users` are one flag either way; at such a site sacct returns an empty set with no error, so the "no jobs for alice" line names the scope it asked about rather than reading as your own quiet window |
 | **Accounting may be off**, or `sacct` absent | a one-line explanation and exit 2, never a traceback; the query has a timeout so an unreachable `slurmdbd` cannot hang the dashboard |
 
 `slurmpast --demo` pins a synthetic cluster config too, so the demo looks the

@@ -67,8 +67,8 @@ def group_key(job):
     in. Resource *magnitudes* are deliberately excluded: raising --mem must not
     fork the history you are trying to learn from.
 
-    The owner is part of that identity. ``sacct -u`` takes a comma-separated list
-    and ``--allusers`` spans the cluster, so a multi-user query is one flag away --
+    The owner is part of that identity. ``-u`` takes a comma-separated list and
+    ``--all-users`` spans the cluster, so a multi-user query is one flag away --
     and without the user in the key, two people's unrelated ``run.sh`` on one
     partition became a single fabricated workload. That is not a cosmetic merge:
     the pattern detector then reported "18 of 18 runs of run.sh failed; stop

@@ -25,6 +25,8 @@ slurmpast              # dashboard, last 7 days
 slurmpast --sizing     # what to request next time, per workload
 slurmpast 51170455     # one job, every field Slurm recorded
 slurmpast --demo       # no Slurm to hand? synthetic cluster
+slurmpast -u alice     # someone else's history (`-u alice,bob` for several)
+slurmpast --all-users  # every account on the cluster
 sp                     # short alias
 ```
 

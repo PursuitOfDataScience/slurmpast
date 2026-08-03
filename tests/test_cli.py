@@ -286,6 +286,70 @@ class TestTheDemoHonoursEveryNarrowingFlag:
         assert json.loads(capsys.readouterr().out)["jobs"][0]["identity"]["job_id"] == "5100001"
 
 
+class TestWhoTheQueryIsAbout:
+    """`_load` collapsed the scope with `args.user or getpass.getuser()`, which made
+    `Sacct.history`'s `--allusers` branch unreachable from the CLI -- and there was
+    no flag for it either, while `patterns.group_key` documented a multi-user query
+    as "one flag away".
+    """
+
+    class _Recorder:
+        """Stands in for Sacct: records the kwargs and reports an empty window,
+        which `_load` turns into the SacctError carrying the scope it asked about."""
+
+        def __init__(self):
+            self.kwargs = None
+
+        def history(self, **kwargs):
+            self.kwargs = kwargs
+            return []
+
+    def _scope(self, *argv):
+        sacct = self._Recorder()
+        args = cli.build_parser().parse_args(list(argv))
+        with pytest.raises(SacctError) as caught:
+            cli._load(args, sacct)
+        return sacct.kwargs, str(caught.value)
+
+    def test_all_users_reaches_the_allusers_branch(self):
+        kwargs, message = self._scope("--all-users")
+        assert kwargs["all_users"] is True
+        assert kwargs["user"] is None
+        assert "any user" in message
+
+    def test_a_named_user_is_queried_and_named_back(self):
+        kwargs, message = self._scope("-u", "alice")
+        assert kwargs["all_users"] is False
+        assert kwargs["user"] == "alice"
+        # A site with PrivateData=jobs answers with an empty set and no error, so
+        # this line is the only thing telling the reader whose window came back.
+        assert "no jobs for alice" in message
+
+    def test_a_list_of_users_is_handed_to_sacct_whole(self):
+        kwargs, _ = self._scope("-u", "alice,bob")
+        assert kwargs["user"] == "alice,bob"
+
+    def test_no_flag_still_means_me(self):
+        import getpass
+
+        kwargs, _ = self._scope()
+        assert kwargs["user"] == getpass.getuser()
+        assert kwargs["all_users"] is False
+
+    def test_the_two_flags_contradict_rather_than_one_winning_silently(self, capsys):
+        with pytest.raises(SystemExit) as caught:
+            run("--all-users", "-u", "alice")
+        assert caught.value.code == 2
+        assert "pick one" in capsys.readouterr().err
+
+    def test_the_demo_offers_the_flag_too(self, capsys):
+        """Every synthetic job is user `youzhi`, so --all-users must not narrow."""
+        run("--demo", "--overview", "--json", "--no-color")
+        everything = json.loads(capsys.readouterr().out)["summary"]["jobs"]
+        run("--demo", "--all-users", "--overview", "--json", "--no-color")
+        assert json.loads(capsys.readouterr().out)["summary"]["jobs"] == everything
+
+
 class TestSizingHonoursTheSort:
     """`--sort` is documented as "workload ordering" with no exception, and
     `--sizing` is a workload-ordered, truncated list -- whose own note says "the

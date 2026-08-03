@@ -325,6 +325,54 @@ class TestStateFilterNeedsEndTime:
         assert args[args.index("--state") + 1] == "FAILED,TIMEOUT"
 
 
+class TestWhoTheQueryIsAbout:
+    """`--allusers` existed in `history` but nothing could reach it: the CLI ran
+    `args.user or getpass.getuser()`, so the empty-string sentinel became your own
+    name and `-u ""` reported *your* jobs while looking like it asked for everyone's.
+    """
+
+    def _captured(self, **kwargs):
+        calls = []
+
+        def runner(args):
+            calls.append(args)
+            return ""
+
+        Sacct(runner=runner, probe=" ".join(_FIELDS_FOR_TEST)).history(**kwargs)
+        return calls[0]
+
+    def test_one_user(self):
+        args = self._captured(user="alice", since="-7days")
+        assert args[args.index("-u") + 1] == "alice"
+        assert "--allusers" not in args
+
+    def test_a_comma_separated_list_goes_through_untouched(self):
+        """`sacct -u` takes a list; splitting it here would only be able to
+        re-join it."""
+        args = self._captured(user="alice,bob", since="-7days")
+        assert args[args.index("-u") + 1] == "alice,bob"
+
+    def test_all_users_spans_the_cluster(self):
+        args = self._captured(all_users=True, since="-7days")
+        assert "--allusers" in args
+        assert "-u" not in args
+
+    def test_all_users_wins_over_a_leftover_user(self):
+        args = self._captured(all_users=True, user="alice", since="-7days")
+        assert "--allusers" in args
+        assert "-u" not in args
+
+    def test_the_empty_string_is_still_the_older_spelling_of_all_users(self):
+        args = self._captured(user="", since="-7days")
+        assert "--allusers" in args
+        assert "-u" not in args
+
+    def test_no_user_at_all_lets_sacct_default_to_the_caller(self):
+        args = self._captured(since="-7days")
+        assert "-u" not in args
+        assert "--allusers" not in args
+
+
 class TestSentinelsAreNotNames:
     """The sentinel table is a claim about a measurement, not about a name.
 

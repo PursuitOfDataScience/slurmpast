@@ -14,6 +14,7 @@ from datetime import datetime
 import pytest
 
 from slurmpast import logs, model
+from slurmpast import sacct as sacct_mod
 from slurmpast.duration import parse_bytes
 from slurmpast.nodes import expand_nodelist
 from slurmpast.sacct import (
@@ -1175,19 +1176,52 @@ class TestCommentLogPaths:
 
 
 class TestSqueueReconciliation:
-    def test_the_fallback_asks_for_one_user_not_the_whole_cluster(self):
-        """`--me` arrived in Slurm 20.02. The old fallback dropped the filter
-        entirely, which on a busy cluster returns every queued job there is."""
+    @staticmethod
+    def _recorder(fail_on_me=False):
         calls = []
 
         def runner(args):
             calls.append(args)
-            if "--me" in args:
+            if fail_on_me and "--me" in args:
                 raise SacctError("squeue: unrecognized option '--me'")
             return "123\n456\n"
 
+        return runner, calls
+
+    def test_the_fallback_asks_for_one_user_not_the_whole_cluster(self, monkeypatch):
+        """`--me` arrived in Slurm 20.02. The old fallback dropped the filter
+        entirely, which on a busy cluster returns every queued job there is."""
+        monkeypatch.setattr(sacct_mod.getpass, "getuser", lambda: "alice")
+        runner, calls = self._recorder(fail_on_me=True)
+
         assert live_job_ids(runner=runner, user="alice") == {"123", "456"}
         assert calls[1] == ["squeue", "--noheader", "-u", "alice", "--format=%i"]
+
+    def test_another_users_records_are_never_checked_against_my_queue(self, monkeypatch):
+        """`--me` used to be tried first unconditionally, so on every Slurm since
+        20.02 -- all of them -- `-u alice` reconciled alice's RUNNING records
+        against *my* queue and the `user` argument was dead. Only the fallback
+        branch had a test, so it read as working."""
+        monkeypatch.setattr(sacct_mod.getpass, "getuser", lambda: "bob")
+        runner, calls = self._recorder()
+
+        assert live_job_ids(runner=runner, user="alice") == {"123", "456"}
+        assert calls == [["squeue", "--noheader", "-u", "alice", "--format=%i"]]
+        assert not any("--me" in c for c in calls)
+
+    def test_my_own_query_still_prefers_me(self, monkeypatch):
+        monkeypatch.setattr(sacct_mod.getpass, "getuser", lambda: "bob")
+        runner, calls = self._recorder()
+
+        assert live_job_ids(runner=runner) == {"123", "456"}
+        assert calls == [["squeue", "--noheader", "--me", "--format=%i"]]
+
+    def test_all_users_asks_the_whole_cluster_on_purpose(self, monkeypatch):
+        monkeypatch.setattr(sacct_mod.getpass, "getuser", lambda: "bob")
+        runner, calls = self._recorder()
+
+        assert live_job_ids(runner=runner, all_users=True) == {"123", "456"}
+        assert calls == [["squeue", "--noheader", "--format=%i"]]
 
     def test_no_squeue_at_all_returns_none_so_nothing_is_guessed(self):
         def broken(_args):

@@ -1,9 +1,69 @@
 # slurmpast — audit and resolution
 
+> **Round four, 2026-08-03, from `4d47d4d`.** Not a sweep — two defects, both
+> surfaced by one user question ("does slurmpast support me looking at other users'
+> past jobs?"). The answer was yes, and asking it found that the multi-user path
+> was half-built: a `--allusers` branch nothing could reach, and a `user` argument
+> that every modern Slurm ignored. 1,083 tests before, **1,098 after**. `ruff`,
+> `ruff format` and `mypy` clean.
+>
 > **Round three, 2026-07-31, from `7f32b1a`.** Thirteen defects found, thirteen
 > upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
 > was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
 > and its control. `ruff`, `ruff format` and `mypy` clean.
+
+---
+
+## Round four — the multi-user path
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `--allusers` existed but nothing could reach it, and no flag offered it | `cli._load` / `cli.build_parser` | `TestWhoTheQueryIsAbout` (`test_cli.py`) |
+| 2 | `live_job_ids` ignored its `user` argument on every Slurm since 20.02 | `sacct.live_job_ids` | `TestSqueueReconciliation` (`test_portability.py`) |
+
+### 1. `--all-users` reaches the branch that was already written
+
+`Sacct.history` had `elif user == "": extra += ["--allusers"]`. `_load` then scoped
+the query with `args.user or getpass.getuser()`, so the empty-string sentinel became
+your own name before it ever arrived: `-u ""` reported **your** jobs while reading as
+a request for everyone's. There was no flag for it either — while `patterns.group_key`
+carried the user in the key specifically because "`--allusers` spans the cluster, so a
+multi-user query is one flag away". The flag did not exist.
+
+`--all-users` now exists and routes to that branch; `--all-users` together with `-u`
+exits 2 rather than letting one win silently and scoping the output to something the
+reader did not ask for. Verified on Midway3: 80,027 jobs across 1,612 workloads in a
+two-day window, against 1,730 in 100 workloads for a single other account.
+
+The empty-string spelling still works, since 0.4.0 shipped it as public API.
+
+### 2. `--me` is only asked about me
+
+`live_job_ids` tried `squeue --me` first **unconditionally** and fell back to
+`-u <who>` only when that raised. `--me` has been in Slurm since 20.02, so on every
+release anyone runs, the fallback never fired and the `user` argument was dead code:
+`-u alice` reconciled alice's RUNNING records against *my* queue.
+
+It read as working because the only test covered the fallback — it stubbed a runner
+that **raises on `--me`**, which is the one condition under which the argument was
+honoured. The `--me` attempt is now made only when the account being reconciled is
+the caller's own; `--all-users` asks an unfiltered `squeue` on purpose, which is the
+same command the docstring warns about as an accident.
+
+Contained rather than harmless today: `_mark_open_records` only tests the result for
+`None`, so a wrong-account answer changed no output. It was one caller away from
+mattering, and three new tests pin each branch.
+
+### Consequence for the numbers
+
+None for a single-user query, which is the default and what every previous round
+measured. `--all-users` is new surface: `patterns.group_key` already carried the
+owner, so cross-account queries group per user rather than fabricating one shared
+workload out of two people's `run.sh`.
+
+---
+
+# Round three — everything below this line
 
 ## Rounds one and two — verified closed before anything new was looked for
 

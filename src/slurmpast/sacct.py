@@ -625,12 +625,23 @@ class Sacct:
             return []
         return self._query(["-j", ",".join(ids)])
 
-    def history(self, user=None, since=None, until=None, states=None, partition=None):
+    def history(
+        self, user=None, since=None, until=None, states=None, partition=None, all_users=False
+    ):
+        """History for one user, a comma-separated list of them, or the cluster.
+
+        ``-u`` takes a list, so ``user="alice,bob"`` is handed straight through.
+        ``all_users=True`` spans the cluster; ``user=""`` is the older spelling of
+        the same request and still honoured. Whether you can actually *see* another
+        account's jobs is the site's call, not ours: with ``PrivateData=jobs`` in
+        slurm.conf sacct returns an empty set rather than an error, which is why
+        the CLI names the user it asked about when it reports nothing found.
+        """
         extra = []
-        if user:
-            extra += ["-u", user]
-        elif user == "":
+        if all_users or user == "":
             extra += ["--allusers"]
+        elif user:
+            extra += ["-u", user]
         if since:
             extra += ["-S", since]
         if states:
@@ -648,8 +659,8 @@ class Sacct:
         return self._query(extra)
 
 
-def live_job_ids(runner=None, user=None):
-    """Job IDs squeue currently reports for this user.
+def live_job_ids(runner=None, user=None, all_users=False):
+    """Job IDs squeue currently reports for the account being reconciled.
 
     Distinguishes a genuinely running job from a stale accounting record: if
     sacct says RUNNING and squeue has never heard of it, the record is dead.
@@ -660,13 +671,26 @@ def live_job_ids(runner=None, user=None):
     as ``-u <user>``. It used to fall back to an unfiltered ``squeue``, which on a
     busy cluster is tens of thousands of rows to answer a question about one
     user's jobs.
+
+    ``--me`` is only asked when the account being reconciled *is* mine. It used to
+    be tried first unconditionally, so on every Slurm since 20.02 -- which is to
+    say all of them -- ``-u alice`` checked alice's RUNNING records against *my*
+    queue and the ``user`` argument was silently dead. Only the fallback branch was
+    covered by a test, which is why it read as working.
     """
     run = runner or _run
-    who = user or getpass.getuser()
-    for args in (
-        ["squeue", "--noheader", "--me", "--format=%i"],
-        ["squeue", "--noheader", "-u", who, "--format=%i"],
-    ):
+    me = getpass.getuser()
+    who = user or me
+    attempts = []
+    if all_users or user == "":
+        # Deliberately unfiltered, unlike the accident above: the caller asked
+        # about every account, so a cluster-wide queue is the honest answer.
+        attempts.append(["squeue", "--noheader", "--format=%i"])
+    else:
+        if who == me:
+            attempts.append(["squeue", "--noheader", "--me", "--format=%i"])
+        attempts.append(["squeue", "--noheader", "-u", who, "--format=%i"])
+    for args in attempts:
         try:
             out = run(args)
         except SacctError:

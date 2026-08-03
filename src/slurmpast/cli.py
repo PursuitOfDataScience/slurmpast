@@ -31,6 +31,8 @@ examples:
   slurmpast --failed --plain       everything that died, as text
   slurmpast --patterns             what keeps failing, across runs
   slurmpast --nodes                which nodes eat your jobs
+  slurmpast -u alice,bob           someone else's history, or several
+  slurmpast --all-users --nodes    every account on the cluster
   slurmpast 51170455 --json        machine readable
 
 `sp` is a short alias for the same entry point.
@@ -62,7 +64,17 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("job_ids", nargs="*", help="job ids to examine")
-    parser.add_argument("-u", "--user", default=None, help="user to query (default: you)")
+    parser.add_argument(
+        "-u",
+        "--user",
+        default=None,
+        help="user to query, or a comma-separated list of them (default: you)",
+    )
+    parser.add_argument(
+        "--all-users",
+        action="store_true",
+        help="every account on the cluster, not just yours",
+    )
     parser.add_argument(
         "-S",
         "--since",
@@ -186,7 +198,7 @@ def _glue_negative_values(argv):
     return out
 
 
-def _mark_open_records(jobs, runner=None, user=None):
+def _mark_open_records(jobs, runner=None, user=None, all_users=False):
     """Reconcile anything unfinished against squeue.
 
     sacct reports State=RUNNING with End=Unknown for jobs that died long ago;
@@ -200,7 +212,7 @@ def _mark_open_records(jobs, runner=None, user=None):
     """
     if not any(j.base_state == "RUNNING" or j.open_ended for j in jobs):
         return jobs
-    if live_job_ids(runner=runner, user=user) is None:
+    if live_job_ids(runner=runner, user=user, all_users=all_users) is None:
         return jobs  # cannot tell -- do not guess
     return [
         j._replace(open_ended=True) if (j.base_state == "RUNNING" or j.open_ended) else j
@@ -262,7 +274,8 @@ def _load(args, sacct):
             raise SacctError("no accounting records for: %s" % ", ".join(args.job_ids))
         return _mark_open_records(jobs, runner=runner, user=args.user)
 
-    user = args.user or getpass.getuser()
+    all_users = getattr(args, "all_users", False)
+    user = None if all_users else (args.user or getpass.getuser())
     # DEADLINE alongside the rest: `Job.failed` counts it, so leaving it out here
     # meant `--failed` quietly excluded a state the tool calls a failure everywhere
     # else.
@@ -272,14 +285,26 @@ def _load(args, sacct):
         else None
     )
     jobs = sacct.history(
-        user=user, since=args.since, until=args.until, states=states, partition=args.partition
+        user=user,
+        since=args.since,
+        until=args.until,
+        states=states,
+        partition=args.partition,
+        all_users=all_users,
     )
     if not jobs:
+        # Name the scope. A site with `PrivateData=jobs` answers `-u alice` with an
+        # empty set and no error, so "no jobs for alice" is the only thing telling
+        # the reader they got someone else's window and not their own.
         raise SacctError(
             "no jobs for %s since %s%s"
-            % (user, args.since, " matching --failed" if args.failed else "")
+            % (
+                "any user" if all_users else user,
+                args.since,
+                " matching --failed" if args.failed else "",
+            )
         )
-    return _mark_open_records(jobs, runner=runner, user=user)
+    return _mark_open_records(jobs, runner=runner, user=user, all_users=all_users)
 
 
 def _logs_for_all(targets, args):
@@ -503,7 +528,13 @@ def _job_json(job, log_path, verdict):
 
 def main(argv=None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    args = build_parser().parse_args(_glue_negative_values(raw))
+    parser = build_parser()
+    args = parser.parse_args(_glue_negative_values(raw))
+    if args.all_users and args.user:
+        # Contradictory rather than ordered: silently letting one win means the
+        # output is scoped to something the reader did not ask for, and nothing on
+        # screen says which of the two flags was ignored.
+        parser.error("--all-users and -u/--user ask for different things; pick one")
     args.since = normalize_time_spec(args.since)
     args.until = normalize_time_spec(args.until)
     if args.demo:
