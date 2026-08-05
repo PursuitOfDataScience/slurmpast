@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import re
 import subprocess
 
 from .duration import mem_scope, parse_bytes, parse_duration
@@ -709,5 +710,53 @@ def live_job_ids(runner=None, user=None, all_users=False):
             out = run(args)
         except SacctError:
             continue
-        return {line.strip() for line in out.splitlines() if line.strip()}
+        return _expand_job_ids(out)
     return None
+
+
+# The `%N` simultaneous-task throttle Slurm writes back into a pending array's id:
+# `--array=0-9%2` comes out of squeue as `900_[0-9%2]`. Stripped before expansion --
+# see _expand_job_ids.
+_ARRAY_THROTTLE = re.compile(r"%\d+")
+
+
+def _expand_job_ids(text):
+    """squeue's ``%i`` column as a set of individual job ids.
+
+    ``%i`` does not print one id per pending array task -- it prints the *range*:
+    ``900_[5-10]``, the same bracketed grammar Slurm uses for hostlists and
+    :func:`slurmpast.nodes.expand_nodelist` already parses (differential-tested
+    against ``scontrol show hostnames``). A running element appears as its own
+    ``900_5``, so a queue holding both spellings at once is the ordinary case.
+
+    Without expansion the membership test in ``cli._mark_open_records`` misses
+    every pending element, and since round five *uses* that answer rather than
+    discarding it, the miss became an assertion: a task sitting in the queue right
+    now was reported as "squeue has never heard of it, so the job is long gone and
+    the record was never closed". Inventing a claim about a job that is plainly
+    queued is the one thing this codebase's rules are written to prevent, and it
+    was one parse away.
+
+    The ``%N`` array throttle is dropped before expanding. Slurm writes
+    ``--array=0-9%2`` back *inside* the brackets -- ``900_[0-9%2]`` -- and left in
+    place it defeats the expansion silently rather than loudly: ``0-9%2`` is not a
+    numeric range, so the range parser keeps it verbatim as one unmatched name and
+    every element of a throttled array goes on being called dead.
+
+    Anything that is not a bracketed range passes through unchanged, so a plain
+    id, a heterogeneous ``500+1`` and an unfamiliar spelling all still match
+    themselves. The raw token is kept either way, so nothing is lost by failing to
+    understand a spelling -- the id simply matches only itself, which is what the
+    whole set did before.
+    """
+    from .nodes import expand_nodelist
+
+    ids = set()
+    for line in text.splitlines():
+        token = line.strip()
+        if not token:
+            continue
+        ids.add(token)
+        if "[" in token:
+            ids.update(expand_nodelist(_ARRAY_THROTTLE.sub("", token)))
+    return ids

@@ -1420,3 +1420,53 @@ class TestTextWidthNeverExceedsTheTerminal:
                 raise RuntimeError("not mounted")
 
         assert tui._text_width(Unmounted(100, None)) == 100 - tui._SCROLLBAR
+
+
+class TestTheNodesScreenSentencesAreShared:
+    """Round six. Both screens draw these sentences and each spelled them out for
+    itself, so they drifted -- `report` said "below threshold", `tui` said "below
+    sample threshold" -- and when round five wrapped the prose above them it
+    wrapped `report`'s copy only. They live in `render` now, which is what that
+    module is for.
+    """
+
+    def test_both_front_ends_use_render_for_the_baseline_sentence(self):
+        import inspect
+
+        from slurmpast import report, tui
+
+        for module in (report, tui):
+            source = inspect.getsource(module)
+            assert "nodes_baseline" in source, module.__name__
+            assert "baseline %s over %d placements" not in source, (
+                "%s spells the sentence out again instead of sharing it" % module.__name__
+            )
+
+    def test_both_front_ends_use_render_for_the_empty_reasons(self):
+        import inspect
+
+        from slurmpast import report, tui
+
+        for module in (report, tui):
+            source = inspect.getsource(module)
+            assert "nodes_empty_reason" in source, module.__name__
+            assert "so there is nothing" not in source, (
+                "%s still carries its own copy of the empty-table sentence" % module.__name__
+            )
+
+    def test_the_empty_reason_carries_the_workload_name_it_controlled_on(self):
+        """The control: sharing the sentence must not drop what it says. The name
+        is the reason the line is unbounded, and also the reason it is worth
+        printing -- a reader has to know which workload found nothing."""
+        from slurmpast.render import nodes_empty_reason
+
+        table = {"hits": 0, "rows": [], "skipped_nodes": 3}
+        assert "for cot-exp" in nodes_empty_reason(table, "hang", "cot-exp")
+        assert "hangs" in nodes_empty_reason(table, "hang", None)
+        assert "for" not in nodes_empty_reason(table, "hang", None).split("recorded")[1][:6]
+
+    def test_a_table_with_rows_has_no_empty_reason(self):
+        from slurmpast.render import nodes_empty_reason
+
+        table = {"hits": 4, "rows": [{"node": "n1"}], "skipped_nodes": 0}
+        assert nodes_empty_reason(table, "hang", "cot-exp") == ""
