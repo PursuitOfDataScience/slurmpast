@@ -1369,3 +1369,54 @@ class TestProseIsWrappedToTheWidgetNotTheScreen:
             body = screen.query_one("#body", Static)
             assert body.size.width < screen.size.width, "no gap left to get wrong"
             assert tui._prose_width(screen, 8) == body.size.width - 8
+
+
+class TestTextWidthNeverExceedsTheTerminal:
+    """A Static can be sized to its *content* rather than to its container, and
+    then reports a width wider than the terminal. Trusting it wraps text off the
+    right-hand edge — which is what Textual 0.89 does with `WorkloadScreen`'s
+    `#summary`, sending the banner out at 83 cells on a 70-cell screen.
+
+    Pinned here against a stub rather than against a Textual version, so it holds
+    on every release in the supported range instead of only the one CI happens to
+    resolve.
+    """
+
+    class _Size:
+        def __init__(self, width):
+            self.width = width
+
+    class _Widget:
+        def __init__(self, width):
+            self.size = TestTextWidthNeverExceedsTheTerminal._Size(width)
+
+    class _Screen:
+        def __init__(self, screen_width, widget_width):
+            self.size = TestTextWidthNeverExceedsTheTerminal._Size(screen_width)
+            self.app = self
+            self._widget_width = widget_width
+
+        def query(self, _selector):
+            if self._widget_width is None:
+                return []
+            return [TestTextWidthNeverExceedsTheTerminal._Widget(self._widget_width)]
+
+    @pytest.mark.parametrize("widget_width", [None, 0, 40, 96, 120, 4096])
+    def test_it_is_never_wider_than_the_screen_less_its_chrome(self, widget_width):
+        screen = self._Screen(100, widget_width)
+        assert tui._text_width(screen) <= 100 - tui._SCROLLBAR
+
+    def test_a_container_sized_widget_is_still_preferred(self):
+        """The control: the whole point is to use the widget when it is narrower,
+        because that is the two cells the screen measurement was missing."""
+        assert tui._text_width(self._Screen(100, 96)) == 96
+
+    def test_an_unmounted_screen_falls_back_instead_of_raising(self):
+        """`WorkloadScreen.on_mount` builds its banner before the screen is in the
+        DOM, where querying it raises."""
+
+        class Unmounted(self._Screen):
+            def query(self, _selector):
+                raise RuntimeError("not mounted")
+
+        assert tui._text_width(Unmounted(100, None)) == 100 - tui._SCROLLBAR

@@ -249,21 +249,30 @@ def _text_width(screen) -> int:
     -- the orphan at column 0 that ``_prose_width`` exists to prevent, surviving
     inside it because the chrome was guessed rather than read.
 
-    The screen stays as the fallback for the moment before the first layout pass,
-    when the widget has no size at all -- and for the moment before *mount*, when
-    querying the screen at all raises because it is not in the DOM yet, which
-    `WorkloadScreen` does reach: its ``on_mount`` builds the banner. Callers render
-    again after the first layout pass (see ``JobScreen.on_mount``) so neither guess
+    The screen is the *ceiling*, not merely a fallback, and that is load-bearing: a
+    Static can be sized to its content rather than to its container, in which case
+    it reports a width WIDER than the terminal and trusting it wraps text off the
+    right-hand edge. Textual 0.89 does exactly that with ``WorkloadScreen``'s
+    ``#summary`` -- caught by CI's oldest-supported-Textual job, which had the
+    banner going out at 83 cells on a 70-cell screen. So: the narrower of what the
+    widget claims and what the terminal has.
+
+    It is also the fallback for the two moments there is nothing to measure -- before
+    the first layout pass, when the widget has no size at all, and before *mount*,
+    when querying the screen raises because it is not in the DOM yet (which
+    ``WorkloadScreen`` reaches: its ``on_mount`` builds the banner). Callers render
+    again after the first layout pass, see ``JobScreen.on_mount``, so neither guess
     survives to the screen.
     """
+    screen_width = screen.size.width or screen.app.size.width or _DEFAULT_TABLE_WIDTH
+    ceiling = max(0, screen_width - _SCROLLBAR)
     try:
         for widget in screen.query("#body, #summary"):
             if widget.size.width:
-                return widget.size.width
-    except Exception:  # not mounted yet; the fallback below is the honest answer
+                return min(widget.size.width, ceiling)
+    except Exception:  # not mounted yet; the ceiling is the honest answer
         pass
-    width = screen.size.width or screen.app.size.width or _DEFAULT_TABLE_WIDTH
-    return max(0, width - _SCROLLBAR)
+    return ceiling
 
 
 def _prose_width(screen, indent: int) -> int:
