@@ -5,7 +5,7 @@
 > running the code before it was written down, and two candidates withdrawn on
 > re-verification and said so. All ten fixed here, along with every minor item and
 > the **Open** gauge entry below, which a second reviewer has now raised. 1,098
-> tests before, **1150 after**. `ruff`, `ruff format` and `mypy` clean.
+> tests before, **1166 after**. `ruff`, `ruff format` and `mypy` clean.
 >
 > > **Round four, 2026-08-03, from `4d47d4d`.** Not a sweep — two defects, both
 > surfaced by one user question ("does slurmpast support me looking at other users'

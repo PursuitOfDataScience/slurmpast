@@ -1312,3 +1312,111 @@ class TestOnlyPathsAreElidedLikePaths:
         path = "/scratch/midway3/youzhi/runs/cot-exp/logs/slurm-51170455.out"
         elided = tui._elide(path, keep=46)
         assert elided == "/scratch/…/slurm-51170455.out"
+
+
+class TestProseIsWrappedToTheWidgetNotTheScreen:
+    """`_prose_width` subtracted a constant `_SCROLLBAR = 2` from the *screen*
+    width, and `JobScreen`'s `#body` is 96 cells inside a 100-cell screen. So a
+    finding wrapped to 90 was drawn at 8 + 90 = 98, Textual soft-wrapped the last
+    word to column 0, and the indent separating evidence from its heading was lost
+    — which is the exact failure `_prose_width` was written to stop, surviving in
+    it because the constant was guessed rather than measured.
+
+    Reproduced on the node-history finding, whose evidence is the longest the
+    dashboard draws: "midway3-0385 failed 12 of your 12 jobs there (100.0%, 95% CI
+    75.7-100.0%) against 25.0% on every other node for cot-exp."
+    """
+
+    @staticmethod
+    async def _open_a_job_with_a_long_finding(pilot, app):
+        await pilot.pause()
+        for key in ("f", "2", "enter", "down", "enter", "end"):
+            await pilot.press(key)
+            await pilot.pause()
+        return app.screen
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("width", [70, 80, 100, 120])
+    async def test_no_body_line_is_wider_than_the_body(self, width):
+        from textual.widgets import Static
+
+        from slurmpast.demo import history as demo
+
+        app = make_app(demo(), no_logs=True)
+        async with app.run_test(size=(width, 40)) as pilot:
+            screen = await self._open_a_job_with_a_long_finding(pilot, app)
+            body = screen.query_one("#body", Static)
+            assert body.size.width, "the body must be laid out before this means anything"
+            for strip in screen._compositor.render_strips():
+                text = "".join(cell.text for cell in strip).rstrip()
+                assert len(text) <= width, "%d cells on a %d-cell screen: %r" % (
+                    len(text),
+                    width,
+                    text,
+                )
+
+    @pytest.mark.asyncio
+    async def test_the_width_comes_from_the_body_not_the_screen(self):
+        """The control on the mechanism, not just the symptom: the two numbers are
+        different, and the wrap has to use the smaller one."""
+        from textual.widgets import Static
+
+        from slurmpast.demo import history as demo
+
+        app = make_app(demo(), no_logs=True)
+        async with app.run_test(size=(100, 40)) as pilot:
+            screen = await self._open_a_job_with_a_long_finding(pilot, app)
+            body = screen.query_one("#body", Static)
+            assert body.size.width < screen.size.width, "no gap left to get wrong"
+            assert tui._prose_width(screen, 8) == body.size.width - 8
+
+
+class TestTextWidthNeverExceedsTheTerminal:
+    """A Static can be sized to its *content* rather than to its container, and
+    then reports a width wider than the terminal. Trusting it wraps text off the
+    right-hand edge — which is what Textual 0.89 does with `WorkloadScreen`'s
+    `#summary`, sending the banner out at 83 cells on a 70-cell screen.
+
+    Pinned here against a stub rather than against a Textual version, so it holds
+    on every release in the supported range instead of only the one CI happens to
+    resolve.
+    """
+
+    class _Size:
+        def __init__(self, width):
+            self.width = width
+
+    class _Widget:
+        def __init__(self, width):
+            self.size = TestTextWidthNeverExceedsTheTerminal._Size(width)
+
+    class _Screen:
+        def __init__(self, screen_width, widget_width):
+            self.size = TestTextWidthNeverExceedsTheTerminal._Size(screen_width)
+            self.app = self
+            self._widget_width = widget_width
+
+        def query(self, _selector):
+            if self._widget_width is None:
+                return []
+            return [TestTextWidthNeverExceedsTheTerminal._Widget(self._widget_width)]
+
+    @pytest.mark.parametrize("widget_width", [None, 0, 40, 96, 120, 4096])
+    def test_it_is_never_wider_than_the_screen_less_its_chrome(self, widget_width):
+        screen = self._Screen(100, widget_width)
+        assert tui._text_width(screen) <= 100 - tui._SCROLLBAR
+
+    def test_a_container_sized_widget_is_still_preferred(self):
+        """The control: the whole point is to use the widget when it is narrower,
+        because that is the two cells the screen measurement was missing."""
+        assert tui._text_width(self._Screen(100, 96)) == 96
+
+    def test_an_unmounted_screen_falls_back_instead_of_raising(self):
+        """`WorkloadScreen.on_mount` builds its banner before the screen is in the
+        DOM, where querying it raises."""
+
+        class Unmounted(self._Screen):
+            def query(self, _selector):
+                raise RuntimeError("not mounted")
+
+        assert tui._text_width(Unmounted(100, None)) == 100 - tui._SCROLLBAR

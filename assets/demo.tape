@@ -1,5 +1,18 @@
-# slurmpast demo — render with:  vhs assets/demo.tape   (produces assets/demo.gif)
-# Requires https://github.com/charmbracelet/vhs  (conda: vhs ttyd ffmpeg)
+# slurmpast demo — an ALTERNATIVE recorder, for real keystroke animation.
+#
+#   vhs assets/demo.tape            (overwrites assets/demo.gif)
+#   Requires https://github.com/charmbracelet/vhs  (conda: vhs ttyd ffmpeg)
+#
+# The GIF actually committed to assets/ is built by `python tools/demo_gif.py`,
+# which needs none of that toolchain — only what a dev install already brings in.
+# That matters: this tape has never once been run to completion here, which is why
+# assets/demo.gif did not exist for the first several releases while README pointed
+# at it, and the repository's lead image 404'd.
+#
+# The two tell the same story and must be kept in step. If you change the beats in
+# one, change them in the other. Two differences are deliberate, both fixes:
+# after `f` the hung workload is row 2, not 3 (3 is a single-run workload), and the
+# job screen is scrolled to its findings, which are below the fold at 30 rows.
 #
 # Drives the REAL slurmpast dashboard against `--demo`, a synthetic history
 # built into the package (src/slurmpast/demo.py). That keeps the recording
