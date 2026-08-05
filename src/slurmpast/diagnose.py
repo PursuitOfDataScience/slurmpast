@@ -14,7 +14,7 @@ principles, both learned the hard way:
   on the job that was 1,100x over.
 """
 
-from .duration import format_bytes, format_duration, format_percent
+from .duration import format_bytes, format_duration, format_mem_flag, format_percent
 from .model import CRITICAL, INFO, WARNING, Finding, Verdict
 
 # An allocation running longer than this with less than NOOP_CPU_SECONDS of CPU
@@ -88,6 +88,25 @@ def diagnose(job, log_text=None, node_note=None):
     add = findings.append
 
     if job.open_ended:
+        # Three actions, because the tool knows three different things here.
+        # `cli._mark_open_records` asks squeue and records the answer on the job,
+        # so telling every reader to "confirm against squeue" was sending them to
+        # re-run a query the tool had already run -- and, where the answer was
+        # that squeue has never heard of the job, withholding the finding's whole
+        # point: the record is stale, and its 62-day elapsed is an artefact.
+        if job.live is True:
+            action = (
+                "squeue confirms it is still there — a live job, not a stale record. "
+                "Excluded from aggregate totals until it ends."
+            )
+        elif job.live is False:
+            action = (
+                "squeue has never heard of it, so the job is long gone and the record was "
+                "never closed. The elapsed above is an artefact. Excluded from aggregate "
+                "totals."
+            )
+        else:
+            action = "Confirm against squeue. Excluded from aggregate totals."
         add(
             Finding(
                 INFO,
@@ -96,7 +115,7 @@ def diagnose(job, log_text=None, node_note=None):
                 "State=%s with End=Unknown. Elapsed (%s) is measured from start to *now*, "
                 "not a duration this job spent working."
                 % (job.state or "?", format_duration(job.elapsed)),
-                "Confirm against squeue. Excluded from aggregate totals.",
+                action,
             )
         )
 
@@ -247,9 +266,11 @@ def _memory_rules(job, add):
                         format_percent(used),
                         format_bytes(unused),
                     ),
+                    # `format_mem_flag`, not `format_bytes`: the display formatter
+                    # spelled this "--mem=52.0 GiB", which sbatch rejects.
                     "Try --mem=%s (peak plus ~30%%). MaxRSS over-reports "
                     "multi-process jobs, so treat it as an upper bound."
-                    % format_bytes(int(rss * 1.3)),
+                    % format_mem_flag(int(rss * 1.3)),
                 )
             )
 
@@ -331,6 +352,25 @@ def _cpu_rules(job, add):
         )
 
 
+# States that are themselves the explanation for a signal 9, so that "look for a
+# wrapper or watchdog killing it" would send the reader hunting for a phantom
+# alongside the finding that already names the real killer. Slurm reaches for
+# SIGKILL on every one of these once KillWait expires -- `scancel`, the wall
+# clock, an eviction, a cgroup OOM -- so the signal carries no information the
+# state has not already given, and the *action* was the whole value of the rule.
+#
+# Severity is the other half. CANCELLED, PREEMPTED and NODE_FAIL are not graded as
+# failures anywhere else in the tool (`theme.STATE_HEALTH` grades CANCELLED "none"
+# because "colouring it red asserts a judgement the data does not support"), yet a
+# CRITICAL finding here made `slurmpast <jobid>` exit 1 on a run the tool had just
+# called not a failure -- asserting through the exit code what the palette
+# deliberately declines to assert in colour. Same suppression, same reason, as
+# _NOOP_ALREADY_EXPLAINED above.
+_SIGKILL_ALREADY_EXPLAINED = frozenset(
+    ["OUT_OF_MEMORY", "TIMEOUT", "CANCELLED", "PREEMPTED", "NODE_FAIL"]
+)
+
+
 def _exit_rules(job, log_text, add):
     code, signal = job.exit_code, job.signal
     state = job.base_state
@@ -391,15 +431,18 @@ def _exit_rules(job, log_text, add):
                 "activated before the interpreter is invoked.",
             )
         )
-    if signal == 9 or code == 137:
+    if (signal == 9 or code == 137) and state not in _SIGKILL_ALREADY_EXPLAINED:
         add(
             Finding(
                 CRITICAL,
                 "sigkill",
                 "Killed by SIGKILL",
-                "Exit signal 9. Either an out-of-memory kill or an external cancellation; "
-                "Slurm records a cgroup OOM as OUT_OF_MEMORY, and this job is %s." % (state or "?"),
-                "If state is not OUT_OF_MEMORY, look for a wrapper or watchdog killing it.",
+                "Exit signal 9, and nothing in the accounting record accounts for it: the "
+                "state is %s, not OUT_OF_MEMORY, TIMEOUT, CANCELLED, PREEMPTED or NODE_FAIL, "
+                "each of which would name its own killer." % (state or "unrecorded"),
+                "Look for a wrapper or watchdog killing it — a queue system layered over "
+                "Slurm, a `timeout` in the batch script, or the node's own OOM killer "
+                "reaping a process Slurm was not accounting for.",
             )
         )
 

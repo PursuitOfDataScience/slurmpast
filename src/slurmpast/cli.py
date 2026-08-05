@@ -209,13 +209,26 @@ def _mark_open_records(jobs, runner=None, user=None, all_users=False):
     ``runner`` is the same command runner the Sacct instance uses, so a caller
     that injected one is not silently bypassed here and made to shell out for
     real -- which is what a test or a replayed history would have done.
+
+    The ids squeue returns are now *used*, not merely counted. This tested the
+    answer for ``None`` and threw the set away, so the reconciliation this
+    docstring describes -- "if sacct says RUNNING and squeue has never heard of
+    it, the record is dead" -- was never actually performed: every open record was
+    flagged identically whether the job was running this second or had died in
+    March. Both are still excluded from aggregates, because both have an elapsed
+    measured to *now* rather than to an end. What the set buys is the sentence the
+    reader gets: the open-record finding said "Confirm against squeue" about a
+    query the tool had already run and discarded the answer to.
     """
     if not any(j.base_state == "RUNNING" or j.open_ended for j in jobs):
         return jobs
-    if live_job_ids(runner=runner, user=user, all_users=all_users) is None:
+    live = live_job_ids(runner=runner, user=user, all_users=all_users)
+    if live is None:
         return jobs  # cannot tell -- do not guess
     return [
-        j._replace(open_ended=True) if (j.base_state == "RUNNING" or j.open_ended) else j
+        j._replace(open_ended=True, live=j.job_id.split(".")[0] in live)
+        if (j.base_state == "RUNNING" or j.open_ended)
+        else j
         for j in jobs
     ]
 
@@ -268,13 +281,18 @@ def _load(args, sacct):
             raise SacctError("no demo jobs match %s" % " and ".join(asked))
         return jobs
     runner = getattr(sacct, "_run", None)
+    all_users = getattr(args, "all_users", False)
     if args.job_ids:
         jobs = sacct.jobs(args.job_ids)
         if not jobs:
             raise SacctError("no accounting records for: %s" % ", ".join(args.job_ids))
-        return _mark_open_records(jobs, runner=runner, user=args.user)
+        # `all_users` forwarded here too. `-j` goes straight to sacct and ignores
+        # every filter, so `--all-users <someone else's jobid>` returns their
+        # record -- and then reconciled it against `squeue --me`, which has never
+        # heard of their job, so a live job of theirs read as a stale record. Same
+        # latent inconsistency round four fixed one level down in `live_job_ids`.
+        return _mark_open_records(jobs, runner=runner, user=args.user, all_users=all_users)
 
-    all_users = getattr(args, "all_users", False)
     user = None if all_users else (args.user or getpass.getuser())
     # DEADLINE alongside the rest: `Job.failed` counts it, so leaving it out here
     # meant `--failed` quietly excluded a state the tool calls a failure everywhere
@@ -729,7 +747,17 @@ def main(argv=None) -> int:
         matches.sort(key=lambda j: (j.start or j.submit or "", j.job_id), reverse=True)
     # Truncated for the work that costs something per job -- resolving logs and
     # diagnosing. `matches` stays whole so the renderer can say what it left out.
-    targets = matches[: args.limit]
+    #
+    # Only on the *list* branch. `--limit` is documented as "rows in plain output",
+    # and ids the caller typed out are not rows the tool chose to show them: `-n`
+    # defaults to 25, so `slurmpast <30 ids>` printed 25 post-mortems, said nothing
+    # about the other five, and -- because the exit code is computed only over what
+    # was examined -- could not report a CRITICAL on ids 26-30 at all. Nor could
+    # `--json`, which returned a 25-entry array for a 30-id query. Every other
+    # truncation here names its tail (`History.tail_summary`, `nodes.excluded_tail`,
+    # `render_list`'s "... N more"); on this branch no renderer ever does, because
+    # a post-mortem block has nowhere to put such a line.
+    targets = matches if args.job_ids else matches[: args.limit]
 
     if args.json:
         payload = []
@@ -770,6 +798,7 @@ def main(argv=None) -> int:
                 show_steps=args.steps,
                 ascii_mode=args.ascii,
                 log_inferred=inferred,
+                no_logs=args.no_logs,
             )
             print(text)
             worst_critical |= any(f.severity == "critical" for f in verdict.findings)

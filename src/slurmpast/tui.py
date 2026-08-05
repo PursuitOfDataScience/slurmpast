@@ -1160,6 +1160,12 @@ class WorkloadScreen(JobListScreen):
         # a bare number with no basis, and for the reason a different command in a
         # different program. The reason belongs where the number is.
         advice = [a for a in recommend(self._group.jobs) if a.actionable]
+        # 10 cells of "next run  " plus the 22-cell flag column: what the basis has
+        # to start after when it shares the line.
+        basis_column = 32
+        # Below this the basis is a column of three-word lines, and putting it
+        # under the flag instead buys 22 cells back.
+        room = self.size.width - basis_column - 2
         for index, item in enumerate(advice):
             banner.append("\n" if banner.plain else "")
             banner.append("next run  " if index == 0 else "          ", style=theme.FAINT)
@@ -1169,10 +1175,22 @@ class WorkloadScreen(JobListScreen):
             # broken rather than as a sentence that did not fit. Wrapped to the
             # width there is, and continuation lines indent under the text rather
             # than under the flag.
-            lines = render.wrap(item.basis, max(40, self.size.width - 34))
-            banner.append(lines[0], style=theme.DIM)
-            for extra in lines[1:]:
-                banner.append("\n" + " " * 32 + extra, style=theme.DIM)
+            #
+            # `max(40, width - 34)` was the wrong floor: it guaranteed 40 cells of
+            # basis whatever the terminal, so below 74 columns the line ran past
+            # the edge -- 72 cells on a 70-cell screen -- which is the soft-wrap to
+            # column 0 this whole block was rewritten to stop. Where 40 will not
+            # fit beside the flag, the basis drops to the next line and indents
+            # under it.
+            if room >= 40:
+                lines = render.wrap(item.basis, room)
+                banner.append(lines[0], style=theme.DIM)
+                rest, indent = lines[1:], basis_column
+            else:
+                lines = render.wrap(item.basis, _prose_width(self, 12))
+                rest, indent = lines, 12
+            for extra in rest:
+                banner.append("\n" + " " * indent + extra, style=theme.DIM)
         return banner if banner.plain else None
 
     def action_patterns(self) -> None:
@@ -1276,8 +1294,13 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         body.append("\n\n")
 
         # Lead with slurmwatch's row idiom, so a job you watched running looks
-        # like the same object afterwards.
-        for line in render.resource_rows(job, ascii_mode=ascii_mode):
+        # like the same object afterwards. Bounded by the terminal for the same
+        # reason the plain renderer is: the MEM row runs to 86 cells with its
+        # detail inline, and Textual soft-wrapping it puts the tail at column 0,
+        # where it no longer reads as part of the block.
+        for line in render.resource_rows(
+            job, ascii_mode=ascii_mode, max_width=_prose_width(self, 0)
+        ):
             body.append_text(line)
             body.append("\n")
         body.append("\n")
@@ -1303,15 +1326,24 @@ class JobScreen(ClipboardMixin, Screen[Any]):
             def cell(label, value, gauge, pad, colour=colour):
                 """One label/value pair. ``pad`` right-fills for a paired line."""
                 # A 118-character workdir wrapped to column 0, leaving the label
-                # looking empty with an orphaned line of path beneath it. Elided
+                # looking empty with an orphaned line of path beneath it. Shortened
                 # here only -- `p` shows it in full, and --plain always does,
                 # because a path you cannot copy whole is no use in a ticket.
-                if not self._show_paths and "/" in value:
+                if not self._show_paths:
                     # A paired cell must fit its column; a row on its own gets the
                     # rest of the line rather than a constant.
                     budget = pad or self._path_budget(4 + render.PAIR_LABEL_WIDTH + 1)
                     if len(value) > budget:
-                        value = _elide(value, keep=budget)
+                        # Middle-out only for the rows render.py declares to *be*
+                        # paths. The test used to be `"/" in value`, which is also
+                        # true of `submitted as` -- a command line, not a path --
+                        # and mangled it. Everything else is cut at the end, where
+                        # the head carries the meaning.
+                        value = (
+                            _elide(value, keep=budget)
+                            if label in render.PATH_ROWS
+                            else _clip(value, budget)
+                        )
                 body.append("    %-*s " % (render.PAIR_LABEL_WIDTH, label), style=theme.FAINT)
                 if gauge is not None:
                     body.append_text(render.bar(gauge, colour, width=14, ascii_mode=ascii_mode))
@@ -1528,17 +1560,28 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
 
         summary = Text()
         summary.append("node reliability — %s rate\n" % self.metric, style="bold %s" % theme.INK)
+        # Wrapped from the terminal, like the findings on the job and patterns
+        # screens. A folded workload name (`nemotron-batch-h#-tokenize-shards-
+        # stage#-retry-#`) took this past 110 cells; Textual soft-wrapped it, so
+        # the orphan landed at column 0 and lost the indent that marks it as a
+        # note under the heading. `report.render_nodes` draws the same line and is
+        # wrapped the same way.
         if workload:
-            summary.append(
-                "  controlled for workload: only %s counted " % workload, style=theme.DIM
-            )
-            summary.append("(placement is not random)\n", style=theme.FAINT)
+            aside = "(placement is not random)"
+            sentence = "controlled for workload: only %s counted %s" % (workload, aside)
+            for line in render.wrap(sentence, _prose_width(self, 2)):
+                head, marker, tail = line.partition(aside)
+                summary.append("  " + head, style=theme.DIM)
+                if marker:
+                    summary.append(marker, style=theme.FAINT)
+                summary.append(tail + "\n", style=theme.DIM)
         else:
-            summary.append(
-                "  UNCONTROLLED — mixes workloads, so a node that hosted one bad "
-                "campaign looks cursed\n",
-                style=theme.HEALTH_COLOR["warn"],
-            )
+            for line in render.wrap(
+                "UNCONTROLLED — mixes workloads, so a node that hosted one bad "
+                "campaign looks cursed",
+                _prose_width(self, 2),
+            ):
+                summary.append("  " + line + "\n", style=theme.HEALTH_COLOR["warn"])
         skipped = table_data["skipped_nodes"]
         summary.append(
             "  baseline %s over %d placements%s\n"
@@ -1816,10 +1859,19 @@ class SlurmpastApp(App[Any]):
     def _restore(self, error: str | None) -> None:
         """Undo a re-query that came back with nothing."""
         assert self._previous is not None
+        moved = self._previous[0] != self._window_at
         self._window_at, self._since, self.window, self.history = self._previous
         self._previous = None
+        # Two callers, two things to say. `w` moved the window and found nothing
+        # there; `r` asked for the same window again and the query failed. "nothing
+        # found there" is the wrong sentence for the second -- there is no "there".
         self.notify(
-            "nothing found there — staying on %s\n%s" % (self.window, error or ""),
+            (
+                "nothing found there — staying on %s\n%s"
+                if moved
+                else "reload failed — keeping the %s data you had\n%s"
+            )
+            % (self.window, error or ""),
             severity="warning",
             timeout=6,
         )
@@ -1871,7 +1923,17 @@ class SlurmpastApp(App[Any]):
         A full rebuild rather than a merge: a job's state changes after it
         finishes, so incremental merging would risk showing a stale outcome for
         no measurable gain against a 1.3 s query.
+
+        The snapshot is what makes the rebuild safe. ``_requery`` clears
+        ``self.history`` first and ``_loaded`` only backs out gracefully while
+        ``_previous`` is set -- and a successful load clears it -- so after any
+        normal session ``r`` plus a slurmdbd blip or a query timeout tore the
+        dashboard down, with the history already discarded, on a transient
+        failure. ``w`` had always snapshotted and so degraded to a toast; the two
+        keys now fail the same way, for the reason `_loaded` gives: "Backing out
+        beats exiting: they still have the data they had."
         """
+        self._previous = (self._window_at, self._since, self.window, self.history)
         self._requery()
 
     def action_cycle_window(self) -> None:
@@ -1923,6 +1985,19 @@ class SlurmpastApp(App[Any]):
         self.load_history()
 
 
+def _clip(value: str, keep: int) -> str:
+    """Hard-cut ``value`` to ``keep`` cells, marking the cut.
+
+    The backstop under every other shortening here. Eliding exists only because a
+    value wider than its cell soft-wraps to column 0 and takes the label's shape
+    with it, so a shortener that can return *more* than its budget has not done
+    the one job it was asked to do.
+    """
+    if keep <= 1:
+        return value[:1]
+    return value if len(value) <= keep else value[: keep - 1] + "…"
+
+
 def _elide(path: str, keep: int = 46) -> str:
     """Shorten a long path to ``first/…/filename``, keeping both ends readable.
 
@@ -1930,6 +2005,17 @@ def _elide(path: str, keep: int = 46) -> str:
     component before stripping the leading slash collapsed every absolute path to
     a bare ``/…/slurm-123.out`` -- throwing away the directory that was the only
     reason to print the path rather than just the file name.
+
+    The middle-out form is tried first because it is the readable one, but a long
+    leading component or a long basename can leave it *over* ``keep`` -- and a
+    shortening that still soft-wraps to column 0 has bought nothing, since not
+    soft-wrapping is the only reason to shorten. So the budget is now enforced:
+    where the ``first/…/last`` shape does not fit, the cut falls back to the end,
+    the head of a path being the part that locates it.
+
+    One case still overruns deliberately, and is pinned by a test: a path with no
+    separator at all. There is nothing to elide *around*, so the choice is between
+    a wrapped line and hiding the only name on it, and the name wins.
     """
     if len(path) <= keep:
         return path
@@ -1937,7 +2023,8 @@ def _elide(path: str, keep: int = 46) -> str:
     head, separator, _ = path.lstrip("/").partition("/")
     if not separator:
         return path  # a single long component; eliding it would hide the name
-    return "%s%s/…/%s" % (lead, head, path.rsplit("/", 1)[-1])
+    shortened = "%s%s/…/%s" % (lead, head, path.rsplit("/", 1)[-1])
+    return shortened if len(shortened) <= keep else _clip(path, keep)
 
 
 def run(

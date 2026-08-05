@@ -285,6 +285,27 @@ def clip(value: str, width: int) -> str:
     return value[: width - 1] + "…"
 
 
+def table_floor(spec, indent: int = 2, gap: int = 1) -> int:
+    """The narrowest terminal ``spec`` can be drawn in without a row overrunning.
+
+    ``fit_columns`` drops columns until the table fits, but it can only drop the
+    ones marked droppable -- so every spec has a width below which it stops
+    shrinking and starts overrunning instead, and that width is a property of the
+    spec rather than a number anyone can keep up to date by hand. ``JOB_COLUMNS``
+    bottoms out at 74 cells and ``NODE_COLUMNS`` at 67, both well above the 60
+    that ``report.PLAIN_MIN_WIDTH`` clamps the layout to, and the overrun in
+    between went unnoticed because the width tests were parametrized over 80, 100
+    and 120 only.
+
+    Kept honest by ``TestPlainOutputFitsATerminal``, which asserts each view
+    against ``max(terminal, table_floor(its spec))`` rather than against a
+    constant -- so adding a never-dropped column moves the floor and the test
+    follows it, instead of the promise quietly becoming false.
+    """
+    keep = [max(c.width, len(c.label)) for c in spec if not c.drop]
+    return indent + sum(keep) + gap * max(0, len(keep) - 1)
+
+
 def text_table(layout, rows, style=None, indent: str = "  ", gap: int = 1):
     """A fit_columns layout drawn as plain text: header, rule, rows.
 
@@ -677,6 +698,16 @@ _COVERED_BY_GAUGES = frozenset(
 )
 
 
+# The :func:`job_sections` rows whose value is a filesystem path, and so the only
+# ones a caller may shorten middle-out into ``first/…/last``. Declared beside the
+# rows rather than inferred from the value, because the dashboard inferred it --
+# ``"/" in value`` -- and caught ``submitted as`` in the net: a SubmitLine is a
+# command, and `sbatch --output=/scratch/midway3/youzhi/logs/%x-%j.out train.sh`
+# came out as `sbatch --output=/…/%x-%j.out train.sh`, throwing away the
+# directory on the one row that records where the output went.
+PATH_ROWS = frozenset(["workdir"])
+
+
 def job_sections(job, summarized: bool = False):
     """Everything known about a finished job, as ``(title, [(label, value, bar)])``.
 
@@ -715,7 +746,7 @@ def job_sections(job, summarized: bool = False):
     if job.reservation:
         ident.append(("reservation", job.reservation, None))
     if job.work_dir:
-        ident.append(("workdir", job.work_dir, None))
+        ident.append(("workdir", job.work_dir, None))  # the only path row -- see PATH_ROWS
     if job.submit_line:
         # Recorded from Slurm 21.08. The one row that answers "what did I actually
         # ask for" without the reader reconstructing it from the numbers below.
@@ -959,7 +990,23 @@ _MARKER = "●"
 _MARKER_ASCII = "*"
 
 
-def resource_rows(job, ascii_mode: bool = False, width: int = 18, flat: bool = False):
+# Everything a gauge row spends outside the bar itself: 2 cells of indent, the
+# marker and its space, the 6-cell label and its space, two cells before the
+# value and the 11-cell value column.
+GAUGE_ROW_OVERHEAD = 2 + 1 + 1 + 6 + 1 + 2 + 11
+# What the "   · " between value and detail costs.
+_GAUGE_DETAIL_GAP = 5
+# Indent of a detail that had to leave its row.
+_GAUGE_DETAIL_INDENT = "      "
+
+
+def resource_rows(
+    job,
+    ascii_mode: bool = False,
+    width: int = 18,
+    flat: bool = False,
+    max_width: int | None = None,
+):
     """The job's resources in slurmwatch's row idiom: ``● LABEL bar value · detail``.
 
     Deliberately the same shape as the live view. The two tools sit either side of
@@ -977,9 +1024,23 @@ def resource_rows(job, ascii_mode: bool = False, width: int = 18, flat: bool = F
     than proportions. The one case here that still drops its gauge is a MaxRSS
     above the limit: the findings below say that figure is not a working set, so a
     101%-full bar would have the summary contradicting the diagnosis.
+
+    ``max_width`` is the terminal to fit, and only the *detail* answers to it. The
+    row up to the value column is a fixed 42 cells and stays that way: a
+    width-adaptive bar is a change to the idiom this tool shares with slurmwatch,
+    and the one thing every reader of both is entitled to is that a 60%% bar looks
+    the same in each. What overran was the tail -- ``● MEM  no percentage  48.5
+    GiB   · an upper bound, over the 48.0 GiB limit`` is 86 cells, so the block
+    broke on an 80-column terminal, not merely a narrow one, and broke by
+    soft-wrapping to column 0 where it lost the marker and the alignment that make
+    it read as a block at all. Past the budget the detail moves to its own
+    indented line instead, which keeps every figure and costs only a line. Leaving
+    ``max_width`` unset keeps the single-line form unconditionally, and at 100
+    cells and up the two are identical anyway.
     """
     marker = _MARKER_ASCII if ascii_mode else _MARKER
     rows = []
+    detail_budget = None if max_width is None else max_width - GAUGE_ROW_OVERHEAD - width
 
     def row(label, color, fraction, value, detail="", instead=""):
         """One gauge row. ``instead`` replaces the bar with a phrase.
@@ -1017,9 +1078,28 @@ def resource_rows(job, ascii_mode: bool = False, width: int = 18, flat: bool = F
         # anything narrower lets the DISK rate overrun and shifts its "·" one cell
         # out of line with every row above it.
         text.append("%11s" % value, style=theme.INK)
-        if detail:
-            text.append("   %s %s" % ("-" if ascii_mode else "·", detail), style=theme.DIM)
-        rows.append(text)
+        bullet = "-" if ascii_mode else "·"
+        if detail and (detail_budget is None or len(detail) + _GAUGE_DETAIL_GAP <= detail_budget):
+            text.append("   %s %s" % (bullet, detail), style=theme.DIM)
+            rows.append(text)
+        elif detail:
+            # Off the row rather than clipped. The detail is where "over the 48.0
+            # GiB limit" lives -- the figure that says the gauge above it is a
+            # ceiling and not a measurement -- so dropping or truncating it to fit
+            # would take the interpretation and leave the number.
+            rows.append(text)
+            assert max_width is not None
+            for index, line in enumerate(
+                wrap(detail, max(20, max_width - len(_GAUGE_DETAIL_INDENT) - 2))
+            ):
+                rows.append(
+                    Text(
+                        "%s%s %s" % (_GAUGE_DETAIL_INDENT, bullet if index == 0 else " ", line),
+                        style=theme.DIM,
+                    )
+                )
+        else:
+            rows.append(text)
 
     row(
         "TIME",

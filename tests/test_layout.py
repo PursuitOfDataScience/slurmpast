@@ -258,10 +258,18 @@ class TestPlainOutputFitsATerminal:
         h = History(history(), window="last 7 days (2026-07-21 to now)")
         # A node name no fixed width survives. The demo's are 12 characters, which
         # is what let `render_nodes` keep a hand-rolled "%-16s" through two audits;
-        # real clusters run to `queue1-dy-c5xlarge-1` and longer.
+        # real clusters run to `queue1-dy-c5xlarge-1` and longer. The workload name
+        # goes with it, for the same reason and one audit later: the demo's is
+        # `cot-exp`, and that is what let render_nodes' "controlled for workload"
+        # line stay unwrapped through two more.
         wide = History(
             [
-                j._replace(node_list=j.node_list.replace("midway3-", "gpu-compute-node-a100-"))
+                j._replace(
+                    node_list=j.node_list.replace("midway3-", "gpu-compute-node-a100-"),
+                    name=j.name.replace(
+                        "cot-exp", "nemotron-batch-h7-tokenize-shards-stage3-retry-2"
+                    ),
+                )
                 for j in history()
             ],
             window="last 7 days (2026-07-21 to now)",
@@ -274,6 +282,19 @@ class TestPlainOutputFitsATerminal:
             "nodes-long-names": render_nodes(wide, style=style),
             "sizing": render_sizing(h, style=style),
         }
+
+    # Each view's own floor: below this the table it draws has no droppable column
+    # left and cannot get narrower. Asserted against rather than assumed, so a new
+    # never-dropped column moves the bar instead of silently breaking the promise.
+    @staticmethod
+    def _floor(name):
+        from slurmpast.render import JOB_COLUMNS, NODE_COLUMNS, table_floor
+
+        if name == "list":
+            return table_floor(JOB_COLUMNS)
+        if name.startswith("nodes"):
+            return table_floor(NODE_COLUMNS)
+        return 0
 
     @staticmethod
     def _table_lines(text):
@@ -289,7 +310,7 @@ class TestPlainOutputFitsATerminal:
             return []
         return [line for line in lines[max(0, rules[-1] - 1) :] if line.strip()]
 
-    @pytest.mark.parametrize("columns", ["80", "100", "120"])
+    @pytest.mark.parametrize("columns", ["60", "66", "74", "80", "100", "120"])
     def test_no_table_row_overruns_the_terminal(self, monkeypatch, columns):
         """Every view that draws a table, not a chosen two.
 
@@ -297,18 +318,77 @@ class TestPlainOutputFitsATerminal:
         node table -- the one still hand-formatted at fixed widths -- was exempt from
         the invariant it was breaking, and the sibling rule test iterating all five
         never caught it because a rule is drawn from the widest *row*.
+
+        The narrow widths are the round-five addition. It was parametrized over
+        80/100/120 while `report.PLAIN_MIN_WIDTH` declares a floor of 60, so the
+        whole 60-79 band -- the band where anything actually breaks -- was
+        unmeasured. Each view is held to its own `table_floor` rather than to a
+        flat 60, because a table with no droppable column left genuinely cannot
+        get narrower and pretending otherwise is how the 60 came to be claimed.
         """
         from slurmpast.report import Style
 
         monkeypatch.setenv("COLUMNS", columns)
         for name, text in self._views(Style(enabled=False)).items():
+            allowed = max(int(columns), self._floor(name))
             for line in self._table_lines(text):
-                assert len(line) <= int(columns), "%s: %d > %s -- %r" % (
+                assert len(line) <= allowed, "%s: %d > %d -- %r" % (
                     name,
+                    len(line),
+                    allowed,
+                    line,
+                )
+
+    @pytest.mark.parametrize("columns", ["60", "66", "74", "80", "100", "120"])
+    def test_no_job_detail_line_overruns_the_terminal(self, monkeypatch, columns):
+        """The post-mortem, which `_views` never built and so nothing measured.
+
+        It has no table to scope to -- every line is prose, a pair row or a gauge
+        row, and all three are supposed to fit. Three did not, at *any* width: the
+        gauge rows carried their detail inline for a fixed 86 cells, a sentence in
+        a single-pair value went out at its full length, and a finding title was
+        the one line of its three that was never wrapped.
+        """
+        from slurmpast.demo import history
+        from slurmpast.report import Style, render_job
+
+        monkeypatch.setenv("COLUMNS", columns)
+        for job in history():
+            text, _ = render_job(job, style=Style(enabled=False))
+            for line in text.splitlines():
+                assert len(line) <= int(columns), "%s: %d > %s -- %r" % (
+                    job.job_id,
                     len(line),
                     columns,
                     line,
                 )
+
+    def test_a_gauge_row_keeps_its_detail_inline_where_there_is_room(self, monkeypatch):
+        """The narrow-terminal form is a fallback, not the new shape.
+
+        `resource_rows` is deliberately the same row idiom as slurmwatch's live
+        view, so at the width it was designed for the detail stays on the row and
+        the output is unchanged.
+        """
+        from slurmpast.demo import history
+        from slurmpast.render import resource_rows
+
+        monkeypatch.setenv("COLUMNS", "100")
+        over = [
+            j
+            for j in history()
+            if j.mem_limit_bytes and j.max_rss and j.max_rss > j.mem_limit_bytes
+        ]
+        assert over, "the demo needs a MaxRSS-above-limit job for this"
+        rows = [r.plain for r in resource_rows(over[0], max_width=100)]
+        assert any("· an upper bound, over the" in r and " MEM " in r for r in rows), rows
+        assert len(rows) == 3, rows
+
+        narrow = [r.plain for r in resource_rows(over[0], max_width=80)]
+        assert len(narrow) == 4, narrow
+        assert max(len(r) for r in narrow) <= 80, narrow
+        # Moved, not dropped: the figure that says the gauge is a ceiling survives.
+        assert any("an upper bound, over the" in r for r in narrow), narrow
 
     @pytest.mark.parametrize("columns", ["80", "100", "120", "200"])
     def test_no_rule_overruns_the_terminal(self, monkeypatch, columns):

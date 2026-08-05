@@ -298,9 +298,23 @@ def _is_unknown_option(message):
     return "unrecognized option" in lowered or "invalid option" in lowered
 
 
-def supported_fields(probe=None):
-    """Field names this Slurm's sacct will accept, lowercased."""
-    text = probe if probe is not None else _run(["sacct", "--helpformat"])
+def supported_fields(probe=None, runner=None):
+    """Field names this Slurm's sacct will accept, lowercased.
+
+    ``probe`` short-circuits with canned ``--helpformat`` text; ``runner`` says
+    *how* to ask when there is none. Both matter to the same caller. This shelled
+    out to the module-level ``_run`` unconditionally, so ``Sacct(runner=...)`` --
+    a recorded history being replayed, or a remote cluster reached over ssh --
+    negotiated its field list against whatever sacct happened to be on the local
+    ``PATH`` while every real query went to the injected runner. That is trap 1 at
+    the top of this module in its own words: one unknown field makes sacct reject
+    the *entire* query, so probing the wrong Slurm is not a degraded answer but no
+    answer. ``_mark_open_records`` makes exactly this argument for ``live_job_ids``
+    ("a caller that injected one is not silently bypassed here and made to shell
+    out for real"); the hole was still open one level up.
+    """
+    run = runner or _run
+    text = probe if probe is not None else run(["sacct", "--helpformat"])
     names = set()
     for token in text.replace("\n", " ").replace(",", " ").split():
         token = token.strip()
@@ -590,7 +604,7 @@ class Sacct:
     def fields(self):
         if self._supported is None:
             try:
-                available = supported_fields(self._probe)
+                available = supported_fields(self._probe, runner=self._run)
             except SacctError:
                 available = None
             self._supported = resolve_fields(available)

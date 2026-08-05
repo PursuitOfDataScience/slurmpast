@@ -289,14 +289,20 @@ def walltime_advice(jobs) -> Advice:
             % (len(computing), "" if len(computing) == 1 else "s")
         )
     if hung:
+        # "further ... that floor" only parses after the sentence above has
+        # established one. Below VETO_MIN_COUNT there are hung timeouts and no
+        # computing ones, so `caution` is empty and the reader got "2 further
+        # timeouts are left out of that floor" with no floor anywhere in sight.
         caution += (
-            "%s%d further timeout%s consumed almost no CPU and %s left out of that "
-            "floor: a run that hung says nothing about how long the work takes."
+            "%s%d %stimeout%s consumed almost no CPU and %s left out%s: a run that hung "
+            "says nothing about how long the work takes."
             % (
                 "  " if caution else "",
                 len(hung),
+                "further " if caution else "",
                 "" if len(hung) == 1 else "s",
                 "is" if len(hung) == 1 else "are",
+                " of that floor" if caution else " of the figure above",
             )
         )
 
@@ -510,7 +516,10 @@ def cpu_advice(jobs) -> Advice:
             % (tasks)
         )
 
-    per_task_label = "core" if peak < 2 else "cores"
+    # Singular only for exactly one, because the figure is printed to one decimal:
+    # `peak < 2` made every value from 1.0 to 1.9 read "1.5 core busy per task".
+    # 0.9 is plural too -- English pluralises everything but one, including zero.
+    per_task_label = "core" if abs(peak - 1.0) < 0.05 else "cores"
     return Advice(
         flag="--cpus-per-task",
         verdict=verdict,
@@ -523,8 +532,12 @@ def cpu_advice(jobs) -> Advice:
         # _latest) and it is already on screen as "(from X)"; borrowing it here as
         # the denominator too produced "used 12.0 of 2 cores per task", a run using
         # six times its own allocation. One sentence, one run.
-        basis="the busiest run used %s of %s cores per task."
-        % (_cores_text(peak), "%g" % busiest.cpus_per_task),
+        basis="the busiest run used %s of %s core%s per task."
+        % (
+            _cores_text(peak),
+            "%g" % busiest.cpus_per_task,
+            "" if busiest.cpus_per_task == 1 else "s",
+        ),
         caution=caution,
     )
 

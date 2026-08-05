@@ -1,5 +1,6 @@
 import pytest
 
+from slurmpast import sacct
 from slurmpast.model import Step
 from slurmpast.sacct import _FIELDS as _FIELDS_FOR_TEST
 from slurmpast.sacct import Sacct, SacctError, parse, supported_fields
@@ -415,3 +416,56 @@ class TestSentinelsAreNotNames:
         )[0]
         assert job.timelimit is None
         assert not job.end
+
+
+class TestAnInjectedRunnerIsUsedForTheProbeToo:
+    """`supported_fields` shelled out to the module-level `_run` unconditionally,
+    so `Sacct(runner=...)` -- a recorded history being replayed, or a remote
+    cluster reached over ssh -- negotiated its field list against whatever sacct
+    was on the local PATH while every real query went to the injected runner.
+
+    Trap 1 at the top of the module is why that is not a degraded answer: one
+    unknown field makes sacct reject the entire query, so probing the wrong Slurm
+    produces no answer at all.
+    """
+
+    @staticmethod
+    def _spies(monkeypatch):
+        escaped, injected = [], []
+
+        def module_run(args):
+            escaped.append(list(args))
+            return "JobID JobName User State"
+
+        def mine(args):
+            injected.append(list(args))
+            return "JobID JobName User State" if "--helpformat" in args else ""
+
+        monkeypatch.setattr(sacct, "_run", module_run)
+        return injected, escaped, mine
+
+    def test_the_probe_goes_to_the_injected_runner(self, monkeypatch):
+        injected, escaped, mine = self._spies(monkeypatch)
+        sacct.Sacct(runner=mine).history(user="alice", since="now-1day")
+        assert escaped == [], escaped
+        assert ["sacct", "--helpformat"] in injected, injected
+
+    def test_the_query_still_goes_there_as_well(self, monkeypatch):
+        injected, _escaped, mine = self._spies(monkeypatch)
+        sacct.Sacct(runner=mine).history(user="alice", since="now-1day")
+        assert any("-u" in call for call in injected), injected
+
+    def test_an_explicit_probe_still_wins(self, monkeypatch):
+        """The control: `probe=` is canned --helpformat text and short-circuits the
+        call entirely, so neither runner is asked."""
+        injected, escaped, mine = self._spies(monkeypatch)
+        sacct.Sacct(runner=mine, probe="JobID,JobName,State").history(user="alice")
+        assert escaped == []
+        assert ["sacct", "--helpformat"] not in injected, injected
+
+    def test_no_runner_at_all_still_shells_out(self, monkeypatch):
+        """The other control: the default is unchanged for a caller that injects
+        nothing."""
+        _injected, escaped, _mine = self._spies(monkeypatch)
+        sacct.Sacct().history(user="alice")
+        assert ["sacct", "--helpformat"] in escaped, escaped

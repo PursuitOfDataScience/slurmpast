@@ -4,6 +4,8 @@ Every function here exists because a naive parse produced a wrong number on a
 real Midway3 record. The docstrings name the record.
 """
 
+import math
+
 # Sentinels sacct uses in place of a value. Each must yield None, never 0.0 --
 # a 0.0 here silently becomes "this job used no time", which is a lie.
 _NOT_A_DURATION = frozenset(
@@ -144,6 +146,26 @@ def format_bytes(value):
         if value >= scale:
             return "%.1f %s" % (value / scale, unit)
     return "%d B" % int(value)
+
+
+def format_mem_flag(value):
+    """Bytes -> the whole-GiB spelling ``--mem=`` accepts. ``None`` -> ``None``.
+
+    The counterpart of :func:`format_duration`'s ``HH:MM:SS``, and closing the
+    same defect: :func:`format_bytes` is a *display* formatter, so advice built on
+    it emitted ``--mem=52.0 GiB`` -- which ``sbatch`` rejects outright, a flag the
+    reader could read but not paste. ``sizing.memory_advice`` had the right
+    spelling (``52G``) all along, so the tool's two sizing surfaces disagreed about
+    the same flag.
+
+    Rounded *up* to whole GiB, matching ``sizing._round_gib``: the value is always
+    a "give it at least this much" figure, and rounding a 52.4 GiB requirement down
+    to 52G would hand back a request the evidence says is too small. A sub-GiB
+    result floors at ``1G`` rather than the ``0G`` Slurm reads as "no limit".
+    """
+    if value is None:
+        return None
+    return "%dG" % max(1, int(math.ceil(float(value) / float(1024**3))))
 
 
 def format_percent(value):

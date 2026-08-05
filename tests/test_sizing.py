@@ -7,6 +7,8 @@ the past runs of a workload are the evidence for both.
 Every guard rail below exists because a naive rule got it wrong on real records.
 """
 
+import pytest
+
 from slurmpast.demo import history
 from slurmpast.index import build_groups
 from slurmpast.sacct import parse
@@ -423,11 +425,23 @@ class TestRequestedIsWhatTheNextRunWillAsk:
         assert advice.suggestion == "1-01:00:00", "the floor is the limit that cut a run off"
 
     def test_memory_requested_is_the_last_ceiling_not_the_largest(self):
-        """On the recorded rc-tok-github_code history this is the difference between
-        the 17 GiB the script says and 48.0 GiB -- a cancelled run five
-        submissions back."""
-        advice = memory_advice(workload("rc-tok-github_code"))
-        assert advice.requested == "17.0 GiB", advice.requested
+        """On the rc-tok-github_code history this is the difference between the
+        32 GiB the script currently says and 48.0 GiB -- a cancelled run nine
+        submissions back, and the largest of the ten.
+
+        This asserted 17.0 GiB, which was neither: it was the ceiling of job
+        5100038, which the demo's own scrambled timestamps (`jid % 9`, wrapping
+        every ninth job within a day) presented as the most recent attempt. So the
+        test that exists to prove `_latest` picks the *last* request was pinned to
+        a value `_latest` only returned because the fixture's clock ran backwards
+        -- and it would have gone on passing had `_latest` broken. The last run of
+        the series is 5100044.
+        """
+        runs = workload("rc-tok-github_code")
+        last = max(runs, key=lambda j: (j.start or j.submit or "", j.job_id))
+        assert last.job_id == "5100044", last.job_id
+        advice = memory_advice(runs)
+        assert advice.requested == "32.0 GiB", advice.requested
 
     def test_cpu_requested_is_the_last_count_not_the_largest(self):
         """A stale figure read "used 1.2 of 64 cores per task" about a script that
@@ -793,3 +807,76 @@ class TestAHungRunIsNotEvidenceOfNeedingMoreTime:
         advice = walltime_advice(parse(make_text(*rows)))
         assert advice.verdict == "unknown"
         assert "blocked, not slow" in advice.basis
+
+
+class TestCoreCountsArePluralisedByTheNumberBesideThem:
+    """`"core" if peak < 2` printed "1.5 core busy per task" for every value from
+    1.0 to 1.9 -- the one range where the figure is displayed to a decimal and so
+    the one range where getting it wrong is visible."""
+
+    @staticmethod
+    def _observed(peak_cores, allocated=8):
+        rows = []
+        for i in range(3):
+            rows += _cpu_run(
+                str(100 + i), allocated, peak_cores / allocated, "2026-01-0%d" % (i + 1)
+            )
+        return cpu_advice(parse("\n".join(rows))).observed
+
+    @pytest.mark.parametrize(
+        "peak,expected",
+        [(1.0, "1.0 core "), (1.5, "1.5 cores"), (1.9, "1.9 cores"), (0.5, "0.5 cores")],
+    )
+    def test_only_exactly_one_is_singular(self, peak, expected):
+        assert self._observed(peak).startswith(expected), self._observed(peak)
+
+    def test_the_denominator_is_pluralised_too(self):
+        """ "used 1.0 of 1 cores per task" is the same defect on the other number."""
+        rows = []
+        for i in range(3):
+            rows += _cpu_run(str(100 + i), 1, 1.0, "2026-01-0%d" % (i + 1))
+        assert "of 1 cores" not in cpu_advice(parse("\n".join(rows))).basis
+
+
+class TestTheHungTimeoutCautionParsesOnItsOwn:
+    """ "2 further timeouts are left out of that floor" was printed with no
+    preceding sentence establishing a floor: below VETO_MIN_COUNT there are hung
+    timeouts and no computing ones, so the clause the wording depends on is
+    absent."""
+
+    @staticmethod
+    def _completed(jid, day):
+        return [
+            row(
+                JobID=str(jid),
+                JobName="w",
+                State="COMPLETED",
+                ExitCode="0:0",
+                ElapsedRaw="1800",
+                TimelimitRaw="60",
+                TotalCPU="00:30:00",
+                Start="2026-01-%02dT01:00:00" % day,
+                ReqCPUS="4",
+                AllocTRES="cpu=4,mem=8G,node=1",
+            )
+        ]
+
+    def _advice(self, extra):
+        rows = []
+        for i in range(3):
+            rows += self._completed(100 + i, i + 1)
+        return walltime_advice(parse("\n".join(rows + extra)))
+
+    def test_no_floor_no_reference_to_one(self):
+        caution = self._advice(_timeout_run("200", 2, 10) + _timeout_run("201", 3, 11)).caution
+        assert "further" not in caution, caution
+        assert "that floor" not in caution, caution
+        assert "left out of the figure above" in caution, caution
+
+    def test_a_floor_that_exists_is_still_referred_to(self):
+        """The control: with a computing timeout the sentence above does establish
+        a floor, and the original wording is the right one."""
+        caution = self._advice(_timeout_run("200", 2, 10) + _timeout_run("300", 3500, 12)).caution
+        assert "this is a floor, not a fit" in caution, caution
+        assert "further timeout" in caution, caution
+        assert "left out of that floor" in caution, caution

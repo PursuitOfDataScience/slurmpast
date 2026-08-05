@@ -44,6 +44,35 @@ def _row(**kw) -> str:
     return "|".join(str(kw.get(name, "")) for name in _FIELDS_ORDER)
 
 
+# The id the synthetic history counts up from; see :func:`history`.
+FIRST_JOB_ID = 5100001
+# Minutes between consecutive synthetic submissions. 58 jobs at this spacing span
+# 00:00 to 12:35, so no series can run past midnight into the next day's records.
+_SUBMIT_SPACING_MINUTES = 13
+
+
+def _time_of_day(jid):
+    """``HH:MM:SS`` that increases with the job id, without wrapping.
+
+    Slurm hands out job ids in submission order, so a demo whose clock disagrees
+    with its ids is a demo of something Slurm cannot produce. This was
+    ``"0%d:00:00" % (jid % 9)``, which wrapped every ninth job: the ten runs of
+    ``rc-tok-github_code`` all carry ``day=20``, so they listed 08:00, 07:00,
+    06:00, 05:00, 05:00 -- the narrative backwards, with two runs sharing a
+    timestamp.
+
+    It fed a wrong number as well as a wrong order. ``sizing._latest`` picks the
+    most recent run by ``start or submit`` to report what the workload currently
+    asks for, so it picked 5100038 (17G) instead of the real last submission
+    5100044 (32G) and the sizing screen advised "--mem raise to 42G (from 17.0
+    GiB)". That is exactly the error ``_latest`` was introduced to fix, arriving
+    through the demo's own fabricated timestamps rather than through the code
+    under test.
+    """
+    total = (jid - FIRST_JOB_ID) * _SUBMIT_SPACING_MINUTES
+    return "%02d:%02d:00" % divmod(total % (24 * 60), 60)
+
+
 def _job(
     jid,
     name,
@@ -68,7 +97,7 @@ def _job(
     min_cpu=None,
 ):
     gres = ",gres/gpu=%d" % gpus if gpus else ""
-    stamp = "2026-07-%02dT0%d:00:00" % (min(day, 28), jid % 9)
+    stamp = "2026-07-%02dT%s" % (min(day, 28), _time_of_day(jid))
     alloc = _row(
         JobID=str(jid),
         JobName=name,
@@ -141,13 +170,28 @@ def _job(
 def history() -> list:
     """A synthetic history with every shape the dashboard is built to surface."""
     rows: list = []
-    jid = 5100000
+    jid = FIRST_JOB_ID - 1  # every series below increments before it emits
 
     # A hung workload: same --time every run, essentially no CPU. 20 attempts,
-    # 2 of which happened to squeeze through.
+    # 6 of which squeezed through -- and *which* six is the point.
+    #
+    # The hang is placed on midway3-0385: 12 placements there, all 12 hung, against
+    # 8 on midway3-0602 of which 6 finished. That is the "one node that eats jobs"
+    # shape demo.tape advertises and `--nodes` exists to find. It was spread evenly
+    # before (`index % 3`), which gave 12/13 on one node against 6/7 on the other --
+    # so with the workload held fixed, which is the only comparison `--nodes` will
+    # make, the demo's own nodes screen answered "no node is worse than the rest;
+    # nothing to exclude". The screen the README leads its "Failure, across runs"
+    # section with did not contain the thing that section is about.
+    #
+    # It also makes the demo tell one story rather than two: a workload that hangs
+    # AND a node that causes it, which is the inference the tool is for.
     for index in range(20):
         jid += 1
-        state = "COMPLETED" if index in (7, 15) else "TIMEOUT"
+        on_bad_node = index % 5 not in (0, 4)
+        # The two that hung elsewhere: without them midway3-0602 is a spotless 0/8
+        # and the comparison is against a baseline no real fleet produces.
+        state = "TIMEOUT" if on_bad_node or index in (0, 5) else "COMPLETED"
         cpu = "00:29:40" if state == "COMPLETED" else "00:00.5%02d" % index
         rows += _job(
             jid,
@@ -160,7 +204,7 @@ def history() -> list:
             rss="2000000K",
             cpus=6,
             gpus=1,
-            node="midway3-0385" if index % 3 else "midway3-0602",
+            node="midway3-0385" if on_bad_node else "midway3-0602",
             day=index + 1,
         )
 
