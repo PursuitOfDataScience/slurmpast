@@ -230,6 +230,42 @@ _SCROLLBAR = 2
 _MIN_PROSE_WIDTH = 32
 
 
+def _text_width(screen) -> int:
+    """Cells the text on ``screen`` actually gets.
+
+    Not to be confused with ``_content_width`` below, which sizes a *table* from
+    its column layout. This one measures a screen for prose.
+
+    Measured on the *widget the text goes into*, not on the screen. Screen width
+    minus a constant ``_SCROLLBAR`` is what both callers below used to do, and it
+    is two cells optimistic on ``JobScreen``, whose ``#body`` is 96 wide inside a
+    100-cell screen. Two cells is enough: a finding wrapped to 90 was drawn at
+    8 + 90 = 98, Textual soft-wrapped the overflow, and the reader got
+
+        midway3-0385 failed 12 of your 12 jobs there (100.0%, ...) against 25.0%
+    on
+        every other node for cot-exp.
+
+    -- the orphan at column 0 that ``_prose_width`` exists to prevent, surviving
+    inside it because the chrome was guessed rather than read.
+
+    The screen stays as the fallback for the moment before the first layout pass,
+    when the widget has no size at all -- and for the moment before *mount*, when
+    querying the screen at all raises because it is not in the DOM yet, which
+    `WorkloadScreen` does reach: its ``on_mount`` builds the banner. Callers render
+    again after the first layout pass (see ``JobScreen.on_mount``) so neither guess
+    survives to the screen.
+    """
+    try:
+        for widget in screen.query("#body, #summary"):
+            if widget.size.width:
+                return widget.size.width
+    except Exception:  # not mounted yet; the fallback below is the honest answer
+        pass
+    width = screen.size.width or screen.app.size.width or _DEFAULT_TABLE_WIDTH
+    return max(0, width - _SCROLLBAR)
+
+
 def _prose_width(screen, indent: int) -> int:
     """Wrap width for indented prose on ``screen``, from the terminal there is.
 
@@ -239,12 +275,9 @@ def _prose_width(screen, indent: int) -> int:
     the constants -- findings wrapped at 86 and actions at 82 under an 8-cell indent,
     up to 94 cells whatever the terminal was -- so below ~96 columns Textual
     re-wrapped the already-wrapped text and the orphan landed at column 0, with the
-    indent that separates evidence from its heading gone. ``JobScreen._path_budget``
-    already measures the terminal for paths on the same screen; this is the same
-    measurement for the prose beside them.
+    indent that separates evidence from its heading gone.
     """
-    width = screen.size.width or screen.app.size.width or _DEFAULT_TABLE_WIDTH
-    return max(_MIN_PROSE_WIDTH, width - indent - _SCROLLBAR)
+    return max(_MIN_PROSE_WIDTH, _text_width(screen) - indent)
 
 
 def _sync_columns(table: DataTable, spec, current, content=None, available=None):
@@ -1226,6 +1259,24 @@ class JobScreen(ClipboardMixin, Screen[Any]):
     def on_mount(self) -> None:
         self.sub_title = "job %s" % self._job.job_id
         self.render_body()
+        # Again once there has been a layout pass. `#body` has *no size at all*
+        # during on_mount -- "size is zero until the first layout pass", as
+        # `_sync_columns` puts it -- so the first render can only guess the chrome
+        # from the screen width, guessed it two cells too wide, and Textual
+        # soft-wrapped the overflow to column 0: `... against 25.0%` / `on` /
+        # `every other node for cot-exp.` This is what makes `_prose_width`'s
+        # measurement actually reach the screen. The table screens have always got
+        # this for free from their own on_resize.
+        self.call_after_refresh(self.render_body)
+
+    def on_resize(self) -> None:
+        """Re-wrap for the width there now is.
+
+        Without this, resizing the terminal left the prose wrapped to the width it
+        had when the screen was opened -- the same staleness every table screen
+        here avoids with its own ``on_resize``.
+        """
+        self.render_body()
 
     def clipboard_row(self) -> str:
         """The whole post-mortem, rendered plain -- the paste-ready artefact."""
@@ -1260,11 +1311,14 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         two directories that were the only reason to print a path at all.
 
         Eliding exists to stop a path wrapping to column 0, and whether it wraps is
-        a function of the width there is. So that is what it is measured against.
+        a function of the width there is. So that is what it is measured against --
+        through `_text_width`, which measures the widget rather than the screen.
+        Subtracting a guessed two cells of chrome from the screen was two too few,
+        and left `utilization  not gathered by this cluster (needs AutoDetect=nvml
+        in gres.conf)` clipped to exactly two cells past the edge, so `g…` wrapped
+        to a line of its own.
         """
-        width = self.size.width or self.app.size.width or _DEFAULT_TABLE_WIDTH
-        # One cell for the scrollbar, one so the text never touches the edge.
-        return max(_MIN_PATH_WIDTH, width - prefix - _SCROLLBAR)
+        return max(_MIN_PATH_WIDTH, _text_width(self) - prefix)
 
     def render_body(self) -> None:
         job = self._job
@@ -1462,8 +1516,16 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
         yield Footer()
 
     def on_mount(self) -> None:
-        history: History | None = self.sp.history
         self.sub_title = "patterns" + (" · %s" % self._group.label if self._group else "")
+        self.render_body()
+        self.call_after_refresh(self.render_body)  # see JobScreen.on_mount
+
+    def on_resize(self) -> None:
+        """Re-wrap for the width there now is. See JobScreen.on_resize."""
+        self.render_body()
+
+    def render_body(self) -> None:
+        history: History | None = self.sp.history
         body = Text()
         if history is None:
             body.append("loading…", style=theme.DIM)
@@ -1641,16 +1703,26 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
         tested = table_data["tested_nodes"]
         note = Text()
         if excl:
-            note.append(
-                "\n  worse than every other node, after correcting for %d tested:\n" % tested,
-                style=theme.DIM,
-            )
+            # Wrapped, like the tail note below it and like the plain report's twin.
+            # These two were bare strings inside a block that only renders when a
+            # node is genuinely worse than the rest -- which the demo did not
+            # produce until round five, so nothing ever looked at them. The second
+            # is 96 cells and soft-wrapped its last word to column 0.
+            note.append("\n")
+            for line in render.wrap(
+                "worse than every other node, after correcting for %d tested:" % tested,
+                _prose_width(self, 2),
+            ):
+                note.append("  %s\n" % line, style=theme.DIM)
+            # Not wrapped, deliberately: one #SBATCH line to copy, and a paste
+            # broken across two lines is not a paste.
             note.append("    #SBATCH --exclude=%s\n" % excl, style="bold %s" % theme.ACCENT)
-            note.append(
-                "    not applied for you — excluding nodes trades availability for "
-                "reliability, and that is your call.\n",
-                style=theme.FAINT,
-            )
+            for line in render.wrap(
+                "not applied for you — excluding nodes trades availability for "
+                "reliability, and that is your call.",
+                _prose_width(self, 4),
+            ):
+                note.append("    %s\n" % line, style=theme.FAINT)
             # Same disclosure as the plain report: the line is capped at 8, so when
             # more nodes scored worse it has to say so rather than read complete.
             left_out = excluded_tail(table_data)

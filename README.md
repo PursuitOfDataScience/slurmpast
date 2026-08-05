@@ -8,12 +8,18 @@
   <a href="https://pypi.org/project/slurmpast/"><img src="https://img.shields.io/pypi/v/slurmpast.svg" alt="PyPI"></a>
   <a href="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/tests-1150-brightgreen.svg" alt="1150 tests">
+  <img src="https://img.shields.io/badge/tests-1158-brightgreen.svg" alt="1158 tests">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
 </p>
 
 <p align="center">
-  <img src="assets/screenshot-overview.svg" width="900" alt="slurmpast overview: finished jobs rolled into workloads, ranked by resource use.">
+  <img src="assets/demo.gif" width="900" alt="The slurmpast dashboard driven end to end: finished jobs rolled into workloads ranked by resource use, filtered to the ones that went wrong, into a workload that timed out 14 times at an unchanged --time, into one run's post-mortem showing 101% of the wall clock against 0% CPU and the finding that says it hung rather than ran out of time, then the cross-run patterns and the node reliability table naming the node that ate them.">
+</p>
+
+<p align="center">
+  <sub>Recorded against <code>slurmpast --demo</code>, which is why the header reads
+  <code>synthetic demo data</code> throughout. Regenerate with
+  <code>python tools/demo_gif.py</code>.</sub>
 </p>
 
 ```bash
@@ -37,6 +43,25 @@ sp                     # short alias
 builds the request. **During** it,
 [`slurmwatch`](https://github.com/PursuitOfDataScience/slurmwatch) watches.
 **After** it, `slurmpast` tells you what happened and what to change.
+
+<details>
+<summary>The same screens as stills</summary>
+
+<p align="center">
+  <img src="assets/screenshot-overview.svg" width="860" alt="Overview: finished jobs rolled into workloads, ranked by resource use, each with an outcome ribbon, failure count and last run.">
+</p>
+
+<p align="center">
+  <img src="assets/screenshot-workload.svg" width="860" alt="One workload: every run of it, with the repeat-failure warning and the sizing advice above the table.">
+</p>
+
+<p align="center">
+  <img src="assets/screenshot-patterns.svg" width="860" alt="Cross-run patterns: a workload that failed repeatedly at an unchanged time limit, and a memory request being hand-searched.">
+</p>
+
+Regenerate with `python tools/screenshots.py`.
+
+</details>
 
 ---
 

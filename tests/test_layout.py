@@ -694,3 +694,66 @@ class TestTheNodeTableGoesThroughTheSharedSpec:
         text = self._table(Style(enabled=False))
         for line in self._rows(text):
             assert len(line) <= int(columns), "%d > %s -- %r" % (len(line), columns, line)
+
+
+class TestTheReadmeAndItsAssetsAgree:
+    """The README's lead image was a 404 for the first several releases: it pointed
+    at `assets/demo.gif`, and no `.gif` was ever committed. Nothing noticed, because
+    nothing checked — a broken image renders as a small grey box that reads like a
+    slow network.
+    """
+
+    @staticmethod
+    def _root():
+        import pathlib
+
+        return pathlib.Path(__file__).resolve().parent.parent
+
+    @staticmethod
+    def _referenced(root):
+        import re
+
+        readme = (root / "README.md").read_text()
+        return set(re.findall(r'src="(assets/[^"]+)"', readme))
+
+    def test_every_image_the_readme_points_at_exists(self):
+        root = self._root()
+        missing = [ref for ref in self._referenced(root) if not (root / ref).is_file()]
+        assert not missing, missing
+
+    def test_every_asset_is_pointed_at(self):
+        """The other direction. An asset nobody references is one a generator keeps
+        rewriting and no reader ever sees -- and it is how three of these came to be
+        stale for four rounds without anyone noticing."""
+        root = self._root()
+        referenced = self._referenced(root)
+        images = {
+            "assets/%s" % path.name
+            for path in (root / "assets").iterdir()
+            if path.suffix in (".svg", ".gif", ".png")
+        }
+        assert images - referenced == set(), sorted(images - referenced)
+
+    def test_the_test_badge_matches_the_suite(self):
+        """`tests-1029` sat in the README for two rounds after the count moved."""
+        import re
+        import subprocess
+        import sys
+
+        root = self._root()
+        claimed = re.search(r"tests-(\d+)-brightgreen", (root / "README.md").read_text())
+        assert claimed, "the badge should still be there"
+        out = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "--collect-only"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+        ).stdout
+        collected = re.search(r"(\d+) tests collected", out) or re.search(r"(\d+)/(\d+)", out)
+        if not collected:  # pytest phrasing varies by version; skip rather than lie
+            import pytest
+
+            pytest.skip("could not read a collected count from this pytest")
+        assert int(claimed.group(1)) == int(collected.group(1)), (
+            "README says %s tests, the suite collects %s" % (claimed.group(1), collected.group(1))
+        )

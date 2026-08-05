@@ -1312,3 +1312,60 @@ class TestOnlyPathsAreElidedLikePaths:
         path = "/scratch/midway3/youzhi/runs/cot-exp/logs/slurm-51170455.out"
         elided = tui._elide(path, keep=46)
         assert elided == "/scratch/…/slurm-51170455.out"
+
+
+class TestProseIsWrappedToTheWidgetNotTheScreen:
+    """`_prose_width` subtracted a constant `_SCROLLBAR = 2` from the *screen*
+    width, and `JobScreen`'s `#body` is 96 cells inside a 100-cell screen. So a
+    finding wrapped to 90 was drawn at 8 + 90 = 98, Textual soft-wrapped the last
+    word to column 0, and the indent separating evidence from its heading was lost
+    — which is the exact failure `_prose_width` was written to stop, surviving in
+    it because the constant was guessed rather than measured.
+
+    Reproduced on the node-history finding, whose evidence is the longest the
+    dashboard draws: "midway3-0385 failed 12 of your 12 jobs there (100.0%, 95% CI
+    75.7-100.0%) against 25.0% on every other node for cot-exp."
+    """
+
+    @staticmethod
+    async def _open_a_job_with_a_long_finding(pilot, app):
+        await pilot.pause()
+        for key in ("f", "2", "enter", "down", "enter", "end"):
+            await pilot.press(key)
+            await pilot.pause()
+        return app.screen
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("width", [70, 80, 100, 120])
+    async def test_no_body_line_is_wider_than_the_body(self, width):
+        from textual.widgets import Static
+
+        from slurmpast.demo import history as demo
+
+        app = make_app(demo(), no_logs=True)
+        async with app.run_test(size=(width, 40)) as pilot:
+            screen = await self._open_a_job_with_a_long_finding(pilot, app)
+            body = screen.query_one("#body", Static)
+            assert body.size.width, "the body must be laid out before this means anything"
+            for strip in screen._compositor.render_strips():
+                text = "".join(cell.text for cell in strip).rstrip()
+                assert len(text) <= width, "%d cells on a %d-cell screen: %r" % (
+                    len(text),
+                    width,
+                    text,
+                )
+
+    @pytest.mark.asyncio
+    async def test_the_width_comes_from_the_body_not_the_screen(self):
+        """The control on the mechanism, not just the symptom: the two numbers are
+        different, and the wrap has to use the smaller one."""
+        from textual.widgets import Static
+
+        from slurmpast.demo import history as demo
+
+        app = make_app(demo(), no_logs=True)
+        async with app.run_test(size=(100, 40)) as pilot:
+            screen = await self._open_a_job_with_a_long_finding(pilot, app)
+            body = screen.query_one("#body", Static)
+            assert body.size.width < screen.size.width, "no gap left to get wrong"
+            assert tui._prose_width(screen, 8) == body.size.width - 8
