@@ -16,7 +16,6 @@ from .duration import format_bytes, format_duration, format_percent
 from .index import GPU_CORE_EQUIVALENT, SORTS, History, sort_groups, sort_label
 from .model import severity_rank
 from .nodes import (
-    MIN_SAMPLES,
     compress_nodelist,
     dominant_workload,
     excluded_tail,
@@ -39,6 +38,8 @@ from .render import (
     hours_pair_text,
     hours_text,
     job_sections,
+    nodes_baseline,
+    nodes_empty_reason,
     pair_rows,
     resource_rows,
     stamp_short,
@@ -86,12 +87,18 @@ _STATE_COLOR = {
 #
 # It is a floor on the *layout*, NOT a promise that every view fits 60 cells, and
 # the two were being confused. A table cannot shrink past its never-dropped
-# columns -- `render.table_floor` computes that per spec: 74 for the job list, 67
+# columns -- `render.table_floor` computes that per spec: 74 for the job list, 41
 # for the node table -- so between 60 and those floors the tables overrun, and no
-# clamp here can change it. What did change: everything that *is* prose (finding
-# titles, the nodes workload line, the gauge details, a long single-pair value)
-# now wraps to the terminal, so a narrow terminal is one or two wide tables
-# rather than a page of wrapped text.
+# clamp here can change it. (This comment said 67 for the node table for one round.
+# That was the length of `render_nodes`' own unwrapped `baseline` line, measured off
+# the view and filed as a property of the spec, which is the framing under which a
+# wrappable sentence never gets wrapped. It now is.)
+#
+# What did change: everything that *is* prose (finding titles, the nodes workload
+# line and its two empty-table sentences, the gauge details, a long single-pair
+# value, the sizing headers) now wraps to the terminal, so a narrow terminal is one
+# or two wide tables rather than a page of wrapped text. The one deliberate overrun
+# left is a recorded log path, which must stay copyable whole.
 PLAIN_MIN_WIDTH = 60
 PLAIN_FALLBACK_WIDTH = 100
 
@@ -282,12 +289,34 @@ def render_job(
 
     out.append("")
     if log_path:
-        # Say when the path was inferred from timing rather than read off a name:
-        # a wrong log invents a cause, so the basis has to travel with it.
-        note = (
-            "  (matched by timing, not by name — verify before trusting it)" if log_inferred else ""
-        )
-        out.append("  %s %s%s" % (style("log", "grey"), log_path, style(note, "grey")))
+        # The path keeps its own line and is never shortened -- `--plain` exists to
+        # be pasted, and a path you cannot copy whole is no use in a ticket, so a
+        # path longer than the terminal is an accepted overrun rather than a defect.
+        # Named here because it is the only one left in this view.
+        # Say when the path was inferred from timing rather than read off a name: a
+        # wrong log invents a cause, so the basis has to travel with it.
+        note = "(matched by timing, not by name — verify before trusting it)"
+        inline = "  log %s  %s" % (log_path, note)
+        if log_inferred and len(inline) <= _plain_width():
+            # Unchanged where the pair fits, which is every short path on a wide
+            # terminal.
+            out.append(
+                "  %s %s  %s" % (style("log", "grey"), log_path, style(note, "grey"))
+            )
+        else:
+            # The path keeps its own line and is never shortened -- `--plain` exists
+            # to be pasted, and a path you cannot copy whole is no use in a ticket,
+            # so a path longer than the terminal is an accepted overrun rather than
+            # a defect. It is the only one left in this view.
+            out.append("  %s %s" % (style("log", "grey"), log_path))
+            # The note is prose, and riding on that line it added 58 cells to
+            # whatever the path already cost -- 133 cells at every terminal width,
+            # every one of them the note's fault rather than the path's. Its own
+            # wrapped line, indented under the path, so what overruns above is the
+            # path alone.
+            if log_inferred:
+                for line in wrap(note.strip("()"), _prose_width(6)):
+                    out.append("      " + style(line, "grey"))
     elif not no_logs:
         # Guarded, because both spellings below are claims about the filesystem and
         # under `--no-logs` nothing was stat'd. "none found" reported a search that
@@ -313,7 +342,12 @@ def render_job(
             detail = "none at %s — moved or deleted; --log-dir points at it" % expected[0]
         else:
             detail = "none found — --log-dir points at one"
-        out.append("  %s %s" % (style("log", "grey"), style(detail, "grey")))
+        # Wrapped: this one is a sentence built around a path, not a bare path, so
+        # unlike the found case above there is nothing here that has to survive a
+        # copy. It reached 122 cells at every terminal width.
+        for index, line in enumerate(wrap(detail, _prose_width(6))):
+            prefix = "  %s " % style("log", "grey") if index == 0 else " " * 6
+            out.append("%s%s" % (prefix, style(line, "grey")))
     out.append("")
     findings = sorted(verdict.findings, key=lambda f: severity_rank(f.severity))
     if not findings:
@@ -590,33 +624,25 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
                 _prose_width(2),
             )
         )
-    skipped = table["skipped_nodes"]
-    out.append(
-        "  baseline %s over %d placements%s"
-        % (
-            format_percent(table["baseline"]),
-            table["trials"],
-            "; %d node%s below threshold omitted" % (skipped, "" if skipped == 1 else "s")
-            if skipped
-            else "",
-        )
-    )
+    # The third of the three prose lines in this function, and the one round five
+    # left bare after wrapping the two above it. Bounded by its own numbers rather
+    # than by a name, so it overran only below 68 -- but it is also the line whose
+    # 67 cells were measured off this view and recorded as `NODE_COLUMNS`' table
+    # floor, which is 41. See render.table_floor.
+    out.extend("  " + line for line in wrap(nodes_baseline(table), _prose_width(2)))
     out.append("")
     # Two ways this table has nothing to say. Printing a column header over no
     # rows -- or eight rows of "0/N, 0.0%, inconclusive" -- is what made this
     # screen read as useless. A sentence is the answer in both cases.
-    if not table["hits"]:
-        out.append(
-            "  No %s recorded%s in this window, so there is nothing to attribute to a node."
-            % (metric + "s", " for %s" % workload if workload else "")
-        )
-        out.append("")
-        return "\n".join(_titled("node reliability (%s rate)" % metric, out, style))
-    if not table["rows"]:
-        out.append(
-            "  No node reached the %d placements a comparison needs — %d seen, all below it. "
-            "A wider --since window is what fixes this." % (MIN_SAMPLES, skipped)
-        )
+    #
+    # Both sentences come from `render` now, and both are wrapped: they were the
+    # longest lines on the screen at every terminal width -- 132 cells and 122 --
+    # which is the sentence written to rescue an empty screen being the thing that
+    # broke it. The first carries a folded workload name, so it is #6 of round five
+    # in a branch that round's reproductions never reached.
+    empty = nodes_empty_reason(table, metric, workload)
+    if empty:
+        out.extend("  " + line for line in wrap(empty, _prose_width(2)))
         out.append("")
         return "\n".join(_titled("node reliability (%s rate)" % metric, out, style))
     tested = table["tested_nodes"]
@@ -735,13 +761,21 @@ def render_sizing(history, style=None, limit=12, sort="cost"):
             hidden_groups += 1
             hidden_runs += group.total
             continue
-        out.append(
-            "  %s  %s"
-            % (
-                style(group.label, "bold"),
-                style("%s · %d runs" % (group.partition, group.total), "grey"),
-            )
-        )
+        # Wrapped: a folded workload name and a partition are both site-controlled
+        # and neither is bounded, so this header reached 86 cells on an 80-column
+        # terminal. `_emphasise` puts the styling back on whichever line kept each
+        # token whole, since the wrap has to run on the plain sentence.
+        aside = "%s · %d runs" % (group.partition, group.total)
+        header = "%s  %s" % (group.label, aside)
+        if len(header) + 2 <= _plain_width():
+            # Unchanged where it fits, which is the ordinary case: `wrap` collapses
+            # runs of whitespace, and the two spaces between the name and its aside
+            # are the separator. Only a header too wide to hold pays for the wrap.
+            out.append("  %s  %s" % (style(group.label, "bold"), style(aside, "grey")))
+        else:
+            for line in wrap(header, _prose_width(2)):
+                line = _emphasise(line, group.label, style)
+                out.append("  " + _emphasise(line, aside, style, "grey"))
         for a in advice:
             if a.verdict == "keep":
                 out.append("    %-17s %s" % (a.flag, style("already about right", "green")))
@@ -783,8 +817,15 @@ def render_sizing(history, style=None, limit=12, sort="cost"):
             out.append("    " + style(line, "bold"))
         out.append("")
     if not shown:
-        out.append(
-            style("  every workload is already about right, or lacks the runs to say.", "green")
+        # Wrapped for the same reason the nodes screen's two are: at 66 cells this
+        # is the only line on the view, so a narrow terminal broke the one sentence
+        # standing in for the whole screen.
+        out.extend(
+            style("  " + line, "green")
+            for line in wrap(
+                "every workload is already about right, or lacks the runs to say.",
+                _prose_width(2),
+            )
         )
         out.append("")
     elif hidden_groups:

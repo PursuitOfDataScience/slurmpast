@@ -469,3 +469,98 @@ class TestAnInjectedRunnerIsUsedForTheProbeToo:
         _injected, escaped, _mine = self._spies(monkeypatch)
         sacct.Sacct().history(user="alice")
         assert ["sacct", "--helpformat"] in escaped, escaped
+
+
+class TestSqueuePrintsPendingArraysAsRanges:
+    """Round six. `squeue --format=%i` does not print one id per pending array
+    task -- it prints the range, `900_[5-10]`, the same bracketed grammar Slurm
+    uses for hostlists. `cli._mark_open_records` tested membership against the raw
+    set, so every pending element missed; and since round five *uses* that answer
+    instead of discarding it, the miss became an assertion that a job sitting in
+    the queue right now was "long gone".
+    """
+
+    def test_a_pending_range_expands_to_its_elements(self):
+        from slurmpast.sacct import _expand_job_ids
+
+        found = _expand_job_ids("900_3\n900_[5-10]\n")
+        assert "900_3" in found, "a running element is printed as its own id"
+        for task in range(5, 11):
+            assert "900_%d" % task in found
+
+    def test_the_array_throttle_does_not_defeat_the_expansion(self):
+        """`--array=0-9%2` comes back inside the brackets. Left in place, `0-9%2`
+        is not a numeric range, so the parser keeps it verbatim as one unmatched
+        name and every element of a throttled array goes on being called dead --
+        silently, which is the worse failure."""
+        from slurmpast.sacct import _expand_job_ids
+
+        found = _expand_job_ids("900_[0-9%2]\n")
+        for task in range(10):
+            assert "900_%d" % task in found
+
+    def test_every_other_spelling_still_matches_itself(self):
+        """The control. Expansion must not lose the ids it does not understand: a
+        plain id, a heterogeneous component, and a bracket shape that is not a
+        numeric range at all."""
+        from slurmpast.sacct import _expand_job_ids
+
+        assert _expand_job_ids("12345\n") == {"12345"}
+        assert _expand_job_ids("500+0\n500+1\n") == {"500+0", "500+1"}
+        assert "weird_[a-b]" in _expand_job_ids("weird_[a-b]\n")
+
+    def test_a_queued_array_element_is_not_called_dead(self):
+        from slurmpast.cli import _mark_open_records
+        from slurmpast.diagnose import diagnose
+        from slurmpast.sacct import _FIELDS, parse
+
+        def row(**kw):
+            return "|".join(str(kw.get(name, "")) for name in _FIELDS)
+
+        jobs = parse(
+            "\n".join(
+                [
+                    row(
+                        JobID="900_7",
+                        JobIDRaw="907",
+                        JobName="sweep",
+                        State="PENDING",
+                        Start="",
+                        End="",
+                        Elapsed="00:00:00",
+                        ReqCPUS="4",
+                        AllocTRES="cpu=4,mem=8G,node=1",
+                        Partition="p",
+                    ),
+                    row(
+                        JobID="900_99",
+                        JobIDRaw="999",
+                        JobName="sweep",
+                        State="RUNNING",
+                        Start="2026-03-01T01:00:00",
+                        End="",
+                        Elapsed="62-00:00:00",
+                        ReqCPUS="4",
+                        AllocTRES="cpu=4,mem=8G,node=1",
+                        Partition="p",
+                    ),
+                ]
+            )
+        )
+        marked = {j.job_id: j for j in _mark_open_records(jobs, runner=lambda _a: "900_[5-10]\n")}
+        assert marked["900_7"].live is True, "queued, and squeue said so"
+        # The control that matters: the fix must not make every open record live.
+        # 900_99 is outside the range and really is a stale record.
+        assert marked["900_99"].live is False
+        actions = [
+            f.action
+            for f in diagnose(marked["900_7"]).findings
+            if f.code == "open-record"
+        ]
+        assert actions and "long gone" not in actions[0]
+        stale = [
+            f.action
+            for f in diagnose(marked["900_99"]).findings
+            if f.code == "open-record"
+        ]
+        assert stale and "long gone" in stale[0]

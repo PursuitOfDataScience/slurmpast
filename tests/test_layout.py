@@ -757,3 +757,242 @@ class TestTheReadmeAndItsAssetsAgree:
         assert int(claimed.group(1)) == int(collected.group(1)), (
             "README says %s tests, the suite collects %s" % (claimed.group(1), collected.group(1))
         )
+
+
+class TestEverySentenceWrapsIncludingTheEmptyOnes:
+    """Round six. Round five wrapped the prose lines its reproductions reached and
+    left the siblings beside them, which is the "fixed only on one side" shape
+    `issues.md` has now named three times.
+
+    Three of the five survivors are the lines a view falls back to when it has
+    nothing else to show, so the sentence written to rescue an empty screen was the
+    longest thing on it -- 132 cells at *every* terminal width, because the first
+    interpolates a folded workload name and the second is a fixed 121-character
+    literal.
+
+    Standalone rather than a subclass of TestPlainOutputFitsATerminal: that class
+    scopes its assertions to table rows on purpose ("a wrapped sentence is what
+    sentences do"), which is exactly the exemption these five hid behind. Every
+    line counts here.
+    """
+
+    LONG_WORKLOAD = "nemotron-batch-h200-tokenize-shards-stage7-retry"
+
+    @classmethod
+    def _history(cls, count, nodes, state, cpu):
+        """A history with long names, chosen to land on one of the empty branches."""
+        from slurmpast.index import History
+        from slurmpast.sacct import _FIELDS, parse
+
+        def row(**kw):
+            return "|".join(str(kw.get(name, "")) for name in _FIELDS)
+
+        rows = []
+        for index in range(count):
+            jid = 7000000 + index
+            day = index % 28 + 1
+            rows.append(
+                row(
+                    JobID=str(jid),
+                    JobName="%s-%d" % (cls.LONG_WORKLOAD, index),
+                    State=state,
+                    ExitCode="0:0",
+                    Start="2026-07-%02dT01:00:00" % day,
+                    End="2026-07-%02dT02:00:00" % day,
+                    Elapsed="01:00:00",
+                    Timelimit="02:00:00",
+                    ReqMem="0n",
+                    ReqCPUS="8",
+                    AllocTRES="cpu=8,mem=64G,node=1",
+                    NodeList="gpu-compute-node-a100-%04d" % (index % nodes),
+                    Partition="gpu",
+                )
+            )
+            rows.append(
+                row(
+                    JobID="%d.batch" % jid,
+                    State=state.split()[0],
+                    Elapsed="01:00:00",
+                    TotalCPU=cpu,
+                    CPUTime="08:00:00",
+                    MaxRSS="2000000K",
+                )
+            )
+        return History(parse("\n".join(rows)))
+
+    @pytest.mark.parametrize("columns", ["66", "80", "100", "120"])
+    def test_the_nodes_screen_with_nothing_to_report_still_fits(self, monkeypatch, columns):
+        """Both "nothing to say" branches, at four widths.
+
+        Branch A -- no hangs anywhere -- carries the workload name, so it reached
+        132 cells at 80, 100 and 120 alike. Branch B is a fixed literal at 122.
+        """
+        from slurmpast.report import Style, render_nodes
+
+        monkeypatch.setenv("COLUMNS", columns)
+        histories = {
+            "no hangs at all": self._history(30, 2, "COMPLETED", "00:50:00"),
+            "nothing reaches MIN_SAMPLES": self._history(12, 12, "TIMEOUT", "00:00.5"),
+        }
+        for label, history in histories.items():
+            text = render_nodes(history, metric="hang", style=Style(enabled=False))
+            for line in text.splitlines():
+                assert len(line) <= int(columns), "%s: %d > %s -- %r" % (
+                    label,
+                    len(line),
+                    columns,
+                    line,
+                )
+
+    @pytest.mark.parametrize("columns", ["66", "80", "100", "120"])
+    def test_the_baseline_line_wraps(self, monkeypatch, columns):
+        """The third sibling. 67 cells, so it overran below 68 only -- and that 67
+        is the number `table_floor`'s docstring recorded as `NODE_COLUMNS`' floor
+        for a round, which is 41. Measuring a prose bug and filing it as a property
+        of the column spec is how it survived."""
+        from slurmpast.demo import history
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_nodes
+
+        monkeypatch.setenv("COLUMNS", columns)
+        text = render_nodes(History(history()), metric="hang", style=Style(enabled=False))
+        baseline = [ln for ln in text.splitlines() if "baseline" in ln]
+        assert baseline, "the baseline line should still be on the screen"
+        for line in text.splitlines():
+            assert len(line) <= int(columns), "%d > %s -- %r" % (len(line), columns, line)
+
+    def test_the_documented_node_table_floor_is_the_one_the_spec_gives(self):
+        """The control for the docstring correction, and the reason it is a test.
+
+        67 was measured off the rendered view and written down as a property of
+        `NODE_COLUMNS`. Asserting the real relationship means the next person to
+        add a never-dropped column moves this number and finds out.
+        """
+        from slurmpast.render import NODE_COLUMNS, table_floor
+
+        assert table_floor(NODE_COLUMNS) == 41
+        keep = [c for c in NODE_COLUMNS if not c.drop]
+        assert table_floor(NODE_COLUMNS) == 2 + sum(
+            max(c.width, len(c.label)) for c in keep
+        ) + (len(keep) - 1)
+
+    @pytest.mark.parametrize("columns", ["66", "80", "100"])
+    def test_the_sizing_screen_wraps_its_headers_and_its_empty_line(
+        self, monkeypatch, columns
+    ):
+        """A folded workload name plus a partition is unbounded (86 cells at 80),
+        and the "nothing to advise" line is 66 -- the only line on that view."""
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_sizing
+        from slurmpast.sacct import _FIELDS, parse
+
+        monkeypatch.setenv("COLUMNS", columns)
+
+        def row(**kw):
+            return "|".join(str(kw.get(name, "")) for name in _FIELDS)
+
+        nothing = History(
+            parse(
+                row(
+                    JobID="500001",
+                    JobName="a",
+                    State="COMPLETED",
+                    ExitCode="0:0",
+                    Start="2026-07-01T00:00:00",
+                    End="2026-07-01T01:00:00",
+                    Elapsed="01:00:00",
+                    Timelimit="01:00:00",
+                    ReqMem="0n",
+                    ReqCPUS="1",
+                    AllocTRES="cpu=1,mem=1G,node=1",
+                    NodeList="n1",
+                    Partition="p",
+                )
+            )
+        )
+        from slurmpast.demo import history
+
+        wide = History(
+            [
+                j._replace(
+                    name=j.name.replace("cot-exp", self.LONG_WORKLOAD),
+                    partition="very-long-partition-name",
+                )
+                for j in history()
+            ]
+        )
+        for label, hist in (("nothing to advise", nothing), ("long headers", wide)):
+            text = render_sizing(hist, style=Style(enabled=False))
+            for line in text.splitlines():
+                assert len(line) <= int(columns), "%s: %d > %s -- %r" % (
+                    label,
+                    len(line),
+                    columns,
+                    line,
+                )
+
+    @pytest.mark.parametrize("columns", ["80", "100", "120"])
+    def test_only_the_recorded_log_path_may_overrun(self, monkeypatch, columns):
+        """The prose around a path wraps; the path itself does not, on purpose.
+
+        `--plain` exists to be pasted, so a path is never shortened -- but the
+        58-cell "matched by timing" note rode on the same line (133 cells at every
+        width) and the "moved or deleted" variant is a whole sentence built around
+        one (122). Both are prose. The demo could not catch either: its jobs record
+        no StdOut, no SubmitLine and a 23-character workdir, and this test's own
+        class already had a long-valued fixture the job-detail test did not use.
+        """
+        from slurmpast.report import Style, render_job
+        from slurmpast.sacct import _FIELDS, parse
+
+        monkeypatch.setenv("COLUMNS", columns)
+
+        def row(**kw):
+            return "|".join(str(kw.get(name, "")) for name in _FIELDS)
+
+        job = parse(
+            row(
+                JobID="884411",
+                JobName="nemotron-batch-h200-tokenize-shards",
+                State="COMPLETED",
+                ExitCode="0:0",
+                Start="2026-07-01T00:00:00",
+                End="2026-07-01T02:00:00",
+                Elapsed="02:00:00",
+                Timelimit="04:00:00",
+                ReqMem="0n",
+                ReqCPUS="8",
+                AllocTRES="cpu=8,mem=64G,node=1",
+                NodeList="n1",
+                Partition="p",
+                WorkDir="/scratch/dana",
+                StdOut="/scratch/dana/logs/%x-%j.out",
+            )
+        )[0]
+        long_path = "/scratch/dana/logs/nemotron-batch-h200-tokenize-shards-884411.out"
+        cases = {
+            "found, matched by timing": {"log_path": long_path, "log_inferred": True},
+            "not found, path recorded": {"log_path": None},
+        }
+        for label, kwargs in cases.items():
+            text, _ = render_job(job, style=Style(enabled=False), **kwargs)
+            for line in text.splitlines():
+                if long_path in line:
+                    continue  # the accepted overrun: a path has to stay copyable
+                assert len(line) <= int(columns), "%s: %d > %s -- %r" % (
+                    label,
+                    len(line),
+                    columns,
+                    line,
+                )
+
+    def test_the_path_itself_is_still_printed_whole(self):
+        """The control for the exemption above: wrapping must not have shortened
+        the one value the plain renderer promises to keep intact."""
+        from slurmpast.demo import history
+        from slurmpast.report import Style, render_job
+
+        long_path = "/scratch/dana/logs/a-very-long-name-indeed-for-one-job-884411.out"
+        text, _ = render_job(history()[0], log_path=long_path, style=Style(enabled=False))
+        assert long_path in text
+        assert "…" not in text.split("log")[-1].splitlines()[0]

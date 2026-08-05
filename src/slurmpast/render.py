@@ -19,6 +19,7 @@ from .duration import (
     format_percent,
 )
 from .model import Job, severity_rank
+from .nodes import MIN_SAMPLES
 
 
 def bar_cells(percent: float | None, width: int) -> int:
@@ -292,10 +293,16 @@ def table_floor(spec, indent: int = 2, gap: int = 1) -> int:
     ones marked droppable -- so every spec has a width below which it stops
     shrinking and starts overrunning instead, and that width is a property of the
     spec rather than a number anyone can keep up to date by hand. ``JOB_COLUMNS``
-    bottoms out at 74 cells and ``NODE_COLUMNS`` at 67, both well above the 60
-    that ``report.PLAIN_MIN_WIDTH`` clamps the layout to, and the overrun in
-    between went unnoticed because the width tests were parametrized over 80, 100
-    and 120 only.
+    bottoms out at 74 cells and ``NODE_COLUMNS`` at 41, and the overrun between 74
+    and the 60 that ``report.PLAIN_MIN_WIDTH`` clamps the layout to went unnoticed
+    because the width tests were parametrized over 80, 100 and 120 only.
+
+    The node figure was recorded here as 67 for one round, which was not a table
+    floor at all: it was the length of ``render_nodes``' unwrapped ``baseline …``
+    line, measured off the rendered view and attributed to the spec. That is worth
+    naming rather than quietly correcting, because filing a wrappable sentence as a
+    property of the column set is the one framing under which nobody fixes it --
+    and nobody did. Take this number from the spec, never from a screenshot.
 
     Kept honest by ``TestPlainOutputFitsATerminal``, which asserts each view
     against ``max(terminal, table_floor(its spec))`` rather than against a
@@ -578,6 +585,56 @@ NODE_COLUMNS: tuple[Column, ...] = (
 )
 
 register_alignment(OVERVIEW_COLUMNS, JOB_COLUMNS, STEP_COLUMNS, NODE_COLUMNS, (CPU_HOURS_COLUMN,))
+
+
+def nodes_baseline(table) -> str:
+    """``baseline 70.0% over 20 placements; 1 node below threshold omitted``.
+
+    One sentence, unindented and unwrapped, for a caller to wrap to its own width.
+    Here rather than in either front end for the reason this module exists: both
+    screens draw it, and while each spelled it out for itself the two drifted --
+    ``report`` said "below threshold" and ``tui`` said "below sample threshold",
+    and when round five wrapped the two prose lines above this one it wrapped them
+    in ``report`` only. A sentence both surfaces show is a shared renderable.
+    """
+    skipped = table["skipped_nodes"]
+    tail = ""
+    if skipped:
+        tail = "; %d node%s below threshold omitted" % (skipped, "" if skipped == 1 else "s")
+    return "baseline %s over %d placements%s" % (
+        format_percent(table["baseline"]),
+        table["trials"],
+        tail,
+    )
+
+
+def nodes_empty_reason(table, metric: str, workload: str | None) -> str:
+    """Why the node table has no rows, or ``""`` when it has some.
+
+    Two ways it can have nothing to say, and round three added these sentences
+    because an empty grid answered neither: "printing a column header over no rows
+    -- or eight rows of 0/N, 0.0%, inconclusive -- is what made this screen read as
+    useless. A sentence is the answer in both cases."
+
+    Both were then left unwrapped in both front ends for two more rounds, so the
+    sentence written to rescue an empty screen was itself the longest line on it --
+    132 cells at every terminal width, because the first interpolates a *folded
+    workload name* (``cot-exp`` in the demo, which is what hid it;
+    ``nemotron-batch-h#-tokenize-shards-stage#-retry-#`` on a real cluster) and the
+    second is a fixed 121-character literal. Returned plain so each caller wraps it
+    to the width it actually has.
+    """
+    if not table["hits"]:
+        return "No %s recorded%s in this window, so there is nothing to attribute to a node." % (
+            metric + "s",
+            " for %s" % workload if workload else "",
+        )
+    if not table["rows"]:
+        return (
+            "No node reached the %d placements a comparison needs — %d seen, all below it. "
+            "A wider window is what fixes this." % (MIN_SAMPLES, table["skipped_nodes"])
+        )
+    return ""
 
 
 def held_back_note(count: int, tested: int) -> str:

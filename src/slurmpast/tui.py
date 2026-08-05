@@ -44,7 +44,7 @@ from .index import (
     sort_label,
 )
 from .logs import assign_logs, load_for, read_tail
-from .nodes import MIN_SAMPLES, compress_nodelist, excluded_tail, node_table, suggest_exclude
+from .nodes import compress_nodelist, excluded_tail, node_table, suggest_exclude
 
 BASE_CSS = """
 Screen { background: $surface; align-horizontal: center; }
@@ -1653,19 +1653,12 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
                 _prose_width(self, 2),
             ):
                 summary.append("  " + line + "\n", style=theme.HEALTH_COLOR["warn"])
-        skipped = table_data["skipped_nodes"]
-        summary.append(
-            "  baseline %s over %d placements%s\n"
-            % (
-                format_percent(table_data["baseline"]),
-                table_data["trials"],
-                "; %d node%s below sample threshold omitted"
-                % (skipped, "" if skipped == 1 else "s")
-                if skipped
-                else "",
-            ),
-            style=theme.FAINT,
-        )
+        # From `render`, wrapped to this screen, like every other sentence here.
+        # Spelled out locally it said "below sample threshold" where the plain
+        # report said "below threshold", and it went unwrapped in both -- the
+        # drift `render` exists to make impossible.
+        for line in render.wrap(render.nodes_baseline(table_data), _prose_width(self, 2)):
+            summary.append("  %s\n" % line, style=theme.FAINT)
         self.summary_text = summary
         self.query_one("#summary", Static).update(summary)
 
@@ -1673,22 +1666,18 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
         table.clear()
         # Two ways this table has nothing to say, and an empty grid says neither.
         rows = table_data["rows"]
-        empty_reason = ""
-        if not table_data["hits"]:
-            empty_reason = (
-                "\n  No %s recorded%s in this window, so there is nothing\n"
-                "  to attribute to a node.\n"
-                % (self.metric + "s", " for %s" % workload if workload else "")
-            )
-        elif not rows:
-            empty_reason = (
-                "\n  No node reached the %d placements a comparison needs — %d seen,\n"
-                "  all below it. A wider window (w) is what fixes this.\n"
-                % (MIN_SAMPLES, table_data["skipped_nodes"])
-            )
+        # Both sentences come from `render` and are wrapped to the width there is.
+        # They were two hardcoded line breaks, which is a wrap guess rather than a
+        # measurement: the first interpolates a folded workload name, so on a real
+        # cluster its first "line" ran well past any terminal and Textual folded
+        # the remainder to column 0 -- the sentence that exists to rescue an empty
+        # screen, breaking it.
+        empty_reason = render.nodes_empty_reason(table_data, self.metric, workload)
         if empty_reason:
             rows = []
-            summary.append(empty_reason, style=theme.HEALTH_COLOR["ok"])
+            summary.append("\n")
+            for line in render.wrap(empty_reason, _prose_width(self, 2)):
+                summary.append("  %s\n" % line, style=theme.HEALTH_COLOR["ok"])
             self.query_one("#summary", Static).update(summary)
         for row in rows:
             grade = {"worse": "crit", "better": "ok"}.get(row["verdict"], "none")

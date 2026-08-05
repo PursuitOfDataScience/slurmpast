@@ -1,5 +1,20 @@
 # slurmpast — audit and resolution
 
+> **Round six, 2026-08-05, from `4f12dc1`.** Filed as issue #5. Round five's ten
+> defects, its documentation set and all six of its minor items re-verified as
+> genuinely fixed — by running each reproduction again, not by reading the entries
+> below. Seven new: one false claim about a live job, introduced *by* one of round
+> five's own fixes, and six unwrapped prose lines, which are one defect wearing six
+> hats. 1166 tests before, **1190 after**.
+>
+> Stated plainly, because this round could not run the full gate: the audit
+> environment had no network, so `pytest`, `rich` and `textual` could not be
+> installed. The suite was executed against a stubbed `rich.text.Text` through a
+> pytest shim (905 of the 1,190 items, everything not requiring Textual, 0 failures),
+> the new count was computed from the collection rules and checked against the badge
+> the CI gate already validates, and `ruff`, `ruff format` and `mypy` were left to CI
+> rather than claimed here.
+>
 > **Round five, 2026-08-05, from `f505d44`.** A full read of all 19 modules,
 > filed as issue #1. Ten defects plus the documentation set, every one reproduced by
 > running the code before it was written down, and two candidates withdrawn on
@@ -18,6 +33,122 @@
 > upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
 > was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
 > and its control. `ruff`, `ruff format` and `mypy` clean.
+
+---
+
+## Round six — issue #5
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | A queued array element was reported as "long gone" | `sacct.live_job_ids` | `TestSqueuePrintsPendingArraysAsRanges` (`test_sacct.py`) |
+| 2 | Both node-screen "nothing to say" sentences overran *every* width | `render.nodes_empty_reason` | `TestEverySentenceWrapsIncludingTheEmptyOnes` (`test_layout.py`) |
+| 3 | The job screen's `log` line overran every width | `report.render_job` | `test_only_the_recorded_log_path_may_overrun` |
+| 4 | The node screen's `baseline` line, the third unwrapped sibling | `render.nodes_baseline` | `test_the_baseline_line_wraps` |
+| 5 | `--sizing`'s group header carried an unbounded name and partition | `report.render_sizing` | `test_the_sizing_screen_wraps_its_headers_and_its_empty_line` |
+| 6 | `--sizing`'s "nothing to advise" line was 66 cells | `report.render_sizing` | *(same)* |
+| 7 | The documented node-table floor was wrong, and it hid #4 | `render.table_floor` | `test_the_documented_node_table_floor_is_the_one_the_spec_gives` |
+
+**Six of the seven are one defect.** Round five wrapped the prose lines its own
+reproductions happened to reach and left the siblings beside them — in
+`render_nodes` it wrapped the `controlled for workload` line and the `UNCONTROLLED`
+warning, and left the three lines under them. That is the shape this file has now
+named three times: round three's "#21 corrected the *caption* above the workload
+table and left the *footer* below it wrong", round five's #6 and #7, and now this.
+The pattern is not carelessness about lines, it is scope taken from whatever the
+reproduction touched, so the fix here is structural: the sentences both screens draw
+moved into `render`, where a wrap applies once.
+
+### 1. squeue does not print one id per pending array task
+
+It prints the range. `900_[5-10]` — the same bracketed grammar Slurm uses for
+hostlists, which `nodes.expand_nodelist` has parsed since round one and is
+differential-tested against `scontrol show hostnames`. `cli._mark_open_records`
+tested membership against the raw set, so every *pending* element missed.
+
+Round five is what made that a defect rather than a wasted call. Before it the set
+was fetched and discarded, so nothing was claimed; the fix turned the value into a
+user-facing assertion without teaching it the range spelling, and the miss became
+the strongest of the finding's three sentences:
+
+```
+squeue --format=%i returns: '900_[5-10]'
+
+  900_7   PENDING  live=False
+      -> squeue has never heard of it, so the job is long gone and the record was
+         never closed. The elapsed above is an artefact.
+```
+
+The job is queued at that moment. A `PENDING` record reaches the path because
+`open_ended` is `not end_raw and state not in _TERMINAL_STATES`, and `PENDING` is in
+neither set. Expanded in `sacct.live_job_ids`, so every caller gets individual ids
+rather than each one learning the grammar.
+
+The `%N` throttle is stripped first. `--array=0-9%2` comes back *inside* the
+brackets as `900_[0-9%2]`, and left in place it defeats the expansion silently:
+`0-9%2` is not a numeric range, so the parser keeps it verbatim as one unmatched
+name and every element of a throttled array goes on being called dead. Unknown
+spellings still match themselves, so failing to understand one costs exactly what
+the whole set cost before.
+
+### 2, 3, 4, 5, 6. Five sentences, measured
+
+```
+                                                  before   after
+nodes, "No hangs recorded for <workload> ..."        132      wraps   (every width)
+nodes, "No node reached the N placements ..."        122      wraps   (every width)
+job,   "log <path>  (matched by timing ...)"         133      wraps   (every width)
+job,   "log none at <path> — moved or deleted"       122      wraps   (every width)
+sizing, "<workload>  <partition> · N runs"            86      wraps   (at 80)
+nodes, "baseline N% over M placements; ..."            67      wraps   (below 68)
+sizing, "every workload is already about right"        66      wraps   (below 66)
+```
+
+Four of those overran **every** terminal width, not merely narrow ones, and three of
+them are the line a view falls back to when it has nothing else to show — so the
+sentence round three added to rescue an empty screen ("printing a column header over
+no rows … is what made this screen read as useless") was the longest thing on it.
+Two carry a folded workload name, which is round five's #6 in branches that round's
+reproductions never entered: `cot-exp` in the demo,
+`nemotron-batch-h#-tokenize-shards-stage#-retry-#` on a real cluster.
+
+**One overrun is kept, and named.** A recorded log path is never shortened —
+`--plain` exists to be pasted and `wrap` cannot break a token with no spaces in it —
+so a path wider than the terminal still overruns. What did not have to was the 58
+cells of prose riding beside it. Where the pair fits, the line is byte-identical to
+before; the same applies to the sizing header, whose two-space separator `wrap`
+would otherwise have collapsed.
+
+### 7. A number taken from a screenshot
+
+`render.table_floor(NODE_COLUMNS)` returns **41**. Three places said 67:
+`table_floor`'s own docstring, the `PLAIN_MIN_WIDTH` comment, and round five §6&7
+above. 74 for `JOB_COLUMNS` was right.
+
+67 is not a table floor at all. It is the length of the unwrapped `baseline` line in
+#4 — measured off the rendered view and written down as a property of the column
+spec. That is worth recording rather than quietly correcting, because it is the one
+framing under which a wrappable sentence never gets wrapped: filed as a column-spec
+property it is an unavoidable limitation, and #4 sat behind it for a round.
+`test_the_documented_node_table_floor_is_the_one_the_spec_gives` now asserts the
+relationship rather than the number, so a new never-dropped column moves it.
+
+### Confirmed fixed from round five
+
+Every reproduction re-run: 30 explicit ids give 30 post-mortems and 30 JSON entries;
+`sigkill` fires on `FAILED` alone; the memory-slack action reads `--mem=52G`; the
+injected runner gets the `--helpformat` probe and nothing escapes to the module
+`_run`; `--no-logs` emits no log line at all; a folded workload name fits 80, 100
+and 120; the job detail fits from 60 up; `_elide` honours `keep` in all three shapes;
+the demo's clock agrees with its ids and `--sizing` reads `(from 32.0 GiB)`; `r`
+snapshots `_previous`. The demo contains its advertised bad node —
+`--demo --nodes` names `midway3-0385` at 12/12 with a paste-ready `--exclude`. All
+six minor items hold.
+
+### Consequence for the numbers
+
+None. Every change is presentation, except #1, which changes one sentence on an
+open record from a false claim to a true one and leaves `open_ended` — and so every
+aggregate — exactly as it was.
 
 ---
 
