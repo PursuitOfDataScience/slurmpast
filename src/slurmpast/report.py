@@ -300,9 +300,7 @@ def render_job(
         if log_inferred and len(inline) <= _plain_width():
             # Unchanged where the pair fits, which is every short path on a wide
             # terminal.
-            out.append(
-                "  %s %s  %s" % (style("log", "grey"), log_path, style(note, "grey"))
-            )
+            out.append("  %s %s  %s" % (style("log", "grey"), log_path, style(note, "grey")))
         else:
             # The path keeps its own line and is never shortened -- `--plain` exists
             # to be pasted, and a path you cannot copy whole is no use in a ticket,

@@ -872,14 +872,12 @@ class TestEverySentenceWrapsIncludingTheEmptyOnes:
 
         assert table_floor(NODE_COLUMNS) == 41
         keep = [c for c in NODE_COLUMNS if not c.drop]
-        assert table_floor(NODE_COLUMNS) == 2 + sum(
-            max(c.width, len(c.label)) for c in keep
-        ) + (len(keep) - 1)
+        assert table_floor(NODE_COLUMNS) == 2 + sum(max(c.width, len(c.label)) for c in keep) + (
+            len(keep) - 1
+        )
 
     @pytest.mark.parametrize("columns", ["66", "80", "100"])
-    def test_the_sizing_screen_wraps_its_headers_and_its_empty_line(
-        self, monkeypatch, columns
-    ):
+    def test_the_sizing_screen_wraps_its_headers_and_its_empty_line(self, monkeypatch, columns):
         """A folded workload name plus a partition is unbounded (86 cells at 80),
         and the "nothing to advise" line is 66 -- the only line on that view."""
         from slurmpast.index import History

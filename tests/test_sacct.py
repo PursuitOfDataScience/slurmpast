@@ -552,15 +552,7 @@ class TestSqueuePrintsPendingArraysAsRanges:
         # The control that matters: the fix must not make every open record live.
         # 900_99 is outside the range and really is a stale record.
         assert marked["900_99"].live is False
-        actions = [
-            f.action
-            for f in diagnose(marked["900_7"]).findings
-            if f.code == "open-record"
-        ]
+        actions = [f.action for f in diagnose(marked["900_7"]).findings if f.code == "open-record"]
         assert actions and "long gone" not in actions[0]
-        stale = [
-            f.action
-            for f in diagnose(marked["900_99"]).findings
-            if f.code == "open-record"
-        ]
+        stale = [f.action for f in diagnose(marked["900_99"]).findings if f.code == "open-record"]
         assert stale and "long gone" in stale[0]
