@@ -289,10 +289,11 @@ def render_job(
 
     out.append("")
     if log_path:
-        # The path keeps its own line and is never shortened -- `--plain` exists to
-        # be pasted, and a path you cannot copy whole is no use in a ticket, so a
-        # path longer than the terminal is an accepted overrun rather than a defect.
-        # Named here because it is the only one left in this view.
+        # The path is never shortened -- `--plain` exists to be pasted, and a path
+        # you cannot copy whole is no use in a ticket -- so a path longer than the
+        # terminal is an accepted overrun rather than a defect, and the only one
+        # left in this view. What did not have to overrun is the note beside it.
+        #
         # Say when the path was inferred from timing rather than read off a name: a
         # wrong log invents a cause, so the basis has to travel with it.
         note = "(matched by timing, not by name — verify before trusting it)"
@@ -302,10 +303,6 @@ def render_job(
             # terminal.
             out.append("  %s %s  %s" % (style("log", "grey"), log_path, style(note, "grey")))
         else:
-            # The path keeps its own line and is never shortened -- `--plain` exists
-            # to be pasted, and a path you cannot copy whole is no use in a ticket,
-            # so a path longer than the terminal is an accepted overrun rather than
-            # a defect. It is the only one left in this view.
             out.append("  %s %s" % (style("log", "grey"), log_path))
             # The note is prose, and riding on that line it added 58 cells to
             # whatever the path already cost -- 133 cells at every terminal width,

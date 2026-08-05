@@ -608,7 +608,7 @@ def nodes_baseline(table) -> str:
     )
 
 
-def nodes_empty_reason(table, metric: str, workload: str | None) -> str:
+def nodes_empty_reason(table, metric: str, workload: str | None, widen: str = "--since") -> str:
     """Why the node table has no rows, or ``""`` when it has some.
 
     Two ways it can have nothing to say, and round three added these sentences
@@ -623,6 +623,15 @@ def nodes_empty_reason(table, metric: str, workload: str | None) -> str:
     ``nemotron-batch-h#-tokenize-shards-stage#-retry-#`` on a real cluster) and the
     second is a fixed 121-character literal. Returned plain so each caller wraps it
     to the width it actually has.
+
+    ``widen`` is how the reader widens the window *on this surface* -- ``--since``
+    for the plain report, pressing ``w`` for the dashboard. Sharing the sentence
+    without it collapsed the two into a bare "A wider window is what fixes this.",
+    dropping the only clause the reader can act on and the only one that
+    legitimately differs between the front ends. This module exists to stop them
+    drifting, not to average them: the wording is shared, the keystroke is passed
+    in. Naming the thing you actually type is the same rule ``format_duration``'s
+    ``HH:MM:SS`` and ``format_mem_flag``'s ``52G`` were written for.
     """
     if not table["hits"]:
         return "No %s recorded%s in this window, so there is nothing to attribute to a node." % (
@@ -632,7 +641,7 @@ def nodes_empty_reason(table, metric: str, workload: str | None) -> str:
     if not table["rows"]:
         return (
             "No node reached the %d placements a comparison needs — %d seen, all below it. "
-            "A wider window is what fixes this." % (MIN_SAMPLES, table["skipped_nodes"])
+            "A wider window (%s) is what fixes this." % (MIN_SAMPLES, table["skipped_nodes"], widen)
         )
     return ""
 

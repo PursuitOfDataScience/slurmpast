@@ -5,15 +5,18 @@
 > genuinely fixed — by running each reproduction again, not by reading the entries
 > below. Seven new: one false claim about a live job, introduced *by* one of round
 > five's own fixes, and six unwrapped prose lines, which are one defect wearing six
-> hats. 1166 tests before, **1190 after**.
+> hats. 1166 tests before, **1195 after**.
 >
-> Stated plainly, because this round could not run the full gate: the audit
+> Stated plainly, because the round itself could not run the full gate: the audit
 > environment had no network, so `pytest`, `rich` and `textual` could not be
 > installed. The suite was executed against a stubbed `rich.text.Text` through a
-> pytest shim (905 of the 1,190 items, everything not requiring Textual, 0 failures),
-> the new count was computed from the collection rules and checked against the badge
-> the CI gate already validates, and `ruff`, `ruff format` and `mypy` were left to CI
-> rather than claimed here.
+> pytest shim (905 of the items, everything not requiring Textual, 0 failures), the
+> new count was computed from the collection rules, and `ruff`, `ruff format` and
+> `mypy` were not claimed.
+>
+> **All four gates were then run for real at review, on the full suite including
+> the three Textual modules: 1195 pass, `ruff`, `ruff format` and `mypy` clean.**
+> The predicted count was exact. Review added one fix of its own, below.
 >
 > **Round five, 2026-08-05, from `f505d44`.** A full read of all 19 modules,
 > filed as issue #1. Ten defects plus the documentation set, every one reproduced by
@@ -22,7 +25,7 @@
 > the **Open** gauge entry below, which a second reviewer has now raised. 1,098
 > tests before, **1166 after**. `ruff`, `ruff format` and `mypy` clean.
 >
-> > **Round four, 2026-08-03, from `4d47d4d`.** Not a sweep — two defects, both
+> **Round four, 2026-08-03, from `4d47d4d`.** Not a sweep — two defects, both
 > surfaced by one user question ("does slurmpast support me looking at other users'
 > past jobs?"). The answer was yes, and asking it found that the multi-user path
 > was half-built: a `--allusers` branch nothing could reach, and a `user` argument
@@ -47,6 +50,7 @@
 | 5 | `--sizing`'s group header carried an unbounded name and partition | `report.render_sizing` | `test_the_sizing_screen_wraps_its_headers_and_its_empty_line` |
 | 6 | `--sizing`'s "nothing to advise" line was 66 cells | `report.render_sizing` | *(same)* |
 | 7 | The documented node-table floor was wrong, and it hid #4 | `render.table_floor` | `test_the_documented_node_table_floor_is_the_one_the_spec_gives` |
+| 8 | Sharing a sentence averaged away the one clause that differs per surface | `render.nodes_empty_reason` | `TestASharedSentenceKeepsWhatIsSurfaceSpecific` (`test_layout.py`) |
 
 **Six of the seven are one defect.** Round five wrapped the prose lines its own
 reproductions happened to reach and left the siblings beside them — in
@@ -131,6 +135,30 @@ framing under which a wrappable sentence never gets wrapped: filed as a column-s
 property it is an unavoidable limitation, and #4 sat behind it for a round.
 `test_the_documented_node_table_floor_is_the_one_the_spec_gives` now asserts the
 relationship rather than the number, so a new never-dropped column moves it.
+
+### 8. Added at review: a shared sentence kept its keystroke
+
+Pooling the two empty-table sentences into `render` was the right call — it is what
+`render.py` is for, and it settled a real drift where `report` said "below threshold"
+and `tui` said "below sample threshold". But it also averaged away the one clause
+that is *supposed* to differ. The plain report had told the reader
+
+    A wider --since window is what fixes this.
+
+and the dashboard had told them `(w)`. The shared version said neither:
+
+    A wider window is what fixes this.
+
+That is the only actionable clause in the sentence, and dropping it is the same
+defect `format_duration`'s `HH:MM:SS` and `format_mem_flag`'s `52G` exist to prevent
+— name the thing the reader actually types. `nodes_empty_reason` now takes `widen`,
+so the wording stays shared and the keystroke is passed in.
+
+Worth recording as its own item rather than folded into #2, because it is a hazard
+of the *remedy* rather than of the original defect, and the remedy is one this
+codebase reaches for often: consolidating a duplicated string is not free, and what
+it costs is exactly the part that was different on purpose. Nothing caught it — the
+suite was green at 1,190 with the clause gone.
 
 ### Confirmed fixed from round five
 

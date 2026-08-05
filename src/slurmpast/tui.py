@@ -1672,7 +1672,11 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
         # cluster its first "line" ran well past any terminal and Textual folded
         # the remainder to column 0 -- the sentence that exists to rescue an empty
         # screen, breaking it.
-        empty_reason = render.nodes_empty_reason(table_data, self.metric, workload)
+        # `w` here, `--since` in the plain report: the wording is shared, the
+        # keystroke is not, because it is the one part of the sentence that
+        # legitimately differs between the two surfaces -- and the only part the
+        # reader can act on.
+        empty_reason = render.nodes_empty_reason(table_data, self.metric, workload, widen="w")
         if empty_reason:
             rows = []
             summary.append("\n")

@@ -994,3 +994,66 @@ class TestEverySentenceWrapsIncludingTheEmptyOnes:
         text, _ = render_job(history()[0], log_path=long_path, style=Style(enabled=False))
         assert long_path in text
         assert "…" not in text.split("log")[-1].splitlines()[0]
+
+
+class TestASharedSentenceKeepsWhatIsSurfaceSpecific:
+    """`render` exists so the two front ends cannot drift — but pooling a sentence
+    can also average away the one part of it that is *supposed* to differ.
+
+    `nodes_empty_reason` did: the plain report told the reader "A wider --since
+    window is what fixes this" and the dashboard told them "(w)", and sharing the
+    sentence collapsed both into a bare "A wider window is what fixes this." That
+    is the only actionable clause in it, and this codebase's whole line on advice
+    is to name the thing the reader actually types — `format_duration`'s
+    `HH:MM:SS`, `format_mem_flag`'s `52G`, the paste-ready `#SBATCH --exclude=`.
+
+    So the wording is shared and the keystroke is passed in. Nothing caught the
+    loss when it happened: the suite stayed green at 1,190.
+    """
+
+    @staticmethod
+    def _no_rows_table():
+        """A table that reaches the "nothing reached MIN_SAMPLES" branch."""
+        return {"hits": 3, "rows": [], "skipped_nodes": 12, "baseline": 0.25, "trials": 12}
+
+    def test_the_plain_report_names_the_flag(self):
+        from slurmpast.render import nodes_empty_reason
+
+        assert "--since" in nodes_empty_reason(self._no_rows_table(), "hang", None)
+
+    def test_the_dashboard_names_the_key(self):
+        from slurmpast.render import nodes_empty_reason
+
+        text = nodes_empty_reason(self._no_rows_table(), "hang", None, widen="w")
+        assert "(w)" in text
+        assert "--since" not in text
+
+    def test_neither_surface_is_left_with_a_bare_sentence(self):
+        """The regression itself: an empty-window message with no way out of it."""
+        from slurmpast.render import nodes_empty_reason
+
+        for widen in ("--since", "w"):
+            text = nodes_empty_reason(self._no_rows_table(), "hang", None, widen=widen)
+            assert "A wider window ()" not in text
+            assert "A wider window is what fixes this" not in text, text
+
+    def test_the_wording_around_it_is_still_shared(self):
+        """The control: the point of pooling the sentence was that `report` said
+        "below threshold" while `tui` said "below sample threshold". Everything but
+        the keystroke has to stay identical."""
+        from slurmpast.render import nodes_empty_reason
+
+        plain = nodes_empty_reason(self._no_rows_table(), "hang", None, widen="--since")
+        dash = nodes_empty_reason(self._no_rows_table(), "hang", None, widen="w")
+        assert plain.replace("(--since)", "<>") == dash.replace("(w)", "<>")
+
+    def test_both_front_ends_actually_pass_their_own(self):
+        """Reading the rendered views, not just the helper: a parameter with a
+        default is only as good as the caller that overrides it."""
+        import inspect
+
+        from slurmpast import report, tui
+
+        assert 'widen="w"' in inspect.getsource(tui.NodesScreen)
+        # report relies on the default, so pin that the default is the flag.
+        assert "--since" in report.nodes_empty_reason(self._no_rows_table(), "hang", None)
