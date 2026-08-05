@@ -1226,3 +1226,89 @@ class TestNothingInTheLoadWorkerTakesTheAppDown:
             assert app.history is not None
             assert isinstance(app.screen, tui.OverviewScreen)
         assert app.load_error is None
+
+
+class TestReloadSurvivesATransientFailure:
+    """`r` did not snapshot `_previous` before re-querying, so it took the exit
+    path in `_loaded` that `w` degrades gracefully out of.
+
+    `_requery` clears `self.history` first, and a successful load clears
+    `_previous`, so after any normal session `r` plus a slurmdbd blip or a query
+    timeout tore the dashboard down with the history already discarded -- while
+    the identical failure on `w` toasted and stayed put. `_loaded`'s own comment
+    gives the reason: "Backing out beats exiting: they still have the data they
+    had."
+    """
+
+    @staticmethod
+    def _flaky(jobs):
+        """A loader that works once, then raises the way slurmdbd does."""
+        state = {"calls": 0}
+
+        def load(*_args):
+            state["calls"] += 1
+            if state["calls"] > 1:
+                raise RuntimeError("slurm_load_jobs error: Socket timed out")
+            return list(jobs)
+
+        return load
+
+    @pytest.mark.asyncio
+    async def test_the_app_stays_up_and_keeps_its_data(self, history_jobs):
+        app = tui.SlurmpastApp(self._flaky(history_jobs), window="test window")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            before = app.history
+            assert before is not None
+            await pilot.press("r")
+            await pilot.pause()
+            assert app.is_running, "a transient query failure must not exit the app"
+            assert app.history is before, "the history the user had was discarded"
+
+    @pytest.mark.asyncio
+    async def test_a_first_load_that_fails_still_exits(self, history_jobs):
+        """The control. With nothing to fall back to there is no data to keep, and
+        exiting with the error is the right answer -- that path is unchanged."""
+
+        def always_fails(*_args):
+            raise RuntimeError("no such cluster")
+
+        app = tui.SlurmpastApp(always_fails, window="test window")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+        assert app.load_error == "no such cluster"
+
+
+class TestOnlyPathsAreElidedLikePaths:
+    """`"/" in value` is not a test for a path. The `submitted as` row (SubmitLine,
+    Slurm 21.08+) is a command line, and middle-eliding it threw away the
+    `--output` directory on the one row that records where the output went."""
+
+    SUBMIT_LINE = (
+        "sbatch --job-name=midtrain --partition=gpu --gres=gpu:4 "
+        "--output=/scratch/midway3/youzhi/logs/%x-%j.out train.sh"
+    )
+
+    def test_a_command_line_keeps_its_head(self):
+        clipped = tui._clip(self.SUBMIT_LINE, 60)
+        assert clipped.startswith("sbatch --job-name=midtrain")
+        assert "/…/" not in clipped
+        assert len(clipped) == 60
+
+    def test_a_path_row_is_still_elided_middle_out(self):
+        """The control: `workdir` is a path and keeps both ends."""
+        from slurmpast.render import PATH_ROWS
+
+        assert "workdir" in PATH_ROWS
+        assert "submitted as" not in PATH_ROWS
+
+    def test_elide_honours_its_budget(self):
+        """At keep=30 this returned 122 characters, so the row soft-wrapped to
+        column 0 anyway -- the only thing eliding exists to prevent."""
+        path = "/scratch/midway3/youzhi/runs/cot-exp/logs/slurm-51170455.out"
+        assert len(tui._elide(path, keep=30)) <= 30
+
+    def test_the_readable_form_is_still_preferred_when_it_fits(self):
+        path = "/scratch/midway3/youzhi/runs/cot-exp/logs/slurm-51170455.out"
+        elided = tui._elide(path, keep=46)
+        assert elided == "/scratch/…/slurm-51170455.out"

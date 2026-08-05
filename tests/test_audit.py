@@ -78,9 +78,13 @@ class TestFailureCountAgreesWithRuns:
         from slurmpast.index import History
 
         group = [g for g in History(demo()).groups if g.name == "cot-exp"][0]
-        assert group.failed == 18
-        assert group.noop == 18
-        assert group.problems == 18  # NOT 36
+        # 14 of the demo's 20 cot-exp runs hang now, not 18: the hang was
+        # redistributed onto midway3-0385 so the demo actually contains the bad
+        # node it advertises. The invariant under test is the overlap, not the
+        # count, so it is asserted as one rather than as three literals.
+        assert group.failed == group.noop, (group.failed, group.noop)
+        assert group.problems == group.failed  # NOT failed + noop
+        assert group.problems < group.failed + group.noop
         assert group.problems <= group.total
 
     def test_problems_excludes_deliberate_cancellations(self):

@@ -80,6 +80,18 @@ _STATE_COLOR = {
 # chat message. No upper cap: fit_columns leaves width no column needs unused, so
 # a wide terminal gets more columns rather than a stretched table, and a cap would
 # mean --plain could never show a column the dashboard does.
+# The narrowest layout prose is asked to fit. Wrapping a sentence tighter than
+# this produces a column of three-word lines that is harder to read than an
+# overrun, so below 60 the renderer stops shrinking.
+#
+# It is a floor on the *layout*, NOT a promise that every view fits 60 cells, and
+# the two were being confused. A table cannot shrink past its never-dropped
+# columns -- `render.table_floor` computes that per spec: 74 for the job list, 67
+# for the node table -- so between 60 and those floors the tables overrun, and no
+# clamp here can change it. What did change: everything that *is* prose (finding
+# titles, the nodes workload line, the gauge details, a long single-pair value)
+# now wraps to the terminal, so a narrow terminal is one or two wide tables
+# rather than a page of wrapped text.
 PLAIN_MIN_WIDTH = 60
 PLAIN_FALLBACK_WIDTH = 100
 
@@ -131,6 +143,21 @@ def _prose_width(indent):
     return max(40, _plain_width() - indent)
 
 
+def _emphasise(line, token, style, colour="bold"):
+    """Re-apply emphasis to ``token`` inside an already-wrapped line.
+
+    Wrapping has to run on the *plain* sentence -- an ANSI wrapper is nine
+    characters the terminal never draws, so `wrap` counting them breaks the line
+    at the wrong column -- which means any emphasis inside the sentence has to go
+    back on afterwards, and only on the line where the wrap left the token whole.
+    A token split across two lines simply keeps the paragraph's own styling; that
+    is the price of measuring width honestly.
+    """
+    if not token or token not in line:
+        return line
+    return line.replace(token, style(token, colour), 1)
+
+
 def _plain_layout(spec, content=None, indent=_PLAIN_INDENT):
     return fit_columns(spec, _plain_width() - len(indent), padding=_PLAIN_GAP, content=content)
 
@@ -169,6 +196,7 @@ def render_job(
     show_steps=False,
     ascii_mode=False,
     log_inferred=False,
+    no_logs=False,
 ):
     style = style or Style()
     verdict = diagnose(job, log_text=log_text, node_note=node_note)
@@ -188,7 +216,7 @@ def render_job(
     out.append("")
     # flat=True: only the characters survive here, and an eighth-block tip with no
     # background behind it reads as a notch rather than as the end of a bar.
-    for line in resource_rows(job, ascii_mode=ascii_mode, flat=True):
+    for line in resource_rows(job, ascii_mode=ascii_mode, flat=True, max_width=_plain_width()):
         out.append(line.plain)
     for title, rows in job_sections(job, summarized=True):
         out.append("")
@@ -207,8 +235,21 @@ def render_job(
             if len(group) == 2:
                 left = cell(group[0][0], group[0][1], PAIR_VALUE_WIDTH)
                 out.append("    %s  %s" % (left, cell(group[1][0], group[1][1], 0)))
-            else:
-                out.append("    %s" % cell(group[0][0], group[0][1], 0))
+                continue
+            label, value = group[0][0], group[0][1]
+            # A value on its own line still has to fit the line. `pair_rows` only
+            # decides how many pairs go on one; it makes no claim about the length
+            # of the survivor, so a sentence-shaped value went out at its full
+            # width -- "not gathered by this cluster (needs AutoDetect=nvml in
+            # gres.conf)" put this row at 86 cells whatever the terminal was, and
+            # the terminal then wrapped it to column 0, away from its label.
+            # Continuation lines hang under the value column so the pair still
+            # reads as one.
+            budget = max(20, _plain_width() - 4 - PAIR_LABEL_WIDTH - 1)
+            lines = wrap(value, budget)
+            out.append("    %s" % cell(label, lines[0] if lines else value, 0))
+            for extra in lines[1:]:
+                out.append("    %s %s" % (" " * PAIR_LABEL_WIDTH, extra))
 
     if show_steps and job.steps:
         out.append("")
@@ -247,7 +288,16 @@ def render_job(
             "  (matched by timing, not by name — verify before trusting it)" if log_inferred else ""
         )
         out.append("  %s %s%s" % (style("log", "grey"), log_path, style(note, "grey")))
-    else:
+    elif not no_logs:
+        # Guarded, because both spellings below are claims about the filesystem and
+        # under `--no-logs` nothing was stat'd. "none found" reported a search that
+        # never ran; with a recorded StdOut the invented claim got stronger and was
+        # simply false -- "none at /scratch/... — moved or deleted" about a file
+        # nobody looked for. `--demo` forces `no_logs` (cli.main), so every
+        # synthetic post-mortem shipped one. `tui.JobScreen` has guarded the
+        # identical line all along; this is the same guard, so the two front ends
+        # stop disagreeing about it.
+        #
         # One line, but which line depends on whether the cluster recorded a path.
         # Where one was recorded -- StdOut/StdErr from Slurm 24.05, the -o inside
         # SubmitLine from 21.08, or a --comment on any version -- the miss is "the
@@ -273,7 +323,18 @@ def render_job(
         for finding in findings:
             colour, tag = _SEV.get(finding.severity, ("bold", "----"))
             out.append("")
-            out.append("  %s %s" % (style("[" + tag + "]", colour), style(finding.title, "bold")))
+            # Wrapped like the evidence and the action beneath it. A title is a
+            # sentence -- "Peak memory reads above the limit, yet nothing was
+            # killed" is 68 cells -- and this was the one line of the three going
+            # out at whatever length it happened to be.
+            for index, line in enumerate(wrap(finding.title, _prose_width(2 + len(tag) + 3))):
+                out.append(
+                    "  %s %s"
+                    % (
+                        style("[" + tag + "]", colour) if index == 0 else " " * (len(tag) + 2),
+                        style(line, "bold"),
+                    )
+                )
             for line in wrap(finding.evidence, _prose_width(8)):
                 out.append("        " + line)
             for index, line in enumerate(wrap(finding.action, _prose_width(11))):
@@ -484,7 +545,14 @@ def render_patterns(history: History, style=None):
         return "\n".join(_titled("cross-run patterns", body, style))
     for finding in sorted(findings, key=lambda f: severity_rank(f.severity)):
         colour, tag = _SEV.get(finding.severity, ("bold", "----"))
-        body.append("  %s %s" % (style("[" + tag + "]", colour), style(finding.title, "bold")))
+        for index, line in enumerate(wrap(finding.title, _prose_width(2 + len(tag) + 3))):
+            body.append(
+                "  %s %s"
+                % (
+                    style("[" + tag + "]", colour) if index == 0 else " " * (len(tag) + 2),
+                    style(line, "bold"),
+                )
+            )
         for line in wrap(finding.evidence, _prose_width(8)):
             body.append("        " + line)
         for index, line in enumerate(wrap(finding.action, _prose_width(11))):
@@ -498,18 +566,28 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
     jobs = history.usable_jobs
     workload = dominant_workload(jobs, metric=metric) if controlled else None
     table = node_table(jobs, workload=workload, metric=metric)
-    out = []
+    out: list[str] = []
+    # Both wrapped, like every other prose line in this function. These two were
+    # bare format strings, and the first carries a *folded workload name*: the
+    # demo's is `cot-exp`, which is what let it pass `test_no_table_row_overruns_
+    # the_terminal` through two audits, but a real one runs to
+    # `nemotron-batch-h#-tokenize-shards-stage#-retry-#` and took the line to 114
+    # cells on a 100-column terminal. Same shape as the node table of round three,
+    # which survived for the same reason -- the demo's own values are short.
     if workload:
-        out.append(
-            "  controlled for workload: only %s counted %s"
-            % (style(workload, "bold"), style("(placement is not random)", "grey"))
+        aside = "(placement is not random)"
+        sentence = "controlled for workload: only %s counted %s" % (workload, aside)
+        out.extend(
+            "  " + _emphasise(_emphasise(line, workload, style), aside, style, "grey")
+            for line in wrap(sentence, _prose_width(2))
         )
     else:
-        out.append(
-            style(
-                "  UNCONTROLLED — mixes workloads; a node that hosted one bad campaign "
+        out.extend(
+            style("  " + line, "yellow")
+            for line in wrap(
+                "UNCONTROLLED — mixes workloads; a node that hosted one bad campaign "
                 "will look cursed",
-                "yellow",
+                _prose_width(2),
             )
         )
     skipped = table["skipped_nodes"]
@@ -578,14 +656,22 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
     out.append("")
     excl = compress_nodelist(suggest_exclude(table))
     if excl:
-        out.append("  worse than every other node, after correcting for %d tested:" % tested)
+        # Wrapped, like the tail note below it. These two were bare strings, and
+        # the block they are in only renders when a node is actually worse than
+        # the rest -- which the demo did not produce, so nothing measured them.
+        for line in wrap(
+            "worse than every other node, after correcting for %d tested:" % tested,
+            _prose_width(2),
+        ):
+            out.append("  " + line)
+        # Not wrapped, deliberately: it is one #SBATCH line to copy, and a paste
+        # broken across two lines is not a paste.
         out.append("    %s" % style("#SBATCH --exclude=" + excl, "bold"))
-        out.append(
-            style(
-                "    not applied for you — excluding nodes trades availability for reliability.",
-                "grey",
-            )
-        )
+        for line in wrap(
+            "not applied for you — excluding nodes trades availability for reliability.",
+            _prose_width(4),
+        ):
+            out.append("    " + style(line, "grey"))
         # The line is capped, so it has to say when it is not the whole list.
         left_out = excluded_tail(table)
         if left_out:

@@ -1,6 +1,13 @@
 # slurmpast — audit and resolution
 
-> **Round four, 2026-08-03, from `4d47d4d`.** Not a sweep — two defects, both
+> **Round five, 2026-08-05, from `f505d44`.** A full read of all 19 modules,
+> filed as issue #1. Ten defects plus the documentation set, every one reproduced by
+> running the code before it was written down, and two candidates withdrawn on
+> re-verification and said so. All ten fixed here, along with every minor item and
+> the **Open** gauge entry below, which a second reviewer has now raised. 1,098
+> tests before, **1150 after**. `ruff`, `ruff format` and `mypy` clean.
+>
+> > **Round four, 2026-08-03, from `4d47d4d`.** Not a sweep — two defects, both
 > surfaced by one user question ("does slurmpast support me looking at other users'
 > past jobs?"). The answer was yes, and asking it found that the multi-user path
 > was half-built: a `--allusers` branch nothing could reach, and a `user` argument
@@ -11,6 +18,212 @@
 > upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
 > was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
 > and its control. `ruff`, `ruff format` and `mypy` clean.
+
+---
+
+## Round five — issue #1
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | Explicit job ids silently truncated at `-n`, so a CRITICAL past the limit could not reach the exit code | `cli.main` | `TestExplicitIdsAreNotTruncated` (`test_cli.py`) |
+| 2 | The SIGKILL finding fired CRITICAL on five states that already explain the kill | `diagnose._exit_rules` | `TestSigkillOnlyFiresWhenNothingElseExplainsIt` (`test_diagnose.py`) |
+| 3 | `--mem=52.0 GiB`, a flag `sbatch` rejects | `diagnose._memory_rules` | `TestAdviceIsPasteable` (`test_diagnose.py`) |
+| 4 | `Sacct(runner=...)` probed the *local* sacct for its field list | `sacct.supported_fields` | `TestAnInjectedRunnerIsUsedForTheProbeToo` (`test_sacct.py`) |
+| 5 | Under `--no-logs` the report asserted a filesystem fact it never checked | `report.render_job` | `TestNoLogsClaimsNothingAboutTheFilesystem` (`test_cli.py`) |
+| 6 | The nodes workload line was never wrapped | `report.render_nodes`, `tui.NodesScreen` | `TestPlainOutputFitsATerminal` (`test_layout.py`) |
+| 7 | The job detail overran *any* terminal, and the width tests never went below 80 | `render.resource_rows`, `report` | `test_no_job_detail_line_overruns_the_terminal` (`test_layout.py`) |
+| 8 | `_elide` mangled any value containing `/`, and ignored its own budget | `tui.JobScreen`, `tui._elide` | `TestOnlyPathsAreElidedLikePaths` (`test_tui.py`) |
+| 9 | `--demo` timestamps wrapped every ninth job, reversing the narrative and feeding `_latest` a wrong "last run" | `demo._job` | `TestTheDemosClockAgreesWithItsJobIds` (`test_cli.py`) |
+| 10 | `r` exited the app on a transient query failure, with the history already discarded | `tui.SlurmpastApp.action_reload` | `TestReloadSurvivesATransientFailure` (`test_tui.py`) |
+
+### 1. `--limit` stops applying to ids the caller typed
+
+`targets = matches[: args.limit]` ran on the job-id branch too. `-n` defaults to 25
+and is documented as "rows in plain output", so `slurmpast <30 ids>` printed 25
+post-mortems and said nothing about the other five; `--json` returned a 25-entry
+array for a 30-id query. Every other truncation here names its tail
+(`History.tail_summary`, `nodes.excluded_tail`, `render_list`'s "… N more"); on this
+branch no renderer ever does, because a post-mortem block has nowhere to put such a
+line.
+
+The exit code is what made it more than a display bug: it is computed only over the
+jobs examined, so 26 healthy ids followed by an `OUT_OF_MEMORY` exited 0.
+
+### 2. SIGKILL says something only when nothing else does
+
+Slurm reaches for signal 9 on `CANCELLED`, `TIMEOUT`, `PREEMPTED`, `NODE_FAIL` and
+`OUT_OF_MEMORY` alike, once `KillWait` expires. Each already produces a finding
+naming its own killer, so the rule added a second one whose action — "look for a
+wrapper or watchdog killing it" — sent the reader after a phantom, directly beneath
+the tool's own sentence saying what actually happened.
+
+Severity was the other half. `theme.STATE_HEALTH` grades CANCELLED `"none"` because
+"colouring it red asserts a judgement the data does not support" — and a CRITICAL
+here asserted it anyway, through the exit code: `slurmpast <jobid>` returned 1 on a
+run the tool had just called not a failure. Suppressed by state, the same shape and
+for the same reason as `_NOOP_ALREADY_EXPLAINED` two rounds earlier. `test_sigkill`
+covered `state="FAILED"` only, which is the one state where nothing else explains
+it — so the rule read as working.
+
+### 3. A flag you can paste
+
+New `duration.format_mem_flag`: bytes to the whole-GiB spelling `--mem=` accepts,
+rounded up, beside `format_duration`'s `HH:MM:SS` and closing the same defect its
+docstring describes. `sizing.memory_advice` had the right spelling all along, so the
+tool's two sizing surfaces disagreed about one flag.
+
+### 4. The probe goes where the queries go
+
+`supported_fields` called the module-level `_run` unconditionally, so a caller
+replaying a recorded history or reaching a remote cluster negotiated its field list
+against whatever sacct was on the local `PATH`:
+
+```
+calls to the INJECTED runner : [['sacct', '--parsable2', ... , '-u', 'alice', ...]]
+calls that escaped to _run   : [['sacct', '--helpformat']]
+```
+
+Trap 1 at the top of that module is why it is not a degraded answer but no answer:
+one unknown field makes sacct reject the entire query. `_mark_open_records` makes
+exactly this argument for `live_job_ids`; the hole was open one level up.
+
+### 5. Nothing was stat'd, so nothing is claimed
+
+`render_job` printed the "no log found" line unconditionally, and `--demo` forces
+`no_logs`, so every synthetic post-mortem reported a search that never ran. With a
+recorded `StdOut` the invented claim got stronger and was simply false — "none at
+/scratch/dana/logs/sft-884411.out — moved or deleted" about a file nobody looked
+for. `tui.JobScreen` has guarded the identical line all along.
+
+### 6 & 7. Width, measured below 80 for the first time
+
+The nodes workload line was a bare format string carrying a folded workload name:
+`cot-exp` in the demo, `nemotron-batch-h#-tokenize-shards-stage#-retry-#` on a real
+cluster, which took it to 114 cells on a 100-column terminal. Same shape as round
+three's node table, which survived two audits because the demo's node names are 12
+characters — so the long-name fixture now folds the workload name too.
+
+The job detail was worse than reported: it overran **every** width, not merely
+narrow ones, because three of its lines were fixed-length. It was never in the
+width test's fixture at all.
+
+```
+                    before   after (COLUMNS=80)
+gauge row + detail      86       80   detail moves to its own indented line
+single-pair value       86       80   wraps, hanging under the value column
+finding title           70       80   wrapped, like the evidence and action below it
+```
+
+The gauge fix is the **Open** item below, and deliberately not the width-adaptive
+bar that entry declined: the row up to the value column stays a fixed 42 cells, so a
+60% bar still looks the same here as in slurmwatch's live view, and at 100 columns
+and up the output is byte-identical. Only the trailing `· detail` answers to the
+terminal.
+
+What cannot be fixed is named rather than clamped: a table with no droppable column
+left has a floor, and `report.PLAIN_MIN_WIDTH = 60` was promising below it. New
+`render.table_floor(spec)` computes it from the spec — 74 for the job list, 67 for
+the node table — and the width test now runs at 60, 66 and 74 and holds each view to
+its own floor, so adding a never-dropped column moves the bar instead of quietly
+making the promise false.
+
+### 8. A `/` is not a path
+
+The dashboard elided any value containing one, which is true of `submitted as`
+(SubmitLine, Slurm 21.08+) — a command line, not a path:
+
+```
+before  sbatch --job-name=midtrain ... --output=/scratch/midway3/youzhi/logs/%x-%j.out train.sh
+after   sbatch --job-name=midtrain ... --output=/…/%x-%j.out train.sh
+```
+
+The one row recording where the output went lost its directory. Path-ness is now
+declared by `render.PATH_ROWS` beside the rows themselves rather than sniffed at the
+point of use; everything else is cut at the end, where the head carries the meaning.
+And `keep` is a budget rather than a trigger: the middle-out form is tried first
+because it is the readable one, but at `keep=30` it could still return 122
+characters, and a shortening that soft-wraps anyway has bought nothing.
+
+### 9. A clock that agrees with the job ids
+
+```python
+stamp = "2026-07-%02dT0%d:00:00" % (min(day, 28), jid % 9)
+```
+
+The hour wrapped every ninth job. All ten `rc-tok-github_code` runs carry `day=20`,
+so they listed 08:00, 07:00, 06:00, 05:00, 05:00 — the narrative backwards, with two
+runs sharing a timestamp. Slurm hands out ids in submission order, so this was a
+demo of something Slurm cannot produce.
+
+It fed a wrong number as well as a wrong order: `sizing._latest` picked 5100038
+(17G) as the last submission instead of 5100044 (32G), and the sizing screen advised
+`--mem raise to 42G (from 17.0 GiB)`. That is the error `_latest` was introduced to
+fix in round two, arriving through the demo's own fabricated timestamps — and
+`test_memory_requested_is_the_last_ceiling_not_the_largest` was **pinned to the wrong
+value**, so the test proving `_latest` picks the last request would have gone on
+passing had `_latest` broken.
+
+**And the demo now contains the bad node it advertises.** `demo.tape` sells the
+synthetic history as holding "one node that eats jobs", but the hang was spread
+evenly across two (12/13 against 6/7), so with the workload held fixed — the only
+comparison `--nodes` makes — `slurmpast --demo --nodes` answered *"no node is worse
+than the rest; nothing to exclude"*, on the screen README leads its "Failure, across
+runs" section with. It is now 12/12 on `midway3-0385` against 2/8 elsewhere, and the
+screen names it with a paste-ready `--exclude`. The workload still hangs, so the
+other advertised shapes are unchanged; all four are pinned by
+`TestTheDemoContainsTheShapesItAdvertises`.
+
+### 10. `r` fails the way `w` does
+
+`action_cycle_window` snapshots `_previous` before re-querying and `action_reload`
+did not, while `_requery` clears the history first and a successful load clears
+`_previous`. So after any normal session `r` plus a slurmdbd blip tore the dashboard
+down with the data already discarded, where the identical failure on `w` degraded to
+a toast. `_loaded`'s own comment gives the reason: "Backing out beats exiting: they
+still have the data they had." `_restore` now words itself for whichever key called
+it — "nothing found there" is the wrong sentence for a reload, since there is no
+"there".
+
+### The documentation
+
+**Every shipped screenshot predated several rounds of fixes, and each advertised a
+bug the code had since closed** — a `KERNEL 192.7%` gauge (the impossible ratio
+`system_cpu_fraction` now returns `None` for and names in its own comment), the
+mixed-unit `USED` column `OVERVIEW_COLUMNS` documents at length as removed, the
+invented `30m26s` format `format_duration` replaced, round three's `1 nodes below
+sample threshold` pluralisation bug. README's pitch is that this tool prints `n/a`
+rather than a fabricated number, illustrated by a screenshot of a fabricated number.
+
+All five regenerated, and the reason they went stale — nothing could regenerate
+them — closed with `tools/screenshots.py`, which drives the real dashboard headless
+against `--demo` at the 100x30 the replaced assets were taken at. The test badge
+moves from a two-round-stale 1029.
+
+### Minor
+
+* `_mark_open_records` **uses** the ids squeue returns instead of testing the answer
+  for `None` and discarding it, so the reconciliation its docstring describes is
+  performed rather than merely described. New `Job.live` — three-valued, because
+  "squeue could not be reached" and "squeue has never heard of it" are different
+  claims and only one is a measurement — and the open-record finding says which,
+  rather than telling every reader to "confirm against squeue" about a query the
+  tool had already run.
+* `--all-users <jobid>` forwards `all_users` to the reconciliation, so someone
+  else's live job is no longer checked against `squeue --me` and called stale.
+* The hung-timeout caution no longer says "**further** timeouts … left out of **that
+  floor**" where no preceding sentence established a floor (below `VETO_MIN_COUNT`,
+  hangs with no computing timeouts).
+* `"core" if peak < 2` printed "1.5 core busy per task" across the whole 1.0–1.9
+  range; singular is now exactly one, and the denominator pluralises too.
+* `site.site`'s two `refresh` branches were two spellings of one statement.
+* `system_cpu_fraction`'s docstring described the pre-round-three step resolution.
+
+### Withdrawn by the issue, and confirmed withdrawn
+
+Two of the twelve candidates did not survive re-verification and the issue said so:
+a suspected node-table width bug that was the same unwrapped prose line as #6, and
+"the demo has no bad node", which was narrowed to "not under the workload control" —
+and is what §9 above then fixed properly.
 
 ---
 
@@ -359,23 +572,41 @@ appear to.
 
 ## Open
 
-Two things are deliberately not fixed, named rather than left implied.
-
-**The job screen's gauges and detail rows below ~96 columns.** One reviewer
-reproduced `JobScreen`'s `resource_rows` gauges (fixed at 18 cells plus label and
-detail) and its pair rows soft-wrapping to column 0 at a 60-column terminal. The
-pair-row half shares a mechanism with #10 and was fixed with it. The gauge half
-needs a width-adaptive bar and is a real change to the row idiom this tool shares
-with slurmwatch, so it wants its own decision, not a drive-by. It was raised by one
-reviewer of three and never put to a second panel.
+One thing is deliberately not fixed, named rather than left implied.
 
 **`--demo` still ignores `-S` and `-E`.** Unlike `-p` and `-u`, the window is not
 silently discarded: the screen says "synthetic demo data" instead of a date range,
 so the output does not claim a filter it did not apply. Left alone.
 
+### Closed in round five
+
+**The job screen's gauges and detail rows below ~96 columns** — the entry that read
+"raised by one reviewer of three and never put to a second panel". Round five's read
+is that second reviewer, and it added what the first could not: the same rows break
+under `--plain` identically, and they break at 80 columns, not merely narrow ones.
+
+The decision that entry was holding out for still stands, though, and the fix
+respects it. It declined "a width-adaptive bar … a real change to the row idiom this
+tool shares with slurmwatch", and the bar is **not** adaptive: the row up to the
+value column is a fixed 42 cells at every terminal size, so a 60% gauge looks the
+same here as in the live view, and at 100 columns and up the output is unchanged
+byte for byte. What was overrunning was the trailing `· detail`, which is prose and
+now behaves like the rest of the prose on that screen. That is the drive-by the
+entry was refusing, replaced by the smallest change that keeps the idiom intact.
+
 ---
 
 ## Consequence for the numbers
+
+**Round five.** Two findings change what the tool *reports*, not how it renders.
+Round five's #2 removes a CRITICAL from every `CANCELLED`, `TIMEOUT`, `PREEMPTED`,
+`NODE_FAIL` and `OUT_OF_MEMORY` job that recorded signal 9 — so `slurmpast <jobid>`
+now exits 0 on a job you cancelled yourself, where it exited 1 before, and any CI
+step keying off that code sees the change. Round five's #1 moves the other way:
+`slurmpast <many ids>` can now exit 1 where it exited 0, because ids past `-n` are
+examined instead of dropped. Everything else is presentation, or the demo.
+
+**Rounds one to four, below.**
 
 Fixing 1 lowers `--time` advice for any workload holding a hung timeout at a
 larger limit than its real ones. Fixing 11 raises `read_bytes`, `write_bytes`,

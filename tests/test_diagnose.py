@@ -1,3 +1,5 @@
+import pytest
+
 from slurmpast.diagnose import diagnose, looks_like_noop
 from slurmpast.model import CRITICAL, INFO
 
@@ -311,3 +313,117 @@ class TestAStateThatAlreadyExplainsTheMissingCpu:
     def test_a_genuine_hang_still_reports_one(self, healthy_job):
         """The suppression is per-state, not a hole in the rule."""
         assert "noop-allocation" in codes(diagnose(self._stalled(healthy_job, "FAILED")))
+
+
+class TestSigkillOnlyFiresWhenNothingElseExplainsIt:
+    """Slurm reaches for SIGKILL on every one of these once KillWait expires, so
+    the signal carries no information the state has not already given -- and the
+    finding's action, "look for a wrapper or watchdog killing it", sent the reader
+    hunting for a phantom when the killer was their own `scancel`, the wall clock
+    or the scheduler.
+
+    Severity was the other half. CANCELLED, PREEMPTED and NODE_FAIL are not graded
+    as failures anywhere else (`theme.STATE_HEALTH` grades CANCELLED "none"
+    because "colouring it red asserts a judgement the data does not support"), yet
+    a CRITICAL here made `slurmpast <jobid>` exit 1 on a run the tool had just
+    called not a failure.
+    """
+
+    @pytest.mark.parametrize(
+        "state,explains",
+        [
+            ("CANCELLED by 1234", "cancelled"),
+            ("TIMEOUT", "timeout-working"),
+            ("PREEMPTED", "preempted"),
+            ("NODE_FAIL", "node-failed"),
+            ("OUT_OF_MEMORY", "oom"),
+        ],
+    )
+    def test_the_state_that_explains_the_kill_wins(self, healthy_job, state, explains):
+        job = healthy_job._replace(state=state, exit_code=137, signal=9)
+        found = codes(diagnose(job))
+        assert "sigkill" not in found, found
+        # And the finding that does name the killer is still there, so nothing was
+        # suppressed into silence.
+        assert found, "a state this specific must still produce a finding"
+
+    def test_a_cancelled_job_does_not_exit_one(self, healthy_job):
+        """The consequence, not just the finding. A CRITICAL is what the exit code
+        is computed from."""
+        job = healthy_job._replace(state="CANCELLED by 1234", exit_code=137, signal=9)
+        assert not [f for f in diagnose(job).findings if f.severity == CRITICAL]
+
+    def test_an_unexplained_sigkill_still_fires(self, healthy_job):
+        """The control. FAILED is the state where nothing else accounts for the
+        signal, and it is the one the original test covered -- which is why the
+        rule read as working."""
+        job = healthy_job._replace(state="FAILED", exit_code=137, signal=9)
+        finding = find(diagnose(job), "sigkill")
+        assert finding is not None
+        assert finding.severity == CRITICAL
+        assert "wrapper or watchdog" in finding.action
+
+
+class TestAdviceIsPasteable:
+    def test_the_memory_slack_flag_is_a_value_sbatch_accepts(self, healthy_job):
+        """`format_bytes` is a display formatter, so this said `--mem=52.0 GiB`,
+        which sbatch rejects. The same defect `format_duration` closed for
+        `--time`, and `sizing.memory_advice` got right all along with "%dG"."""
+        import re
+
+        from slurmpast.sacct import parse
+
+        from .conftest import _row, make_text
+
+        # 40 GiB peak against a 400 GiB limit: 10% used, 360 GiB never touched --
+        # both gates of the memory-slack rule, with a headline of "Try --mem=52".
+        job = parse(
+            make_text(
+                _row(
+                    JobID="1",
+                    JobName="w",
+                    State="COMPLETED",
+                    ExitCode="0:0",
+                    ElapsedRaw="3600",
+                    TimelimitRaw="60",
+                    ReqCPUS="8",
+                    AllocTRES="cpu=8,mem=400G,node=1",
+                ),
+                _row(
+                    JobID="1.batch",
+                    JobName="batch",
+                    State="COMPLETED",
+                    ExitCode="0:0",
+                    ElapsedRaw="3600",
+                    TotalCPU="07:00:00",
+                    MaxRSS="41943040K",
+                ),
+            )
+        )[0]
+        finding = find(diagnose(job), "memory-slack")
+        assert finding is not None, codes(diagnose(job))
+        flag = re.search(r"--mem=(\S+)", finding.action)
+        assert flag, finding.action
+        assert re.fullmatch(r"\d+G", flag.group(1)), flag.group(1)
+
+
+class TestAnOpenRecordSaysWhatSqueueAnswered:
+    """`cli._mark_open_records` asks squeue and now records the answer, so telling
+    every reader to "confirm against squeue" was sending them to re-run a query the
+    tool had already run and thrown away."""
+
+    def test_a_confirmed_live_job_says_so(self, healthy_job):
+        job = healthy_job._replace(state="RUNNING", open_ended=True, live=True)
+        assert "still there" in find(diagnose(job), "open-record").action
+
+    def test_a_job_squeue_has_never_heard_of_is_called_stale(self, healthy_job):
+        job = healthy_job._replace(state="RUNNING", open_ended=True, live=False)
+        action = find(diagnose(job), "open-record").action
+        assert "never heard of it" in action
+        assert "artefact" in action
+
+    def test_no_answer_still_asks_the_reader_to_check(self, healthy_job):
+        """The control: squeue unreachable is not the same claim as "no such job",
+        and only one of the two is a measurement."""
+        job = healthy_job._replace(state="RUNNING", open_ended=True, live=None)
+        assert "Confirm against squeue" in find(diagnose(job), "open-record").action

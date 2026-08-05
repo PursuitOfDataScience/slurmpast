@@ -115,10 +115,11 @@ def site(runner=None, refresh=False):
         found = _parse_config(run(["scontrol", "show", "config"]))
     except (SacctError, OSError):
         found = Site()
-    if not refresh or not _CACHE:
-        _CACHE[:] = [found]
-    else:
-        _CACHE[0] = found
+    # One branch. `_CACHE[:] = [found]` and `_CACHE[0] = found` do the same thing
+    # to a list that is empty or holds exactly one element, which is the only two
+    # shapes this list ever has, so the condition chose between two spellings of
+    # one statement.
+    _CACHE[:] = [found]
     return found
 
 

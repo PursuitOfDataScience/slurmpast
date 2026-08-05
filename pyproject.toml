@@ -98,8 +98,10 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "C4", "T20"]
 ignore = ["UP031"]
 
 [tool.ruff.lint.per-file-ignores]
-# A CLI writes to stdout; that is the point of it.
+# A CLI writes to stdout; that is the point of it, and so does a script whose
+# whole job is to report which files it rewrote.
 "src/slurmpast/cli.py" = ["T201"]
+"tools/*" = ["T201"]
 # Tests deliberately accept arguments they do not use (stub runners that must
 # match a real signature) and build fixtures with sacct's own CamelCase names.
 "tests/*" = ["ARG", "N802", "N803", "N806", "N815"]

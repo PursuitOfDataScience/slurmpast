@@ -227,6 +227,12 @@ class Job(NamedTuple):
 
     steps: tuple = ()
     open_ended: bool = False
+    # What squeue said about an open record, when it was asked and could answer:
+    # True = still queued or running, False = squeue has never heard of it, so the
+    # record is stale. None = not asked, or squeue unreachable. Three values, not
+    # two, because "no answer" and "no such job" are different claims and only one
+    # of them is a measurement. See cli._mark_open_records.
+    live: bool | None = None
 
     # ------------------------------------------------------------------- state
 
@@ -406,11 +412,15 @@ class Job(NamedTuple):
             return None
         if system > total:
             # TotalCPU is user + system by definition, so this cannot happen from
-            # one measurement -- it means the two figures came from different
-            # steps (each is resolved independently: batch if present, else the
-            # largest work step). The ratio is then meaningless, and it rendered
-            # as "KERNEL 200.0%" -- a share of CPU time exceeding all of it.
-            # Unmeasurable is the honest answer.
+            # one consistent measurement -- it means the two figures disagree
+            # about which steps they cover. Both are sums over the work steps
+            # now (`_from_steps`, round three; this note used to say "batch if
+            # present, else the largest work step", which was the resolution
+            # before that), so the remaining way to get here is a record whose
+            # per-step SystemCPU and TotalCPU were not gathered over the same set
+            # -- a step that reported one and not the other. The ratio is then
+            # meaningless, and it rendered as "KERNEL 200.0%" -- a share of CPU
+            # time exceeding all of it. Unmeasurable is the honest answer.
             return None
         if total < MIN_CPU_FOR_A_SHARE:
             # A ratio needs a denominator worth dividing by. Observed on real

@@ -376,3 +376,162 @@ class TestSizingHonoursTheSort:
         assert "ordered by failure rate" in capsys.readouterr().out
         run("--demo", "--sizing", "--no-color")
         assert "ordered by" not in capsys.readouterr().out
+
+
+class TestExplicitIdsAreNotTruncated:
+    """`--limit` is documented as "rows in plain output". Ids the caller typed out
+    are not rows the tool chose to show them, and `-n` defaults to 25, so a query
+    naming 30 jobs printed 25 post-mortems and said nothing about the other five.
+    """
+
+    IDS = [str(5100001 + i) for i in range(30)]
+
+    def test_every_id_asked_for_is_answered(self, capsys):
+        run("--demo", "--plain", "--no-color", *self.IDS)
+        out = capsys.readouterr().out
+        missing = [j for j in self.IDS if "job %s" % j not in out]
+        assert not missing, missing
+
+    def test_the_json_array_is_not_short(self, capsys):
+        run("--demo", "--json", "--no-color", *self.IDS)
+        payload = json.loads(capsys.readouterr().out)
+        assert [j["identity"]["job_id"] for j in payload["jobs"]] == self.IDS
+
+    def test_a_finding_past_the_limit_still_reaches_the_exit_code(self):
+        """What the truncation actually cost. The exit code is computed only over
+        the jobs examined, so with the tail dropped a CRITICAL on ids 26-30 could
+        not reach it: 26 healthy ids and one OUT_OF_MEMORY exited 0."""
+        healthy = [str(5100021 + i) for i in range(14)]  # the midtrain runs
+        assert run("--demo", "--plain", "--no-color", *healthy) == 0, "control"
+        oom = "5100036"  # OUT_OF_MEMORY, rc-tok-github_code
+        padded = healthy + [str(5100021 + i) for i in range(14)] + [oom]
+        assert len(padded) > 25, "the tail has to fall past the default -n"
+        assert run("--demo", "--plain", "--no-color", *padded) == 1
+
+    def test_the_list_branch_still_truncates(self, capsys):
+        """The control the other way: `-n` is unchanged where it means something."""
+        run("--demo", "--plain", "--no-color", "-n", "5")
+        assert "more (raise --limit)" in capsys.readouterr().out
+
+
+class TestNoLogsClaimsNothingAboutTheFilesystem:
+    """Under `--no-logs` nothing is stat'd, so "none found" reported a search that
+    never ran -- and with a recorded StdOut the invented claim got stronger and was
+    simply false. `--demo` forces `--no-logs`, so every synthetic post-mortem
+    shipped one. `tui.JobScreen` has guarded the identical line all along."""
+
+    def test_the_demo_does_not_report_a_search_it_did_not_run(self, capsys):
+        run("--demo", "--plain", "--no-color", "5100003")
+        out = capsys.readouterr().out
+        assert "none found" not in out
+        assert "moved or deleted" not in out
+
+    def test_a_recorded_path_is_not_declared_missing(self):
+        from slurmpast.model import Job
+        from slurmpast.report import Style, render_job
+
+        job = Job(
+            job_id="884411",
+            name="sft",
+            state="FAILED",
+            std_out="/scratch/dana/logs/sft-884411.out",
+            elapsed=60.0,
+        )
+        text, _ = render_job(job, style=Style(enabled=False), no_logs=True)
+        assert "moved or deleted" not in text
+        # The control: asked to look, it says what it found.
+        text, _ = render_job(job, style=Style(enabled=False), no_logs=False)
+        assert "moved or deleted" in text
+
+
+class TestTheDemosClockAgreesWithItsJobIds:
+    """Slurm hands out job ids in submission order, so a demo whose clock
+    disagrees with its ids is a demo of something Slurm cannot produce.
+
+    The stamp was `"0%d:00:00" % (jid % 9)`, which wrapped every ninth job. The
+    ten runs of `rc-tok-github_code` all carry `day=20`, so they listed 08:00,
+    07:00, 06:00, 05:00, 05:00 -- the narrative backwards, with two runs sharing a
+    timestamp -- and it fed a wrong number as well as a wrong order: `sizing._latest`
+    picked 5100038 (17G) as the last submission instead of 5100044 (32G).
+    """
+
+    @staticmethod
+    def _jobs():
+        from slurmpast.demo import history
+
+        return history()
+
+    def test_start_order_matches_id_order_within_a_day(self):
+        by_day: dict[str, list] = {}
+        for job in self._jobs():
+            by_day.setdefault(job.start[:10], []).append(job)
+        for day, jobs in by_day.items():
+            jobs.sort(key=lambda j: int(j.job_id))
+            stamps = [j.start for j in jobs]
+            assert stamps == sorted(stamps), (day, stamps)
+
+    def test_no_two_runs_of_a_workload_share_a_start(self):
+        seen: dict[tuple, str] = {}
+        for job in self._jobs():
+            key = (job.name, job.start)
+            assert key not in seen, "%s and %s both start %s" % (
+                seen[key],
+                job.job_id,
+                job.start,
+            )
+            seen[key] = job.job_id
+
+    def test_no_series_runs_past_midnight_into_the_next_day(self):
+        """The spacing has to keep a day's worth of submissions inside that day,
+        or the wrap comes back in a different form."""
+        for job in self._jobs():
+            assert job.start[11:] < "24:00:00", job.start
+
+    def test_the_sizing_screen_quotes_the_last_request(self, capsys):
+        """What the scrambled clock actually cost: the demo advised against a
+        ceiling five submissions old."""
+        run("--demo", "--sizing", "--json", "--no-color")
+        payload = json.loads(capsys.readouterr().out)
+        workload = next(w for w in payload["workloads"] if w["name"] == "rc-tok-github_code")
+        mem = next(a for a in workload["advice"] if a["flag"] == "--mem")
+        assert mem["requested"] == "32.0 GiB", mem
+
+
+class TestTheDemoContainsTheShapesItAdvertises:
+    """`demo.tape` sells the synthetic history as containing "a workload that
+    hangs and times out at an unchanged --time, a --mem hand-search that ends by
+    succeeding at a value that already OOM'd, healthy training runs that correctly
+    draw no findings, and one node that eats jobs."
+
+    The last of those was not true. The hang was spread evenly across two nodes
+    (12/13 against 6/7), so with the workload held fixed -- the only comparison
+    `--nodes` makes -- the demo's own nodes screen said "no node is worse than the
+    rest; nothing to exclude", on the screen README leads its "Failure, across
+    runs" section with.
+    """
+
+    def test_the_nodes_screen_names_a_bad_node(self, capsys):
+        run("--demo", "--nodes", "--no-color")
+        out = capsys.readouterr().out
+        assert "#SBATCH --exclude=" in out, out
+        assert "nothing to exclude" not in out
+
+    def test_it_does_so_with_the_workload_control_on(self, capsys):
+        """The control that matters. Uncontrolled, the tool labels the table
+        "UNCONTROLLED — mixes workloads; a node that hosted one bad campaign will
+        look cursed" -- a finding it disclaims is not a demo of the feature."""
+        run("--demo", "--nodes", "--no-color")
+        out = capsys.readouterr().out
+        assert "controlled for workload" in out
+        assert "UNCONTROLLED" not in out
+
+    def test_the_workload_still_hangs(self, capsys):
+        """And the other advertised shapes survive the redistribution."""
+        run("--demo", "--patterns", "--json", "--no-color")
+        codes = {f["code"] for f in json.loads(capsys.readouterr().out)["findings"]}
+        assert "repeat-failure" in codes
+        assert "memory-search" in codes
+
+    def test_the_healthy_workload_still_draws_no_findings(self, capsys):
+        assert run("--demo", "--plain", "--no-color", "5100021") == 0
+        assert "nothing to flag" in capsys.readouterr().out

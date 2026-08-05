@@ -207,7 +207,11 @@ class TestSearchMatchesWhatIsOnScreen:
 
         return history()
 
-    @pytest.mark.parametrize("query", ["07-01", "2026-07-01", "07-01 07:00", "07:00", "2026-07"])
+    # 07-20 07:22 is demo job 5100035, the first of the rc-tok-github_code series.
+    # Deliberately not a midnight stamp: the demo's clock now counts up from 00:00
+    # on each day (see demo._time_of_day), and an "HH:MM" case of "00:00" would
+    # pass against a haystack that had lost its time component entirely.
+    @pytest.mark.parametrize("query", ["07-20", "2026-07-20", "07-20 07:22", "07:22", "2026-07"])
     def test_a_date_from_the_started_column_matches(self, query):
         assert filter_jobs(self._jobs(), "all", query), query
 
@@ -236,11 +240,11 @@ class TestSearchMatchesWhatIsOnScreen:
                 assert stamp in (job.start or ""), (stamp, job.start)
 
     def test_the_display_spelling_and_the_raw_spelling_both_match(self):
-        """The table shows "07-01 07:00"; sacct stores "2026-07-01T07:00:00". One
+        """The table shows "07-20 07:22"; sacct stores "2026-07-20T07:22:00". One
         normalised haystack covers both, so a query copied off the screen works."""
         jobs = self._jobs()
-        assert filter_jobs(jobs, "all", "2026-07-01T07:00:00".replace("T", " "))
-        assert filter_jobs(jobs, "all", "07-01 07:00")
+        assert filter_jobs(jobs, "all", "2026-07-20T07:22:00".replace("T", " "))
+        assert filter_jobs(jobs, "all", "07-20 07:22")
 
     def test_the_existing_fields_still_match(self):
         jobs = self._jobs()
