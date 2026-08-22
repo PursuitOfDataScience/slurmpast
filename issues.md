@@ -1,5 +1,22 @@
 # slurmpast — audit and resolution
 
+> **Round thirty-one, 2026-08-22.** One defect: a hostname printed on the job
+> screen that the job list could not find. 1553 tests before, **1560 after**; all
+> four gates clean.
+>
+> `filter_jobs` names the standard it broke -- "typing what you can plainly see and
+> getting an empty list is the worst kind of empty result" -- and offers `what died
+> on midway3-0385` as one of the four queries the box exists for. Slurm folds a
+> multi-node allocation to `midway3-[0003-0004]`, the raw string was what got
+> searched, and neither hostname is in it.
+>
+> Two large checks found nothing and are recorded as carefully as the defect. Log
+> discovery was tested against the real filesystem for the first time -- 8,161 jobs
+> whose log exists under a searched root -- and **never once attached the wrong
+> file**. And this cluster runs Slurm 20.11.8, which turned the field negotiation
+> into a live test rather than a fixture: `StdOut`, `StdErr` and `SubmitLine` do
+> not exist here, the tool dropped all three and asked for the other 80.
+
 > **Round thirty, 2026-08-22.** One defect: a CRITICAL finding that denied, in
 > plain words, the terabytes the WARNING directly beneath it was reporting. 1547
 > tests before, **1553 after**; all four gates clean.
@@ -380,6 +397,75 @@
 > and its control. `ruff`, `ruff format` and `mypy` clean.
 
 ---
+
+## Round thirty-one — the hostname on screen that search could not find
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `filter_jobs` searched the folded `NodeList` as stored, so no hostname inside a multi-node range matched the job that ran on it | `index.py:301` | `TestAFoldedNodeListIsSearchableByHostname` |
+
+### 1. "peak on midway3-0003", and the list says no such job
+
+Slurm compresses a multi-node allocation. The search haystack took `job.node_list`
+verbatim, and `midway3-[0003-0004]` contains the string `midway3-0003` nowhere.
+
+The reader is not guessing at those names -- the job screen prints them. Real job
+51553906, rendered:
+
+```
+    nodes            midway3-[0003-0004] (2 nodes)
+    slowest task     0.3% below average (task 1 on midway3-0003)
+    peak on          midway3-0003 task 0
+```
+
+Two rows name `midway3-0003`. Typing it into the job list returned nothing, on a
+history that contained the job. `filter_jobs`' own docstring calls this out in
+advance, about a different column:
+
+> Typing what you can plainly see and getting an empty list is the worst kind of
+> empty result -- it reads as missing data.
+
+and offers `what died on midway3-0385` as one of the four things the box is for.
+
+Measured here: 26 of 20,905 jobs carry a folded NodeList, and 72 hostname searches
+came back empty for a job that had run on that node. After the fix, 0 do, and
+`midway3-0003` returns its 44 rows in 29 ms across the whole history -- the common
+path is untouched because 20,879 of the jobs have no bracket to expand.
+
+`nodes.expand_nodelist` already did this work for the reliability table, and is
+bounded by `MAX_EXPANSION`; the raw string stays in the haystack beside the
+expansion, so a reader who copies the bracketed form off the `nodes` row still
+matches. Four of the seven new tests are controls, including one that a
+match-everything "fix" would fail.
+
+### Consequence for the numbers
+
+No statistic changes. One search returns rows it should always have returned:
+here, 26 jobs become findable by the names of the 2-4 nodes each ran on.
+
+### What was verified and not changed
+
+* **Log discovery, against the real filesystem for the first time.** 23,647 log
+  files were indexed by the job ids in their names, giving 8,161 jobs whose log
+  demonstrably exists under a root the tool searches. On an 800-job sample
+  `assign_logs` attached **the right file 121 times and the wrong file 0 times**.
+  Never attaching another job's log is the property that matters, since a wrong
+  log means a wrong diagnosis, and it holds.
+* The 679 misses are all outside the documented search scope, and are left alone
+  deliberately: 457 sit at `logs/<subdir>/<file>`, one level below the `logs`
+  entry in `_SUBDIRS`, and the rest are under names the tool never claimed to
+  search (`midtraining`, `results`, `work`). Deepening the walk is a scope and
+  cost decision, not a defect fix; `--log-dir` already covers it.
+* **Field negotiation, on a cluster old enough to test it.** This machine runs
+  Slurm 20.11.8. `StdOut` and `StdErr` arrived in 24.05 and `SubmitLine` in 21.08,
+  so all three are genuinely absent -- `supported_fields`/`resolve_fields` dropped
+  exactly those and queried the remaining 80 without error. The JSON payload's
+  `stdout_pattern`, `stderr_pattern` and `submit_line` are correctly null here
+  rather than empty strings.
+* Every searchable field is searchable by its displayed value: 6,000 jobs were
+  probed with their own job id, name, state, partition, node list and start
+  timestamp in three formats (`2026-07-28`, `07-28`, `07-28 15:00`). Zero
+  returned nothing before the fix, and the folded NodeList was the only gap.
 
 ## Round thirty — "Nothing was computed", over 18.4 TiB of traffic
 

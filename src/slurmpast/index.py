@@ -298,6 +298,17 @@ def match_job(job: Job, mode: str) -> bool:
     return True
 
 
+def _searchable_nodes(node_list: str | None) -> str:
+    """The raw NodeList plus, when it is folded, the hostnames inside it."""
+    if not node_list:
+        return ""
+    if "[" not in node_list:
+        return node_list
+    from .nodes import expand_nodelist
+
+    return " ".join([node_list, *expand_nodelist(node_list)])
+
+
 def filter_jobs(jobs: Iterable[Job], mode: str = "all", query: str = "") -> list[Job]:
     """Filter and free-text search, in memory.
 
@@ -322,7 +333,23 @@ def filter_jobs(jobs: Iterable[Job], mode: str = "all", query: str = "") -> list
                     job.name or "",
                     job.base_state,
                     job.partition or "",
-                    job.node_list or "",
+                    # Expanded, not as stored. Slurm folds a multi-node
+                    # allocation to `midway3-[0003-0004]`, and the raw string
+                    # contains neither hostname -- so searching `midway3-0003`
+                    # returned nothing for a job that ran on it. Both of this
+                    # module's own examples are the case that failed: the
+                    # docstring above offers "what died on midway3-0385", and the
+                    # job screen for one of these prints `peak on midway3-0003`
+                    # and `slowest task ... on midway3-0003` while the list could
+                    # not find it. That is exactly what the comment below calls
+                    # the worst kind of empty result.
+                    #
+                    # The raw form is kept alongside, because a reader who copies
+                    # `midway3-[0003-0004]` off the job screen's `nodes` row must
+                    # still match. Only 26 of 20,905 real jobs here carry a
+                    # bracket at all, and `expand_nodelist` is bounded by
+                    # `nodes.MAX_EXPANSION`, so the common path pays nothing.
+                    _searchable_nodes(job.node_list),
                     # START ONLY, deliberately. Indexing the end time too made a
                     # run that began 07-24 23:02 and finished 07-25 06:58 match
                     # "07-25" while its row displayed 07-24 -- a hit the reader
