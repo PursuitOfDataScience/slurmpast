@@ -1693,8 +1693,15 @@ class TestATruncatedStateMeansWhatItSays:
         from slurmpast.patterns import find_memory_search
         from slurmpast.sizing import memory_advice
 
+        # Four identical records, so the detector names it `memory-unchanged`
+        # rather than `memory-search` -- the request never moved. Which of the two
+        # is beside the point here: this test is about the truncated spelling being
+        # *visible* to the cross-run detectors at all, and pinning the code made it
+        # over-specified.
         jobs = self._jobs("OUT_OF_ME+", count=4)
-        assert [f.code for f in find_memory_search(jobs)] == ["memory-search"]
+        found = find_memory_search(jobs)
+        assert len(found) == 1, [f.code for f in found]
+        assert "4 OOM kills" in found[0].evidence
         advice = memory_advice(jobs)
         assert advice.verdict == "raise"
         assert "4 OOM kills" in advice.observed
@@ -2056,3 +2063,155 @@ class TestNothingImportsPastTheDeclaredPythonFloor:
             "try:\n    import tomllib\nexcept ModuleNotFoundError:\n    import tomli as tomllib\n"
         )
         assert "tomllib" in self._guarded_imports(wrapped)
+
+
+class TestTheNoNodesSentinelIsNotANodeName:
+    """`NodeList=None assigned` is what sacct writes for a job that never held an
+    allocation. It is a sentence meaning "no nodes", and it was carried through as
+    though it were a hostname:
+
+        nodes            None assigned  (1 node)
+
+    -- a node called "None assigned", and a count of 1 asserted about a job that
+    got zero. 38 of a real 15,085-job history carry it, every one CANCELLED at
+    elapsed 0: cancelled while still pending.
+
+    Only real data showed it. No fixture in this suite had ever built the value,
+    because you have to have watched sacct emit it to know it exists.
+
+    Folded at the parse boundary for the reason `_TRUNCATED_STATES` folds
+    `OUT_OF_ME+`: that is where sacct's spellings stop being sacct's problem.
+    """
+
+    COMMON = {
+        "JobName": "pending-then-cancelled",
+        "Partition": "test",
+        "State": "CANCELLED by 12345",
+        "ExitCode": "0:0",
+        "Submit": "2026-06-01T01:00:00",
+        "End": "2026-06-01T01:00:00",
+        "ElapsedRaw": "0",
+        "Elapsed": "00:00:00",
+        "Timelimit": "01:00:00",
+        "ReqCPUS": "8",
+        "NNodes": "1",
+    }
+
+    def _job(self, node_list):
+        return parse(row(JobID="700", NodeList=node_list, **self.COMMON))[0]
+
+    def test_the_sentinel_becomes_no_nodes(self):
+        assert self._job("None assigned").node_list == ""
+
+    def test_a_real_node_list_is_untouched(self):
+        """The control, in three shapes -- a name, a range, and a comma list."""
+        for value in ("midway3-0602", "midway3-[0600-0607,0611]", "n1,n2"):
+            assert self._job(value).node_list == value
+
+    def test_the_post_mortem_stops_inventing_a_node(self):
+        from slurmpast.report import Style, render_job
+
+        text, _ = render_job(self._job("None assigned"), style=Style(enabled=False), no_logs=True)
+        assert "None assigned" not in text
+        # The row is omitted rather than blanked: `job_sections` already guards on
+        # a falsy node_list, so there is no "nodes  (1 node)" left behind either.
+        assert not [ln for ln in text.splitlines() if ln.strip().startswith("nodes ")], text
+
+    def test_json_does_not_hand_a_consumer_a_fake_hostname(self):
+        from slurmpast.cli import _job_json
+        from slurmpast.diagnose import diagnose
+
+        job = self._job("None assigned")
+        doc = _job_json(job, None, diagnose(job))
+        assert doc["shape"]["node_list"] == ""
+
+    def test_the_requested_node_count_is_left_alone(self):
+        """Deliberately not "fixed": for a job cancelled while pending, NNodes is
+        what was *requested*, which is a real reading and the only one sacct has."""
+        assert self._job("None assigned").node_count == 1
+
+    def test_the_node_table_was_never_polluted_and_still_is_not(self):
+        """`expand_nodelist` already returned [] for the sentinel, so this half was
+        correct before the fold. Asserted so a future change to either one cannot
+        quietly reintroduce a node named "None assigned"."""
+        from slurmpast.nodes import expand_nodelist, node_table
+
+        assert expand_nodelist("None assigned") == []
+        assert expand_nodelist("") == []
+        # The comparison job is FAILED, not CANCELLED: the failure metric censors
+        # cancellations from the denominator now, and a fixture of two cancelled
+        # jobs would produce an empty table for a reason that has nothing to do
+        # with the sentinel this class is about. The sentinel job stays CANCELLED,
+        # because that is what all 38 real ones are.
+        real = self._job("midway3-0602")._replace(state="FAILED", exit_code=1)
+        table = node_table(
+            [self._job("None assigned"), real], workload=None, metric="failure", min_samples=1
+        )
+        assert [r["node"] for r in table["rows"]] == ["midway3-0602"]
+
+
+class TestAnUnexpandedArrayIdCanBeLookedUp:
+    """sacct prints `49046820_[1-20%10]` and then refuses it.
+
+    That is the spelling of a pending array in sacct's own `JobID` column under
+    `--parsable2`, and in `squeue`, which is where anyone copies a job id from. The
+    tool handed it straight to `sacct -j` and got a fatal error, so the one command
+    a reader would reach for did not work on any throttled pending array:
+
+        $ slurmpast '49046820_[1-20%10]'
+        slurmpast: sacct: fatal: Bad job array element specified: 49046820
+
+    Verified against the live scheduler rather than reasoned about:
+
+        sacct -j '49046820_[1-20%10]'   fatal
+        sacct -j '49046820_[1-20]'      fatal   -- the brackets, not the %throttle
+        sacct -j 49046820               49046820_[1-20%10]|PENDING
+        sacct -j 49046820_4             accepted (a real element)
+        sacct -j 53833807.batch         accepted (a step id)
+
+    Found only by running against the cluster: no user's own history contains a
+    pending array belonging to someone else, and the demo has none at all.
+    """
+
+    def test_an_unexpanded_range_reduces_to_the_master(self):
+        from slurmpast.sacct import queryable_job_id
+
+        assert queryable_job_id("49046820_[1-20%10]") == "49046820"
+        assert queryable_job_id("53601970_[0-4%2]") == "53601970"
+        # The throttle is not the problem, so a plain range folds too.
+        assert queryable_job_id("49046820_[1-20]") == "49046820"
+
+    def test_every_other_spelling_is_left_alone(self):
+        """The control. sacct accepts all of these, so touching them could only
+        break a lookup that works."""
+        from slurmpast.sacct import queryable_job_id
+
+        for value in ("12345", "49046820_4", "500+1", "53833807.batch", "53833807.extern", ""):
+            assert queryable_job_id(value) == value, value
+
+    def test_the_query_is_built_from_the_reduced_id(self):
+        """End to end through `Sacct.jobs`, with the runner captured: what reaches
+        sacct is what sacct will answer."""
+        from slurmpast.sacct import Sacct
+
+        seen = []
+
+        def runner(args):
+            seen.append(args)
+            return ""
+
+        sacct = Sacct(runner=runner)
+        sacct.jobs(["49046820_[1-20%10]", "53363721_4"])
+        # The first call is `sacct --helpformat`, the field negotiation.
+        queries = [args for args in seen if "-j" in args]
+        assert queries, seen
+        asked = queries[0][queries[0].index("-j") + 1]
+        assert asked == "49046820,53363721_4", asked
+        assert "[" not in asked
+
+    def test_the_id_the_reader_typed_is_what_gets_echoed_back(self):
+        """The reduction is a query detail. An error names what they asked for."""
+        from slurmpast.cli import main
+
+        code = main(["49046820_[1-20%10]", "--demo", "--plain", "--no-color"])
+        assert code == 2

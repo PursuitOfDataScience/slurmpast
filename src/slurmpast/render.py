@@ -905,6 +905,7 @@ _ASCII_FOLD = {
     "\u2026": ".",  # ellipsis -- `clip`'s cut marker, which must stay one cell
     "\u2192": ">",  # rightwards arrow
     "\u2190": "<",  # leftwards arrow
+    "\u00d7": "x",  # multiplication sign, as in `patterns._mem_walk`'s "6.0 GiB x2"
 }
 _ASCII_TABLE = str.maketrans(_ASCII_FOLD)
 
@@ -1056,6 +1057,26 @@ _COVERED_BY_GAUGES = frozenset(
 PATH_ROWS = frozenset(["workdir"])
 
 
+def wrap_or_clip(text: str, width: int) -> list[str]:
+    """``text`` wrapped to ``width``, with anything that would not break clipped.
+
+    ``wrap`` breaks at spaces, so a single long word comes back unchanged and the
+    caller emits a line wider than it asked for. `report` learned this once, for a
+    detail value -- "a 68-character job name is one word, so it came out of the
+    wrapper unchanged and the row went to 89 cells on an 80-column terminal" -- and
+    fixed it there; two other places do the same wrap without the clip.
+
+    A real cluster has the names to prove it: over two days of cluster-wide history
+    the longest job name is 123 characters and contains no space at all
+    (``nf-NFCORE_RNASEQ_..._SALMON_INDEX_(genome.transcripts.fa)``), which put the
+    `--sizing` workload header at 125 cells on every terminal from 60 to 120.
+
+    Named here so the rule has one home and a fourth caller inherits it.
+    """
+    lines = wrap(text, width)
+    return [line if len(line) <= width else clip(line, width) for line in lines] or [text]
+
+
 def pair_value_budget(width: int, bar_cells: int = 0) -> int:
     """Cells a single-pair value has, on a line of ``width`` carrying ``bar_cells``.
 
@@ -1080,10 +1101,9 @@ def pair_value_lines(label: str, value: str, budget: int) -> list[str]:
     the half of the sentence naming the fix, while the same row under ``--plain``
     wrapped and kept it. Neither surface should be deciding that on its own.
     """
-    lines = wrap(value, budget)
-    if label not in PATH_ROWS:
-        lines = [line if len(line) <= budget else clip(line, budget) for line in lines]
-    return lines or [value]
+    if label in PATH_ROWS:
+        return wrap(value, budget) or [value]
+    return wrap_or_clip(value, budget)
 
 
 def job_sections(job, summarized: bool = False):

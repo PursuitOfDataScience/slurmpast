@@ -401,6 +401,42 @@ def _sync_columns(table: DataTable, spec, current, content=None, available=None)
     return layout
 
 
+def _rows_already_drawn(screen, layout, key) -> bool:
+    """Whether the table already holds exactly this layout and these rows.
+
+    `on_mount` populates the table and the first resize populates it again -- with
+    the *same* layout and the *same* rows, because a screen pushed onto a laid-out
+    app already has its size. On the demo that is invisible. On a real 30-day
+    history it is 13,363 rows built twice, and `a` -- the flat job list -- took
+    **6.8 seconds** to open, of which none was slurmpast's own arithmetic: the cell
+    values for all 13,363 rows compute in 0.32s, and the rest is Textual laying out
+    a table it is about to discard.
+
+    Deferring the mount build to `call_after_refresh` was tried and measured at
+    3.64s against this guard's 3.55s -- it buys nothing, because the guard already
+    catches the second call, so it is not here. Measured rather than reasoned: the
+    first account of this bug blamed a provisional mount-time width, and the trace
+    that was supposed to confirm it showed both calls computing an identical
+    layout.
+
+    ``key`` is the caller's fingerprint of the row set -- the job ids, or the
+    workload labels. NOT ``id(rows)``, which was the first attempt and never
+    matched: every caller builds a fresh list, so its identity differs on every
+    call and the guard silently never fired. Caught by tracing rather than by
+    reasoning -- the trace showed two builds at an *identical* layout, which is
+    what gave it away.
+
+    Building the tuple costs microseconds against the seconds it saves, and unlike
+    a cheaper fingerprint it cannot miss a filter that changes the middle of the
+    list while preserving its length and its ends.
+    """
+    signature = (tuple(layout), key)
+    if getattr(screen, "_drawn", None) == signature:
+        return True
+    screen._drawn = signature
+    return False
+
+
 def _content_width(layout, padding: int = 2) -> int:
     """Cells a table of ``layout`` occupies: columns, DataTable's cell padding, a
     scrollbar. This is what the centring container is sized to."""
@@ -831,6 +867,7 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
             filter_groups(history.groups, self.filter_mode, self.search_text), self.sort_mode
         )
         self._rows = groups
+        drawn = _rows_already_drawn(self, layout, tuple((g.label, g.partition) for g in groups))
         self.summary_text = self._summary(history, shown=len(groups))
         # An empty grid is not an answer. See render.nothing_matches, and the node
         # screen, which learned the same thing one round earlier: a column header
@@ -841,6 +878,8 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
                 self.summary_text.append("  %s\n" % line, style=theme.HEALTH_COLOR["ok"])
         table.display = bool(groups)
         summary.update(self.summary_text)
+        if drawn:
+            return
         table.clear()
         ascii_mode = self.sp.ascii_mode
         for index, group in enumerate(groups, start=1):
@@ -1200,8 +1239,12 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
         # Newest first: after a failed run you look at the most recent attempt.
         jobs.sort(key=lambda j: (j.start or j.submit or "", j.job_id), reverse=True)
         self._rows = jobs
-        table.clear()
-        for index, job in enumerate(jobs, start=1):
+        # Only the row loop is skipped -- the summary below is rebuilt either way,
+        # because it reports counts a caller may have just changed.
+        drawn = _rows_already_drawn(self, layout, tuple(j.job_id for j in jobs))
+        if not drawn:
+            table.clear()
+        for index, job in enumerate([] if drawn else jobs, start=1):
             grade = theme.STATE_HEALTH.get(job.base_state, "none")
             if looks_like_noop(job):
                 grade = "crit"
@@ -1240,13 +1283,19 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
                 "NODE": Text(job.node_list or "", style=theme.FAINT),
             }
             table.add_row(*(cells[label] for label, _ in layout), key=str(index))
-        if cursor and cursor < len(jobs):
+        if not drawn and cursor and cursor < len(jobs):
             table.move_cursor(row=cursor)
 
         table.display = bool(jobs)
 
         summary = Text()
-        summary.append(self._title, style="bold %s" % theme.INK)
+        # Clipped, not wrapped: this is the head of a one-line summary that goes on
+        # to carry the counts, so a title that wrapped would push them onto a line
+        # of their own. A folded workload name can be one word -- the longest on a
+        # real cluster is 123 characters with no space in it -- and `wrap` hands a
+        # single word back whole, which is what put it past the edge. The plain
+        # renderer's twin takes the same rule through `render.wrap_or_clip`.
+        summary.append(render.clip(self._title, _prose_width(self, 2)), style="bold %s" % theme.INK)
         summary.append(
             "  ·  %d job%s" % (len(jobs), "" if len(jobs) == 1 else "s"), style=theme.DIM
         )
@@ -1577,11 +1626,14 @@ class JobScreen(ScreenChrome, Screen[Any]):
         history: History | None = self.sp.history
         note = ""
         if history is not None and len(history) > 20:
-            from .nodes import note_for_allocation
+            from .nodes import Workload, note_for_allocation
 
             # The whole allocation, not just its first node -- a multi-node job's
             # bad node is rarely the one Slurm happened to list first.
-            note = note_for_allocation(history.usable_jobs, job.node_list, workload=job.name)
+            # The job's own workload, user included -- see nodes.Workload.
+            note = note_for_allocation(
+                history.usable_jobs, job.node_list, workload=Workload(job.name, job.user)
+            )
 
         verdict = diagnose(job, log_text=log_text, node_note=note)
 

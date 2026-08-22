@@ -25,6 +25,10 @@ from .model import CRITICAL, INFO, WARNING, Finding
 REPEAT_MIN = 5
 REPEAT_FAIL_FRACTION = 0.5
 BISECTION_MIN_OOM = 3
+# Collapsed steps of a --mem walk to print before eliding the middle. Seven is what
+# the longest genuine bisection in a real 90-day history needs, so nothing that is
+# actually a search gets elided; see _mem_walk.
+MEM_WALK_STEPS = 8
 # How many repeat-failure groups to print before summarising the rest.
 REPEAT_REPORT_LIMIT = 4
 
@@ -215,7 +219,15 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
                 "Raise --time above that limit; a timeout's Elapsed only bounds runtime from below."
             )
         elif dominant == "OUT_OF_MEMORY":
-            action = "See the memory-search check — the next increment is probably not the fix."
+            # Names the finding rather than the code. The detector emits two titles
+            # now -- "Memory request is being hand-searched" and "The same memory
+            # request keeps being OOM-killed" -- and "the memory-search check" is
+            # neither of them on screen, so a reader following the pointer was
+            # looking for a heading that is not there.
+            action = (
+                "See the memory finding for this workload — the next increment is probably "
+                "not the fix."
+            )
         else:
             action = "Stop resubmitting; the failure is deterministic. Reproduce interactively."
 
@@ -253,6 +265,37 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
     return kept
 
 
+def _mem_walk(values):
+    """``32.0 GiB ×2 -> 17.0 GiB -> 12.0 GiB ×2`` -- the request sequence, collapsed.
+
+    A plain ``" -> ".join(...)`` was fine on a bisection of six values and became
+    unreadable on real data: one workload put **71 consecutive OOMs at an unchanged
+    6.0 GiB** through it, rendering 777 characters -- ten screen lines of the same
+    four characters -- under a heading calling it a search.
+
+    Consecutive repeats collapse to ``×N``, which is the honest shape: a value
+    submitted twice is one step of a walk, not two. Past ``MEM_WALK_STEPS`` the
+    middle is elided and says how much it dropped, because every other truncation
+    in this codebase announces itself and this one ran on instead. Head and tail are
+    both kept -- the first value is where the search started and the last is what is
+    being asked for now, and either alone tells half the story.
+    """
+    if not values:
+        return ""
+    steps = []
+    for value in values:
+        if steps and steps[-1][0] == value:
+            steps[-1][1] += 1
+        else:
+            steps.append([value, 1])
+    rendered = ["%s ×%d" % (format_bytes(v), n) if n > 1 else format_bytes(v) for v, n in steps]
+    if len(rendered) <= MEM_WALK_STEPS:
+        return " -> ".join(rendered)
+    head, tail = 4, 3
+    dropped = len(rendered) - head - tail
+    return " -> ".join(rendered[:head] + ["... %d more ..." % dropped] + rendered[-tail:])
+
+
 def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
     """Hand-bisection of --mem, visible as a non-monotone walk across OOMs."""
     groups = {}
@@ -276,7 +319,15 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
         # strict=False on purpose: this pairs a list with its own tail, so the
         # lengths differ by one by construction.
         monotone = all(b >= a for a, b in zip(requests, requests[1:], strict=False))
-        walk = " -> ".join(format_bytes(v) for v in requests)
+        # Whether this is a search at all. The docstring above has always said
+        # "visible as a non-monotone walk", and the code never tested that the walk
+        # moved: `monotone` only chose between two actions, so a request that was
+        # never touched was still reported as "being hand-searched". On a real
+        # 90-day history that was two of the three findings this rule produced --
+        # 71 OOMs at an unchanged 6.0 GiB, and 16 at an unchanged 8.0 GiB. The
+        # pattern is real and worth reporting; it is a different pattern.
+        searching = len(set(requests)) > 1
+        walk = _mem_walk(requests)
 
         # Did a later run succeed at a value that had already OOM'd? That proves
         # --mem was never the deciding variable.
@@ -298,7 +349,13 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
                 contradiction = job
                 break
 
-        evidence = "%d OOM kills for %s with --mem walking %s." % (len(ooms), key[0], walk)
+        if searching:
+            evidence = "%d OOM kills for %s with --mem walking %s." % (len(ooms), key[0], walk)
+        else:
+            evidence = (
+                "%d OOM kills for %s, every one of them at --mem %s: the request has not moved."
+                % (len(ooms), key[0], format_bytes(requests[0]))
+            )
         if contradiction is not None:
             evidence += " Job %s then COMPLETED at %s — a value that had already OOM'd." % (
                 contradiction.job_id,
@@ -310,6 +367,13 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
                 "--mem is not the deciding variable: the same request both failed and "
                 "succeeded. Something else changed (worker count, batch size, input shard). "
                 "Find that before tuning memory again."
+            )
+        elif not searching:
+            # "Stop stepping" below is advice about a search, and there was none.
+            action = (
+                "Nothing has been tried yet: every one of these asked for the same %s. "
+                "Measure the working set once and request that plus a margin, rather than "
+                "resubmitting the request that is already failing." % format_bytes(requests[0])
             )
         elif not monotone:
             action = (
@@ -326,8 +390,14 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
         findings.append(
             Finding(
                 CRITICAL if contradiction is not None else WARNING,
-                "memory-search",
-                "Memory request is being hand-searched",
+                # Two codes for the two shapes, as `timeout-hang` and `timeout-real`
+                # already do for the rule above: a consumer of `--json` should be
+                # able to tell "they are bisecting" from "they have changed
+                # nothing", because the two call for different things.
+                "memory-search" if searching else "memory-unchanged",
+                "Memory request is being hand-searched"
+                if searching
+                else "The same memory request keeps being OOM-killed",
                 evidence,
                 action,
             )

@@ -20,7 +20,7 @@ from .duration import humanize_window
 from .index import History, filter_jobs, sort_groups
 from .logs import assign_logs, read_tail
 from .model import severity_rank
-from .nodes import note_for_allocation
+from .nodes import Workload, note_for_allocation
 from .sacct import Sacct, SacctError, live_job_ids
 
 EPILOG = """\
@@ -358,7 +358,11 @@ def _node_note(job, history):
     if history is None or len(history) <= 20:
         return ""
     # The whole allocation, not just its first node -- see note_for_allocation.
-    return note_for_allocation(history.usable_jobs, job.node_list, workload=job.name)
+    # The job's OWN workload, user included: `history` may span users under
+    # `-u alice,bob` or `--all-users`, and a bare name pools whoever shares it.
+    return note_for_allocation(
+        history.usable_jobs, job.node_list, workload=Workload(job.name, job.user)
+    )
 
 
 def _job_json(job, log_path, verdict):
@@ -466,7 +470,24 @@ def _job_json(job, log_path, verdict):
             "system_fraction": job.system_cpu_fraction,
             "allocated_core_seconds": job.cpu_time,
             "utilization": job.cpu_utilization,
+            # Raw string and resolved number, for the reason stated below about
+            # `req_mem_raw`: a consumer should never have to guess which
+            # convention a figure is in. Here it could not even guess. Slurm
+            # applies AveCPUFreq's magnitude suffix to a kHz base in some code
+            # paths and a Hz base in others, so the string is ambiguous by a
+            # factor of 1000 -- `duration.parse_cpu_freq` resolves it by taking
+            # whichever reading lands in a plausible clock range, and drops the
+            # value entirely when neither does.
+            #
+            # Both text surfaces spend `cpu_freq_hz` (render.py: "avg clock").
+            # This payload emitted only the string, so of 20,550 real jobs
+            # carrying the field, 17,503 published a figure that reads 1000x low
+            # -- "3.00M" for a part running at 3.00 GHz -- and 2,061 published
+            # one the tool itself refuses to display as uninterpretable. A
+            # machine surface that hands back the ambiguity the tool resolved is
+            # not exhaustive, whatever this docstring claims.
             "frequency": job.cpu_freq or None,
+            "frequency_hz": job.cpu_freq_hz,
             "straggler_spread": job.straggler_spread,
             "slowest_task_node": job.slowest_task[0] or None,
             "slowest_task_id": job.slowest_task[1] or None,

@@ -1,5 +1,183 @@
 # slurmpast — audit and resolution
 
+> **Release 0.7.0, 2026-08-22.** Eleven rounds (twenty-two through thirty-two),
+> ten defects, all found by running the tool against a real cluster's accounting
+> database and log tree rather than against fixtures. 1503 tests at 0.6.0,
+> **1560** here.
+>
+> What a user gets that they did not have at 0.6.0: a traceback finding that shows
+> the traceback, a clock speed in `--json` that is not wrong by 1000x, a workload
+> comparison that holds the workload fixed, a node table that does not count a
+> cancellation as a node behaving, no NCCL fault invented from the word NCCL, no
+> "Nothing was computed" over 18.4 TiB of traffic, and a job list that finds a
+> host by the name the job screen prints for it.
+
+> **Round thirty-two, 2026-08-22.** No defect in the product -- and one in the
+> audit itself, caught not by any of this round's four probes but by CI, on the
+> job four local gates cannot see. 1560 tests; green on Textual 0.86 **and** 8.2.8,
+> which is the first time this branch has been run against the floor.
+>
+> Four probes, three of them against ground truth outside this repository:
+> `compress_nodelist` validated by Slurm's own `scontrol show hostnames`; the
+> parser fuzzed with 3,000 realistically corrupted real rows; and `sizing.py` held
+> to the four rules its module docstring states, across 872 actionable
+> recommendations.
+>
+> Three of my own checks reported violations that turned out to be the harness
+> being wrong, not the code -- each time by using a looser definition of "evidence"
+> than the module itself uses. `sizing.py` had already written the warning I
+> tripped over: "Both numbers were right; they came from different runs."
+
+> **Round thirty-one, 2026-08-22.** One defect: a hostname printed on the job
+> screen that the job list could not find. 1553 tests before, **1560 after**; all
+> four gates clean.
+>
+> `filter_jobs` names the standard it broke -- "typing what you can plainly see and
+> getting an empty list is the worst kind of empty result" -- and offers `what died
+> on midway3-0385` as one of the four queries the box exists for. Slurm folds a
+> multi-node allocation to `midway3-[0003-0004]`, the raw string was what got
+> searched, and neither hostname is in it.
+>
+> Two large checks found nothing and are recorded as carefully as the defect. Log
+> discovery was tested against the real filesystem for the first time -- 8,161 jobs
+> whose log exists under a searched root -- and **never once attached the wrong
+> file**. And this cluster runs Slurm 20.11.8, which turned the field negotiation
+> into a live test rather than a fixture: `StdOut`, `StdErr` and `SubmitLine` do
+> not exist here, the tool dropped all three and asked for the other 80.
+
+> **Round thirty, 2026-08-22.** One defect: a CRITICAL finding that denied, in
+> plain words, the terabytes the WARNING directly beneath it was reporting. 1547
+> tests before, **1553 after**; all four gates clean.
+>
+> Found by asking which findings co-occur on real jobs and which of those pairs
+> pull a reader in opposite directions. Nine contradictory pairs were proposed and
+> eight never occur; the ninth fires on 33 jobs, and reading one of them showed the
+> tool naming a job's blocking call one line below an action telling the reader to
+> go find it.
+>
+> The larger part of this round found nothing, which is worth recording as
+> plainly as the defect. `render.py`'s reason for existing -- the dashboard and
+> `--plain` cannot drift -- was tested directly for the first time and holds
+> exactly: over 59 real jobs, every label and every value on one surface appears on
+> the other. So do the overview's headline statistics, re-derived independently,
+> and `--ascii` purity across 409 renderings.
+
+> **Round twenty-nine, 2026-08-22.** One defect and the exemption that hid it: the
+> machine-readable surface published a clock speed that reads 1000x wrong, on 85%
+> of the real jobs carrying the field. 1542 tests before, **1547 after**; all four
+> gates clean.
+>
+> Round twenty-eight asked whether a rule's *evidence* matches its promise. This
+> round asked the same of a surface: `_job_json` opens "Deliberately exhaustive: if
+> the tool read it, this emits it", and `docs/details.md` repeats it. Checking
+> every `Job` value against the payload turned up one gap -- and the reason it had
+> never been caught is the sharper half of the finding.
+>
+> Sixth "tests that assert less than they appear to", and the first that was
+> *deliberate*: `TestTheJsonPayloadKeepsItsPromise` carries an allow-list written
+> so "the next value that is not emitted has to be argued for here instead of
+> passing quietly". One of its entries was an argument that was simply false, and
+> it silenced exactly the finding the class exists to surface.
+>
+> Two further things were checked and are sound: every number 20,905 real jobs put
+> into a finding reproduces from the record, and no finding's text shows an
+> unfilled placeholder, a stray `None`, a percentage over 100 or a negative
+> quantity.
+
+> **Round twenty-eight, 2026-08-22.** One defect with two halves, and it is the
+> largest-impact finding of the streak by share of affected output: a finding
+> headed "Traceback tail from the log" was showing the tail of the **file**. 1535
+> tests before, **1542 after**; all four gates clean.
+>
+> Round twenty-seven read real log contents for the first time and found a fault
+> invented from a word. This round stayed in the same vein and asked the opposite
+> question -- not "does the marker match something harmless?" but "when a rule does
+> fire, is the evidence it prints the evidence it promises?" Of 27,435 readable
+> logs, 486 hold a Python traceback and **173 of them (36%) rendered something
+> that was not one**.
+>
+> Two measurements in this round were wrong before they were right, and both were
+> corrected by re-running rather than by re-reading. The first probe compared a
+> list's length against a string's character count and reported 1%; the second
+> claimed no real log needs the rank-prefix half of the fix, on a scan that had
+> missed 25,000 files. The numbers below are the ones a re-run reproduces.
+
+> **Round twenty-seven, 2026-08-22.** One defect, from the first pass over real log
+> *contents* rather than real job records: a CRITICAL "Collective communication
+> fault" manufactured from the word NCCL. 1524 tests before, **1535 after**; all
+> four gates clean.
+>
+> The round opened by re-verifying `nodes.py`, which had produced the previous two
+> rounds' defects. Its statistics are sound in both directions -- and the finding
+> that matters is *where* those two bugs were: not in the machinery but in the
+> sample fed to it. The Fisher test, the correction and the intervals were never
+> wrong; the stratum (round 25) and the denominator (round 26) were.
+
+> **Round twenty-six, 2026-08-22.** One defect, and it moves a rate on real data:
+> a cancellation counted as a placement the node handled fine. 1520 tests before,
+> **1524 after**; all four gates clean.
+>
+> Found by making the "fixed only on one side" hunt systematic instead of
+> incidental. Round twenty-five's bug came from two modules disagreeing about an
+> identity, so this round asked the same question of a different invariant --
+> **which jobs does each module count as evidence?** -- and drove seven marginal
+> job shapes through `usable()`, the grouping, the node table and `sizing` to see
+> where they disagreed.
+>
+> Six of the seven agreed. The seventh was a cancellation, and the disagreement was
+> inside one module: excluded from the numerator, counted in the denominator.
+
+> **Round twenty-five, 2026-08-22.** One defect, and it is the most consequential
+> of the streak: the module whose entire reason for existing is holding a workload
+> fixed was not holding it fixed. It changes a *rate*, not wording. 1514 tests
+> before, **1520 after**; all four gates clean.
+>
+> `patterns.group_key` had this same defect and it was fixed there, in these words:
+> "two people's unrelated `run.sh` on one partition became a single fabricated
+> workload". `nodes.py` never got the fix. Seventh "fixed only on one side" in this
+> record, and the first to move a number a reader acts on.
+>
+> Found by running `--all-users --nodes` -- a combination in the README's own
+> examples -- against the real cluster and asking why a 486,882-job query had
+> reduced itself to 17 placements of one stranger's workload.
+
+> **Round twenty-four, 2026-08-22.** Real data, widened from one user to the whole
+> cluster: 471 users, 486,882 jobs in two days, and states, id shapes and string
+> lengths no single account contains. Two defects. 1498 tests before, **1514
+> after**; all four gates clean.
+>
+> The cluster is where the *shapes* live. A pending throttled array is spelled
+> `49046820_[1-20%10]`, which sacct prints in its own JobID column and then refuses
+> in `-j`. The longest job name is 123 characters with no space in it. Neither
+> exists in one user's history and neither could be invented by a fixture author
+> who had not seen sacct emit it.
+
+> **Round twenty-three, 2026-08-22.** Real data again, pushed harder: all 15,085
+> jobs through the post-mortem renderer, and the dashboard driven against 930 real
+> workloads. Two defects -- one a sentinel rendered as a hostname, one the slowest
+> interaction in the app doing twice the work. 1487 tests before, **1498 after**;
+> all four gates clean.
+>
+> The second is also a lesson about method. My first account of it blamed a
+> provisional mount-time column width; the trace meant to confirm that showed both
+> builds computing an *identical* layout, and the fix I then wrote to defer the
+> mount build measured 3.64s against the plain guard's 3.55s. It is not in the tree.
+> Two wrong explanations, both caught by measuring instead of reasoning.
+
+> **Round twenty-two, 2026-08-22, after the 0.6.0 release.** The angle none of the
+> twenty-one rounds before it used: **run the tool against this cluster's real
+> sacct data.** Every previous round used `--demo` or a hand-built fixture. One
+> defect, in two halves, and it was the first thing real data showed. 1476 tests
+> before, **1487 after**; all four gates clean.
+>
+> 15,085 real jobs over 90 days. `find_memory_search` produced three findings and
+> **two of them described a search that never happened** -- 71 OOM kills at an
+> unchanged 6.0 GiB, and 16 at an unchanged 8.0 GiB -- the first rendering 777
+> characters of `6.0 GiB -> 6.0 GiB -> ...` under a heading calling it a search.
+>
+> Fixing it then exposed a *fixture* asserting the same thing: a test that had been
+> pinning "a search" over five identical values since it was written.
+
 > **Round twenty-one, 2026-08-22.** One defect, and CI found it rather than any
 > local gate: `tests/test_portability.py` imported `tomllib`, stdlib from **3.11**,
 > in a package declaring `requires-python = ">=3.10"`. Four assertions died with
@@ -245,6 +423,959 @@
 > upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
 > was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
 > and its control. `ruff`, `ruff format` and `mypy` clean.
+
+---
+
+## Round thirty-two — nothing found, and what was looked at
+
+No code changed this round. The value of the round is the list below, so a later
+one does not spend itself re-checking the same ground.
+
+### The one thing that was wrong: a test of mine, not the code
+
+Rounds twenty-two to thirty-two were never pushed, so none of them had reached
+CI's matrix. The first push failed the **Oldest supported Textual** job:
+
+```
+FAILED test_the_job_list_adds_each_row_once  - AssertionError: 800 add_row calls for 400 rows
+FAILED test_the_overview_adds_each_row_once  - AssertionError: 16 add_row calls for 8 rows
+```
+
+Round twenty-three's guard was written against the locally installed Textual
+8.2.8 and its tests asserted `add_row == row_count`: exactly one build per screen.
+Tracing on 0.86 -- rather than guessing, which round twenty-three's own docstring
+records getting wrong twice -- showed the guard is fine and fires correctly:
+
+```
+  0 OverviewScreen rows=8 guard_fired=False layout=(('#',4),('JOB NAME',25),...,('CPU / GPU-HOURS',17))
+  1 OverviewScreen rows=8 guard_fired=True  layout=(same)
+  2 OverviewScreen rows=8 guard_fired=False layout=(('#',4),('JOB NAME',22),...,('COMPLETED',9),...)
+  3 OverviewScreen rows=8 guard_fired=True  layout=(same)
+```
+
+Textual 0.86 lays the screen out at one size and then at its real one, so there
+are two *genuinely different* layouts -- the second gains a `COMPLETED` column --
+and the guard suppressed the duplicate within each pair, which is precisely what
+it promises: "whether the table already holds exactly this layout and these rows".
+It never promised one build per screen. That is a coincidence of newer Textual,
+where a screen pushed onto a laid-out app already has its size.
+
+So the test asserted more than the code claims, and the two tests now check the
+contract instead: no `(layout, rows)` signature is ever built twice, and the
+`add_row` count is one build per *distinct* layout. Both pass on 0.86 and 8.2.8,
+and both fail on both versions when the guard is disabled.
+
+Recorded here rather than shrugged off, because the pattern is the one this file
+keeps naming. A test written against one version of a dependency, asserting a
+property that version happens to produce, is the same defect as a test that pins
+a buggy value -- and the only reason it surfaced is that CI runs a matrix and a
+local gate runs one interpreter.
+
+### `compress_nodelist`, against `scontrol show hostnames`
+
+This is the one output a user pastes straight into a submission script, so the
+standard is not "our round trip agrees with itself" but "Slurm accepts it and
+expands it to the nodes we meant". 57 cases were built from this cluster's real
+607-node fleet -- random scatters of 1 to 40 nodes, contiguous runs at four
+offsets, the `beagle3-bigmem` group, 63 midway3 nodes, and the entire fleet at
+once -- compressed, then handed to `scontrol`:
+
+```
+real nodes on this cluster: 607
+cases: 57   our round trip failed: 0   slurm disagreed: 0
+```
+
+### The parser, on 3,000 corrupted real rows
+
+250 real sacct rows, each mutated twelve ways: truncated, a field dropped, a
+field added, everything emptied, a 40-digit number, a negative, `wörk—dir…✓`, an
+embedded newline, an embedded `|`, a NUL byte, a 5,000-character value, and
+nothing but delimiters. Each result was pushed through `parse`, `diagnose`,
+`render_job`, `filter_jobs` and `History.stats`. **No exception, anywhere.**
+
+One asymmetry was examined and left alone. `parse` drops a row with more fields
+than were requested -- documented, because "every column after the offending one
+would be shifted" -- but accepts one with fewer, where the same shift can occur:
+
+```
+  intact             -> state='CANCELLED by 940740146'
+  one field dropped  -> state='0:0'          <- ExitCode, shifted into State
+  one extra field    -> row REJECTED
+```
+
+It is not filed as a defect because it is not reachable. The `>` case is what the
+docstring is about -- a value containing the delimiter makes a row *longer* -- and
+all 68,222 real rows here carry exactly the 80 fields requested. Recorded so the
+asymmetry is a known choice rather than an oversight.
+
+### `sizing.py`, against the four rules it states about itself
+
+872 actionable recommendations over 1,528 real workloads. Every rule holds:
+
+* **Never size walltime down from a TIMEOUT** -- no `--time` suggestion falls
+  below what its own evidence proves, counting completed non-hung runs and the
+  limits that truncated computing timeouts.
+* **Never treat a hung run as evidence of needing more time** -- no mostly-hung
+  workload is told to raise its limit.
+* **Never size memory from MaxRSS above the cgroup limit** -- no `--mem`
+  suggestion sits below the highest trustworthy peak.
+* **Say "not enough evidence" rather than guess** -- no actionable number appears
+  below `MIN_RUNS`.
+* And the unit claim: `--cpus-per-task` is advised per task. The one apparent
+  violation -- 26 cores/task on a 30-core allocation -- was the harness reading
+  `max(task_count)` and `max(cpu_count)` from two different runs of a
+  heterogeneous group. The busiest run is single-task, 21.7 of 24 cores busy,
+  and 27 is right.
+
+### On the three false alarms
+
+All three came from the same mistake: checking a module against a plausible rule
+rather than the rule it states. `memory_advice` excludes `looks_like_noop` runs
+from its evidence and `walltime_advice` floors on a computing timeout's *limit*
+rather than its elapsed; harnesses that ignored both produced 13 and 8
+"violations" respectively, and 193 more came from counting completed runs where
+the module counts usable observations. Worth writing down because it is the
+failure mode of an audit, not of the code: a finding measured against the wrong
+standard looks exactly like a real one until you read the source.
+
+## Round thirty-one — the hostname on screen that search could not find
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `filter_jobs` searched the folded `NodeList` as stored, so no hostname inside a multi-node range matched the job that ran on it | `index.py:301` | `TestAFoldedNodeListIsSearchableByHostname` |
+
+### 1. "peak on midway3-0003", and the list says no such job
+
+Slurm compresses a multi-node allocation. The search haystack took `job.node_list`
+verbatim, and `midway3-[0003-0004]` contains the string `midway3-0003` nowhere.
+
+The reader is not guessing at those names -- the job screen prints them. Real job
+51553906, rendered:
+
+```
+    nodes            midway3-[0003-0004] (2 nodes)
+    slowest task     0.3% below average (task 1 on midway3-0003)
+    peak on          midway3-0003 task 0
+```
+
+Two rows name `midway3-0003`. Typing it into the job list returned nothing, on a
+history that contained the job. `filter_jobs`' own docstring calls this out in
+advance, about a different column:
+
+> Typing what you can plainly see and getting an empty list is the worst kind of
+> empty result -- it reads as missing data.
+
+and offers `what died on midway3-0385` as one of the four things the box is for.
+
+Measured here: 26 of 20,905 jobs carry a folded NodeList, and 72 hostname searches
+came back empty for a job that had run on that node. After the fix, 0 do, and
+`midway3-0003` returns its 44 rows in 29 ms across the whole history -- the common
+path is untouched because 20,879 of the jobs have no bracket to expand.
+
+`nodes.expand_nodelist` already did this work for the reliability table, and is
+bounded by `MAX_EXPANSION`; the raw string stays in the haystack beside the
+expansion, so a reader who copies the bracketed form off the `nodes` row still
+matches. Four of the seven new tests are controls, including one that a
+match-everything "fix" would fail.
+
+### Consequence for the numbers
+
+No statistic changes. One search returns rows it should always have returned:
+here, 26 jobs become findable by the names of the 2-4 nodes each ran on.
+
+### What was verified and not changed
+
+* **Log discovery, against the real filesystem for the first time.** 23,647 log
+  files were indexed by the job ids in their names, giving 8,161 jobs whose log
+  demonstrably exists under a root the tool searches. On an 800-job sample
+  `assign_logs` attached **the right file 121 times and the wrong file 0 times**.
+  Never attaching another job's log is the property that matters, since a wrong
+  log means a wrong diagnosis, and it holds.
+* The 679 misses are all outside the documented search scope, and are left alone
+  deliberately: 457 sit at `logs/<subdir>/<file>`, one level below the `logs`
+  entry in `_SUBDIRS`, and the rest are under names the tool never claimed to
+  search (`midtraining`, `results`, `work`). Deepening the walk is a scope and
+  cost decision, not a defect fix; `--log-dir` already covers it.
+* **Field negotiation, on a cluster old enough to test it.** This machine runs
+  Slurm 20.11.8. `StdOut` and `StdErr` arrived in 24.05 and `SubmitLine` in 21.08,
+  so all three are genuinely absent -- `supported_fields`/`resolve_fields` dropped
+  exactly those and queried the remaining 80 without error. The JSON payload's
+  `stdout_pattern`, `stderr_pattern` and `submit_line` are correctly null here
+  rather than empty strings.
+* Every searchable field is searchable by its displayed value: 6,000 jobs were
+  probed with their own job id, name, state, partition, node list and start
+  timestamp in three formats (`2026-07-28`, `07-28`, `07-28 15:00`). Zero
+  returned nothing before the fix, and the folded NodeList was the only gap.
+
+## Round thirty — "Nothing was computed", over 18.4 TiB of traffic
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `noop-allocation` said "Nothing was computed" and "Find the blocking call" on jobs whose `io-heavy` finding, rendered directly below it, reported terabytes moved at a sustained rate | `diagnose.py:341` | `TestNothingWasComputedIsNotSaidOverTerabytes` |
+
+### 1. The tool named the blocking call one line under an order to go find it
+
+`_cpu_rules` states the standard it is held to, in a comment guarding three job
+states:
+
+> "Find the blocking call" is advice about the user's own code, and it is only
+> honest when nothing else already explains the missing CPU time.
+
+`OUT_OF_MEMORY`, `NODE_FAIL` and `PREEMPTED` were guarded on that basis in round
+eighteen. A *measurement* on the same record was not. Real job 36362003 rendered:
+
+```
+  [critical] Allocation did essentially nothing
+      18:52:05 of wall clock, 3.5s of CPU, holding 4 GPU(s). Nothing was computed.
+      -> Find the blocking call. If this allocation is a deliberate reservation,
+         mark it so and this rule will stay quiet.
+
+  [warning] Filesystem may be setting the pace, not the GPU
+      read 18.4 TiB, wrote 15.1 GiB — 284.4 MiB/s sustained over 18:52:05.
+```
+
+Eighteen point four terabytes, read at 284 MiB/s for nineteen hours, described as
+nothing. The reader is sent into their own code after a hang that is not there,
+while the answer sits in the next finding down.
+
+Measured over 20,905 real jobs:
+
+```
+jobs told 'Nothing was computed'            : 986
+  of those, moving at least the IO floor    : 287
+  of those, ALSO flagged io-heavy alongside :  33
+total data moved by allocations told nothing was computed: 419.3 TiB
+```
+
+The finding stays CRITICAL and stays raised -- an allocation holding four GPUs
+for nineteen hours to feed a filesystem is wasting them however it got there.
+What changes is that it stops contradicting its neighbour:
+
+```
+  [critical] Allocation computed almost nothing — it was moving data
+      18:52:05 of wall clock, 3.5s of CPU, holding 4 GPU(s), and 18.4 TiB of
+      filesystem traffic at 284.4 MiB/s. The time went to I/O, not to compute.
+      -> Treat this as the I/O problem below, not as a hang: stage the input
+         somewhere faster, or overlap the transfer with compute.
+```
+
+`_io_explains_idle_cpu` deliberately reuses `_io_rules`' own two thresholds rather
+than picking a third. The defect is two findings on one screen disagreeing, so the
+guard has to fire on exactly the jobs the other rule fires on -- 33 of the 986,
+not a similar-looking set. The 287 that clear the volume floor but trickle keep
+the original wording, and a hang with no I/O at all is untouched, which is what
+three of the six new tests pin.
+
+### Consequence for the numbers
+
+No statistic moves. `looks_like_noop` is unchanged, so `noop_jobs` (1391 here),
+`gpu_hours_noop` (3338) and the overview's "in allocations that never computed"
+are all the same figures as before -- and remain correct, because an I/O-bound
+job's GPUs genuinely did not compute. Only the wording of one finding changes,
+on the jobs where it was false.
+
+### What was verified and not changed
+
+* **`render.py`'s reason for existing, tested directly for the first time.** Both
+  surfaces were rendered for 59 real jobs and diffed fact by fact: every label
+  `job_sections` produces appears on both, and so does every value. 0 gaps in
+  either direction. The patterns and nodes screens agree number-for-number too.
+* The overview's tail note (`… 1503 more workloads (14365 runs) holding 20.1% of
+  the compute`) is absent from the dashboard, and that is correct rather than
+  drift: the dashboard's table holds all 1528 workloads and scrolls, so there is
+  no truncation for it to name.
+* Every headline statistic re-derived independently and matched exactly:
+  completion rate 78.3%, 11,674 GPU-hours total, 3,337.5 idle, goodput 0.6578,
+  noop fraction 0.2859, 6 open records excluded.
+* `--ascii` output is pure ASCII across all six aggregate views and 403 job
+  screens built from real records.
+* `ascii_fold` rewrites seven characters and is applied to finished text, so it
+  would rewrite a data value containing one. No data field in 20,905 real jobs
+  contains any non-ASCII character at all, so this stays a hypothesis and is not
+  filed as a defect.
+* Eight further contradictory pairs were looked for and do not occur:
+  memory-slack with host-oom or rss-above-limit, walltime-slack with either
+  timeout finding, timeout-hang with timeout-real, and noop-allocation with
+  system-cpu-heavy.
+
+## Round twenty-nine — a machine surface that published the ambiguity
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `--json` emitted the raw `AveCPUFreq` string and withheld the resolved hertz, so a consumer read 3 MHz where the dashboard showed 3.00 GHz | `cli.py:473` | `TestTheResolvedClockIsMachineReadable` |
+| 2 | the exhaustiveness test exempted `cpu_freq_hz` as "recoverable from `cpu.frequency`", which it is not | `tests/test_audit.py` | same class; the exemption is gone |
+
+### 1. 17,503 of 20,550 real jobs published a figure that reads 1000x low
+
+`duration.parse_cpu_freq` exists precisely because this field cannot be read as
+printed. Its own docstring:
+
+> Slurm's magnitude suffix is applied to a kHz base in some code paths and a Hz
+> base in others, so the string alone is ambiguous by a factor of 1000.
+
+It resolves that by trying both readings and keeping whichever lands in a
+plausible clock range, and returns `None` when neither does. `render.py:1215`
+builds the dashboard's "avg clock" row from the resolved number. The payload
+emitted the string.
+
+```
+jobs with an AveCPUFreq string      : 20550
+  string reads 1000x wrong          : 17503  (85%)
+  tool drops it as uninterpretable  :  2061
+  string and tool agree             :   986
+
+most common misreadings:
+    3984  3.00M -> tool says 3.00 GHz, the string reads as 3 MHz
+    3040  3M    -> tool says 3.00 GHz, the string reads as 3 MHz
+    1792  800K  -> tool says 800 MHz,  the string reads as 1 MHz
+```
+
+The 2,061 are worse than wrong, they are unanswerable: `385K` resolves to neither
+a plausible kHz nor Hz reading, so the dashboard omits the row entirely -- and the
+payload published `"385K"` with nothing to say it should not be believed.
+
+The fix is the rule the payload already states two lines further down, about
+`req_mem_raw` sitting beside `limit_bytes`: *"both are emitted so a consumer never
+has to guess which convention a figure is in."* `cpu.frequency_hz` now carries the
+resolved number, `null` where the tool will not vouch for it, and `cpu.frequency`
+keeps the raw string unchanged so nothing downstream breaks.
+
+### 2. The allow-list that silenced it
+
+`TestTheJsonPayloadKeepsItsPromise` reads `_job_json` with `ast` and holds every
+`Job` value to it, with exemptions "listed by name rather than inferred, so the
+next value that is not emitted has to be argued for here instead of passing
+quietly". Under the heading *Derived views of emitted numbers* -- "each is
+recoverable from something that is emitted, so emitting it as well would be the
+same number under two names" -- sat:
+
+```python
+"cpu_freq_hz": "cpu.frequency",
+```
+
+It is not recoverable from `cpu.frequency`, and on 85% of real jobs it is not the
+same number. The other four entries in that group were re-checked and are sound:
+`cores_busy` is `cpu.utilization x shape.cpus`, `fs_disk_bytes` is a documented
+alias of `read_bytes`, and the `*_alloc` spellings are the allocation-row fallback
+the emitted properties already read through.
+
+A mechanism for making omissions argue for themselves only works if the arguments
+are checked. This is the sixth "tests that assert less than they appear to" in
+this record and the first that was written deliberately rather than by oversight.
+
+### Consequence for the numbers
+
+`--json` grows one key per job, 95 to 96; README and `docs/details.md` both
+carried the old count and are updated. No text surface changes -- the dashboard
+and `--plain` were already right, which is what made the drift invisible.
+
+### What was verified and not changed
+
+* Every number quoted by a finding across 20,905 real jobs reproduces from the
+  job record: `walltime-slack`'s elapsed, limit and percentage, `timeout-real`'s
+  limit, `timeout-hang`'s elapsed. No finding fires with an elapsed above its own
+  limit.
+* No finding's rendered text on those jobs contains an unfilled `%s`/`{}`, a
+  stray `None`, a doubled space, a percentage over 100, a negative quantity, or
+  an empty parenthesis. 18 findings across 27,000 checks matched a
+  "dangling preposition" pattern; all 18 were the regex mis-reading a legitimate
+  sentence end.
+* `shape.req_cpu_freq_min`/`max` are raw strings too and stay that way: the tool
+  never resolves them anywhere, so unlike `AveCPUFreq` there is no better answer
+  being withheld.
+* The rest of the payload's raw/resolved pairs are consistent -- `state_raw` with
+  `state`, `job_id_raw` with `job_id`, `req_mem_raw` with `limit_bytes`,
+  `alloc_gres`/`alloc_tres` with `gpu.count`.
+
+## Round twenty-eight — a traceback tail that was the file's tail
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `_traceback_tail` took `lines[start:]` to EOF, so anything printed after the traceback became the "traceback tail" a reader was shown | `diagnose.py:638` | `TestTheTracebackTailEndsWhereTheTracebackEnds` |
+| 1b | the same function's header scan did not strip torchrun's `[rankN]: ` prefix, so a log whose every traceback is prefixed produced no finding at all | `diagnose.py:638` | `test_a_torchrun_only_traceback_is_found_at_all` |
+
+### 1. 173 of 486 real tracebacks rendered as something else
+
+A traceback is frequently *not* the last thing in a log file. A wrapper retries,
+torchrun prints its own summary, a shell banner follows, slurmstepd appends the
+kill notice. The function scanned backwards for the last `Traceback` header --
+correct, the one that killed the job is the last -- and then took everything from
+there to the end of the file. The six-line trim kept the header, an ellipsis, and
+the last four lines **of the file**.
+
+On `report/4-train.err`, the rule promised a traceback and delivered the shell's
+epilogue:
+
+```
+before   Traceback (most recent call last):
+           ...
+         slurmstepd: error: Detected 1 oom-kill event(s) in StepId=53371939.batch cgroup.
+
+after    Traceback (most recent call last):
+           ...
+         torch.distributed.elastic.multiprocessing.errors.ChildFailedError:
+```
+
+The line the reader needed -- the one naming what the process actually raised --
+was the line the trim discarded.
+
+Measured across every readable log on this machine:
+
+```
+log files read                                : 27435
+  containing a traceback                      : 486
+  where the rendered tail CHANGED             : 173  (36%)
+  where the old code found no traceback at all: 3
+```
+
+A traceback ends at its exception line: the first line after the header carrying
+no leading whitespace, because frames are indented and the exception line is not.
+
+### 1b. And three logs where the rule never fired
+
+The same fix needs `[rankN]: ` stripped before the indentation test, or torchrun's
+prefix makes the first frame look unindented and cuts the tail to one line. The
+backward header scan needed the identical strip for a separate reason, found by
+writing the test for the first half: when *every* copy of the traceback is
+prefixed, the scan matches nothing and there is **no finding at all**.
+
+torchrun normally prints its own wrapper traceback unprefixed beside the worker's,
+which is why 50 of the 53 prefixed logs were found anyway. Three were not, and one
+of them died on a line a reader would have wanted immediately:
+
+```
+[rank0]: AttributeError: '_OpNamespace' '_moe_C' object has no attribute 'grouped_topk'
+```
+
+Stripping in one of the two tests and not the other is the shape this record has
+now named eight times. Both halves cost one call.
+
+### Consequence for the numbers
+
+No rate, interval or ranking moves -- this is evidence text, not statistics. What
+changes is what 173 of 486 traceback findings display, and whether 3 logs produce
+a traceback finding at all. A reader who acted on the old evidence was reading the
+end of the file under a heading that said otherwise.
+
+### What was verified and not changed
+
+* Every fixture in the suite puts the traceback last, which is the 64% case that
+  always worked; two of the seven new tests pin it and pass against the reverted
+  tree, which is what makes them controls rather than decoration.
+* The backward scan itself is right and was left alone. A log holding several
+  tracebacks should show the last, and a chained `During handling of the above
+  exception` block is not reached because the scan already landed past it.
+* `cuda-oom` and `import-error` markers were re-checked over the same corpus and
+  are clean: every hit is a FAILED job.
+* Round twenty-seven's narrowed `_NCCL_MARKERS` holds up on the wider corpus --
+  the surviving hits are genuine, three of them ending on `NCCL WARN Cuda failure
+  'CUDA driver version is insufficient for CUDA runtime version'`.
+
+## Round twenty-seven — a fault invented from the word NCCL
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `_NCCL_MARKERS` held the bare substring `"nccl"`, so any distributed job's startup or shutdown line drew a CRITICAL interconnect fault | `diagnose.py` | `TestMentioningNcclIsNotAnNcclFault` |
+
+### 1. Ten real logs mention NCCL; none of them faulted; all ten were flagged
+
+Every distributed PyTorch job prints NCCL when it starts and when it stops. The
+marker tuple matched the word, so the finding was manufactured out of:
+
+```
+[rank0]:[W818 12:54:11 ProcessGroupNCCL.cpp:1524] Warning: WARNING:
+    destroy_process_group() was not called before program exit
+INFO [parallel_state.py:1208] ... distributed_init_method=... backend=nccl
+NCCL version 2.19.3+cuda12.1
+NCCL INFO Bootstrap : Using eth0:10.50.221.11<0>
+```
+
+Measured over 400 real log files on this machine: **ten mention NCCL, none of them
+faulted, and every one of the ten drew the finding.** Two of those jobs had a
+genuine CUDA OOM, so the post-mortem showed two CRITICALs -- one correct, one
+sending the reader to debug an interconnect that was fine while the actual fix was
+a smaller batch:
+
+```
+before   findings: ['cuda-oom', 'nccl', 'traceback']
+after    findings: ['cuda-oom', 'traceback']
+```
+
+Only real logs could show it. Every fixture in the suite passed a string that *was*
+a fault, so the loose marker was never exercised as a false positive -- and both
+pre-existing NCCL tests still pass untouched, because `"nccl timeout"` and
+`"NCCL WARN Watchdog caught collective operation timeout"` are fault shapes.
+
+The replacement set is checked in both directions rather than tightened by
+intuition: **zero hits across those ten logs**, and hits on all five real fault
+shapes -- the watchdog timeout, `DistBackendError: NCCL error`,
+`ncclUnhandledCudaError`, `ncclInternalError`, and NCCL's own `NCCL WARN` channel,
+which it uses for trouble rather than for chatter. A guard test asserts no marker
+is short enough to be a bare mention.
+
+### The negative result: the node statistics, re-verified end to end
+
+Rounds twenty-five and twenty-six both found defects in `nodes.py`, so this round
+re-measured what it claims. `dominant_workload`'s docstring cites a simulation --
+"3.73% ... and 3.17% ... under the 5% target either way" -- and both of those
+rounds changed the sample it is computed from.
+
+**False positives, every node genuinely identical:**
+
+```
+nodes  per node  nodes/job  p(fail)   flagged
+10     30        1          0.20      4.5%
+20     30        1          0.20      3.0%
+10     30        1          0.05      1.2%
+20     30        4          0.20      1.5%
+10     30        4          0.20      0.5%
+```
+
+Still under 5%, and consistent with the recorded figures. The multi-node rows are
+new: one job spanning four nodes contributes four *correlated* observations, which
+the Fisher test treats as independent, so the concern was that it would inflate
+the rate. It does the opposite -- correlated outcomes make every node look alike,
+which makes the test conservative.
+
+**Detection power, one node genuinely worse:**
+
+```
+nodes  nodes/job  p(good) -> p(bad)   found    innocent flagged
+10     1          0.10 -> 0.50        98.3%    0.3%
+10     1          0.10 -> 0.30        53.3%    1.3%
+20     1          0.10 -> 0.50        96.7%    2.3%
+10     4          0.10 -> 0.50        66.0%    0.3%
+10 (60/node) 4    0.10 -> 0.50        99.3%    0.0%
+```
+
+Sound in both directions, and the innocents are within the FDR the correction
+targets by design. Multi-node allocations cost power rather than correctness, and
+recover it with more placements.
+
+So the machinery was never the problem. That is worth writing down: two rounds of
+defects in this module were both about *which observations reach it* -- the wrong
+stratum, then an uninformative denominator -- and none about the arithmetic.
+
+---
+
+## Round twenty-six — an unknown outcome scored as a success
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | A cancelled placement was excluded from the failure numerator and left in the denominator, scoring it as a node behaving | `nodes.py` `node_table` | `TestACancellationIsNotASuccess` |
+
+### 1. "Cancellations excluded -- ambiguous", except from the denominator
+
+`_bad` says it in its own docstring, and it is true of `_bad`. The table around it
+counted every usable placement as a trial, so twenty cancellations on a node
+arrived as twenty observations of that node not failing.
+
+That is the one thing this module does that the rest of it argues against.
+`index` states the position plainly:
+
+> "a cancelled run is neither [completed nor flagged] ... a deliberate kill and an
+> abandoned one are identical in accounting"
+
+and everything else here works hard not to over-claim -- a Fisher exact test, a
+Benjamini-Hochberg correction, Wilson intervals, `MIN_SAMPLES` -- before padding
+the denominator with rows it had itself called uninformative.
+
+Measured on a real 90-day history: **7.3% of placements are cancellations**, and
+censoring them moves **7 of 9 rows**.
+
+```
+node             counted as successes    censored
+midway3-0250     32/36   88.9%           32/33   97.0%
+midway3-0330      9/73   12.3%            9/45   20.0%
+midway3-0376     17/78   21.8%           17/64   26.6%
+midway3-0025      1/12    8.3%           below MIN_SAMPLES
+midway3-0116      0/12    0.0%           below MIN_SAMPLES
+```
+
+Two nodes falling below the threshold is the honest outcome when the informative
+sample really is that small -- the tool already refuses to judge on thin evidence,
+and inflating the denominator manufactures a confidence the data does not support.
+
+**The hang metric keeps them, and that is not an inconsistency.** There a
+cancellation is frequently the evidence itself: **340 of those 1,094** satisfy
+`looks_like_noop` -- a job that held its allocation and computed nothing until
+someone killed it. Dropping those would gut the metric that is the *default*. A
+cancellation that did compute stays a trial there too: it ran, it did not hang,
+and that is evidence. So `--nodes` with no flags is byte-identical, and only
+`--metric failure` moves.
+
+### The test that named the whole rate and pinned half of it
+
+`test_cancelled_excluded_from_failure_rate` asserted `bad == 0` and nothing about
+`trials`. Its own name says "the failure rate", which is a numerator over a
+denominator; it held the numerator. With `bad` zero in that fixture the rate came
+out the same either way, so it could never have caught this. It now asserts both.
+Fifth instance in this record of a test that asserts less than its name claims.
+
+### The negative result: everything else agrees
+
+Seven marginal job shapes driven through all four consumers -- `patterns.usable`,
+the workload grouping, `node_table` and `sizing.recommend`:
+
+```
+                 usable()  groups  node_tbl  sizing
+open_ended         no        no       no       no
+live RUNNING       no        no       no       no
+no elapsed         no        no       no       no
+zero elapsed       yes       yes      yes      no
+no node            yes       yes      no       yes
+cancelled          yes       yes      *        no
+no steps           yes       yes      yes      yes
+```
+
+Every row is deliberate and consistent: an open record is unusable everywhere, a
+job with no node cannot be attributed to one, and `sizing` alone declines
+zero-elapsed and cancelled runs because it is the only consumer inferring a
+*request* from them. The starred cell is this round's defect.
+
+---
+
+## Round twenty-five — "controlled for workload" was controlling on a name
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | The node comparison held a job *name* fixed, not a workload, so a multi-user query pooled different people's unrelated jobs into one stratum | `nodes.py` `dominant_workload`, `node_table` | `TestTheWorkloadControlHoldsOnePersonsWork` |
+
+### 1. A confound the control did not control
+
+`nodes.py` exists to answer "which nodes eat my jobs", and its whole method is
+holding the workload fixed because placement is not random. It did that by
+comparing normalised job **names**:
+
+```python
+records = [j for j in records if normalize_name(j.name) == normalize_name(workload)]
+```
+
+A multi-user query is one flag away -- `-u alice,bob` and `--all-users`, both in
+the README's examples -- and on this cluster **25 job names are used by more than
+one person** over two days: `interactive` by eight of them, `ssd_lab_base` by six,
+`bc_jupyter` by four. Constructed from that shape:
+
+```
+alice: 12 runs of `interactive` on n1, all hung
+bob:   12 runs of `interactive` on n1, all clean
+alice: 12 runs of `interactive` on n2, all clean
+
+before   n1  12/24   50.0%  worse     <- neither person's rate
+after    n1  12/12  100.0%  worse     <- alice's, which is what was asked for
+```
+
+50% is a number belonging to nobody. `patterns.group_key` already puts the user in
+the identity, for exactly this reason and in exactly these words -- "two people's
+unrelated `run.sh` on one partition became a single fabricated workload" -- so the
+codebase had already diagnosed the hazard and fixed it in one of the two places it
+occurs.
+
+`nodes.Workload` is that identity now: a name, an owner, and `matches()`.
+`dominant_workload` counts by `(name, user)` and returns one; `node_table` filters
+through it. Under the single-user query that is the default the user is constant
+and nothing changes -- verified against a real 30-day history, byte for byte.
+
+**It is a `str` subclass, and that was the second attempt.** A `NamedTuple` is a
+tuple, so `"only %s counted" % workload` unpacks it and `workload in text` raises:
+71 tests failed in one run. A value whose whole job is to be displayed should be
+the thing displayed, so the class *is* its label and carries `.name` / `.user`
+alongside. Every existing caller -- and the 47 test call sites that pass a bare
+name -- keep working untouched, and a bare name still means "any user", which is
+what it has always meant and is correct for a single-user history.
+
+**The screen names the owner only where that is load-bearing.** `qualified` is set
+when the history the workload was chosen from spans more than one user:
+
+```
+--all-users   controlled for workload: only dsafarian's oligomers counted
+own history   controlled for workload: only rd-s#-run counted
+```
+
+**`--nodes --json` keeps a machine-readable field.** `workload` stays the bare
+name, with the owner beside it in a new `workload_user`, rather than the display
+label -- a consumer filtering on `workload` was reading a name and must keep
+reading one.
+
+### The negative results
+
+* **`--all-users --nodes` at cluster scale**: 3 hours, ~80,000 jobs, 20.0s and
+  514 MB. It runs, and its answer ("no node reached the 10 placements a comparison
+  needs") is honest rather than wrong -- three hours of one workload is genuinely
+  too thin. The defect was never that it failed; it was that the stratum it chose
+  was not a workload.
+* **453 distinct nodes** touched cluster-wide in two days, against the 3 the demo
+  has and the 34 in a personal history. No layout or statistical problem at that
+  scale.
+
+---
+
+## Round twenty-four — the shapes only a whole cluster has
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `slurmpast '49046820_[1-20%10]'` died: sacct prints that id and will not accept it | `sacct.py` `Sacct.jobs` | `TestAnUnexpandedArrayIdCanBeLookedUp` |
+| 2 | A 123-character workload name with no spaces overran `--sizing` at every width and broke the workload title mid-name | `report.py`, `tui.py` | `TestAWorkloadNameWithNoSpacesInIt` |
+
+### 1. An id sacct prints and then rejects
+
+A pending array with a throttle is `49046820_[1-20%10]`. That is what sacct writes
+in `JobID` under `--parsable2`, and what `squeue` shows -- so it is what anyone
+copies. Handed back to sacct:
+
+```
+$ slurmpast '49046820_[1-20%10]'
+slurmpast: sacct: fatal: Bad job array element specified: 49046820
+```
+
+Established against the live scheduler rather than reasoned about:
+
+```
+sacct -j '49046820_[1-20%10]'   fatal
+sacct -j '49046820_[1-20]'      fatal      <- the brackets, not the %throttle
+sacct -j 49046820               49046820_[1-20%10]|PENDING
+sacct -j 49046820_4             accepted   (a real element)
+sacct -j 53833807.batch         accepted   (a step id)
+```
+
+`queryable_job_id` reduces an unexpanded range to the master, which is the only
+spelling sacct answers, and leaves every other form alone. The bracketed form does
+not survive expansion, so there is no completed array to over-fetch.
+
+Two real records now resolve that could not before, and both exercise round
+eighteen's new findings on genuine data: a `DEADLINE` array reporting "Killed at
+its --deadline, not its time limit", and a `NODE_FAIL` reporting "The node failed
+under this job".
+
+### 2. A name that `wrap` cannot break
+
+`wrap` breaks at spaces. The longest job name on this cluster is 123 characters and
+contains none:
+
+```
+nf-NFCORE_RNASEQ_RNASEQ_FASTQ_QC_TRIM_FILTER_SETSTRANDEDNESS_FASTQ_SUBSAMPLE_FQ_
+SALMON_SALMON_INDEX_(genome.transcripts.fa)
+```
+
+`--sizing`'s workload header was **125 cells at 60, 74, 80, 100 and 120 columns** --
+it wraps, and a single word comes back from the wrapper whole. The dashboard's
+workload title did the same and Textual soft-wrapped it mid-name to column 0.
+
+`report` documents this failure exactly, for a *detail value*: "a 68-character job
+name is one word, so it came out of the wrapper unchanged and the row went to 89
+cells on an 80-column terminal." It was fixed there with a clip and left in two
+other places -- the sixth "fixed only on one side" in this record. So the rule is
+named once now, `render.wrap_or_clip`, and `pair_value_lines` is expressed in terms
+of it rather than repeating it.
+
+The dashboard title is clipped rather than wrapped: it heads a one-line summary
+that goes on to carry the counts, and wrapping it would push them onto a line of
+their own. The counts themselves can still take that line past the width and
+soft-wrap -- the overview's summary already does this with a long window string,
+it is accepted behaviour on these screens, and the test says so rather than
+quietly asserting less.
+
+### The negative results
+
+* **`expand_nodelist` on a real 264-character, 63-node allocation** --
+  `midway3-[0002,0008,0012-0015,...]` -- expands and round-trips through
+  `compress_nodelist` exactly. Round twelve fuzzed that over 4,000 synthetic
+  hostlists; this is the first real one.
+* **Every job-id shape the cluster produces** through `base_job_id`,
+  `numeric_job_id` and `job_identifiers`: unexpanded arrays with and without a
+  throttle, real elements, heterogeneous components, step ids, and the
+  column-truncated `53601970_[0+`. No exception, and every one resolves to a
+  sensible master.
+* **The `_[0+` truncation is a display artifact, not a defect.** sacct's default
+  column width truncates JobID exactly as it truncates `OUT_OF_ME+`; slurmpast
+  queries with `--parsable2`, which does not. Checked because the two look alike
+  and one of them *was* a defect.
+
+---
+
+## Round twenty-three — a hostname that was a sentence, and a table built twice
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `a` took 6.8s on a real history: every row of the job list was built twice | `tui.py` `OverviewScreen`, `JobListScreen` | `TestATableIsNotBuiltTwiceToOpenItOnce` |
+| 2 | `NodeList=None assigned` -- sacct's "no nodes" sentinel -- was rendered as a node name with a count beside it | `sacct.py` `parse` | `TestTheNoNodesSentinelIsNotANodeName` |
+
+### 1. 26,714 rows added for 13,363 jobs
+
+Opening the flat job list on a real 30-day history:
+
+```
+width  before   after
+   80   6.06s   3.13s
+  100   7.11s   3.70s
+  160   9.03s   4.79s
+```
+
+**None of it was slurmpast's arithmetic.** The cell values for all 13,363 rows --
+every `cpu_utilization`, `cores_text`, `format_bytes`, `looks_like_noop` -- compute
+in **0.32s**. `DataTable.add_row` was called 26,714 times: exactly twice per job.
+`on_mount` populates the table and the first resize populates it again, with the
+same layout and the same rows, because a screen pushed onto a laid-out app already
+has its size.
+
+`_rows_already_drawn` records the layout and a fingerprint of the row set and makes
+the second call a no-op. The fingerprint is the job ids (or workload labels), built
+fresh each call: microseconds against the seconds it saves, and unlike a cheaper
+one it cannot miss a filter that changes the middle of a list while preserving its
+length and its ends.
+
+**Two wrong explanations, recorded because the method is the point.** The first was
+that `on_mount` builds at `_DEFAULT_TABLE_WIDTH` before the screen has a size, so
+the resize rebuilds at the real width -- and the trace written to confirm it printed
+two builds at an identical layout, which is the opposite. The second was the fix
+that followed from it: deferring the mount build to `call_after_refresh`. Measured
+side by side, guard-plus-deferral is 3.64s and the guard alone is 3.55s, so the
+deferral does nothing and is not in the tree. A first attempt at the guard itself
+keyed on `id(rows)` and never fired at all, because every caller builds a fresh
+list.
+
+No overrun at 80, 100 or 160 columns on 930 real workloads, so the layout holds at
+real scale; this was only ever latency.
+
+### 2. A node called "None assigned"
+
+sacct writes `None assigned` into `NodeList` for a job that never held an
+allocation. 38 of the 15,085 carry it, every one CANCELLED at elapsed 0 --
+cancelled while still pending. It was carried through as though it were a hostname:
+
+```
+nodes            None assigned  (1 node)
+```
+
+A node named "None assigned", and a count of 1 asserted about a job that got zero.
+
+`expand_nodelist` already returned `[]` for it, so the node-reliability table was
+never polluted -- verified, and now pinned. What leaked was the display and
+`--json`'s `shape.node_list`, where a consumer would read it as a hostname.
+
+Folded at the parse boundary, for the reason `_TRUNCATED_STATES` folds `OUT_OF_ME+`
+there: that is where sacct's spellings stop being sacct's problem. Empty is what
+the rest of the codebase already means by "no nodes", and `job_sections` omits the
+row on a falsy `node_list`, so the contradiction disappears rather than being
+papered over. `NNodes` is deliberately left alone: for a job cancelled while
+pending it is what was *requested*, which is a real reading and the only one sacct
+has.
+
+No fixture in this suite had ever built the value. You have to have watched sacct
+emit it to know it exists.
+
+### The negative results
+
+* **All 15,085 real post-mortems rendered**, checked for exceptions, overruns and
+  leaked Python. No exceptions. The 89 overruns are all `workdir` and all declared
+  `PATH_ROWS` -- deliberate, per its own comment: "a path you cannot copy whole is
+  no use in a ticket". The "leaked `inf`" hits were the substring in
+  `exp22-inference-serving`.
+* **The finding distribution over a real history**, recorded because nothing had
+  ever looked at it: `walltime-slack` 11,252, `memory-slack` 1,405, `cancelled`
+  1,094, `system-cpu-heavy` 641, down to `command-not-found` 1. Every rule fires on
+  real data and none of them floods it.
+
+---
+
+## Round twenty-two — the first round run against real data
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | A rule whose docstring says "non-monotone walk" fired on requests that never moved, and rendered them unbounded | `patterns.py` `find_memory_search` | `TestAWalkThatDoesNotWalkIsNotASearch`, `TestTheMemoryWalkIsBounded` |
+
+### 1. A search that never searched, printed 777 characters wide
+
+`find_memory_search`'s docstring: *"Hand-bisection of `--mem`, visible as a
+**non-monotone walk** across OOMs."* The code computes `monotone` and spends it
+only on choosing between two *actions* -- it never tests that the walk moved. Over
+90 days of this cluster's own history:
+
+```
+workload            OOMs  distinct  collapsed   rendered walk
+caai-p#b_scan         71         1          1   777 characters
+rd-r#-recon           16         1          1   172 characters
+rc-tok-github_code     7         6          6    80 characters  <- an actual search
+```
+
+Two of three. The first rendered as ten screen lines of the same four characters:
+
+```
+[FAIL] Memory request is being hand-searched
+       71 OOM kills for caai-p#b_scan with --mem walking 6.0 GiB -> 6.0 GiB ->
+       6.0 GiB -> 6.0 GiB -> 6.0 GiB -> 6.0 GiB -> 6.0 GiB -> 6.0 GiB -> 6.0 GiB
+       -> ... (seven more lines) ...
+```
+
+Both halves are wrong and both are fixed:
+
+**The claim.** 71 OOMs at an unchanged request is not a hand-search; it is the same
+request resubmitted 71 times. That is a real pattern and worth reporting -- it is a
+*different* pattern. `memory-unchanged` now says so, with `memory-search` reserved
+for a request that actually moved, following the `timeout-hang` / `timeout-real`
+precedent of one rule, two shapes, two codes. The action follows: "Stop stepping"
+is advice about a search, and there was none.
+
+```
+[FAIL] The same memory request keeps being OOM-killed
+       71 OOM kills for caai-p#b_scan, every one of them at --mem 6.0 GiB: the
+       request has not moved. Job 53363721_4 then COMPLETED at 6.0 GiB — a value
+       that had already OOM'd.
+```
+
+**The rendering.** `_mem_walk` collapses consecutive repeats to `×N` -- a value
+submitted twice is one step of a walk, not two -- and elides the middle past eight
+steps, keeping both ends, because the first value is where the search started and
+the last is what is being asked for now. Every other truncation in this codebase
+announces itself; this one ran on instead. 777 characters becomes `6.0 GiB ×71`.
+The cap is set so the longest genuine bisection in 90 days of real history (seven
+collapsed steps) is never elided. `×` is in `_ASCII_FOLD` like every other mark.
+
+Also corrected: `find_repeat_failures` pointed readers at "the memory-search
+check", which is now one of two titles and neither of them on screen.
+
+### The fixture the fix exposed
+
+Two existing tests broke, and both were asserting more than they had evidence for.
+
+`TestMemorySearchUsesTheRealLimit._series("48Gn")` set an explicit **per-node**
+`ReqMem` of 48G on every row while `AllocTRES` varied 48 → 32 → 17 → 12. Slurm
+cannot produce that record: `--mem=48G` allocates 48G. And `Job.mem_limit_bytes`
+honours a per-node `ReqMem` over `AllocTRES` **by design**, documented at the
+property -- so the fixture flattened all five requests to 48 GiB and the test had
+been pinning "a search" over five identical values. It passed only because the
+detector fired on any OOM series. The fixture now tracks the allocation, which is
+what a real record does, and a guard asserts the series really varies.
+
+Worth stating plainly, because the temptation was to "fix" `mem_limit_bytes`: it is
+correct, the comment in `find_memory_search` that says "the limit comes from
+AllocTRES first" is the imprecise one, and only the artificial fixture made them
+look inconsistent.
+
+`TestATruncatedStateMeansWhatItSays::test_the_cross_run_detectors_see_it` built
+four identical records and pinned the code `memory-search`. Its subject is that the
+truncated spelling `OUT_OF_ME+` is *visible* to the cross-run detectors at all;
+which shape they name is beside that point, so it asserts the finding and its count
+instead.
+
+### The negative results from real data
+
+* **Performance.** 15,085 jobs over 90 days: 11.0s end to end, 204 MB peak RSS.
+  8.4s of that is the `sacct` subprocess and 2.7s is `parse()` over 36.5 MB;
+  everything slurmpast then computes -- grouping 1,260 workloads, all patterns, the
+  node table, sizing for every group -- is **1.0s together**. Nothing to optimise on
+  our side of the subprocess.
+* **The stale-record path, on a genuine stale record.** An 88-day `RUNNING` row that
+  squeue has never heard of: correctly flagged, correctly excluded from totals, and
+  correctly worded "squeue has never heard of it, so the job is long gone". That is
+  round fifteen's `live` reaching real data.
+* **Truncation tails** with 930 real workloads, including the case round five got
+  wrong: `--sort name -n 3` reports "927 more workloads (13353 runs) holding 100.0%
+  of the compute", which is correct -- the three alphabetically-first hold under an
+  hour between them.
+* Real post-mortems across FAILED, TIMEOUT and COMPLETED read correctly, including
+  a TIMEOUT with 0.02s of CPU and 17.1 GiB of MaxRSS, where the report says the
+  figure is not a footprint rather than sizing from it.
 
 ---
 
@@ -2699,6 +3830,46 @@ entry was refusing, replaced by the smallest change that keeps the idiom intact.
 ---
 
 ## Consequence for the numbers
+
+**Round twenty-seven.** A job whose log merely mentions NCCL loses its
+`nccl` finding, and with it a CRITICAL -- so `slurmpast <jobid>` can exit 0 where
+it exited 1, on a job whose only CRITICAL was the invented one. A job with a real
+fault is unchanged, as is every job with no log. Nothing else moves, and the demo
+writes no logs at all.
+
+**Round twenty-six.** `slurmpast --nodes --metric failure` reports different rates:
+a cancellation is no longer a trial, so denominators shrink and rates rise -- on a
+real history 7 of 9 rows moved and two nodes dropped below `MIN_SAMPLES`. A node
+that was `worse` can stay `worse` at a higher rate, and a node with few
+non-cancelled placements can vanish from the table. `--nodes` with no flags is the
+hang metric and is **unchanged**, as is the demo and every committed asset.
+`note_for_allocation` on the job screen uses the failure metric and moves with it.
+
+**Round twenty-five.** This one moves a measurement, but only on a query that spans
+users. `--all-users --nodes` and `-u alice,bob --nodes` now compare one person's
+workload rather than everyone's jobs that share its name, so a rate can change --
+50.0% to 100.0% on the constructed pair above. A single-user query, which is the
+default, is byte-identical. `--nodes --json` gains `workload_user`; `workload`
+itself still carries the bare name. The screens name the owner only when the
+history spans users.
+
+**Round twenty-four.** `slurmpast <unexpanded array id>` starts working where it
+exited 2; nothing that worked before changes, since every other id form is passed
+through untouched. A workload name too long to wrap is now clipped with `…` in the
+`--sizing` header and the dashboard's workload title, where it used to overrun.
+No measurement, no verdict, no exit code, and the demo is unaffected.
+
+**Round twenty-three.** `shape.node_list` in `--json` becomes `""` instead of
+`"None assigned"` for a job that never held an allocation, and the post-mortem drops
+the `nodes` row for those jobs rather than inventing one. Nothing else changes on
+screen; the table fix is latency only, and the demo is unaffected either way.
+
+**Round twenty-two.** A finding changes its code, title and wording where a
+workload's `--mem` never moved: `memory-search` becomes `memory-unchanged`, which a
+`--json` consumer filtering on the code will see. The walk in the evidence of a
+genuine search is collapsed (`32.0 GiB ×2` for what was `32.0 GiB -> 32.0 GiB`) and
+elided past eight steps -- so the demo's own patterns output, its screenshot and the
+GIF all change. No measurement, no verdict, no exit code.
 
 **Round twenty.** Nothing changes. Two tests were added and no source file was
 touched.

@@ -210,6 +210,32 @@ _TERMINAL_STATES = frozenset(
 # one state cannot mean two things in one codebase.
 _TRUNCATED_STATES = {"OUT_OF_ME+": "OUT_OF_MEMORY"}
 
+# sacct writes this into NodeList for a job that never held an allocation -- one
+# cancelled while still pending, which is 38 of a real 15,085-job history, all of
+# them CANCELLED at elapsed 0. It is a sentence meaning "no nodes", not a node name,
+# and it was carried through as though it were one:
+#
+#     nodes            None assigned  (1 node)
+#
+# -- a node called "None assigned", and a count of 1 asserted about a job that got
+# zero. `expand_nodelist` already returned [] for it, so the node-reliability table
+# was never polluted; what leaked was the display and `--json`'s `shape.node_list`,
+# where a consumer would read it as a hostname.
+#
+# Folded here for the reason `_TRUNCATED_STATES` is: this is where sacct's spellings
+# stop being sacct's problem. Empty is what the rest of the codebase already means
+# by "no nodes" -- `render.job_sections` omits the row on a falsy `node_list`, so
+# the contradiction disappears rather than being papered over.
+#
+# `NNodes` is left alone: for a job cancelled while pending it is what was
+# *requested*, which is a real reading and the only one sacct has.
+_NO_NODES = "None assigned"
+
+
+def _canonical_nodelist(value):
+    """``None assigned`` -> ``""``. Any real node list passes through untouched."""
+    return "" if (value or "").strip() == _NO_NODES else value
+
 
 def _canonical_state(value):
     """A state with sacct's column truncation undone. Other spellings pass through.
@@ -538,7 +564,7 @@ def parse(text, fields=None, delimiter="|"):
                     ave_disk_write=parse_bytes(get(row, "AveDiskWrite")),
                     ntasks=_int(get(row, "NTasks")),
                     nnodes=_int(get(row, "NNodes")),
-                    node_list=get(row, "NodeList"),
+                    node_list=_canonical_nodelist(get(row, "NodeList")),
                     tres_in_tot=get(row, "TRESUsageInTot"),
                     tres_out_tot=get(row, "TRESUsageOutTot"),
                     tres_in_max=get(row, "TRESUsageInMax"),
@@ -608,7 +634,7 @@ def parse(text, fields=None, delimiter="|"):
             ncpus=_int(get(row, "NCPUS")),
             nnodes=_int(get(row, "NNodes")),
             ntasks=_int(get(row, "NTasks")),
-            node_list=get(row, "NodeList"),
+            node_list=_canonical_nodelist(get(row, "NodeList")),
             total_cpu_alloc=parse_duration(get(row, "TotalCPU")),
             user_cpu_alloc=parse_duration(get(row, "UserCPU")),
             system_cpu_alloc=parse_duration(get(row, "SystemCPU")),
@@ -631,6 +657,37 @@ def parse(text, fields=None, delimiter="|"):
     return [
         allocations[job_id]._replace(steps=tuple(pending_steps.get(job_id, ()))) for job_id in order
     ]
+
+
+# An array that has not been expanded yet: `49046820_[1-20%10]`, or `_[0-4]` without
+# a throttle. Anchored, and the brackets are required -- `49046820_4` is a real
+# element and sacct takes it.
+_UNEXPANDED_ARRAY = re.compile(r"^(\d+)_\[")
+
+
+def queryable_job_id(value: str) -> str:
+    """A job id ``sacct -j`` will actually accept.
+
+    sacct prints an unexpanded array as ``49046820_[1-20%10]`` -- in its own JobID
+    column under ``--parsable2``, and squeue prints the same, which is where anyone
+    copies it from -- and then refuses that exact string:
+
+        $ sacct -j '49046820_[1-20%10]' -X -o JobID
+        sacct: fatal: Bad job array element specified: 49046820
+        $ sacct -j 49046820 -X -o JobID
+        49046820_[1-20%10]
+
+    So the tool handed straight through what sacct had just printed and got a fatal
+    error on it. Verified against the live scheduler: it is the brackets, not the
+    ``%throttle`` -- ``_[1-20]`` fails the same way -- and everything else passes,
+    including ``.batch`` and ``.extern`` step ids and a plain ``_4`` element.
+
+    Reduced to the master, which is the only spelling sacct answers. For a pending
+    array that returns the one unexpanded row the caller asked about; the bracketed
+    form does not survive expansion, so there is no completed array to over-fetch.
+    """
+    match = _UNEXPANDED_ARRAY.match(value)
+    return match.group(1) if match else value
 
 
 class Sacct:
@@ -679,7 +736,7 @@ class Sacct:
         ids = [str(j) for j in job_ids if str(j).strip()]
         if not ids:
             return []
-        return self._query(["-j", ",".join(ids)])
+        return self._query(["-j", ",".join(queryable_job_id(i) for i in ids)])
 
     def history(
         self, user=None, since=None, until=None, states=None, partition=None, all_users=False

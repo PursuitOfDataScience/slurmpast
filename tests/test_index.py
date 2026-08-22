@@ -419,3 +419,92 @@ class TestSortTieBreaksRunTheSameWayInEveryMode:
     def test_recent_still_puts_the_newest_first(self):
         groups = self._tied(["alpha", "bravo"]) + self._tied(["zulu"], "2026-07-25T00:00:00")
         assert [g.name for g in sort_groups(groups, "recent")] == ["zulu", "alpha", "bravo"]
+
+
+class TestAFoldedNodeListIsSearchableByHostname:
+    """`midway3-[0003-0004]` contains neither hostname, so neither found the job.
+
+    `filter_jobs` states the standard it failed: "typing what you can plainly see
+    and getting an empty list is the worst kind of empty result -- it reads as
+    missing data." Its own docstring offers `what died on midway3-0385` as one of
+    the four queries the box is for.
+
+    Slurm folds a multi-node allocation, and the raw string was what got searched.
+    The reader can plainly see the individual hostnames -- the job screen for one
+    of these real jobs prints both of these rows:
+
+        nodes            midway3-[0003-0004] (2 nodes)
+        slowest task     0.3% below average (task 1 on midway3-0003)
+        peak on          midway3-0003 task 0
+
+    and then the job list could not find `midway3-0003`. On this machine 26 of
+    20,905 jobs carry a folded NodeList and 72 hostname searches came back empty
+    for a job that had run on that node.
+    """
+
+    def _on(self, healthy_job, nodelist, job_id="1"):
+        return healthy_job._replace(job_id=job_id, node_list=nodelist)
+
+    def test_each_hostname_in_a_range_finds_the_job(self, healthy_job):
+        job = self._on(healthy_job, "midway3-[0003-0004]")
+        assert filter_jobs([job], query="midway3-0003") == [job]
+        assert filter_jobs([job], query="midway3-0004") == [job]
+
+    def test_the_folded_string_itself_still_matches(self, healthy_job):
+        """The control: a reader who copies the `nodes` row verbatim off the job
+        screen types the bracketed form, and that has to keep working."""
+        job = self._on(healthy_job, "midway3-[0003-0004]")
+        assert filter_jobs([job], query="midway3-[0003-0004]") == [job]
+        assert filter_jobs([job], query="midway3-") == [job]
+
+    def test_a_plain_single_node_is_unaffected(self, healthy_job):
+        """The other control. 20,879 of the 20,905 real jobs have no bracket at
+        all, and the fast path they take must not change."""
+        job = self._on(healthy_job, "midway3-0294")
+        assert filter_jobs([job], query="midway3-0294") == [job]
+        assert filter_jobs([job], query="midway3-0295") == []
+
+    def test_expanding_does_not_invent_a_match(self, healthy_job):
+        """The control that matters most: searching a hostname outside the range
+        must still return nothing. A fix that makes every search match everything
+        would pass the first test in this class."""
+        job = self._on(healthy_job, "midway3-[0003-0004]")
+        assert filter_jobs([job], query="midway3-0005") == []
+        assert filter_jobs([job], query="beagle3-0003") == []
+
+    def test_the_suffixed_and_multi_range_forms_too(self, healthy_job):
+        """`expand_nodelist` handles the whole hostlist grammar; the search has to
+        get the same answers it does, not a simpler subset."""
+        job = self._on(healthy_job, "beagle3-bigmem[1-4]")
+        assert filter_jobs([job], query="beagle3-bigmem1") == [job]
+        assert filter_jobs([job], query="beagle3-bigmem4") == [job]
+        assert filter_jobs([job], query="beagle3-bigmem5") == []
+
+    def test_no_node_list_does_not_raise(self, healthy_job):
+        for value in ("", None, "None assigned"):
+            job = self._on(healthy_job, value)
+            assert filter_jobs([job], query="midway3-0003") == []
+
+    def test_the_hostname_the_job_screen_prints_is_findable(self, healthy_job):
+        """End to end, and the exact path a reader walks: read a hostname off the
+        job screen, type it into the list."""
+        import re
+
+        from slurmpast.report import render_job
+
+        # Shaped like real job 51553906: the allocation is folded, and the
+        # per-step readers name one host inside it, which is what gets printed.
+        job = self._on(healthy_job, "midway3-[0003-0004]")._replace(
+            alloc_nodes=2,
+            nnodes=2,
+            steps=tuple(
+                st._replace(max_rss_node="midway3-0003", nnodes=2) for st in healthy_job.steps
+            ),
+        )
+        text = re.sub(r"\x1b\[[0-9;]*m", "", render_job(job)[0])
+        # "peak on  midway3-0003" -- a bare hostname the folded NodeList in the
+        # row above it does not contain.
+        shown = set(re.findall(r"midway3-\d{4}", text))
+        assert "midway3-0003" in shown, text
+        for hostname in shown:
+            assert filter_jobs([job], query=hostname) == [job], hostname

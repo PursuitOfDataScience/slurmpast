@@ -73,7 +73,36 @@ _CUDA_OOM_MARKERS = (
     "hip out of memory",
     "cublas_status_alloc_failed",
 )
-_NCCL_MARKERS = ("nccl", "watchdog caught collective operation timeout", "ncclinternalerror")
+# Fault signatures, not the word "NCCL". The bare substring was in this tuple, and
+# every distributed PyTorch job prints NCCL at startup and at shutdown -- so a
+# CRITICAL "Collective communication fault" was manufactured out of, among others:
+#
+#     [rank0]:[W818 12:54] ProcessGroupNCCL.cpp:1524] Warning: WARNING:
+#         destroy_process_group() was not called before program exit
+#     INFO [parallel_state.py:1208] ... distributed_init_method=... backend=nccl
+#     NCCL version 2.19.3+cuda12.1
+#
+# Measured on 400 real log files: ten mention NCCL, none of them faulted, and every
+# one of the ten drew the finding. Two of those jobs had a genuine CUDA OOM, so the
+# reader got two CRITICALs -- one real, one sending them to debug an interconnect
+# that was fine.
+#
+# Every marker below is a string a healthy run does not print, and the set is
+# checked both ways: zero hits across those ten logs, and hits on all five real
+# fault shapes -- the watchdog timeout, `DistBackendError: NCCL error`,
+# `ncclUnhandledCudaError`, `ncclInternalError`, and NCCL's own `NCCL WARN`
+# channel, which it uses for trouble rather than for chatter.
+_NCCL_MARKERS = (
+    "watchdog caught collective operation timeout",
+    "ncclinternalerror",
+    "ncclunhandledcudaerror",
+    "ncclsystemerror",
+    "ncclremoteerror",
+    "nccl error",
+    "nccl timeout",
+    "nccl warn",
+    "distbackenderror",
+)
 _IMPORT_MARKERS = ("modulenotfounderror", "importerror", "no module named")
 
 
@@ -309,6 +338,19 @@ _CPU_TIME_ALREADY_EXPLAINED = frozenset(
 )
 
 
+def _io_explains_idle_cpu(job):
+    """True when the filesystem already accounts for the missing CPU time.
+
+    Exactly the condition `_io_rules` uses to raise `io-heavy`, so this is true
+    precisely when that finding is about to appear beside this one. Sharing the
+    test rather than picking a second threshold is deliberate: the defect being
+    fixed is two findings on one screen disagreeing, so the guard has to fire on
+    the same jobs the other rule does, not on a similar-looking set.
+    """
+    total, rate = job.io_bytes, job.io_rate
+    return bool(total and total >= IO_VOLUME_FLOOR and rate and rate >= IO_RATE_LOUD)
+
+
 def _cpu_rules(job, add):
     if job.base_state == "TIMEOUT" or job.open_ended:
         return  # already covered, or not measurable
@@ -334,6 +376,41 @@ def _cpu_rules(job, add):
         return
 
     if looks_like_noop(job):
+        held = (", holding %d GPU(s)" % job.gpu_count) if job.gpu_count else ""
+        if _io_explains_idle_cpu(job):
+            # The same honesty test the three states above get, applied to a
+            # measurement instead of a state. "Nothing was computed" sat directly
+            # above `io-heavy` reporting 18.4 TiB read at 284.4 MiB/s sustained
+            # over the same 18:52:05 -- the tool naming the blocking call one line
+            # under an action telling the reader to go find it. Across 20,905 real
+            # jobs, 986 were told nothing was computed and 287 of those had moved
+            # at least the 10 GiB floor, 419.3 TiB between them.
+            #
+            # Still CRITICAL, and still raised: an allocation that holds GPUs for
+            # nineteen hours to feed a filesystem is wasting them whatever the
+            # cause. What changes is that the finding no longer denies the traffic
+            # the next line reports, and no longer sends the reader into their own
+            # code after a hang that is not there.
+            add(
+                Finding(
+                    CRITICAL,
+                    "noop-allocation",
+                    "Allocation computed almost nothing — it was moving data",
+                    "%s of wall clock, %s of CPU%s, and %s of filesystem traffic at "
+                    "%s/s. The time went to I/O, not to compute."
+                    % (
+                        format_duration(job.elapsed),
+                        format_duration(job.total_cpu),
+                        held,
+                        format_bytes(job.io_bytes or 0),
+                        format_bytes(job.io_rate or 0),
+                    ),
+                    "Treat this as the I/O problem below, not as a hang: stage the input "
+                    "somewhere faster, or overlap the transfer with compute so the "
+                    "allocation is not idle while it waits.",
+                )
+            )
+            return
         add(
             Finding(
                 CRITICAL,
@@ -343,7 +420,7 @@ def _cpu_rules(job, add):
                 % (
                     format_duration(job.elapsed),
                     format_duration(job.total_cpu),
-                    (", holding %d GPU(s)" % job.gpu_count) if job.gpu_count else "",
+                    held,
                 ),
                 "Find the blocking call. If this allocation is a deliberate reservation, "
                 "mark it so and this rule will stay quiet.",
@@ -595,19 +672,69 @@ def _exit_rules(job, log_text, add):
         add(Finding(INFO, "traceback", "Traceback tail from the log", tail, ""))
 
 
+def _strip_rank(line):
+    """``[rank0]: File "x.py"`` -> ``File "x.py"``.
+
+    torchrun prefixes every line of every worker's output, so indentation -- which
+    is how a traceback's frames are told from its exception line -- is behind the
+    prefix rather than at the start of the line.
+    """
+    head, sep, tail = line.partition("]:")
+    return tail[1:] if sep and head.lstrip().startswith("[rank") and tail.startswith(" ") else line
+
+
 def _traceback_tail(log_text, max_lines=6):
-    """Last Python traceback in the log, trimmed."""
+    """Last Python traceback in the log, trimmed -- and ending where it ends.
+
+    Scanning backwards for the last ``Traceback`` header is right: a log can hold
+    several, and the one that killed the job is the last. Taking ``lines[start:]``
+    was not, because a traceback is frequently *not* the last thing in the file --
+    a wrapper retries, torchrun prints its own summary, slurmstepd adds a line. The
+    trim then kept the header, an ellipsis, and the last four lines **of the file**,
+    so a finding titled "Traceback tail from the log" showed:
+
+        Traceback (most recent call last):
+          ...
+        Validation data: disabled (no held-out file provided)
+        Wall time: 999999s, will save checkpoint at 999819s
+        ------------------------------------------------------------
+
+    -- the startup banner of a later retry, under a heading promising a traceback.
+    Measured on this machine: of 27,435 readable logs, 486 hold a traceback and
+    **173 of those (36%) rendered a tail that was not it**. One ended on
+    ``slurmstepd: error: Detected 1 oom-kill event(s)`` where the traceback's own
+    last line was ``ChildFailedError:``.
+
+    A traceback ends at its exception line: the first line after the header that
+    carries no leading whitespace. Frames are indented, ``[rank0]:`` prefixes are
+    stripped first so that test still works under torchrun, and a chained
+    ``During handling of the above exception`` block is not reached because the
+    backward scan already landed on the final segment.
+
+    The header is matched through the same strip, which is load-bearing separately:
+    three of those logs carry *only* a prefixed traceback, and before this the rule
+    did not fire on them at all -- no finding, from a file whose last line reads
+    ``[rank0]: AttributeError: '_OpNamespace' '_moe_C' object has no attribute
+    'grouped_topk'``. Stripping in one of the two tests and not the other is the
+    shape that has produced eight defects in this record; both cost one call.
+    """
     if not log_text:
         return ""
     lines = log_text.splitlines()
     start = None
     for idx in range(len(lines) - 1, -1, -1):
-        if lines[idx].strip().startswith("Traceback (most recent call last)"):
+        if _strip_rank(lines[idx]).strip().startswith("Traceback (most recent call last)"):
             start = idx
             break
     if start is None:
         return ""
-    chunk = [ln.rstrip() for ln in lines[start:] if ln.strip()]
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        body = _strip_rank(lines[idx])
+        if body.strip() and not body[:1].isspace():
+            end = idx + 1  # the exception line closes the traceback
+            break
+    chunk = [ln.rstrip() for ln in lines[start:end] if ln.strip()]
     if len(chunk) > max_lines:
         chunk = [chunk[0], "  ..."] + chunk[-(max_lines - 2) :]
     return "\n".join(chunk)

@@ -279,6 +279,17 @@ class TestMemorySearchUsesTheRealLimit:
     """
 
     def _series(self, req_mem):
+        """``req_mem`` is a *template*: "0n" is literal, "{}n" tracks the allocation.
+
+        It used to be one literal string on every row, so the populated case sent
+        `ReqMem=48Gn` -- an explicit per-node request -- on a job whose AllocTRES
+        says it got 12G. Slurm cannot produce that: `--mem=48G` allocates 48G. And
+        `mem_limit_bytes` honours a per-node ReqMem over AllocTRES *by design* (see
+        its docstring), so the fixture flattened all four requests to 48 GiB and the
+        "search" it was asserting had no varying values in it at all. The test
+        passed only because the detector fired on any OOM series; once the detector
+        learned to tell a search from an unchanged request, the fixture was exposed.
+        """
         from slurmpast.sacct import parse
         from tests.conftest import row
 
@@ -302,7 +313,7 @@ class TestMemorySearchUsesTheRealLimit:
                     End="2026-07-01T01:00:00",
                     ElapsedRaw="1200",
                     TimelimitRaw="480",
-                    ReqMem=req_mem,
+                    ReqMem=req_mem.format(mem),
                     AllocTRES="cpu=16,mem=%s,node=1" % mem,
                     AllocCPUS="16",
                 )
@@ -324,8 +335,16 @@ class TestMemorySearchUsesTheRealLimit:
         assert "memory-search" in {f.code for f in findings}
 
     def test_still_detected_when_reqmem_is_populated(self):
-        findings = find_memory_search(self._series("48Gn"))
+        """`{}n` -- a per-node ReqMem that matches what was allocated, which is what
+        a real record carries."""
+        findings = find_memory_search(self._series("{}n"))
         assert "memory-search" in {f.code for f in findings}
+
+    def test_the_populated_case_really_varies(self):
+        """Guard on the fixture. If ReqMem flattens the series again this class goes
+        back to asserting a search over five identical values."""
+        limits = [j.mem_limit_bytes for j in self._series("{}n")]
+        assert len(set(limits)) == 4, limits
 
     def test_contradiction_reported_from_alloc_tres(self):
         finding = [f for f in find_memory_search(self._series("0n")) if f.code == "memory-search"][
@@ -493,3 +512,158 @@ class TestTheRepeatFailureActionNamesTheSplitToo:
         sizing = (src / "sizing.py").read_text()
         assert "hung_split_note" in sizing
         assert "did compute, and" not in sizing, "sizing writes the clause itself again"
+
+
+def _oom(job_id, mem_gib, day_index, state="OUT_OF_MEMORY"):
+    """One run that asked for ``mem_gib`` and was OOM-killed."""
+    day = "2026-06-%02d" % (day_index + 1)
+    return [
+        row(
+            JobID=job_id,
+            JobName="scan",
+            State=state,
+            ExitCode="0:125",
+            Submit="%sT01:00:00" % day,
+            Start="%sT01:00:01" % day,
+            End="%sT01:10:01" % day,
+            ElapsedRaw="600",
+            Elapsed="00:10:00",
+            Timelimit="01:00:00",
+            ReqCPUS="1",
+            AllocTRES="cpu=1,mem=%dG,node=1" % mem_gib,
+            ReqMem="%dG" % mem_gib,
+            NodeList="n1",
+            NTasks="1",
+            TotalCPU="00:09:00",
+        ),
+        row(
+            JobID="%s.batch" % job_id,
+            JobName="batch",
+            State=state,
+            ElapsedRaw="600",
+            Elapsed="00:10:00",
+            NTasks="1",
+            TotalCPU="00:09:00",
+            MaxRSS="%dK" % (mem_gib * 1024 * 1024),
+        ),
+    ]
+
+
+class TestAWalkThatDoesNotWalkIsNotASearch:
+    """`find_memory_search`'s docstring: "Hand-bisection of --mem, visible as a
+    **non-monotone walk** across OOMs." The code never tested that the walk moved.
+
+    `monotone` was computed and used only to pick between two *actions*, so a
+    request that had never been touched was still announced as "Memory request is
+    being hand-searched". Run against a real 90-day history, **two of the three
+    findings this rule produced described a search that never happened**:
+
+        caai-p#b_scan   71 OOMs, 1 distinct request   777 characters of walk
+        rd-r#-recon     16 OOMs, 1 distinct request   172 characters of walk
+        rc-tok-github…   7 OOMs, 6 distinct requests   80 characters -- a real search
+
+    and the first rendered as ten screen lines of `6.0 GiB -> 6.0 GiB -> ...`.
+
+    Only real data could show this: the demo's walk has six distinct values, so
+    twenty rounds of `--demo` never produced the shape. Same lesson as round
+    sixteen -- the fixture is too well-behaved -- reached from the other side.
+    """
+
+    @staticmethod
+    def _unchanged(count=6, mem_gib=8):
+        rows = []
+        for index in range(count):
+            rows += _oom("60%02d" % index, mem_gib, index)
+        return parse(make_text(*rows))
+
+    @staticmethod
+    def _searched():
+        rows = []
+        for index, mem in enumerate([32, 32, 17, 12, 12, 14, 16, 18]):
+            rows += _oom("61%02d" % index, mem, index)
+        return parse(make_text(*rows))
+
+    def test_an_unchanged_request_is_reported_as_what_it_is(self):
+        finding = find(find_memory_search(self._unchanged()), "memory-unchanged")
+        assert finding is not None, codes(find_memory_search(self._unchanged()))
+        assert finding.title == "The same memory request keeps being OOM-killed"
+        assert "the request has not moved" in finding.evidence
+        assert "walking" not in finding.evidence
+        # And "->" would be a walk it never took.
+        assert "->" not in finding.evidence
+
+    def test_and_is_not_told_to_stop_stepping(self):
+        """The action has to match too: "Stop stepping" is advice about a search."""
+        finding = find(find_memory_search(self._unchanged()), "memory-unchanged")
+        assert "Stop stepping" not in finding.action
+        assert "Nothing has been tried yet" in finding.action
+        assert "8.0 GiB" in finding.action
+
+    def test_a_real_search_still_reads_as_one(self):
+        """The control. Six distinct values is a bisection and keeps its wording."""
+        finding = find(find_memory_search(self._searched()), "memory-search")
+        assert finding is not None
+        assert finding.title == "Memory request is being hand-searched"
+        assert "--mem walking" in finding.evidence
+        assert "17.0 GiB" in finding.evidence and "18.0 GiB" in finding.evidence
+
+    def test_the_two_shapes_have_two_codes(self):
+        """`timeout-hang` and `timeout-real` set the precedent: one rule, two
+        shapes, two codes, so `--json` can tell them apart."""
+        assert codes(find_memory_search(self._unchanged())) == {"memory-unchanged"}
+        assert codes(find_memory_search(self._searched())) == {"memory-search"}
+
+
+class TestTheMemoryWalkIsBounded:
+    """777 characters of `6.0 GiB -> 6.0 GiB -> ...` is not evidence, it is a wall.
+
+    Every other truncation in this codebase announces itself -- `... N more`,
+    `excluded_tail`, `clip`'s `…`. This one had no cap and no dedup.
+    """
+
+    G = 1 << 30
+
+    def test_consecutive_repeats_collapse(self):
+        from slurmpast.patterns import _mem_walk
+
+        assert _mem_walk([6 * self.G] * 71) == "6.0 GiB ×71"
+        assert _mem_walk([8 * self.G, 8 * self.G]) == "8.0 GiB ×2"
+
+    def test_a_value_submitted_twice_is_one_step_not_two(self):
+        from slurmpast.patterns import _mem_walk
+
+        walk = _mem_walk([32 * self.G, 32 * self.G, 17 * self.G, 12 * self.G, 12 * self.G])
+        assert walk == "32.0 GiB ×2 -> 17.0 GiB -> 12.0 GiB ×2"
+
+    def test_a_long_walk_keeps_both_ends_and_says_what_it_dropped(self):
+        """The first value is where the search started; the last is what is being
+        asked for now. Dropping either loses half the story."""
+        from slurmpast.patterns import MEM_WALK_STEPS, _mem_walk
+
+        walk = _mem_walk([index * self.G for index in range(1, 21)])
+        assert walk.startswith("1.0 GiB -> 2.0 GiB")
+        assert walk.endswith("19.0 GiB -> 20.0 GiB")
+        assert "... 13 more ..." in walk, walk
+        assert walk.count("->") < MEM_WALK_STEPS + 2
+
+    def test_the_longest_real_bisection_is_not_elided(self):
+        """The cap is set so a genuine search never hits it: the longest in a real
+        90-day history collapses to seven steps."""
+        from slurmpast.patterns import MEM_WALK_STEPS, _mem_walk
+
+        demo = _mem_walk([self.G * n for n in (32, 32, 17, 12, 12, 14, 16, 18)])
+        assert "more" not in demo, demo
+        assert MEM_WALK_STEPS >= 8
+
+    def test_degenerate_inputs(self):
+        from slurmpast.patterns import _mem_walk
+
+        assert _mem_walk([]) == ""
+        assert _mem_walk([8 * self.G]) == "8.0 GiB"
+
+    def test_the_multiplication_sign_folds_under_ascii(self):
+        """It is the one new non-ASCII mark, so it needs an entry like every other."""
+        from slurmpast.render import _ASCII_FOLD, ascii_fold
+
+        assert _ASCII_FOLD["×"] == "x"
+        assert ascii_fold("32.0 GiB ×2").isascii()

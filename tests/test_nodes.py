@@ -156,10 +156,18 @@ class TestNodeTable:
         assert table["rows"][0]["rate"] == pytest.approx(1.0)
 
     def test_cancelled_excluded_from_failure_rate(self):
+        """Both halves of "the rate", which this asserted one of.
+
+        It checked the numerator only, so "excluded from the failure rate" was
+        true of `bad` and false of `trials`: twenty cancellations sat in the
+        denominator scoring as twenty placements the node handled fine. See
+        `TestACancellationIsNotASuccess`.
+        """
         jobs = _placements("midway3-0100", 0, 20)
         cancelled = tuple(j._replace(state="CANCELLED by 1") for j in jobs)
         table = node_table(list(jobs) + list(cancelled), workload="node-evaluation")
         assert table["rows"][0]["bad"] == 0
+        assert table["rows"][0]["trials"] == 20, table["rows"][0]
 
 
 class TestSuggestions:
@@ -704,3 +712,205 @@ class TestTheExcludeLineSaysWhatItLeftOut:
     def test_it_agrees_with_the_list_it_describes(self):
         table = self._table(11)
         assert len(suggest_exclude(table)) + excluded_tail(table) == 11
+
+
+class TestTheWorkloadControlHoldsOnePersonsWork:
+    """ "controlled for workload" was controlling on a job *name*.
+
+    `patterns.group_key` had exactly this defect and it was fixed there, in these
+    words: "two people's unrelated `run.sh` on one partition became a single
+    fabricated workload". `nodes` never got the fix, and it is the module whose
+    entire reason for existing is holding the workload fixed.
+
+    A multi-user query is one flag away -- `-u alice,bob`, `--all-users`, both in
+    the README's own examples -- and on this cluster **25 job names are used by
+    more than one person** over two days, `interactive` by eight of them and
+    `ssd_lab_base` by six. Measured on a constructed pair:
+
+        alice: 12 runs of `interactive` on n1, all hung
+        bob:   12 runs of `interactive` on n1, all clean
+        before  n1  12/24  50.0%     <- neither person's rate
+        after   n1  12/12  100.0%    <- alice's, which is what was asked
+
+    Found by running `--all-users --nodes` against the real cluster and asking why
+    a 486,882-job query had reduced itself to 17 placements of one stranger's
+    workload.
+    """
+
+    @staticmethod
+    def _shared_name(base):
+        step = base.steps[0]
+
+        def run(user, index, node, hung):
+            cpu = 0.1 if hung else 3000.0
+            return base._replace(
+                job_id="%s%03d" % (user[0], index),
+                name="interactive",
+                user=user,
+                state="TIMEOUT" if hung else "COMPLETED",
+                node_list=node,
+                elapsed=1800.0,
+                timelimit=1800.0,
+                start="2026-07-%02dT00:00:00" % (index % 28 + 1),
+                end="2026-07-%02dT00:30:00" % (index % 28 + 1),
+                steps=(step._replace(total_cpu=cpu, elapsed=1800.0, max_rss=10**9),),
+                total_cpu_alloc=cpu,
+                alloc_tres="cpu=8,mem=16G,node=1",
+                alloc_cpus=8,
+            )
+
+        return (
+            [run("alice", i, "n1", True) for i in range(12)]
+            + [run("bob", 100 + i, "n1", False) for i in range(12)]
+            + [run("alice", 200 + i, "n2", False) for i in range(12)]
+        )
+
+    def _jobs(self):
+        from slurmpast.demo import history
+
+        return self._shared_name(next(j for j in history() if j.completed and j.steps))
+
+    def test_the_fixture_is_the_collision_that_happens_in_practice(self):
+        """Two users, one job name, one node. `group_key` already tells them apart;
+        this class is about whether `nodes` does."""
+        from slurmpast.patterns import group_key
+
+        jobs = self._jobs()
+        assert len({group_key(j) for j in jobs}) == 2
+        assert len({j.user for j in jobs}) == 2
+        assert len({j.name for j in jobs}) == 1
+
+    def test_the_control_picks_one_persons_work(self):
+        from slurmpast.nodes import dominant_workload
+
+        workload = dominant_workload(self._jobs(), metric="hang")
+        assert workload.name == "interactive"
+        assert workload.user == "alice"
+
+    def test_and_the_table_counts_only_that_persons_runs(self):
+        from slurmpast.nodes import dominant_workload, node_table
+
+        jobs = self._jobs()
+        workload = dominant_workload(jobs, metric="hang")
+        rows = {r["node"]: r for r in node_table(jobs, workload=workload, metric="hang")["rows"]}
+        assert rows["n1"]["trials"] == 12, rows["n1"]
+        assert rows["n1"]["bad"] == 12
+        assert rows["n1"]["rate"] == 1.0
+
+    def test_the_screen_names_the_owner_only_when_it_matters(self):
+        """A single-user history is the default and must stay terse; a history that
+        spans users has to say whose workload it settled on."""
+        from slurmpast.demo import history
+        from slurmpast.nodes import dominant_workload
+
+        mixed = dominant_workload(self._jobs(), metric="hang")
+        assert str(mixed) == "alice's interactive"
+
+        mine = dominant_workload([j for j in history() if not j.open_ended], metric="hang")
+        assert str(mine) == "cot-exp", mine
+        assert mine.user  # known, just not worth printing
+
+    def test_a_bare_name_still_means_any_user(self):
+        """The control on the widening: every existing caller passes a string, and
+        a string has always meant "this name, whoever ran it" -- which is exactly
+        right for the single-user query that is the default."""
+        from slurmpast.nodes import as_workload, node_table
+
+        jobs = self._jobs()
+        table = node_table(jobs, workload="interactive", metric="hang")
+        rows = {r["node"]: r for r in table["rows"]}
+        assert rows["n1"]["trials"] == 24, "a bare name must not start scoping by user"
+        assert as_workload("interactive").user is None
+        assert as_workload(None) is None
+
+    def test_the_workload_is_still_a_string_everywhere_it_is_printed(self):
+        """It is a `str` subclass on purpose: a tuple type broke 71 tests, because
+        `"%s" % workload` unpacks a tuple and `workload in text` raises."""
+        from slurmpast.nodes import Workload
+        from slurmpast.render import nodes_workload_control
+
+        workload = Workload("interactive", "alice", qualified=True)
+        assert isinstance(workload, str)
+        assert "only alice's interactive counted" in nodes_workload_control(workload)
+        assert "interactive" in workload
+
+
+class TestACancellationIsNotASuccess:
+    """`_bad` said "Cancellations excluded -- ambiguous" and excluded them from the
+    numerator only, so they stayed in the denominator scoring as placements the
+    node handled fine.
+
+    That is the one thing this module did that the rest of it argues against.
+    `index` states the position -- "a cancelled run is neither [completed nor
+    flagged] ... a deliberate kill and an abandoned one are identical in
+    accounting" -- and everything here works hard not to over-claim: Fisher exact,
+    a Benjamini-Hochberg correction, Wilson intervals, MIN_SAMPLES. Then it padded
+    the denominator with rows it had itself called uninformative.
+
+    Measured on a real 90-day history: 7.3% of placements are cancellations, and
+    censoring them moves 7 of 9 rows -- midway3-0330 from 12.3% to 20.0%,
+    midway3-0376 from 21.8% to 26.6%, two nodes below MIN_SAMPLES.
+
+    The old test was named `test_cancelled_excluded_from_failure_rate` and asserted
+    `bad == 0`. Named for the whole rate, pinning half of it.
+    """
+
+    @staticmethod
+    def _mixed(failed, clean, cancelled, node="midway3-0100"):
+        jobs = list(_placements(node, failed, failed + clean))
+        extra = [
+            jobs[0]._replace(job_id="c%d" % index, state="CANCELLED by 1", exit_code=0)
+            for index in range(cancelled)
+        ]
+        return jobs + extra
+
+    def test_a_cancellation_is_not_a_trial_for_the_failure_metric(self):
+        table = node_table(self._mixed(10, 10, 20), workload="node-evaluation")
+        row = table["rows"][0]
+        assert row["bad"] == 10
+        assert row["trials"] == 20, row
+        assert row["rate"] == 0.5
+
+    def test_the_denominator_was_what_moved(self):
+        """The control that names the defect: the numerator was always right."""
+        with_cancels = node_table(self._mixed(10, 10, 20), workload="node-evaluation")["rows"][0]
+        without = node_table(self._mixed(10, 10, 0), workload="node-evaluation")["rows"][0]
+        assert with_cancels["bad"] == without["bad"] == 10
+        assert with_cancels["trials"] == without["trials"] == 20
+        assert with_cancels["rate"] == without["rate"]
+
+    def test_the_hang_metric_keeps_them_because_there_they_are_the_evidence(self):
+        """Not an inconsistency. A cancellation that held its allocation and
+        computed nothing IS a hang -- 340 of the 1,094 in a real history are -- and
+        dropping them would gut the metric that is the default."""
+        from slurmpast.diagnose import looks_like_noop
+
+        jobs = list(_placements("midway3-0100", 0, 10))
+        hung = [
+            jobs[0]._replace(
+                job_id="h%d" % index,
+                state="CANCELLED by 1",
+                exit_code=0,
+                steps=(),
+                total_cpu_alloc=0.1,
+            )
+            for index in range(10)
+        ]
+        assert all(looks_like_noop(j) for j in hung), "the fixture must actually hang"
+        table = node_table(jobs + hung, workload="node-evaluation", metric="hang", min_samples=5)
+        row = table["rows"][0]
+        assert row["trials"] == 20, "the hang metric counts every placement"
+        assert row["bad"] == 10, row
+
+    def test_a_cancellation_that_did_compute_still_counts_for_hangs(self):
+        """The other control on that: it ran, it did not hang, and that is
+        evidence too."""
+        jobs = list(_placements("midway3-0100", 0, 10))
+        cancelled = [
+            jobs[0]._replace(job_id="k%d" % index, state="CANCELLED by 1", exit_code=0)
+            for index in range(10)
+        ]
+        table = node_table(
+            jobs + cancelled, workload="node-evaluation", metric="hang", min_samples=5
+        )
+        assert table["rows"][0]["trials"] == 20

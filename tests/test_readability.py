@@ -1807,3 +1807,111 @@ class TestTheSizingCaveatReachesEverySurface:
         h = History(history())
         payloads = [a._asdict() for g in h.groups for a in recommend(g.jobs)]
         assert any(p["caution"] for p in payloads), payloads[:2]
+
+
+class TestAWorkloadNameWithNoSpacesInIt:
+    """`wrap` breaks at spaces, and a folded workload name need not have any.
+
+    `report` documents this exact failure for a *detail value* -- "a 68-character
+    job name is one word, so it came out of the wrapper unchanged and the row went
+    to 89 cells on an 80-column terminal" -- and fixed it there with a clip. Two
+    other places do the same wrap without the clip, and a real cluster has the name
+    to prove it: over two days of cluster-wide history the longest job name is 123
+    characters and contains no space at all.
+
+        --sizing header, every width from 60 to 120:  125 cells
+        workload screen title:                        123 cells, soft-wrapped
+                                                      mid-name to column 0
+
+    Neither could show up on the demo, whose folded names are `att-speed-#`.
+    """
+
+    # The real one, from `sacct --allusers`. Kept verbatim: an invented name would
+    # not have the shape -- underscores throughout and a parenthesised tail.
+    LONG = (
+        "nf-NFCORE_RNASEQ_RNASEQ_FASTQ_QC_TRIM_FILTER_SETSTRANDEDNESS_FASTQ_"
+        "SUBSAMPLE_FQ_SALMON_SALMON_INDEX_(genome.transcripts.fa)"
+    )
+
+    def test_the_fixture_is_one_word(self):
+        assert len(self.LONG) == 123, len(self.LONG)
+        assert " " not in self.LONG
+
+    def test_wrap_alone_cannot_break_it(self):
+        """The premise. If `wrap` ever learns to split a long word this class is
+        testing something that no longer happens, and should say so."""
+        assert render.wrap(self.LONG, 40) == [self.LONG]
+
+    def test_wrap_or_clip_does(self):
+        for width in (20, 40, 78, 98):
+            lines = render.wrap_or_clip(self.LONG, width)
+            assert all(len(line) <= width for line in lines), (width, lines)
+            assert lines[0].endswith("…"), lines[0]
+
+    def test_wrap_or_clip_leaves_ordinary_prose_alone(self):
+        """The control: a sentence that wraps must not be clipped as well."""
+        prose = "the most any run used was 1.9 GiB, which is well under the limit"
+        assert render.wrap_or_clip(prose, 30) == render.wrap(prose, 30)
+        assert not any(line.endswith("…") for line in render.wrap_or_clip(prose, 30))
+
+    def _jobs(self):
+        base = next(j for j in history() if j.completed and j.steps)
+        return [base._replace(job_id="99%04d" % i, name=self.LONG) for i in range(6)]
+
+    @pytest.mark.parametrize("columns", ["60", "80", "100", "120"])
+    def test_the_sizing_header_fits(self, columns, monkeypatch):
+        from slurmpast.report import Style, render_sizing
+
+        monkeypatch.setenv("COLUMNS", columns)
+        text = render_sizing(History(self._jobs()), style=Style(enabled=False))
+        over = [line for line in text.splitlines() if len(line) > int(columns)]
+        assert not over, "%d cells: %r" % (len(over[0]), over[0][:80])
+        assert "nf-NFCORE" in text, "the name is clipped, not dropped"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("width", [80, 100, 160])
+    async def test_the_workload_title_fits(self, width, monkeypatch):
+        from textual.widgets import Static
+
+        seen = {}
+        original = Static.update
+
+        def spy(self, renderable="", *args, **kwargs):
+            if getattr(self, "id", None) == "summary":
+                seen["t"] = getattr(renderable, "plain", str(renderable))
+            return original(self, renderable, *args, **kwargs)
+
+        monkeypatch.setattr(Static, "update", spy)
+        app = make_app(self._jobs(), no_logs=True)
+        async with app.run_test(size=(width, 26)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            composited = [
+                "".join(segment.text for segment in strip).rstrip()
+                for strip in app.screen._compositor.render_strips()
+            ]
+        # The *title*, which is what was 123 cells. The counts appended after it can
+        # still take the line past the width and soft-wrap, exactly as the overview's
+        # own summary does with a long window string -- that is accepted behaviour
+        # on these screens and is not what this class is about.
+        title = seen["t"].splitlines()[0].split("  ·  ")[0]
+        assert len(title) <= width, "%d cells: %r" % (len(title), title[:80])
+        assert title.startswith("nf-NFCORE"), title[:40]
+        # And nothing reaches the screen wider than the screen.
+        over = [line for line in composited if len(line) > width]
+        assert not over, "%d cells: %r" % (len(over[0]), over[0][:80])
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_name_is_not_clipped(self):
+        """The control on the dashboard side: the demo's own titles are untouched."""
+
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(100, 26)) as pilot:
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            title = app.screen.summary_text.plain.splitlines()[0]
+        assert "…" not in title, title

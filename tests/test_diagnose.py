@@ -624,3 +624,288 @@ class TestTheTwoStatesDiagnoseHadNeverHeardOf:
             verdict = diagnose(_interrupted(healthy_job, state))
             for finding in verdict.findings:
                 assert "blocking call" not in finding.action, (state, finding.code)
+
+
+class TestMentioningNcclIsNotAnNcclFault:
+    """`_NCCL_MARKERS` contained the bare substring `"nccl"`.
+
+    Every distributed PyTorch job prints NCCL at startup and at shutdown, so a
+    CRITICAL "Collective communication fault" was manufactured out of ordinary
+    lines. Measured over 400 real log files: **ten mention NCCL, none of them
+    faulted, and every one of the ten drew the finding.** Two of those jobs had a
+    genuine CUDA OOM, so the report showed two CRITICALs -- one real, one sending
+    the reader to debug an interconnect that was fine.
+
+    Only real logs could show this. Every fixture in this suite passed a string
+    that *was* a fault, so the loose marker was never exercised as a false
+    positive -- the test below that reads `"nccl timeout"` still passes, because
+    that is a fault shape.
+    """
+
+    # Verbatim from real logs on this cluster, or from the vendors' own output.
+    BENIGN = (
+        "[rank0]:[W818 12:54:11.591239218 ProcessGroupNCCL.cpp:1524] Warning: WARNING: "
+        "destroy_process_group() was not called before program exit",
+        "INFO 08-02 18:49:04 [parallel_state.py:1208] world_size=1 rank=0 local_rank=0 "
+        "distributed_init_method=tcp://127.0.0.1:0 backend=nccl",
+        "NCCL version 2.19.3+cuda12.1",
+        "NCCL INFO Bootstrap : Using eth0:10.50.221.11<0>",
+    )
+
+    FAULTS = (
+        "[E ProcessGroupNCCL.cpp:828] [Rank 3] Watchdog caught collective operation timeout",
+        "torch.distributed.DistBackendError: NCCL error in: ../torch/csrc/distributed/c10d",
+        "RuntimeError: NCCL Error 1: unhandled cuda error (ncclUnhandledCudaError)",
+        "ncclInternalError: Internal check failed.",
+        "NCCL WARN Call to connect returned Connection refused, retrying",
+    )
+
+    def _failed(self, healthy_job):
+        return healthy_job._replace(state="FAILED", exit_code=1)
+
+    @pytest.mark.parametrize("line", BENIGN)
+    def test_a_healthy_run_that_mentions_nccl_draws_no_finding(self, healthy_job, line):
+        assert "nccl" in line.lower(), "the fixture must actually mention it"
+        assert "nccl" not in codes(diagnose(self._failed(healthy_job), log_text=line))
+
+    @pytest.mark.parametrize("line", FAULTS)
+    def test_every_real_fault_shape_is_still_caught(self, healthy_job, line):
+        assert "nccl" in codes(diagnose(self._failed(healthy_job), log_text=line)), line
+
+    def test_the_oom_job_gets_one_critical_not_two(self, healthy_job):
+        """The case that showed it: a genuine CUDA OOM whose log also carries the
+        shutdown warning. One real finding, and no invented second one."""
+        log = (
+            "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n"
+            "[rank0]:[W818 12:54:11 ProcessGroupNCCL.cpp:1524] Warning: WARNING: "
+            "destroy_process_group() was not called before program exit\n"
+        )
+        found = codes(diagnose(self._failed(healthy_job), log_text=log))
+        assert "cuda-oom" in found
+        assert "nccl" not in found, found
+
+    def test_the_marker_set_holds_no_bare_mention(self):
+        """The guard. A marker that a healthy run prints is the whole defect, so
+        the shortest way back into it is adding one."""
+        from slurmpast.diagnose import _NCCL_MARKERS
+
+        assert "nccl" not in _NCCL_MARKERS
+        for marker in _NCCL_MARKERS:
+            assert len(marker) > 8, marker
+
+
+class TestTheTracebackTailEndsWhereTheTracebackEnds:
+    """ "Traceback tail from the log" was showing the tail of the *file*.
+
+    Scanning backwards for the last `Traceback` header is right -- a log can hold
+    several and the one that killed the job is the last. Taking everything from
+    there to EOF was not: a traceback is frequently not the last thing in the
+    file. A wrapper retries, torchrun prints its own summary, a shell banner
+    follows, slurmstepd adds a line. The trim then kept the header, an ellipsis,
+    and the last four lines of the file:
+
+        Traceback (most recent call last):
+          ...
+        Validation data: disabled (no held-out file provided)
+        Wall time: 999999s, will save checkpoint at 999819s
+        ------------------------------------------------------------
+
+    Measured on 27,435 readable logs on this machine: 486 contain a traceback and
+    **173 of them -- 36% -- rendered a tail that was not the traceback**. One
+    finished on `slurmstepd: error: Detected 1 oom-kill event(s)` while the
+    traceback's own last line, the one naming the failure, was
+    `torch.distributed.elastic.multiprocessing.errors.ChildFailedError:`.
+
+    Only real logs show it. Every fixture in this suite puts the traceback last,
+    which is the 64% case that always worked.
+    """
+
+    TRACEBACK = (
+        "Traceback (most recent call last):\n"
+        '  File "/x/train.py", line 42, in <module>\n'
+        "    main()\n"
+        '  File "/x/train.py", line 30, in main\n'
+        "    model.step()\n"
+        "RuntimeError: something broke\n"
+    )
+    AFTER = (
+        "=== job exit 1 | Tue Aug 18 08:06:30 CDT 2026 ===\n"
+        "Validation data: disabled (no held-out file provided)\n"
+        "Wall time: 999999s, will save checkpoint at 999819s\n"
+        "------------------------------------------------------------\n"
+    )
+
+    def _tail(self, text):
+        from slurmpast.diagnose import _traceback_tail
+
+        return _traceback_tail(text)
+
+    def test_output_after_the_traceback_is_not_shown_as_the_traceback(self):
+        tail = self._tail("startup\n" + self.TRACEBACK + self.AFTER)
+        assert tail.splitlines()[-1] == "RuntimeError: something broke", tail
+        assert "Wall time" not in tail
+        assert "exit 1 | Tue" not in tail
+
+    def test_a_traceback_at_the_end_of_the_file_is_unchanged(self):
+        """The 75% case, which always worked and must keep working."""
+        tail = self._tail("startup\n" + self.TRACEBACK)
+        assert tail.splitlines()[0].startswith("Traceback")
+        assert tail.splitlines()[-1] == "RuntimeError: something broke"
+
+    def test_the_last_traceback_wins_when_there_are_several(self):
+        first = self.TRACEBACK.replace("something broke", "the first one")
+        text = first + "retrying\n" + self.TRACEBACK + self.AFTER
+        tail = self._tail(text)
+        assert "the first one" not in tail
+        assert tail.splitlines()[-1] == "RuntimeError: something broke"
+
+    def test_a_torchrun_rank_prefix_does_not_hide_the_frames(self):
+        """torchrun prefixes every line, so the indentation that tells a frame from
+        the exception line sits behind `[rank0]: `. Without stripping it the first
+        frame looks unindented and the traceback is cut to one line.
+
+        The header is matched through the same strip, and that half is load-bearing
+        on its own: of 27,435 real logs on this machine, three carry only a
+        prefixed traceback, and the rule did not fire on them at all -- a job that
+        died on `AttributeError: '_OpNamespace' '_moe_C' object has no attribute
+        'grouped_topk'` produced no traceback finding whatsoever.
+        """
+        prefixed = "".join("[rank0]: %s\n" % line for line in self.TRACEBACK.splitlines())
+        tail = self._tail(prefixed + self.AFTER)
+        assert tail.splitlines()[-1].endswith("RuntimeError: something broke"), tail
+        assert len(tail.splitlines()) > 2, tail
+
+    def test_a_torchrun_only_traceback_is_found_at_all(self, healthy_job):
+        """The other half of the same strip, and a separate symptom: when *every*
+        copy of the traceback is rank-prefixed, the backward header scan used to
+        match nothing, so there was no finding at all -- not a truncated one.
+
+        Three real logs on this machine are shaped exactly this way. torchrun
+        usually prints its own wrapper traceback unprefixed beside the worker's,
+        which is why the other 50 were found; these three are the ones where it
+        did not.
+        """
+        prefixed = "".join("[rank0]: %s\n" % line for line in self.TRACEBACK.splitlines())
+        job = healthy_job._replace(state="FAILED", exit_code=1)
+        verdict = diagnose(job, log_text="startup\n" + prefixed + self.AFTER)
+        finding = find(verdict, "traceback")
+        assert finding is not None, "a rank-prefixed traceback is still a traceback"
+        assert "RuntimeError: something broke" in finding.evidence
+
+    def test_no_traceback_is_still_nothing(self):
+        assert self._tail("just some output\nand more\n") == ""
+        assert self._tail("") == ""
+
+    def test_the_finding_shows_it(self, healthy_job):
+        """End to end, since the evidence is what a reader sees."""
+        job = healthy_job._replace(state="FAILED", exit_code=1)
+        verdict = diagnose(job, log_text="startup\n" + self.TRACEBACK + self.AFTER)
+        finding = find(verdict, "traceback")
+        assert finding is not None
+        assert "RuntimeError: something broke" in finding.evidence
+        assert "Wall time" not in finding.evidence
+
+
+class TestNothingWasComputedIsNotSaidOverTerabytes:
+    """The CRITICAL denied the traffic the WARNING under it reported.
+
+    `_cpu_rules` states the standard it is held to here: "'Find the blocking call'
+    is advice about the user's own code, and it is only honest when nothing else
+    already explains the missing CPU time." Three job *states* were guarded on
+    that basis. A measurement on the same record was not, so a real job rendered:
+
+        [critical] Allocation did essentially nothing
+            18:52:05 of wall clock, 3.5s of CPU, holding 4 GPU(s).
+            Nothing was computed.
+            -> Find the blocking call.
+        [warning] Filesystem may be setting the pace, not the GPU
+            read 18.4 TiB, wrote 15.1 GiB - 284.4 MiB/s sustained over 18:52:05.
+
+    The tool named the blocking call one line below an action telling the reader
+    to go find it. Of 20,905 real jobs here, 986 were told nothing was computed;
+    287 of those had moved at least the rule's own 10 GiB floor, 419.3 TiB
+    between them.
+
+    The finding stays CRITICAL and stays raised -- an allocation holding four GPUs
+    for nineteen hours to feed a filesystem is wasting them however it got there.
+    What changes is that it stops contradicting its neighbour.
+    """
+
+    @staticmethod
+    def _stalled(job, elapsed, read=0, write=0):
+        """Long wall clock, no CPU, and whatever filesystem traffic is asked for.
+        Same shape `_stalled` above builds, with the I/O counters set."""
+        steps = tuple(
+            s._replace(
+                total_cpu=0.0,
+                tres_in_tot="cpu=00:00:00,energy=0,fs/disk=%d" % read,
+                tres_out_tot="energy=0,fs/disk=%d" % write,
+            )
+            for s in job.steps
+        )
+        return job._replace(state="CANCELLED", elapsed=elapsed, steps=steps)
+
+    def _io_bound(self, job):
+        """Nineteen hours, no CPU, 18.4 TiB moved. Job 36362003's shape."""
+        return self._stalled(job, 67925.0, read=20241314765114, write=16181744795)
+
+    def test_the_two_findings_no_longer_disagree(self, healthy_job):
+        job = self._io_bound(healthy_job)
+        verdict = diagnose(job)
+        noop = find(verdict, "noop-allocation")
+        io = find(verdict, "io-heavy")
+        assert noop is not None and io is not None, [f.code for f in verdict.findings]
+        assert "Nothing was computed" not in noop.evidence
+        assert "Find the blocking call" not in noop.action
+        # and it says what did happen, in the same units the other finding uses
+        assert "18.4 TiB" in noop.evidence, noop.evidence
+
+    def test_it_is_still_critical_and_still_names_the_idle_gpus(self, healthy_job):
+        """The control on severity: this must not become a softer finding. Four
+        GPUs held for nineteen hours is the reason the rule exists."""
+        from slurmpast.diagnose import CRITICAL
+
+        job = self._io_bound(healthy_job)._replace(alloc_tres="gres/gpu=4")
+        noop = find(diagnose(job), "noop-allocation")
+        assert noop.severity == CRITICAL
+        assert "4 GPU(s)" in noop.evidence, noop.evidence
+
+    def test_a_genuinely_idle_allocation_still_gets_the_old_wording(self, healthy_job):
+        """The control that matters most. A hang with no I/O is what the original
+        wording is *for*, and it has to survive intact -- otherwise this fix has
+        traded one wrong message for another."""
+        job = self._stalled(healthy_job, 67925.0)
+        noop = find(diagnose(job), "noop-allocation")
+        assert noop is not None
+        assert "Nothing was computed" in noop.evidence
+        assert "Find the blocking call" in noop.action
+
+    def test_traffic_below_the_rules_own_floor_is_not_an_explanation(self, healthy_job):
+        """2.8 GB over two hours does not explain a missing CPU-hour, and the
+        guard shares `_io_rules`' threshold precisely so the reworded finding
+        appears only where the contradicting one does. Job 31199412's shape."""
+        job = self._stalled(healthy_job, 8172.0, read=2984952396, write=1174232073)
+        verdict = diagnose(job)
+        assert find(verdict, "io-heavy") is None
+        assert "Nothing was computed" in find(verdict, "noop-allocation").evidence
+
+    def test_high_volume_at_a_trickle_is_not_an_explanation_either(self, healthy_job):
+        """Both halves of the threshold are load-bearing: 30 GiB dribbled out over
+        a week is not a filesystem setting the pace."""
+        job = self._stalled(healthy_job, 604800.0, read=32 * 1024**3)
+        verdict = diagnose(job)
+        assert find(verdict, "io-heavy") is None
+        assert "Nothing was computed" in find(verdict, "noop-allocation").evidence
+
+    def test_end_to_end_the_plain_output_does_not_argue_with_itself(self, healthy_job):
+        """The defect as a reader met it: both findings in one rendered report,
+        one denying what the other measures."""
+        import re
+
+        from slurmpast.report import render_job
+
+        text, _ = render_job(self._io_bound(healthy_job))
+        text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+        assert "18.4 TiB" in text, text
+        assert "Nothing was computed" not in text, text
+        assert "Find the blocking call" not in text, text

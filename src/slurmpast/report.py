@@ -68,6 +68,7 @@ from .render import (
     stamp_short,
     text_table,
     wrap,
+    wrap_or_clip,
 )
 from .sizing import recommend, sbatch_lines
 
@@ -847,7 +848,10 @@ def render_sizing(history, style=None, limit=12, sort="cost", ascii_mode=False):
             # are the separator. Only a header too wide to hold pays for the wrap.
             out.append("  %s  %s" % (style(group.label, "bold"), style(aside, "grey")))
         else:
-            for line in wrap(header, _prose_width(2)):
+            # `wrap_or_clip`, not `wrap`: a folded workload name can be one word --
+            # the longest on this cluster is 123 characters with no space in it --
+            # and `wrap` hands a single word back whole.
+            for line in wrap_or_clip(header, _prose_width(2)):
                 line = _emphasise(line, group.label, style)
                 out.append("  " + _emphasise(line, aside, style, "grey"))
         for a in advice:
