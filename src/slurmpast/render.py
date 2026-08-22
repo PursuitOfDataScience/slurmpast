@@ -905,6 +905,7 @@ _ASCII_FOLD = {
     "\u2026": ".",  # ellipsis -- `clip`'s cut marker, which must stay one cell
     "\u2192": ">",  # rightwards arrow
     "\u2190": "<",  # leftwards arrow
+    "\u00d7": "x",  # multiplication sign, as in `patterns._mem_walk`'s "6.0 GiB x2"
 }
 _ASCII_TABLE = str.maketrans(_ASCII_FOLD)
 

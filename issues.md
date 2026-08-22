@@ -1,5 +1,19 @@
 # slurmpast — audit and resolution
 
+> **Round twenty-two, 2026-08-22, after the 0.6.0 release.** The angle none of the
+> twenty-one rounds before it used: **run the tool against this cluster's real
+> sacct data.** Every previous round used `--demo` or a hand-built fixture. One
+> defect, in two halves, and it was the first thing real data showed. 1476 tests
+> before, **1487 after**; all four gates clean.
+>
+> 15,085 real jobs over 90 days. `find_memory_search` produced three findings and
+> **two of them described a search that never happened** -- 71 OOM kills at an
+> unchanged 6.0 GiB, and 16 at an unchanged 8.0 GiB -- the first rendering 777
+> characters of `6.0 GiB -> 6.0 GiB -> ...` under a heading calling it a search.
+>
+> Fixing it then exposed a *fixture* asserting the same thing: a test that had been
+> pinning "a search" over five identical values since it was written.
+
 > **Round twenty-one, 2026-08-22.** One defect, and CI found it rather than any
 > local gate: `tests/test_portability.py` imported `tomllib`, stdlib from **3.11**,
 > in a package declaring `requires-python = ">=3.10"`. Four assertions died with
@@ -245,6 +259,107 @@
 > upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
 > was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
 > and its control. `ruff`, `ruff format` and `mypy` clean.
+
+---
+
+## Round twenty-two — the first round run against real data
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | A rule whose docstring says "non-monotone walk" fired on requests that never moved, and rendered them unbounded | `patterns.py` `find_memory_search` | `TestAWalkThatDoesNotWalkIsNotASearch`, `TestTheMemoryWalkIsBounded` |
+
+### 1. A search that never searched, printed 777 characters wide
+
+`find_memory_search`'s docstring: *"Hand-bisection of `--mem`, visible as a
+**non-monotone walk** across OOMs."* The code computes `monotone` and spends it
+only on choosing between two *actions* -- it never tests that the walk moved. Over
+90 days of this cluster's own history:
+
+```
+workload            OOMs  distinct  collapsed   rendered walk
+caai-p#b_scan         71         1          1   777 characters
+rd-r#-recon           16         1          1   172 characters
+rc-tok-github_code     7         6          6    80 characters  <- an actual search
+```
+
+Two of three. The first rendered as ten screen lines of the same four characters:
+
+```
+[FAIL] Memory request is being hand-searched
+       71 OOM kills for caai-p#b_scan with --mem walking 6.0 GiB -> 6.0 GiB ->
+       6.0 GiB -> 6.0 GiB -> 6.0 GiB -> 6.0 GiB -> 6.0 GiB -> 6.0 GiB -> 6.0 GiB
+       -> ... (seven more lines) ...
+```
+
+Both halves are wrong and both are fixed:
+
+**The claim.** 71 OOMs at an unchanged request is not a hand-search; it is the same
+request resubmitted 71 times. That is a real pattern and worth reporting -- it is a
+*different* pattern. `memory-unchanged` now says so, with `memory-search` reserved
+for a request that actually moved, following the `timeout-hang` / `timeout-real`
+precedent of one rule, two shapes, two codes. The action follows: "Stop stepping"
+is advice about a search, and there was none.
+
+```
+[FAIL] The same memory request keeps being OOM-killed
+       71 OOM kills for caai-p#b_scan, every one of them at --mem 6.0 GiB: the
+       request has not moved. Job 53363721_4 then COMPLETED at 6.0 GiB — a value
+       that had already OOM'd.
+```
+
+**The rendering.** `_mem_walk` collapses consecutive repeats to `×N` -- a value
+submitted twice is one step of a walk, not two -- and elides the middle past eight
+steps, keeping both ends, because the first value is where the search started and
+the last is what is being asked for now. Every other truncation in this codebase
+announces itself; this one ran on instead. 777 characters becomes `6.0 GiB ×71`.
+The cap is set so the longest genuine bisection in 90 days of real history (seven
+collapsed steps) is never elided. `×` is in `_ASCII_FOLD` like every other mark.
+
+Also corrected: `find_repeat_failures` pointed readers at "the memory-search
+check", which is now one of two titles and neither of them on screen.
+
+### The fixture the fix exposed
+
+Two existing tests broke, and both were asserting more than they had evidence for.
+
+`TestMemorySearchUsesTheRealLimit._series("48Gn")` set an explicit **per-node**
+`ReqMem` of 48G on every row while `AllocTRES` varied 48 → 32 → 17 → 12. Slurm
+cannot produce that record: `--mem=48G` allocates 48G. And `Job.mem_limit_bytes`
+honours a per-node `ReqMem` over `AllocTRES` **by design**, documented at the
+property -- so the fixture flattened all five requests to 48 GiB and the test had
+been pinning "a search" over five identical values. It passed only because the
+detector fired on any OOM series. The fixture now tracks the allocation, which is
+what a real record does, and a guard asserts the series really varies.
+
+Worth stating plainly, because the temptation was to "fix" `mem_limit_bytes`: it is
+correct, the comment in `find_memory_search` that says "the limit comes from
+AllocTRES first" is the imprecise one, and only the artificial fixture made them
+look inconsistent.
+
+`TestATruncatedStateMeansWhatItSays::test_the_cross_run_detectors_see_it` built
+four identical records and pinned the code `memory-search`. Its subject is that the
+truncated spelling `OUT_OF_ME+` is *visible* to the cross-run detectors at all;
+which shape they name is beside that point, so it asserts the finding and its count
+instead.
+
+### The negative results from real data
+
+* **Performance.** 15,085 jobs over 90 days: 11.0s end to end, 204 MB peak RSS.
+  8.4s of that is the `sacct` subprocess and 2.7s is `parse()` over 36.5 MB;
+  everything slurmpast then computes -- grouping 1,260 workloads, all patterns, the
+  node table, sizing for every group -- is **1.0s together**. Nothing to optimise on
+  our side of the subprocess.
+* **The stale-record path, on a genuine stale record.** An 88-day `RUNNING` row that
+  squeue has never heard of: correctly flagged, correctly excluded from totals, and
+  correctly worded "squeue has never heard of it, so the job is long gone". That is
+  round fifteen's `live` reaching real data.
+* **Truncation tails** with 930 real workloads, including the case round five got
+  wrong: `--sort name -n 3` reports "927 more workloads (13353 runs) holding 100.0%
+  of the compute", which is correct -- the three alphabetically-first hold under an
+  hour between them.
+* Real post-mortems across FAILED, TIMEOUT and COMPLETED read correctly, including
+  a TIMEOUT with 0.02s of CPU and 17.1 GiB of MaxRSS, where the report says the
+  figure is not a footprint rather than sizing from it.
 
 ---
 
@@ -2699,6 +2814,13 @@ entry was refusing, replaced by the smallest change that keeps the idiom intact.
 ---
 
 ## Consequence for the numbers
+
+**Round twenty-two.** A finding changes its code, title and wording where a
+workload's `--mem` never moved: `memory-search` becomes `memory-unchanged`, which a
+`--json` consumer filtering on the code will see. The walk in the evidence of a
+genuine search is collapsed (`32.0 GiB ×2` for what was `32.0 GiB -> 32.0 GiB`) and
+elided past eight steps -- so the demo's own patterns output, its screenshot and the
+GIF all change. No measurement, no verdict, no exit code.
 
 **Round twenty.** Nothing changes. Two tests were added and no source file was
 touched.
