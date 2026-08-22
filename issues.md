@@ -1,5 +1,17 @@
 # slurmpast — audit and resolution
 
+> **Round twenty-three, 2026-08-22.** Real data again, pushed harder: all 15,085
+> jobs through the post-mortem renderer, and the dashboard driven against 930 real
+> workloads. Two defects -- one a sentinel rendered as a hostname, one the slowest
+> interaction in the app doing twice the work. 1487 tests before, **1498 after**;
+> all four gates clean.
+>
+> The second is also a lesson about method. My first account of it blamed a
+> provisional mount-time column width; the trace meant to confirm that showed both
+> builds computing an *identical* layout, and the fix I then wrote to defer the
+> mount build measured 3.64s against the plain guard's 3.55s. It is not in the tree.
+> Two wrong explanations, both caught by measuring instead of reasoning.
+
 > **Round twenty-two, 2026-08-22, after the 0.6.0 release.** The angle none of the
 > twenty-one rounds before it used: **run the tool against this cluster's real
 > sacct data.** Every previous round used `--demo` or a hand-built fixture. One
@@ -259,6 +271,91 @@
 > upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
 > was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
 > and its control. `ruff`, `ruff format` and `mypy` clean.
+
+---
+
+## Round twenty-three — a hostname that was a sentence, and a table built twice
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `a` took 6.8s on a real history: every row of the job list was built twice | `tui.py` `OverviewScreen`, `JobListScreen` | `TestATableIsNotBuiltTwiceToOpenItOnce` |
+| 2 | `NodeList=None assigned` -- sacct's "no nodes" sentinel -- was rendered as a node name with a count beside it | `sacct.py` `parse` | `TestTheNoNodesSentinelIsNotANodeName` |
+
+### 1. 26,714 rows added for 13,363 jobs
+
+Opening the flat job list on a real 30-day history:
+
+```
+width  before   after
+   80   6.06s   3.13s
+  100   7.11s   3.70s
+  160   9.03s   4.79s
+```
+
+**None of it was slurmpast's arithmetic.** The cell values for all 13,363 rows --
+every `cpu_utilization`, `cores_text`, `format_bytes`, `looks_like_noop` -- compute
+in **0.32s**. `DataTable.add_row` was called 26,714 times: exactly twice per job.
+`on_mount` populates the table and the first resize populates it again, with the
+same layout and the same rows, because a screen pushed onto a laid-out app already
+has its size.
+
+`_rows_already_drawn` records the layout and a fingerprint of the row set and makes
+the second call a no-op. The fingerprint is the job ids (or workload labels), built
+fresh each call: microseconds against the seconds it saves, and unlike a cheaper
+one it cannot miss a filter that changes the middle of a list while preserving its
+length and its ends.
+
+**Two wrong explanations, recorded because the method is the point.** The first was
+that `on_mount` builds at `_DEFAULT_TABLE_WIDTH` before the screen has a size, so
+the resize rebuilds at the real width -- and the trace written to confirm it printed
+two builds at an identical layout, which is the opposite. The second was the fix
+that followed from it: deferring the mount build to `call_after_refresh`. Measured
+side by side, guard-plus-deferral is 3.64s and the guard alone is 3.55s, so the
+deferral does nothing and is not in the tree. A first attempt at the guard itself
+keyed on `id(rows)` and never fired at all, because every caller builds a fresh
+list.
+
+No overrun at 80, 100 or 160 columns on 930 real workloads, so the layout holds at
+real scale; this was only ever latency.
+
+### 2. A node called "None assigned"
+
+sacct writes `None assigned` into `NodeList` for a job that never held an
+allocation. 38 of the 15,085 carry it, every one CANCELLED at elapsed 0 --
+cancelled while still pending. It was carried through as though it were a hostname:
+
+```
+nodes            None assigned  (1 node)
+```
+
+A node named "None assigned", and a count of 1 asserted about a job that got zero.
+
+`expand_nodelist` already returned `[]` for it, so the node-reliability table was
+never polluted -- verified, and now pinned. What leaked was the display and
+`--json`'s `shape.node_list`, where a consumer would read it as a hostname.
+
+Folded at the parse boundary, for the reason `_TRUNCATED_STATES` folds `OUT_OF_ME+`
+there: that is where sacct's spellings stop being sacct's problem. Empty is what
+the rest of the codebase already means by "no nodes", and `job_sections` omits the
+row on a falsy `node_list`, so the contradiction disappears rather than being
+papered over. `NNodes` is deliberately left alone: for a job cancelled while
+pending it is what was *requested*, which is a real reading and the only one sacct
+has.
+
+No fixture in this suite had ever built the value. You have to have watched sacct
+emit it to know it exists.
+
+### The negative results
+
+* **All 15,085 real post-mortems rendered**, checked for exceptions, overruns and
+  leaked Python. No exceptions. The 89 overruns are all `workdir` and all declared
+  `PATH_ROWS` -- deliberate, per its own comment: "a path you cannot copy whole is
+  no use in a ticket". The "leaked `inf`" hits were the substring in
+  `exp22-inference-serving`.
+* **The finding distribution over a real history**, recorded because nothing had
+  ever looked at it: `walltime-slack` 11,252, `memory-slack` 1,405, `cancelled`
+  1,094, `system-cpu-heavy` 641, down to `command-not-found` 1. Every rule fires on
+  real data and none of them floods it.
 
 ---
 
@@ -2814,6 +2911,11 @@ entry was refusing, replaced by the smallest change that keeps the idiom intact.
 ---
 
 ## Consequence for the numbers
+
+**Round twenty-three.** `shape.node_list` in `--json` becomes `""` instead of
+`"None assigned"` for a job that never held an allocation, and the post-mortem drops
+the `nodes` row for those jobs rather than inventing one. Nothing else changes on
+screen; the table fix is latency only, and the demo is unaffected either way.
 
 **Round twenty-two.** A finding changes its code, title and wording where a
 workload's `--mem` never moved: `memory-search` becomes `memory-unchanged`, which a
