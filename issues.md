@@ -1,5 +1,21 @@
 # slurmpast — audit and resolution
 
+> **Round thirty-two, 2026-08-22.** **No defects.** The first round since the
+> real-data streak began to find nothing, and it is recorded in full because a
+> clean round is only meaningful if what was actually checked is written down.
+> 1560 tests, unchanged; all four gates clean.
+>
+> Four probes, three of them against ground truth outside this repository:
+> `compress_nodelist` validated by Slurm's own `scontrol show hostnames`; the
+> parser fuzzed with 3,000 realistically corrupted real rows; and `sizing.py` held
+> to the four rules its module docstring states, across 872 actionable
+> recommendations.
+>
+> Three of my own checks reported violations that turned out to be the harness
+> being wrong, not the code -- each time by using a looser definition of "evidence"
+> than the module itself uses. `sizing.py` had already written the warning I
+> tripped over: "Both numbers were right; they came from different runs."
+
 > **Round thirty-one, 2026-08-22.** One defect: a hostname printed on the job
 > screen that the job list could not find. 1553 tests before, **1560 after**; all
 > four gates clean.
@@ -397,6 +413,78 @@
 > and its control. `ruff`, `ruff format` and `mypy` clean.
 
 ---
+
+## Round thirty-two — nothing found, and what was looked at
+
+No code changed this round. The value of the round is the list below, so a later
+one does not spend itself re-checking the same ground.
+
+### `compress_nodelist`, against `scontrol show hostnames`
+
+This is the one output a user pastes straight into a submission script, so the
+standard is not "our round trip agrees with itself" but "Slurm accepts it and
+expands it to the nodes we meant". 57 cases were built from this cluster's real
+607-node fleet -- random scatters of 1 to 40 nodes, contiguous runs at four
+offsets, the `beagle3-bigmem` group, 63 midway3 nodes, and the entire fleet at
+once -- compressed, then handed to `scontrol`:
+
+```
+real nodes on this cluster: 607
+cases: 57   our round trip failed: 0   slurm disagreed: 0
+```
+
+### The parser, on 3,000 corrupted real rows
+
+250 real sacct rows, each mutated twelve ways: truncated, a field dropped, a
+field added, everything emptied, a 40-digit number, a negative, `wörk—dir…✓`, an
+embedded newline, an embedded `|`, a NUL byte, a 5,000-character value, and
+nothing but delimiters. Each result was pushed through `parse`, `diagnose`,
+`render_job`, `filter_jobs` and `History.stats`. **No exception, anywhere.**
+
+One asymmetry was examined and left alone. `parse` drops a row with more fields
+than were requested -- documented, because "every column after the offending one
+would be shifted" -- but accepts one with fewer, where the same shift can occur:
+
+```
+  intact             -> state='CANCELLED by 940740146'
+  one field dropped  -> state='0:0'          <- ExitCode, shifted into State
+  one extra field    -> row REJECTED
+```
+
+It is not filed as a defect because it is not reachable. The `>` case is what the
+docstring is about -- a value containing the delimiter makes a row *longer* -- and
+all 68,222 real rows here carry exactly the 80 fields requested. Recorded so the
+asymmetry is a known choice rather than an oversight.
+
+### `sizing.py`, against the four rules it states about itself
+
+872 actionable recommendations over 1,528 real workloads. Every rule holds:
+
+* **Never size walltime down from a TIMEOUT** -- no `--time` suggestion falls
+  below what its own evidence proves, counting completed non-hung runs and the
+  limits that truncated computing timeouts.
+* **Never treat a hung run as evidence of needing more time** -- no mostly-hung
+  workload is told to raise its limit.
+* **Never size memory from MaxRSS above the cgroup limit** -- no `--mem`
+  suggestion sits below the highest trustworthy peak.
+* **Say "not enough evidence" rather than guess** -- no actionable number appears
+  below `MIN_RUNS`.
+* And the unit claim: `--cpus-per-task` is advised per task. The one apparent
+  violation -- 26 cores/task on a 30-core allocation -- was the harness reading
+  `max(task_count)` and `max(cpu_count)` from two different runs of a
+  heterogeneous group. The busiest run is single-task, 21.7 of 24 cores busy,
+  and 27 is right.
+
+### On the three false alarms
+
+All three came from the same mistake: checking a module against a plausible rule
+rather than the rule it states. `memory_advice` excludes `looks_like_noop` runs
+from its evidence and `walltime_advice` floors on a computing timeout's *limit*
+rather than its elapsed; harnesses that ignored both produced 13 and 8
+"violations" respectively, and 193 more came from counting completed runs where
+the module counts usable observations. Worth writing down because it is the
+failure mode of an audit, not of the code: a finding measured against the wrong
+standard looks exactly like a real one until you read the source.
 
 ## Round thirty-one — the hostname on screen that search could not find
 
