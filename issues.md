@@ -1,5 +1,17 @@
 # slurmpast — audit and resolution
 
+> **Release 0.7.0, 2026-08-22.** Eleven rounds (twenty-two through thirty-two),
+> ten defects, all found by running the tool against a real cluster's accounting
+> database and log tree rather than against fixtures. 1503 tests at 0.6.0,
+> **1560** here.
+>
+> What a user gets that they did not have at 0.6.0: a traceback finding that shows
+> the traceback, a clock speed in `--json` that is not wrong by 1000x, a workload
+> comparison that holds the workload fixed, a node table that does not count a
+> cancellation as a node behaving, no NCCL fault invented from the word NCCL, no
+> "Nothing was computed" over 18.4 TiB of traffic, and a job list that finds a
+> host by the name the job screen prints for it.
+
 > **Round thirty-two, 2026-08-22.** **No defects.** The first round since the
 > real-data streak began to find nothing, and it is recorded in full because a
 > clean round is only meaningful if what was actually checked is written down.
