@@ -1,5 +1,16 @@
 # slurmpast — audit and resolution
 
+> **Round twenty-seven, 2026-08-22.** One defect, from the first pass over real log
+> *contents* rather than real job records: a CRITICAL "Collective communication
+> fault" manufactured from the word NCCL. 1524 tests before, **1535 after**; all
+> four gates clean.
+>
+> The round opened by re-verifying `nodes.py`, which had produced the previous two
+> rounds' defects. Its statistics are sound in both directions -- and the finding
+> that matters is *where* those two bugs were: not in the machinery but in the
+> sample fed to it. The Fisher test, the correction and the intervals were never
+> wrong; the stratum (round 25) and the denominator (round 26) were.
+
 > **Round twenty-six, 2026-08-22.** One defect, and it moves a rate on real data:
 > a cancellation counted as a placement the node handled fine. 1520 tests before,
 > **1524 after**; all four gates clean.
@@ -310,6 +321,93 @@
 > upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
 > was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
 > and its control. `ruff`, `ruff format` and `mypy` clean.
+
+---
+
+## Round twenty-seven — a fault invented from the word NCCL
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `_NCCL_MARKERS` held the bare substring `"nccl"`, so any distributed job's startup or shutdown line drew a CRITICAL interconnect fault | `diagnose.py` | `TestMentioningNcclIsNotAnNcclFault` |
+
+### 1. Ten real logs mention NCCL; none of them faulted; all ten were flagged
+
+Every distributed PyTorch job prints NCCL when it starts and when it stops. The
+marker tuple matched the word, so the finding was manufactured out of:
+
+```
+[rank0]:[W818 12:54:11 ProcessGroupNCCL.cpp:1524] Warning: WARNING:
+    destroy_process_group() was not called before program exit
+INFO [parallel_state.py:1208] ... distributed_init_method=... backend=nccl
+NCCL version 2.19.3+cuda12.1
+NCCL INFO Bootstrap : Using eth0:10.50.221.11<0>
+```
+
+Measured over 400 real log files on this machine: **ten mention NCCL, none of them
+faulted, and every one of the ten drew the finding.** Two of those jobs had a
+genuine CUDA OOM, so the post-mortem showed two CRITICALs -- one correct, one
+sending the reader to debug an interconnect that was fine while the actual fix was
+a smaller batch:
+
+```
+before   findings: ['cuda-oom', 'nccl', 'traceback']
+after    findings: ['cuda-oom', 'traceback']
+```
+
+Only real logs could show it. Every fixture in the suite passed a string that *was*
+a fault, so the loose marker was never exercised as a false positive -- and both
+pre-existing NCCL tests still pass untouched, because `"nccl timeout"` and
+`"NCCL WARN Watchdog caught collective operation timeout"` are fault shapes.
+
+The replacement set is checked in both directions rather than tightened by
+intuition: **zero hits across those ten logs**, and hits on all five real fault
+shapes -- the watchdog timeout, `DistBackendError: NCCL error`,
+`ncclUnhandledCudaError`, `ncclInternalError`, and NCCL's own `NCCL WARN` channel,
+which it uses for trouble rather than for chatter. A guard test asserts no marker
+is short enough to be a bare mention.
+
+### The negative result: the node statistics, re-verified end to end
+
+Rounds twenty-five and twenty-six both found defects in `nodes.py`, so this round
+re-measured what it claims. `dominant_workload`'s docstring cites a simulation --
+"3.73% ... and 3.17% ... under the 5% target either way" -- and both of those
+rounds changed the sample it is computed from.
+
+**False positives, every node genuinely identical:**
+
+```
+nodes  per node  nodes/job  p(fail)   flagged
+10     30        1          0.20      4.5%
+20     30        1          0.20      3.0%
+10     30        1          0.05      1.2%
+20     30        4          0.20      1.5%
+10     30        4          0.20      0.5%
+```
+
+Still under 5%, and consistent with the recorded figures. The multi-node rows are
+new: one job spanning four nodes contributes four *correlated* observations, which
+the Fisher test treats as independent, so the concern was that it would inflate
+the rate. It does the opposite -- correlated outcomes make every node look alike,
+which makes the test conservative.
+
+**Detection power, one node genuinely worse:**
+
+```
+nodes  nodes/job  p(good) -> p(bad)   found    innocent flagged
+10     1          0.10 -> 0.50        98.3%    0.3%
+10     1          0.10 -> 0.30        53.3%    1.3%
+20     1          0.10 -> 0.50        96.7%    2.3%
+10     4          0.10 -> 0.50        66.0%    0.3%
+10 (60/node) 4    0.10 -> 0.50        99.3%    0.0%
+```
+
+Sound in both directions, and the innocents are within the FDR the correction
+targets by design. Multi-node allocations cost power rather than correctness, and
+recover it with more placements.
+
+So the machinery was never the problem. That is worth writing down: two rounds of
+defects in this module were both about *which observations reach it* -- the wrong
+stratum, then an uninformative denominator -- and none about the arithmetic.
 
 ---
 
@@ -3185,6 +3283,12 @@ entry was refusing, replaced by the smallest change that keeps the idiom intact.
 ---
 
 ## Consequence for the numbers
+
+**Round twenty-seven.** A job whose log merely mentions NCCL loses its
+`nccl` finding, and with it a CRITICAL -- so `slurmpast <jobid>` can exit 0 where
+it exited 1, on a job whose only CRITICAL was the invented one. A job with a real
+fault is unchanged, as is every job with no log. Nothing else moves, and the demo
+writes no logs at all.
 
 **Round twenty-six.** `slurmpast --nodes --metric failure` reports different rates:
 a cancellation is no longer a trial, so denominators shrink and rates rise -- on a

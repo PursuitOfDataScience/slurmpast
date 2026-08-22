@@ -73,7 +73,36 @@ _CUDA_OOM_MARKERS = (
     "hip out of memory",
     "cublas_status_alloc_failed",
 )
-_NCCL_MARKERS = ("nccl", "watchdog caught collective operation timeout", "ncclinternalerror")
+# Fault signatures, not the word "NCCL". The bare substring was in this tuple, and
+# every distributed PyTorch job prints NCCL at startup and at shutdown -- so a
+# CRITICAL "Collective communication fault" was manufactured out of, among others:
+#
+#     [rank0]:[W818 12:54] ProcessGroupNCCL.cpp:1524] Warning: WARNING:
+#         destroy_process_group() was not called before program exit
+#     INFO [parallel_state.py:1208] ... distributed_init_method=... backend=nccl
+#     NCCL version 2.19.3+cuda12.1
+#
+# Measured on 400 real log files: ten mention NCCL, none of them faulted, and every
+# one of the ten drew the finding. Two of those jobs had a genuine CUDA OOM, so the
+# reader got two CRITICALs -- one real, one sending them to debug an interconnect
+# that was fine.
+#
+# Every marker below is a string a healthy run does not print, and the set is
+# checked both ways: zero hits across those ten logs, and hits on all five real
+# fault shapes -- the watchdog timeout, `DistBackendError: NCCL error`,
+# `ncclUnhandledCudaError`, `ncclInternalError`, and NCCL's own `NCCL WARN`
+# channel, which it uses for trouble rather than for chatter.
+_NCCL_MARKERS = (
+    "watchdog caught collective operation timeout",
+    "ncclinternalerror",
+    "ncclunhandledcudaerror",
+    "ncclsystemerror",
+    "ncclremoteerror",
+    "nccl error",
+    "nccl timeout",
+    "nccl warn",
+    "distbackenderror",
+)
 _IMPORT_MARKERS = ("modulenotfounderror", "importerror", "no module named")
 
 

@@ -624,3 +624,71 @@ class TestTheTwoStatesDiagnoseHadNeverHeardOf:
             verdict = diagnose(_interrupted(healthy_job, state))
             for finding in verdict.findings:
                 assert "blocking call" not in finding.action, (state, finding.code)
+
+
+class TestMentioningNcclIsNotAnNcclFault:
+    """`_NCCL_MARKERS` contained the bare substring `"nccl"`.
+
+    Every distributed PyTorch job prints NCCL at startup and at shutdown, so a
+    CRITICAL "Collective communication fault" was manufactured out of ordinary
+    lines. Measured over 400 real log files: **ten mention NCCL, none of them
+    faulted, and every one of the ten drew the finding.** Two of those jobs had a
+    genuine CUDA OOM, so the report showed two CRITICALs -- one real, one sending
+    the reader to debug an interconnect that was fine.
+
+    Only real logs could show this. Every fixture in this suite passed a string
+    that *was* a fault, so the loose marker was never exercised as a false
+    positive -- the test below that reads `"nccl timeout"` still passes, because
+    that is a fault shape.
+    """
+
+    # Verbatim from real logs on this cluster, or from the vendors' own output.
+    BENIGN = (
+        "[rank0]:[W818 12:54:11.591239218 ProcessGroupNCCL.cpp:1524] Warning: WARNING: "
+        "destroy_process_group() was not called before program exit",
+        "INFO 08-02 18:49:04 [parallel_state.py:1208] world_size=1 rank=0 local_rank=0 "
+        "distributed_init_method=tcp://127.0.0.1:0 backend=nccl",
+        "NCCL version 2.19.3+cuda12.1",
+        "NCCL INFO Bootstrap : Using eth0:10.50.221.11<0>",
+    )
+
+    FAULTS = (
+        "[E ProcessGroupNCCL.cpp:828] [Rank 3] Watchdog caught collective operation timeout",
+        "torch.distributed.DistBackendError: NCCL error in: ../torch/csrc/distributed/c10d",
+        "RuntimeError: NCCL Error 1: unhandled cuda error (ncclUnhandledCudaError)",
+        "ncclInternalError: Internal check failed.",
+        "NCCL WARN Call to connect returned Connection refused, retrying",
+    )
+
+    def _failed(self, healthy_job):
+        return healthy_job._replace(state="FAILED", exit_code=1)
+
+    @pytest.mark.parametrize("line", BENIGN)
+    def test_a_healthy_run_that_mentions_nccl_draws_no_finding(self, healthy_job, line):
+        assert "nccl" in line.lower(), "the fixture must actually mention it"
+        assert "nccl" not in codes(diagnose(self._failed(healthy_job), log_text=line))
+
+    @pytest.mark.parametrize("line", FAULTS)
+    def test_every_real_fault_shape_is_still_caught(self, healthy_job, line):
+        assert "nccl" in codes(diagnose(self._failed(healthy_job), log_text=line)), line
+
+    def test_the_oom_job_gets_one_critical_not_two(self, healthy_job):
+        """The case that showed it: a genuine CUDA OOM whose log also carries the
+        shutdown warning. One real finding, and no invented second one."""
+        log = (
+            "torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB\n"
+            "[rank0]:[W818 12:54:11 ProcessGroupNCCL.cpp:1524] Warning: WARNING: "
+            "destroy_process_group() was not called before program exit\n"
+        )
+        found = codes(diagnose(self._failed(healthy_job), log_text=log))
+        assert "cuda-oom" in found
+        assert "nccl" not in found, found
+
+    def test_the_marker_set_holds_no_bare_mention(self):
+        """The guard. A marker that a healthy run prints is the whole defect, so
+        the shortest way back into it is adding one."""
+        from slurmpast.diagnose import _NCCL_MARKERS
+
+        assert "nccl" not in _NCCL_MARKERS
+        for marker in _NCCL_MARKERS:
+            assert len(marker) > 8, marker
