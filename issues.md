@@ -1,5 +1,22 @@
 # slurmpast — audit and resolution
 
+> **Round thirty, 2026-08-22.** One defect: a CRITICAL finding that denied, in
+> plain words, the terabytes the WARNING directly beneath it was reporting. 1547
+> tests before, **1553 after**; all four gates clean.
+>
+> Found by asking which findings co-occur on real jobs and which of those pairs
+> pull a reader in opposite directions. Nine contradictory pairs were proposed and
+> eight never occur; the ninth fires on 33 jobs, and reading one of them showed the
+> tool naming a job's blocking call one line below an action telling the reader to
+> go find it.
+>
+> The larger part of this round found nothing, which is worth recording as
+> plainly as the defect. `render.py`'s reason for existing -- the dashboard and
+> `--plain` cannot drift -- was tested directly for the first time and holds
+> exactly: over 59 real jobs, every label and every value on one surface appears on
+> the other. So do the overview's headline statistics, re-derived independently,
+> and `--ascii` purity across 409 renderings.
+
 > **Round twenty-nine, 2026-08-22.** One defect and the exemption that hid it: the
 > machine-readable surface published a clock speed that reads 1000x wrong, on 85%
 > of the real jobs carrying the field. 1542 tests before, **1547 after**; all four
@@ -363,6 +380,97 @@
 > and its control. `ruff`, `ruff format` and `mypy` clean.
 
 ---
+
+## Round thirty — "Nothing was computed", over 18.4 TiB of traffic
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `noop-allocation` said "Nothing was computed" and "Find the blocking call" on jobs whose `io-heavy` finding, rendered directly below it, reported terabytes moved at a sustained rate | `diagnose.py:341` | `TestNothingWasComputedIsNotSaidOverTerabytes` |
+
+### 1. The tool named the blocking call one line under an order to go find it
+
+`_cpu_rules` states the standard it is held to, in a comment guarding three job
+states:
+
+> "Find the blocking call" is advice about the user's own code, and it is only
+> honest when nothing else already explains the missing CPU time.
+
+`OUT_OF_MEMORY`, `NODE_FAIL` and `PREEMPTED` were guarded on that basis in round
+eighteen. A *measurement* on the same record was not. Real job 36362003 rendered:
+
+```
+  [critical] Allocation did essentially nothing
+      18:52:05 of wall clock, 3.5s of CPU, holding 4 GPU(s). Nothing was computed.
+      -> Find the blocking call. If this allocation is a deliberate reservation,
+         mark it so and this rule will stay quiet.
+
+  [warning] Filesystem may be setting the pace, not the GPU
+      read 18.4 TiB, wrote 15.1 GiB — 284.4 MiB/s sustained over 18:52:05.
+```
+
+Eighteen point four terabytes, read at 284 MiB/s for nineteen hours, described as
+nothing. The reader is sent into their own code after a hang that is not there,
+while the answer sits in the next finding down.
+
+Measured over 20,905 real jobs:
+
+```
+jobs told 'Nothing was computed'            : 986
+  of those, moving at least the IO floor    : 287
+  of those, ALSO flagged io-heavy alongside :  33
+total data moved by allocations told nothing was computed: 419.3 TiB
+```
+
+The finding stays CRITICAL and stays raised -- an allocation holding four GPUs
+for nineteen hours to feed a filesystem is wasting them however it got there.
+What changes is that it stops contradicting its neighbour:
+
+```
+  [critical] Allocation computed almost nothing — it was moving data
+      18:52:05 of wall clock, 3.5s of CPU, holding 4 GPU(s), and 18.4 TiB of
+      filesystem traffic at 284.4 MiB/s. The time went to I/O, not to compute.
+      -> Treat this as the I/O problem below, not as a hang: stage the input
+         somewhere faster, or overlap the transfer with compute.
+```
+
+`_io_explains_idle_cpu` deliberately reuses `_io_rules`' own two thresholds rather
+than picking a third. The defect is two findings on one screen disagreeing, so the
+guard has to fire on exactly the jobs the other rule fires on -- 33 of the 986,
+not a similar-looking set. The 287 that clear the volume floor but trickle keep
+the original wording, and a hang with no I/O at all is untouched, which is what
+three of the six new tests pin.
+
+### Consequence for the numbers
+
+No statistic moves. `looks_like_noop` is unchanged, so `noop_jobs` (1391 here),
+`gpu_hours_noop` (3338) and the overview's "in allocations that never computed"
+are all the same figures as before -- and remain correct, because an I/O-bound
+job's GPUs genuinely did not compute. Only the wording of one finding changes,
+on the jobs where it was false.
+
+### What was verified and not changed
+
+* **`render.py`'s reason for existing, tested directly for the first time.** Both
+  surfaces were rendered for 59 real jobs and diffed fact by fact: every label
+  `job_sections` produces appears on both, and so does every value. 0 gaps in
+  either direction. The patterns and nodes screens agree number-for-number too.
+* The overview's tail note (`… 1503 more workloads (14365 runs) holding 20.1% of
+  the compute`) is absent from the dashboard, and that is correct rather than
+  drift: the dashboard's table holds all 1528 workloads and scrolls, so there is
+  no truncation for it to name.
+* Every headline statistic re-derived independently and matched exactly:
+  completion rate 78.3%, 11,674 GPU-hours total, 3,337.5 idle, goodput 0.6578,
+  noop fraction 0.2859, 6 open records excluded.
+* `--ascii` output is pure ASCII across all six aggregate views and 403 job
+  screens built from real records.
+* `ascii_fold` rewrites seven characters and is applied to finished text, so it
+  would rewrite a data value containing one. No data field in 20,905 real jobs
+  contains any non-ASCII character at all, so this stays a hypothesis and is not
+  filed as a defect.
+* Eight further contradictory pairs were looked for and do not occur:
+  memory-slack with host-oom or rss-above-limit, walltime-slack with either
+  timeout finding, timeout-hang with timeout-real, and noop-allocation with
+  system-cpu-heavy.
 
 ## Round twenty-nine — a machine surface that published the ambiguity
 

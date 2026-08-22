@@ -804,3 +804,108 @@ class TestTheTracebackTailEndsWhereTheTracebackEnds:
         assert finding is not None
         assert "RuntimeError: something broke" in finding.evidence
         assert "Wall time" not in finding.evidence
+
+
+class TestNothingWasComputedIsNotSaidOverTerabytes:
+    """The CRITICAL denied the traffic the WARNING under it reported.
+
+    `_cpu_rules` states the standard it is held to here: "'Find the blocking call'
+    is advice about the user's own code, and it is only honest when nothing else
+    already explains the missing CPU time." Three job *states* were guarded on
+    that basis. A measurement on the same record was not, so a real job rendered:
+
+        [critical] Allocation did essentially nothing
+            18:52:05 of wall clock, 3.5s of CPU, holding 4 GPU(s).
+            Nothing was computed.
+            -> Find the blocking call.
+        [warning] Filesystem may be setting the pace, not the GPU
+            read 18.4 TiB, wrote 15.1 GiB - 284.4 MiB/s sustained over 18:52:05.
+
+    The tool named the blocking call one line below an action telling the reader
+    to go find it. Of 20,905 real jobs here, 986 were told nothing was computed;
+    287 of those had moved at least the rule's own 10 GiB floor, 419.3 TiB
+    between them.
+
+    The finding stays CRITICAL and stays raised -- an allocation holding four GPUs
+    for nineteen hours to feed a filesystem is wasting them however it got there.
+    What changes is that it stops contradicting its neighbour.
+    """
+
+    @staticmethod
+    def _stalled(job, elapsed, read=0, write=0):
+        """Long wall clock, no CPU, and whatever filesystem traffic is asked for.
+        Same shape `_stalled` above builds, with the I/O counters set."""
+        steps = tuple(
+            s._replace(
+                total_cpu=0.0,
+                tres_in_tot="cpu=00:00:00,energy=0,fs/disk=%d" % read,
+                tres_out_tot="energy=0,fs/disk=%d" % write,
+            )
+            for s in job.steps
+        )
+        return job._replace(state="CANCELLED", elapsed=elapsed, steps=steps)
+
+    def _io_bound(self, job):
+        """Nineteen hours, no CPU, 18.4 TiB moved. Job 36362003's shape."""
+        return self._stalled(job, 67925.0, read=20241314765114, write=16181744795)
+
+    def test_the_two_findings_no_longer_disagree(self, healthy_job):
+        job = self._io_bound(healthy_job)
+        verdict = diagnose(job)
+        noop = find(verdict, "noop-allocation")
+        io = find(verdict, "io-heavy")
+        assert noop is not None and io is not None, [f.code for f in verdict.findings]
+        assert "Nothing was computed" not in noop.evidence
+        assert "Find the blocking call" not in noop.action
+        # and it says what did happen, in the same units the other finding uses
+        assert "18.4 TiB" in noop.evidence, noop.evidence
+
+    def test_it_is_still_critical_and_still_names_the_idle_gpus(self, healthy_job):
+        """The control on severity: this must not become a softer finding. Four
+        GPUs held for nineteen hours is the reason the rule exists."""
+        from slurmpast.diagnose import CRITICAL
+
+        job = self._io_bound(healthy_job)._replace(alloc_tres="gres/gpu=4")
+        noop = find(diagnose(job), "noop-allocation")
+        assert noop.severity == CRITICAL
+        assert "4 GPU(s)" in noop.evidence, noop.evidence
+
+    def test_a_genuinely_idle_allocation_still_gets_the_old_wording(self, healthy_job):
+        """The control that matters most. A hang with no I/O is what the original
+        wording is *for*, and it has to survive intact -- otherwise this fix has
+        traded one wrong message for another."""
+        job = self._stalled(healthy_job, 67925.0)
+        noop = find(diagnose(job), "noop-allocation")
+        assert noop is not None
+        assert "Nothing was computed" in noop.evidence
+        assert "Find the blocking call" in noop.action
+
+    def test_traffic_below_the_rules_own_floor_is_not_an_explanation(self, healthy_job):
+        """2.8 GB over two hours does not explain a missing CPU-hour, and the
+        guard shares `_io_rules`' threshold precisely so the reworded finding
+        appears only where the contradicting one does. Job 31199412's shape."""
+        job = self._stalled(healthy_job, 8172.0, read=2984952396, write=1174232073)
+        verdict = diagnose(job)
+        assert find(verdict, "io-heavy") is None
+        assert "Nothing was computed" in find(verdict, "noop-allocation").evidence
+
+    def test_high_volume_at_a_trickle_is_not_an_explanation_either(self, healthy_job):
+        """Both halves of the threshold are load-bearing: 30 GiB dribbled out over
+        a week is not a filesystem setting the pace."""
+        job = self._stalled(healthy_job, 604800.0, read=32 * 1024**3)
+        verdict = diagnose(job)
+        assert find(verdict, "io-heavy") is None
+        assert "Nothing was computed" in find(verdict, "noop-allocation").evidence
+
+    def test_end_to_end_the_plain_output_does_not_argue_with_itself(self, healthy_job):
+        """The defect as a reader met it: both findings in one rendered report,
+        one denying what the other measures."""
+        import re
+
+        from slurmpast.report import render_job
+
+        text, _ = render_job(self._io_bound(healthy_job))
+        text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+        assert "18.4 TiB" in text, text
+        assert "Nothing was computed" not in text, text
+        assert "Find the blocking call" not in text, text

@@ -338,6 +338,19 @@ _CPU_TIME_ALREADY_EXPLAINED = frozenset(
 )
 
 
+def _io_explains_idle_cpu(job):
+    """True when the filesystem already accounts for the missing CPU time.
+
+    Exactly the condition `_io_rules` uses to raise `io-heavy`, so this is true
+    precisely when that finding is about to appear beside this one. Sharing the
+    test rather than picking a second threshold is deliberate: the defect being
+    fixed is two findings on one screen disagreeing, so the guard has to fire on
+    the same jobs the other rule does, not on a similar-looking set.
+    """
+    total, rate = job.io_bytes, job.io_rate
+    return bool(total and total >= IO_VOLUME_FLOOR and rate and rate >= IO_RATE_LOUD)
+
+
 def _cpu_rules(job, add):
     if job.base_state == "TIMEOUT" or job.open_ended:
         return  # already covered, or not measurable
@@ -363,6 +376,41 @@ def _cpu_rules(job, add):
         return
 
     if looks_like_noop(job):
+        held = (", holding %d GPU(s)" % job.gpu_count) if job.gpu_count else ""
+        if _io_explains_idle_cpu(job):
+            # The same honesty test the three states above get, applied to a
+            # measurement instead of a state. "Nothing was computed" sat directly
+            # above `io-heavy` reporting 18.4 TiB read at 284.4 MiB/s sustained
+            # over the same 18:52:05 -- the tool naming the blocking call one line
+            # under an action telling the reader to go find it. Across 20,905 real
+            # jobs, 986 were told nothing was computed and 287 of those had moved
+            # at least the 10 GiB floor, 419.3 TiB between them.
+            #
+            # Still CRITICAL, and still raised: an allocation that holds GPUs for
+            # nineteen hours to feed a filesystem is wasting them whatever the
+            # cause. What changes is that the finding no longer denies the traffic
+            # the next line reports, and no longer sends the reader into their own
+            # code after a hang that is not there.
+            add(
+                Finding(
+                    CRITICAL,
+                    "noop-allocation",
+                    "Allocation computed almost nothing — it was moving data",
+                    "%s of wall clock, %s of CPU%s, and %s of filesystem traffic at "
+                    "%s/s. The time went to I/O, not to compute."
+                    % (
+                        format_duration(job.elapsed),
+                        format_duration(job.total_cpu),
+                        held,
+                        format_bytes(job.io_bytes or 0),
+                        format_bytes(job.io_rate or 0),
+                    ),
+                    "Treat this as the I/O problem below, not as a hang: stage the input "
+                    "somewhere faster, or overlap the transfer with compute so the "
+                    "allocation is not idle while it waits.",
+                )
+            )
+            return
         add(
             Finding(
                 CRITICAL,
@@ -372,7 +420,7 @@ def _cpu_rules(job, add):
                 % (
                     format_duration(job.elapsed),
                     format_duration(job.total_cpu),
-                    (", holding %d GPU(s)" % job.gpu_count) if job.gpu_count else "",
+                    held,
                 ),
                 "Find the blocking call. If this allocation is a deliberate reservation, "
                 "mark it so and this rule will stay quiet.",
