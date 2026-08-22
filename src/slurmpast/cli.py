@@ -87,7 +87,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--failed", action="store_true", help="only jobs that failed")
     parser.add_argument("-n", "--limit", type=_row_limit, default=25, help="rows in plain output")
 
-    parser.add_argument("--plain", action="store_true", help="text output, no dashboard")
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="text output, no dashboard (automatic when stdout is not a terminal)",
+    )
     parser.add_argument("--overview", action="store_true", help="workload rollup as text")
     parser.add_argument("--patterns", action="store_true", help="cross-run patterns as text")
     parser.add_argument("--nodes", action="store_true", help="node reliability as text")
@@ -592,6 +596,27 @@ def _job_json(job, log_path, verdict):
     }
 
 
+def _has_terminal(stdin=None, stdout=None) -> bool:
+    """Whether both ends the dashboard needs are attached to a terminal.
+
+    Both, not just stdout: Textual reads keys from stdin, so `slurmpast </dev/null`
+    paints a screen nobody can drive or quit. Written defensively because this
+    decides whether the process can hang -- a stream can be ``None`` under
+    ``pythonw`` and a closed one raises ``ValueError`` from ``isatty()``, and
+    either way the answer wanted here is "no terminal", not a traceback.
+
+    The one pre-existing ``isatty`` call in this package (`report.Style`) only
+    chooses colours, so nothing was guarding the decision to launch the app.
+    """
+    for stream in (sys.stdin if stdin is None else stdin, sys.stdout if stdout is None else stdout):
+        try:
+            if not stream.isatty():
+                return False
+        except (AttributeError, ValueError):
+            return False
+    return True
+
+
 def main(argv=None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -616,6 +641,21 @@ def main(argv=None) -> int:
         args.no_logs = True
     style = report.Style(enabled=False if args.no_color else None)
     sacct = Sacct()
+
+    # A dashboard needs a terminal on both ends, and without this the most
+    # ordinary thing anyone does with a report -- redirect it to a file -- hung
+    # forever. Measured on midway2: `slurmpast -S now-2days > report.txt` wrote
+    # 26,514 bytes of escape sequences into the file, entered the alternate
+    # screen, and then waited for a keypress a redirect can never deliver; killed
+    # at 20 s with rc=137, and identical under `| cat`. Under cron or CI the job
+    # simply never finishes.
+    #
+    # Degrading is right rather than erroring: `--plain` carries the same
+    # information, so a redirect should just work. Silently, too -- a note on
+    # stdout would corrupt the very file being written, and one on stderr would
+    # be noise in every CI log for a fallback that did what was wanted.
+    if not _has_terminal():
+        args.plain = True
 
     wants_text = (
         args.plain

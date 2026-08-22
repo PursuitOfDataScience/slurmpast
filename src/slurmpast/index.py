@@ -25,7 +25,15 @@ from typing import NamedTuple
 from .diagnose import looks_like_noop
 from .duration import plural
 from .model import Job
-from .patterns import find_memory_search, find_repeat_failures, goodput, group_key, usable
+from .patterns import (
+    find_memory_search,
+    find_repeat_failures,
+    fold_erased_the_name,
+    goodput,
+    group_key,
+    newest_name,
+    usable,
+)
 
 # Core-hours one GPU-hour is worth when ranking mixed workloads. See
 # GroupStats.cost for why this number and not a site billing weight.
@@ -87,9 +95,20 @@ class GroupStats(NamedTuple):
 
         Grouping still keys on the pattern, so a second differently-numbered run
         joins this same group and the label folds the moment it means something.
+
+        The second fallback is for a pattern that never says anything, however
+        many names it covers: an all-digit job name folds to ``#``, and a
+        date-stamped one to ``#-#``. Reported from a real cluster-wide window,
+        where a 20-run workload holding 559 CPU-hours sat at row 23 of the top 25
+        labelled ``#``. Falling back to the same representative name is what stops
+        the main table and ``--nodes`` disagreeing about what the workload is
+        called -- they take the rule from one place, `patterns`, for the reason
+        `render` exists.
         """
         if self.distinct_names == 1 and self.jobs:
             return self.jobs[0].name or self.name
+        if fold_erased_the_name(self.name):
+            return newest_name(self.jobs) or self.name
         return self.name
 
     @property

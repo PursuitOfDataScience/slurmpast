@@ -651,7 +651,14 @@ def nodes_baseline(table) -> str:
     """
     skipped = table["skipped_nodes"]
     tail = ""
-    if skipped:
+    # Not when nothing was recorded to attribute. The two lines then contradicted
+    # each other on any sparse history -- "2 nodes below threshold omitted" says
+    # nodes were evaluated and withheld, directly above `nodes_empty_reason`
+    # saying "No hangs recorded ... so there is nothing to attribute to a node".
+    # Only one of them can be the answer, and it is the second: with no events
+    # the sample threshold is not what is standing between the reader and a
+    # verdict, so naming it points at a fix that would not produce one.
+    if skipped and table["hits"]:
         tail = "; %d node%s below threshold omitted" % (skipped, "" if skipped == 1 else "s")
     # `placement%s` for the same reason `node%s` beside it already does: a window
     # holding one job printed "baseline 100.0% over 1 placements" out of a sentence

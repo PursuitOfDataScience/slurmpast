@@ -40,7 +40,7 @@ import math
 import re
 
 from .diagnose import looks_like_noop
-from .patterns import normalize_name, usable
+from .patterns import fold_erased_the_name, newest_name, normalize_name, usable
 
 MIN_SAMPLES = 10
 Z = 1.96  # 95%, and the interval the table displays stays a plain 95% interval
@@ -522,10 +522,11 @@ def dominant_workload(jobs, metric=None):
     # tested the sweep's genuinely bad node at all.
     # Keyed by (name, user), not by name: see Workload. Under the single-user query
     # that is the default this changes nothing, because the user is constant.
-    counts, events = {}, {}
+    counts, events, members = {}, {}, {}
     for job in records:
         key = (normalize_name(job.name), job.user)
         counts[key] = counts.get(key, 0) + 1
+        members.setdefault(key, []).append(job)
         if predicate is not None and predicate(job):
             events[key] = events.get(key, 0) + 1
     spans_users = len({job.user for job in records}) > 1
@@ -536,6 +537,15 @@ def dominant_workload(jobs, metric=None):
     else:
         best = max(counts.items(), key=lambda kv: kv[1])[0]
     name, user = best
+    # The signature is the stratum, but it is not always a name: an all-digit job
+    # name folds to `#` and a date-stamped one to `#-#`, and this screen then said
+    # "controlled for workload: only #-# counted" and "No hangs recorded for #-#",
+    # naming nothing the reader could match to a job. A real name from the same
+    # group reads, and costs nothing: `Workload.matches` normalises before
+    # comparing, so the stratum this selects is unchanged either way -- and
+    # `--nodes --json` keeps emitting a name, which is what its consumers read.
+    if fold_erased_the_name(name):
+        name = newest_name(members[best]) or name
     return Workload(name, user, qualified=spans_users)
 
 

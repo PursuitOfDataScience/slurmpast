@@ -132,6 +132,49 @@ class TestTheFoldIsOnlyShownWhenItStandsForSomething:
         assert "exp-a35-newckpt" in text
         assert "exp-a#-newckpt" not in text
 
+    def test_a_fold_that_kept_no_name_falls_back_too(self, healthy_job):
+        """Reported from a real cluster-wide window, row 23 of the top 25:
+
+            #   JOB NAME     PARTITION  RUNS COMPLETED FLAGGED  CPU-HOURS
+            23  #            broadwl      20        14       6  559 / -
+
+        20 runs and 559 CPU-hours under the name `#`. An all-digit job name --
+        a date stamp -- folds to a single placeholder, so unlike `exp-a#-gate`
+        this signature stands for a family and still says nothing. Several
+        distinct names, so the one-name branch above does not catch it.
+        """
+        group = self._groups(healthy_job, ["20260821", "20260822", "20260823"])[0]
+        assert group.name == "#", "the key still folds, so the three runs stay one workload"
+        assert group.distinct_names == 3
+        assert group.label == "20260823", group.label
+        assert "#" not in group.label
+
+    def test_a_date_with_separators_falls_back_as_well(self, healthy_job):
+        """`2026-01` folds to `#-#`: separators are not information either."""
+        group = self._groups(healthy_job, ["2026-01", "2026-02"])[0]
+        assert group.name == "#-#"
+        assert group.label == "2026-02", group.label
+
+    def test_one_surviving_letter_is_enough_to_keep_the_fold(self, healthy_job):
+        """The control on where the line is drawn. `a#` still names something and
+        must keep folding -- substituting one arm's name would invent a workload
+        narrower than the row's own RUNS column."""
+        group = self._groups(healthy_job, ["a2026", "a2027"])[0]
+        assert group.label == "a#" == group.name
+
+    def test_the_plain_overview_prints_the_fallback(self, healthy_job):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_overview
+
+        jobs = [
+            healthy_job._replace(job_id=str(3000 + i), name=n)
+            for i, n in enumerate(["20260821", "20260822"])
+        ]
+        text = render_overview(History(jobs), style=Style(enabled=False))
+        assert "20260822" in text
+        table = text.split("JOB NAME", 1)[1]
+        assert " # " not in table, table
+
     def test_the_hash_footnote_goes_with_it(self, healthy_job):
         """The "#" stands for a name's digits note explained notation that is no
         longer on screen."""

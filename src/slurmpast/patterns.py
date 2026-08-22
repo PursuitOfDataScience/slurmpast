@@ -63,6 +63,46 @@ def normalize_name(name):
     return _DIGIT_RUN.sub("#", name)
 
 
+def fold_erased_the_name(signature) -> bool:
+    """Whether :func:`normalize_name` left a signature with no name left in it.
+
+    A job name that is *entirely* digits and separators folds to placeholders and
+    punctuation -- ``20260821`` to ``#``, ``2026-01`` to ``#-#`` -- and that
+    identifies nothing. Date-stamping a run is one of the most common naming
+    conventions there is, so this is not a rare shape: on a real cluster-wide
+    window, row 23 of the top 25 workloads was 20 runs and 559 CPU-hours printed
+    under the name ``#``.
+
+    Only a *display* rule. The fold stays the grouping key either way -- it is
+    what puts today's and yesterday's run in one workload -- and callers use this
+    to decide whether the key is fit to be read aloud, substituting a real job
+    name where it is not. Letters are the test because the fold has already taken
+    the digits: anything with one left, like ``a#_anneal_#``, still names
+    something.
+    """
+    return not any(ch.isalpha() for ch in signature or "")
+
+
+def newest_name(jobs) -> str:
+    """The most recent run's ``JobName`` in a group, or ``""`` if none recorded.
+
+    The representative to show when the folded signature cannot be
+    (:func:`fold_erased_the_name`). Ordered the way :func:`index.build_groups`
+    orders a group's members -- start, falling back to submit -- with
+    :func:`numeric_job_id` breaking the tie, so records carrying no usable
+    timestamp still resolve to the last one submitted rather than to whichever
+    happened to arrive first from sacct.
+    """
+    best = None
+    for job in jobs:
+        if not job.name:
+            continue
+        key = (job.start or job.submit or "", numeric_job_id(job))
+        if best is None or key > best[0]:
+            best = (key, job.name)
+    return best[1] if best else ""
+
+
 def group_key(job):
     """Identity for "the same piece of work".
 

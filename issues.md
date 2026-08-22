@@ -12,6 +12,23 @@
 > "Nothing was computed" over 18.4 TiB of traffic, and a job list that finds a
 > host by the name the job screen prints for it.
 
+> **Round thirty-three, 2026-08-22.** Four defects, none of them found here: the
+> published 0.7.0 was installed on **midway2** -- CentOS 7.9, Python 3.14.6, Slurm
+> 23.02, cgroup v1, no GPU -- and run against that cluster's real history. 1560
+> tests before, **1581 after**; all four gates clean.
+>
+> A `sacct` field containing a newline shattered the record, so 41 real rows parsed
+> as 56 "jobs" and the overview reported 47 unterminated records where there were
+> 2. `slurmpast > report.txt` launched the dashboard anyway and hung until killed,
+> having written 26 KB of escape sequences into the file. And the internal grouping
+> signature was being printed as a workload's name, so a date-stamped job appeared
+> in the top 25 as `#`.
+>
+> Two parts of the report were narrowed rather than adopted, and say so: the
+> suggested delimiter-counting reassembly is wrong for the field that triggers the
+> bug, and the predicted cluster-wide merge of all-numeric names is bounded by
+> `group_key` already keying on user and partition.
+
 > **Round thirty-two, 2026-08-22.** No defect in the product -- and one in the
 > audit itself, caught not by any of this round's four probes but by CI, on the
 > job four local gates cannot see. 1560 tests; green on Textual 0.86 **and** 8.2.8,
@@ -425,6 +442,205 @@
 > and its control. `ruff`, `ruff format` and `mypy` clean.
 
 ---
+
+## Round thirty-three — four defects a second cluster found in a day
+
+The first round driven entirely by someone else's report. slurmpast 0.7.0 was
+installed from PyPI onto **midway2** -- CentOS 7.9, glibc 2.17, Python 3.14.6,
+**Slurm 23.02.0**, cgroup v1, a one-node free partition and no GPU -- and
+exercised against that cluster's real accounting history. Every axis of that
+environment differs from the Midway3 the tool was written on, which is the whole
+point: none of the four below is midway2-specific, and none of them was reachable
+from this repository's fixtures.
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | A field containing a newline shattered the record, so 41 real rows parsed as 56 "jobs" -- 45 of them shell fragments -- and the overview reported 47 unterminated records where there were 2 | `sacct.py` | `TestAFieldMayContainANewline` |
+| 2 | `slurmpast > report.txt` launched the dashboard anyway: 26 KB of escape sequences into the file, then a wait for a keypress a redirect cannot deliver | `cli.py` | `TestARedirectMustNotLaunchTheDashboard` |
+| 3 | The internal grouping signature was printed as the workload's name, so an all-digit job name read as `#` and a date-stamped one as `#-#` | `index.py`, `nodes.py`, `patterns.py` | `TestADateStampedWorkloadIsNamedNotFolded`, `TestTheFoldIsOnlyShownWhenItStandsForSomething` |
+| 4 | `--nodes` printed "2 nodes below threshold omitted" directly above "there is nothing to attribute to a node" | `render.py` | `TestTheBaselineDoesNotContradictTheEmptyReason` |
+
+### 1. `sacct --parsable2` does not escape a newline inside a value
+
+`--parsable2` separates fields with the delimiter and records with a newline, and
+it escapes neither. Several of the 85 fields this tool asks for legitimately hold
+a newline: `SubmitLine` is the common one, because `sbatch --wrap=$'echo one\necho
+two'` records the whole multi-line script, and `Comment`, `AdminComment` and
+`WorkDir` can carry one too. Slurm has stored `SubmitLine` since 21.08, so the
+trigger is the *submit style* and not the site.
+
+Splitting on newlines therefore promoted every continuation line to a record.
+Measured on midway2 against a real 60-day history:
+
+```
+raw lines:            123
+lines with delimiter:  41      <- the real record count
+records parsed:        56      <- 15 too many, and 45 of them junk
+records with a NON-NUMERIC job id: 45
+```
+
+```
+job_id='hostname; cat /etc/redhat-release; ldd --version | head -1'
+job_id='module use /project/rcc/youzhi/modulefiles'
+```
+
+None of the 45 carries an `End`, so each was `open_ended`, and the overview said:
+
+```
+  9 jobs in 8 workloads · 77.8% completed
+  47 unterminated, excluded          <- the true number is 2
+```
+
+`45 phantoms + 2 real`. The one line whose entire purpose is explaining why the
+job count is lower than expected was manufacturing the discrepancy it explained.
+
+Records are now reassembled: a physical line opens a new record only when it
+carries the delimiter *and* the text before the first one is shaped like a JobID;
+anything else continues the record above it, newline included.
+
+**Counting delimiters -- the fix the report suggested -- was tried first and is
+wrong in the case that matters.** `SubmitLine` is the *last* field in the query,
+so the first physical line of a shattered record already holds every delimiter a
+complete one has. A rule that closes on the count closes there, and silently
+truncates the script at its first newline: the phantom records disappear, every
+count comes out right, and the job screen quietly loses most of the submit line.
+`test_the_multi_line_submit_line_survives_whole` is the test that separates the
+two, and it is why the boundary test does not depend on where the field sits.
+
+The JobID guard is deliberately loose -- first character a digit, no whitespace --
+rather than the anchored `^\d+(_\d+)?(\.\S+)?$` the report proposed. Every JobID
+Slurm emits has both properties (`123_[1-20%10]`, `123+0`, `123_4.batch`), while
+nothing else about the spelling is guaranteed across releases, and on a package
+whose point is running on a cluster nobody here has seen, discarding a real row is
+a worse failure than admitting a malformed one.
+
+**Narrowed from the report.** It also asked that rejected records be *counted*
+rather than silently dropped. They are not. There is no channel from `parse` to
+the screens for such a count, and adding one touches `sacct` → `cli`/`tui` →
+`History` → both front ends for a number that reads 0 on every well-formed
+cluster. Dropping a row the parser cannot trust is the policy this module already
+documents for a pipe-shifted row, and the harm the count was asked for -- garbage
+silently binned into `open_ended` -- is gone either way. Recorded here rather than
+quietly skipped.
+
+### 2. There is no tty guard anywhere in the package
+
+Measured on midway2 under a 20-second `SIGKILL` cap:
+
+| command | rc | alt-screen | bytes written |
+|---|---|---|---|
+| `slurmpast -S now-2days > file` | **137** | yes | 26,514 |
+| `slurmpast -S now-2days \| cat` | **137** | yes | 26,514 |
+| `slurmpast -S now-2days --plain \| cat` | 0 | no | 2,157 |
+
+So the most ordinary thing anyone does with a report -- redirect it to a file to
+read later or attach to a ticket -- wrote 26 KB of ANSI into the file and then
+hung until killed. Under cron or CI the job never finishes.
+
+The package had exactly one `isatty` call, in `report.Style`, and it only chooses
+colours. `main` now degrades to `--plain` when either stdin or stdout is not a
+terminal. Both, because Textual reads keys from stdin: `slurmpast </dev/null`
+paints a screen nobody can drive or quit.
+
+Degrading rather than erroring, and silently. `--plain` carries the same
+information, so a redirect should simply work; a note on stdout would corrupt the
+file being written, and one on stderr would be noise in every CI log for a
+fallback that did what was wanted. `--help` now says `--plain` is automatic when
+stdout is not a terminal.
+
+### 3. The grouping signature is not always a name
+
+`normalize_name` folds digit runs so that reruns group -- `att-speed-23` and
+`att-speed-40` are one workload -- and the folded key was then displayed as the
+workload's name. A name that is *entirely* digits and separators folds to
+placeholders and punctuation, which identifies nothing. On midway2's cluster-wide
+window this was row 23 of the top 25:
+
+```
+  #   JOB NAME                        PARTITION  RUNS COMPLETED FLAGGED  CPU-HOURS
+  23  #                               broadwl      20        14       6  559 / -
+```
+
+and on `--nodes`, in both the caption and the empty-table sentence:
+
+```
+  controlled for workload: only #-# counted (placement is not random)
+  No hangs recorded for #-# in this window, so there is nothing to attribute to a node.
+```
+
+`--json` carried `"workload": "#-#"`, confirming the value and not a rendering
+artifact. Date-stamping a run is one of the most common naming conventions there
+is, so this is not an edge case.
+
+Both surfaces now fall back to the most recent run's real `JobName` when the fold
+kept no letter, from one rule in `patterns` so they cannot disagree -- the reason
+`render.py` exists, applied to a rule rather than a renderable. `GroupStats.label`
+already did exactly this for a group covering a single name; this is the second
+branch of the same idea.
+
+**The grouping is unchanged, and that is the load-bearing part.** `Workload.matches`
+normalises before comparing, so the stratum `--nodes` controls on is identical
+either way; `GroupStats.name` still holds the fold; `--json` still emits a name,
+which is what its consumers read. Where the fold still says something -- `a#`,
+`att-speed-#` -- it is kept, because substituting one arm's name there would claim
+the screen controlled on less than it did. `test_one_surviving_letter_is_enough_to_keep_the_fold`
+and `test_a_folded_name_that_still_says_something_keeps_its_fold` are the controls,
+and both pass against the reverted tree.
+
+**One claim in the report is narrowed rather than adopted.** It reasoned that the
+`#` row "will collide with every other all-numeric job name on the cluster -- so
+the row may not even be one workload". `group_key` is `(signature, partition,
+kind, user)`, so a collision needs two all-numeric naming conventions from the
+same person on the same partition. That is possible and no worse than the fold
+this tool already accepts elsewhere; it is not the cluster-wide merge the sentence
+describes, and the grouping was left alone on that basis.
+
+### 4. Two sentences that disagreed on a sparse history
+
+```
+  baseline 0.0% over 2 placements; 2 nodes below threshold omitted
+  No hangs recorded for #-# in this window, so there is nothing to attribute to a node.
+```
+
+The first says nodes were evaluated and withheld for want of samples; the second
+says there was nothing to evaluate. Only the second can be right: with no events
+recorded, the sample threshold is not what stands between the reader and a
+verdict, so naming it points at a fix that would not produce one. The omission
+count is now suppressed when `hits` is zero, and kept otherwise -- with events on
+record those nodes *are* why the table is empty, and every other truncated view
+here names its tail.
+
+### Consequence for the numbers
+
+* **The parser fix moves a count that was wrong, and no measurement.** Any history
+  containing a multi-line `sbatch --wrap` loses its phantom records, so
+  `excluded_open_records` -- the `"N unterminated, excluded"` line, and the same
+  figure in `--json` -- falls to the true number. On the reported history that is
+  47 → 2. Real job records were never corrupted: the 11 real rows parsed correctly
+  before and after, so no rate, ranking or hour total moves. Anything iterating
+  raw `jobs` rather than `usable()` sees 45 fewer objects.
+* **`SubmitLine` now arrives whole** where it holds a newline, so the job screen
+  shows the script rather than its first line.
+* **A redirect changes output completely, from ANSI to the plain report**, and
+  from hanging to exiting. Any script that was piping slurmpast and timing out
+  now gets text and an exit code. Nothing changes in a terminal.
+* **Two labels change on screen and one in `--json`:** a workload whose folded
+  name kept no letter is now shown by a real job name, in the overview table, on
+  `--nodes`, and in `--nodes --json`'s `workload` field. A consumer matching the
+  literal `#` or `#-#` sees a name instead; one matching a name still does.
+* `--nodes` drops the omission clause on a window with no recorded events.
+
+### What was verified and not changed
+
+* Everything the report lists under "Works correctly (do not fix these)" was left
+  alone: field probing against `--helpformat`, the `SLURM_TIME_FORMAT` guard, the
+  locale neutrality, the `-S '-7days'` rewrite, the nonexistent-user error, the
+  `--all-users` scaling, and the exclusion of still-running array tasks.
+* The report's own two retractions were not re-litigated.
+* 1560 tests before, **1581 after** -- 21 new, one per fix and its control. Each
+  new test was run against the reverted tree: 15 fail there and 6 pass, and the 6
+  are exactly the controls.
+* `ruff`, `ruff format`, `mypy` and `pytest` all clean.
 
 ## Round thirty-two — nothing found, and what was looked at
 

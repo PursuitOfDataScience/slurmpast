@@ -489,6 +489,83 @@ def _base_job_id(step_id):
     return step_id.split(".")[0]
 
 
+def _records(text, delimiter, width):
+    """Physical lines reassembled into records, because a field may contain one.
+
+    ``--parsable2`` separates *fields* with the delimiter and *records* with a
+    newline, and it does not escape a newline occurring inside a value -- while
+    several of the fields asked for above legitimately hold one. ``SubmitLine`` is
+    the common case: ``sbatch --wrap=$'echo one\\necho two'`` records the whole
+    multi-line script, and Slurm has stored SubmitLine since 21.08, so this is
+    live on any current site. ``Comment``, ``AdminComment`` and ``WorkDir`` can
+    carry one too.
+
+    Splitting on newlines therefore shatters such a record into fragments, and
+    every fragment is then read as a fresh row whose JobID is a piece of shell.
+    Measured on midway2 (Slurm 23.02) against a real 60-day history: 41 records
+    arrived as 123 physical lines and parsed as 56 "jobs", 45 of them fragments
+    with ids like ``module use /project/rcc/youzhi/modulefiles``. None of the 45
+    had an ``End``, so each counted as an unterminated record and the overview
+    reported ``47 unterminated, excluded`` where the true number was 2 -- the one
+    line whose whole purpose is to explain a low job count was manufacturing the
+    discrepancy it was explaining.
+
+    A physical line therefore opens a new record only when it *looks* like one:
+    it carries the delimiter, and the text before the first one is shaped like a
+    JobID. Anything else continues the record above it, newline and all -- which
+    is also what a reader wants, since ``SubmitLine`` really is multi-line and the
+    job screen should show it that way.
+
+    Counting delimiters instead was tried and is wrong in the case that matters.
+    ``SubmitLine`` is the *last* field asked for, so the first physical line of a
+    shattered record already holds every delimiter a complete one has; a rule that
+    closes on the count closes there and silently truncates the script at its
+    first newline. The boundary test does not depend on where the multi-line field
+    sits.
+    """
+    # One field means no delimiter to find, so every line is its own record --
+    # the boundary test below would treat all of them as continuations.
+    if width <= 1 or not delimiter:
+        return [line for line in text.split("\n") if line.strip()]
+    records = []
+    buf = None
+    for line in text.split("\n"):
+        if _starts_record(line, delimiter):
+            if buf is not None:
+                records.append(buf)
+            buf = line
+        elif buf is not None:
+            # Blank lines included: one *between* records never reaches here,
+            # while one inside a multi-line script is part of the script.
+            buf = buf + "\n" + line
+        # Otherwise there is no open record to attach it to -- a `--noheader`
+        # query that returned a header anyway, or a line of noise before the
+        # first record. Dropped here rather than parsed into a phantom job.
+    if buf is not None:
+        records.append(buf)
+    return records
+
+
+def _starts_record(line, delimiter):
+    """Whether a physical line begins a record rather than continuing one."""
+    head, found, _ = line.partition(delimiter)
+    return bool(found) and _looks_like_job_id(head.strip())
+
+
+def _looks_like_job_id(value):
+    """Whether a first field could be a JobID sacct printed.
+
+    Deliberately loose. Every JobID Slurm emits begins with the numeric job id
+    and contains no whitespace -- ``123``, ``123_4``, ``123_[1-20%10]``,
+    ``123+0``, and any of those with a ``.batch``/``.extern``/``.0`` step suffix
+    -- while nothing else about the spelling is guaranteed across releases, so
+    matching an exact shape risks discarding real rows on a site nobody here has
+    seen. Those two properties are enough: the shell fragments that used to reach
+    this point (``echo "--- $m ---"``, ``2>&1 | tail -1``) fail one or the other.
+    """
+    return value[:1].isdigit() and not any(ch.isspace() for ch in value)
+
+
 def parse(text, fields=None, delimiter="|"):
     """Parse ``sacct --parsable2`` output into Jobs with their steps attached.
 
@@ -497,6 +574,10 @@ def parse(text, fields=None, delimiter="|"):
     so such rows are dropped rather than silently misread -- every column after
     the offending one would be shifted, which on this field list means reporting
     another job's memory and CPU figures as this job's.
+
+    Records are reassembled rather than split blindly (see :func:`_records`), and
+    a row still not keyed by something shaped like a JobID is dropped under that
+    same rule: one the parser cannot trust is worth less than no row at all.
     """
     fields = list(fields or _FIELDS)
     index = _field_index(fields)
@@ -516,14 +597,14 @@ def parse(text, fields=None, delimiter="|"):
     order = []
     pending_steps = {}
 
-    for line in text.splitlines():
-        if not line.strip():
-            continue
+    for line in _records(text, delimiter, len(fields)):
         row = line.split(delimiter)
         if len(row) > len(fields):
             continue
         raw_id = (row[job_id_at] if job_id_at < len(row) else "").strip()
         if not raw_id or raw_id.lower() == "jobid":
+            continue
+        if not _looks_like_job_id(raw_id):
             continue
 
         exit_code, signal = _parse_exit(get(row, "ExitCode"))

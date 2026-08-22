@@ -31,7 +31,7 @@ from slurmpast.sacct import (
 )
 from slurmpast.site import Site, gpu_utilization_note, maxrss_caveat, site
 
-from .conftest import row
+from .conftest import make_text, row
 
 _SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "slurmpast"
 
@@ -2215,3 +2215,184 @@ class TestAnUnexpandedArrayIdCanBeLookedUp:
 
         code = main(["49046820_[1-20%10]", "--demo", "--plain", "--no-color"])
         assert code == 2
+
+
+class TestAFieldMayContainANewline:
+    """`sacct --parsable2` separates records with a newline and does not escape
+    one occurring inside a value, so splitting on newlines shatters a record.
+
+    Measured on midway2 (Slurm 23.02) against a real 60-day history: 41 records
+    arrived as 123 physical lines and parsed as 56 "jobs", 45 of them shell
+    fragments promoted to job ids --
+
+        job_id='hostname; cat /etc/redhat-release; ldd --version | head -1'
+        job_id='module use /project/rcc/youzhi/modulefiles'
+
+    -- none of which carry an `End`, so each counted as an unterminated record
+    and the overview reported `47 unterminated, excluded` where the true number
+    was 2. The one line whose whole purpose is explaining a low job count was
+    manufacturing the discrepancy it was explaining.
+
+    Cluster-agnostic: the trigger is the submit style, not the site. Slurm has
+    recorded `SubmitLine` since 21.08 and `sbatch --wrap=$'a\\nb'` is ordinary.
+    """
+
+    WRAP = "hostname; cat /etc/redhat-release\nmodule use /project/rcc/modulefiles\necho done"
+
+    def _text(self):
+        return make_text(
+            row(
+                JobID="48818838",
+                JobName="probe",
+                User="youzhi",
+                State="COMPLETED",
+                Start="2026-08-22T09:58:00",
+                End="2026-08-22T10:00:00",
+                ElapsedRaw="120",
+                SubmitLine=self.WRAP,
+            ),
+            row(
+                JobID="48818838.batch",
+                JobName="batch",
+                State="COMPLETED",
+                ElapsedRaw="120",
+                TotalCPU="00:01.000",
+            ),
+            row(
+                JobID="48818841",
+                JobName="probe2",
+                User="youzhi",
+                State="COMPLETED",
+                Start="2026-08-22T10:59:00",
+                End="2026-08-22T11:00:00",
+                ElapsedRaw="60",
+                SubmitLine="sbatch --wrap='echo hi'",
+            ),
+        )
+
+    def test_the_embedded_newlines_do_not_become_records(self):
+        jobs = parse(self._text(), fields=_FIELDS)
+        assert [j.job_id for j in jobs] == ["48818838", "48818841"]
+
+    def test_no_shell_fragment_is_promoted_to_a_job_id(self):
+        jobs = parse(self._text(), fields=_FIELDS)
+        assert [j for j in jobs if not j.job_id[:1].isdigit()] == []
+
+    def test_the_unterminated_count_is_not_inflated(self):
+        """The number the reader actually saw. Both records are closed, so the
+        report has nothing to exclude and must say so."""
+        from slurmpast.patterns import goodput
+
+        assert goodput(parse(self._text(), fields=_FIELDS))["excluded_open_records"] == 0
+
+    def test_the_multi_line_submit_line_survives_whole(self):
+        """Not merely "the phantoms are gone" -- the script is data the job screen
+        shows, and truncating it at the first newline would pass every assertion
+        above while losing most of it. `SubmitLine` is the LAST field asked for,
+        which is exactly the case a delimiter-counting reassembly gets wrong."""
+        job = parse(self._text(), fields=_FIELDS)[0]
+        assert job.submit_line == self.WRAP
+        assert job.submit_line.count("\n") == 2
+
+    def test_a_history_with_no_embedded_newline_is_untouched(self, cot_exp):
+        """The control. Ordinary output must parse exactly as it did before."""
+        assert cot_exp.job_id == "47865145"
+        assert len(cot_exp.steps) == 2
+
+    def test_a_genuinely_open_record_is_still_counted(self):
+        """The other control, and the one that matters: the fix must not reach
+        the count by suppressing real unterminated records."""
+        from slurmpast.patterns import goodput
+
+        text = make_text(
+            row(
+                JobID="48818900",
+                JobName="live",
+                State="RUNNING",
+                Start="2026-08-22T10:00:00",
+                ElapsedRaw="300",
+                SubmitLine="sbatch --wrap='sleep 1000'",
+            )
+        )
+        assert goodput(parse(text, fields=_FIELDS))["excluded_open_records"] == 1
+
+
+class TestARedirectMustNotLaunchTheDashboard:
+    """`slurmpast > report.txt` hung forever, which is the most ordinary thing
+    anyone does with a report.
+
+    Measured on midway2 under a 20 s SIGKILL cap: `slurmpast -S now-2days > file`
+    exited **137**, having written 26,514 bytes of escape sequences into the file
+    and entered the alternate screen, then waited for a keypress a redirect can
+    never deliver. `| cat` did the same. Under cron or CI the job never finishes.
+
+    The package had exactly one `isatty` call before this (`report.Style`) and it
+    only chooses colours; nothing guarded the decision to launch Textual.
+    """
+
+    class _Stream:
+        def __init__(self, tty):
+            self._tty = tty
+
+        def isatty(self):
+            return self._tty
+
+    def test_two_terminals_is_the_only_interactive_case(self):
+        from slurmpast.cli import _has_terminal
+
+        yes, no = self._Stream(True), self._Stream(False)
+        assert _has_terminal(stdin=yes, stdout=yes) is True
+        assert _has_terminal(stdin=yes, stdout=no) is False
+        # stdin too: Textual reads keys from it, so `slurmpast </dev/null` would
+        # paint a screen nobody can drive or quit.
+        assert _has_terminal(stdin=no, stdout=yes) is False
+
+    def test_a_stream_that_cannot_answer_is_not_a_terminal(self):
+        """A closed stream raises ValueError from isatty(), and one replaced by a
+        harness may not have the method at all. Either way the answer wanted is
+        "no terminal", not a traceback out of an argument-parsing path."""
+        from slurmpast.cli import _has_terminal
+
+        class Closed:
+            def isatty(self):
+                raise ValueError("I/O operation on closed file")
+
+        assert _has_terminal(stdin=Closed(), stdout=self._Stream(True)) is False
+        assert _has_terminal(stdin=object(), stdout=self._Stream(True)) is False
+
+    def test_a_redirect_gets_the_plain_report_instead_of_ansi(self, monkeypatch, capsys):
+        """End to end. pytest's captured stdout is not a tty, which is the same
+        condition a redirect creates -- so `--demo` with no text flag must return
+        the plain report and exit rather than block on the app."""
+        from slurmpast import cli
+
+        def no_dashboard(*a, **kw):
+            raise AssertionError("the dashboard was launched with stdout redirected")
+
+        monkeypatch.setattr("slurmpast.tui.run", no_dashboard)
+        code = cli.main(["--demo", "--no-color"])
+        out = capsys.readouterr().out
+        assert code in (0, 1), code
+        assert out.strip(), "a redirect produced no report at all"
+        assert "\x1b[" not in out, "escape sequences reached a non-terminal stdout"
+
+    def test_a_terminal_still_gets_the_dashboard(self, monkeypatch):
+        """The control, and the one worth writing carefully: a guard that
+        degrades unconditionally would pass every assertion above and quietly
+        delete the dashboard."""
+        from slurmpast import cli
+
+        launched = []
+        monkeypatch.setattr("slurmpast.cli._has_terminal", lambda *a, **kw: True)
+        monkeypatch.setattr("slurmpast.tui.run", lambda *a, **kw: launched.append(True) or 0)
+        assert cli.main(["--demo"]) == 0
+        assert launched == [True]
+
+    def test_an_explicit_text_flag_is_unaffected_either_way(self, monkeypatch, capsys):
+        """`--overview` in a terminal must stay text: the guard only ever adds
+        `--plain`, it never takes a chosen view away."""
+        from slurmpast import cli
+
+        monkeypatch.setattr("slurmpast.cli._has_terminal", lambda *a, **kw: True)
+        cli.main(["--demo", "--overview", "--no-color"])
+        assert capsys.readouterr().out.strip()
