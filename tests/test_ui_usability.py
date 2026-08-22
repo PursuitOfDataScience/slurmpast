@@ -1381,33 +1381,77 @@ class TestATableIsNotBuiltTwiceToOpenItOnce:
         monkeypatch.setattr(DataTable, "add_row", counted)
         return seen
 
+    @staticmethod
+    def _builds(monkeypatch):
+        """Every (layout, rows) the guard let through, i.e. every actual build.
+
+        Counting `add_row` alone cannot express the guard's contract. It does not
+        promise one build per screen -- it promises no build at a layout already
+        drawn -- and on Textual 0.86 those differ. There the app lays a screen out
+        at one size and then at its real one, so the overview builds a 7-column
+        table and then an 8-column table that gains `COMPLETED`; both are honest
+        builds of genuinely different layouts, and the guard correctly suppressed
+        the duplicate *within* each pair.
+
+        The original form of these two tests asserted `add_row == row_count`, which
+        is that stronger property, and it happens to hold on modern Textual because
+        a screen pushed onto a laid-out app already has its size. It was written
+        against 8.2.8 and never ran on the floor until CI reached it. Asserting the
+        contract the code states, rather than the coincidence one version produces,
+        is the point of the class this sits in.
+        """
+        import slurmpast.tui as tui_module
+
+        seen = []
+        original = tui_module._rows_already_drawn
+
+        def spy(screen, layout, key):
+            already = original(screen, layout, key)
+            if not already:
+                seen.append((type(screen).__name__, tuple(layout), key))
+            return already
+
+        monkeypatch.setattr(tui_module, "_rows_already_drawn", spy)
+        return seen
+
     @pytest.mark.asyncio
     async def test_the_job_list_adds_each_row_once(self, monkeypatch):
         from textual.widgets import DataTable
 
         jobs = self._many()
+        builds = self._builds(monkeypatch)
         seen = self._counting_add_row(monkeypatch)
         app = make_app(jobs, no_logs=True)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             seen["n"] = 0
+            builds.clear()
             await pilot.press("a")
             await pilot.pause()
             rows = app.screen.query_one("#jobs", DataTable).row_count
         assert rows == len(jobs), rows
-        assert seen["n"] == rows, "%d add_row calls for %d rows" % (seen["n"], rows)
+        # No layout is built twice, and the work done is one build per distinct
+        # layout -- never the same table over again.
+        assert len(builds) == len(set(builds)), builds
+        assert seen["n"] == rows * len(builds), (
+            "%d add_row calls for %d rows across %d build(s)" % (seen["n"], rows, len(builds))
+        )
 
     @pytest.mark.asyncio
     async def test_the_overview_adds_each_row_once(self, monkeypatch):
         from textual.widgets import DataTable
 
+        builds = self._builds(monkeypatch)
         seen = self._counting_add_row(monkeypatch)
         app = make_app(history(), no_logs=True)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
             rows = app.screen.query_one("#groups", DataTable).row_count
         assert rows > 1
-        assert seen["n"] == rows, "%d add_row calls for %d rows" % (seen["n"], rows)
+        assert len(builds) == len(set(builds)), builds
+        assert seen["n"] == rows * len(builds), (
+            "%d add_row calls for %d rows across %d build(s)" % (seen["n"], rows, len(builds))
+        )
 
     @pytest.mark.asyncio
     async def test_a_refresh_that_changes_nothing_rebuilds_nothing(self, monkeypatch):

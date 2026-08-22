@@ -12,10 +12,10 @@
 > "Nothing was computed" over 18.4 TiB of traffic, and a job list that finds a
 > host by the name the job screen prints for it.
 
-> **Round thirty-two, 2026-08-22.** **No defects.** The first round since the
-> real-data streak began to find nothing, and it is recorded in full because a
-> clean round is only meaningful if what was actually checked is written down.
-> 1560 tests, unchanged; all four gates clean.
+> **Round thirty-two, 2026-08-22.** No defect in the product -- and one in the
+> audit itself, caught not by any of this round's four probes but by CI, on the
+> job four local gates cannot see. 1560 tests; green on Textual 0.86 **and** 8.2.8,
+> which is the first time this branch has been run against the floor.
 >
 > Four probes, three of them against ground truth outside this repository:
 > `compress_nodelist` validated by Slurm's own `scontrol show hostnames`; the
@@ -430,6 +430,46 @@
 
 No code changed this round. The value of the round is the list below, so a later
 one does not spend itself re-checking the same ground.
+
+### The one thing that was wrong: a test of mine, not the code
+
+Rounds twenty-two to thirty-two were never pushed, so none of them had reached
+CI's matrix. The first push failed the **Oldest supported Textual** job:
+
+```
+FAILED test_the_job_list_adds_each_row_once  - AssertionError: 800 add_row calls for 400 rows
+FAILED test_the_overview_adds_each_row_once  - AssertionError: 16 add_row calls for 8 rows
+```
+
+Round twenty-three's guard was written against the locally installed Textual
+8.2.8 and its tests asserted `add_row == row_count`: exactly one build per screen.
+Tracing on 0.86 -- rather than guessing, which round twenty-three's own docstring
+records getting wrong twice -- showed the guard is fine and fires correctly:
+
+```
+  0 OverviewScreen rows=8 guard_fired=False layout=(('#',4),('JOB NAME',25),...,('CPU / GPU-HOURS',17))
+  1 OverviewScreen rows=8 guard_fired=True  layout=(same)
+  2 OverviewScreen rows=8 guard_fired=False layout=(('#',4),('JOB NAME',22),...,('COMPLETED',9),...)
+  3 OverviewScreen rows=8 guard_fired=True  layout=(same)
+```
+
+Textual 0.86 lays the screen out at one size and then at its real one, so there
+are two *genuinely different* layouts -- the second gains a `COMPLETED` column --
+and the guard suppressed the duplicate within each pair, which is precisely what
+it promises: "whether the table already holds exactly this layout and these rows".
+It never promised one build per screen. That is a coincidence of newer Textual,
+where a screen pushed onto a laid-out app already has its size.
+
+So the test asserted more than the code claims, and the two tests now check the
+contract instead: no `(layout, rows)` signature is ever built twice, and the
+`add_row` count is one build per *distinct* layout. Both pass on 0.86 and 8.2.8,
+and both fail on both versions when the guard is disabled.
+
+Recorded here rather than shrugged off, because the pattern is the one this file
+keeps naming. A test written against one version of a dependency, asserting a
+property that version happens to produce, is the same defect as a test that pins
+a buggy value -- and the only reason it surfaced is that CI runs a matrix and a
+local gate runs one interpreter.
 
 ### `compress_nodelist`, against `scontrol show hostnames`
 
