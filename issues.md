@@ -1,5 +1,19 @@
 # slurmpast — audit and resolution
 
+> **Round twenty-six, 2026-08-22.** One defect, and it moves a rate on real data:
+> a cancellation counted as a placement the node handled fine. 1520 tests before,
+> **1524 after**; all four gates clean.
+>
+> Found by making the "fixed only on one side" hunt systematic instead of
+> incidental. Round twenty-five's bug came from two modules disagreeing about an
+> identity, so this round asked the same question of a different invariant --
+> **which jobs does each module count as evidence?** -- and drove seven marginal
+> job shapes through `usable()`, the grouping, the node table and `sizing` to see
+> where they disagreed.
+>
+> Six of the seven agreed. The seventh was a cancellation, and the disagreement was
+> inside one module: excluded from the numerator, counted in the denominator.
+
 > **Round twenty-five, 2026-08-22.** One defect, and it is the most consequential
 > of the streak: the module whose entire reason for existing is holding a workload
 > fixed was not holding it fixed. It changes a *rate*, not wording. 1514 tests
@@ -296,6 +310,83 @@
 > upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
 > was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
 > and its control. `ruff`, `ruff format` and `mypy` clean.
+
+---
+
+## Round twenty-six — an unknown outcome scored as a success
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | A cancelled placement was excluded from the failure numerator and left in the denominator, scoring it as a node behaving | `nodes.py` `node_table` | `TestACancellationIsNotASuccess` |
+
+### 1. "Cancellations excluded -- ambiguous", except from the denominator
+
+`_bad` says it in its own docstring, and it is true of `_bad`. The table around it
+counted every usable placement as a trial, so twenty cancellations on a node
+arrived as twenty observations of that node not failing.
+
+That is the one thing this module does that the rest of it argues against.
+`index` states the position plainly:
+
+> "a cancelled run is neither [completed nor flagged] ... a deliberate kill and an
+> abandoned one are identical in accounting"
+
+and everything else here works hard not to over-claim -- a Fisher exact test, a
+Benjamini-Hochberg correction, Wilson intervals, `MIN_SAMPLES` -- before padding
+the denominator with rows it had itself called uninformative.
+
+Measured on a real 90-day history: **7.3% of placements are cancellations**, and
+censoring them moves **7 of 9 rows**.
+
+```
+node             counted as successes    censored
+midway3-0250     32/36   88.9%           32/33   97.0%
+midway3-0330      9/73   12.3%            9/45   20.0%
+midway3-0376     17/78   21.8%           17/64   26.6%
+midway3-0025      1/12    8.3%           below MIN_SAMPLES
+midway3-0116      0/12    0.0%           below MIN_SAMPLES
+```
+
+Two nodes falling below the threshold is the honest outcome when the informative
+sample really is that small -- the tool already refuses to judge on thin evidence,
+and inflating the denominator manufactures a confidence the data does not support.
+
+**The hang metric keeps them, and that is not an inconsistency.** There a
+cancellation is frequently the evidence itself: **340 of those 1,094** satisfy
+`looks_like_noop` -- a job that held its allocation and computed nothing until
+someone killed it. Dropping those would gut the metric that is the *default*. A
+cancellation that did compute stays a trial there too: it ran, it did not hang,
+and that is evidence. So `--nodes` with no flags is byte-identical, and only
+`--metric failure` moves.
+
+### The test that named the whole rate and pinned half of it
+
+`test_cancelled_excluded_from_failure_rate` asserted `bad == 0` and nothing about
+`trials`. Its own name says "the failure rate", which is a numerator over a
+denominator; it held the numerator. With `bad` zero in that fixture the rate came
+out the same either way, so it could never have caught this. It now asserts both.
+Fifth instance in this record of a test that asserts less than its name claims.
+
+### The negative result: everything else agrees
+
+Seven marginal job shapes driven through all four consumers -- `patterns.usable`,
+the workload grouping, `node_table` and `sizing.recommend`:
+
+```
+                 usable()  groups  node_tbl  sizing
+open_ended         no        no       no       no
+live RUNNING       no        no       no       no
+no elapsed         no        no       no       no
+zero elapsed       yes       yes      yes      no
+no node            yes       yes      no       yes
+cancelled          yes       yes      *        no
+no steps           yes       yes      yes      yes
+```
+
+Every row is deliberate and consistent: an open record is unusable everywhere, a
+job with no node cannot be attributed to one, and `sizing` alone declines
+zero-elapsed and cancelled runs because it is the only consumer inferring a
+*request* from them. The starred cell is this round's defect.
 
 ---
 
@@ -3094,6 +3185,14 @@ entry was refusing, replaced by the smallest change that keeps the idiom intact.
 ---
 
 ## Consequence for the numbers
+
+**Round twenty-six.** `slurmpast --nodes --metric failure` reports different rates:
+a cancellation is no longer a trial, so denominators shrink and rates rise -- on a
+real history 7 of 9 rows moved and two nodes dropped below `MIN_SAMPLES`. A node
+that was `worse` can stay `worse` at a higher rate, and a node with few
+non-cancelled placements can vanish from the table. `--nodes` with no flags is the
+hang metric and is **unchanged**, as is the demo and every committed asset.
+`note_for_allocation` on the job screen uses the failure metric and moves with it.
 
 **Round twenty-five.** This one moves a measurement, but only on a query that spans
 users. `--all-users --nodes` and `-u alice,bob --nodes` now compare one person's

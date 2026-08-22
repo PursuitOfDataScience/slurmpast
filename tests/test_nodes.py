@@ -156,10 +156,18 @@ class TestNodeTable:
         assert table["rows"][0]["rate"] == pytest.approx(1.0)
 
     def test_cancelled_excluded_from_failure_rate(self):
+        """Both halves of "the rate", which this asserted one of.
+
+        It checked the numerator only, so "excluded from the failure rate" was
+        true of `bad` and false of `trials`: twenty cancellations sat in the
+        denominator scoring as twenty placements the node handled fine. See
+        `TestACancellationIsNotASuccess`.
+        """
         jobs = _placements("midway3-0100", 0, 20)
         cancelled = tuple(j._replace(state="CANCELLED by 1") for j in jobs)
         table = node_table(list(jobs) + list(cancelled), workload="node-evaluation")
         assert table["rows"][0]["bad"] == 0
+        assert table["rows"][0]["trials"] == 20, table["rows"][0]
 
 
 class TestSuggestions:
@@ -825,3 +833,84 @@ class TestTheWorkloadControlHoldsOnePersonsWork:
         assert isinstance(workload, str)
         assert "only alice's interactive counted" in nodes_workload_control(workload)
         assert "interactive" in workload
+
+
+class TestACancellationIsNotASuccess:
+    """`_bad` said "Cancellations excluded -- ambiguous" and excluded them from the
+    numerator only, so they stayed in the denominator scoring as placements the
+    node handled fine.
+
+    That is the one thing this module did that the rest of it argues against.
+    `index` states the position -- "a cancelled run is neither [completed nor
+    flagged] ... a deliberate kill and an abandoned one are identical in
+    accounting" -- and everything here works hard not to over-claim: Fisher exact,
+    a Benjamini-Hochberg correction, Wilson intervals, MIN_SAMPLES. Then it padded
+    the denominator with rows it had itself called uninformative.
+
+    Measured on a real 90-day history: 7.3% of placements are cancellations, and
+    censoring them moves 7 of 9 rows -- midway3-0330 from 12.3% to 20.0%,
+    midway3-0376 from 21.8% to 26.6%, two nodes below MIN_SAMPLES.
+
+    The old test was named `test_cancelled_excluded_from_failure_rate` and asserted
+    `bad == 0`. Named for the whole rate, pinning half of it.
+    """
+
+    @staticmethod
+    def _mixed(failed, clean, cancelled, node="midway3-0100"):
+        jobs = list(_placements(node, failed, failed + clean))
+        extra = [
+            jobs[0]._replace(job_id="c%d" % index, state="CANCELLED by 1", exit_code=0)
+            for index in range(cancelled)
+        ]
+        return jobs + extra
+
+    def test_a_cancellation_is_not_a_trial_for_the_failure_metric(self):
+        table = node_table(self._mixed(10, 10, 20), workload="node-evaluation")
+        row = table["rows"][0]
+        assert row["bad"] == 10
+        assert row["trials"] == 20, row
+        assert row["rate"] == 0.5
+
+    def test_the_denominator_was_what_moved(self):
+        """The control that names the defect: the numerator was always right."""
+        with_cancels = node_table(self._mixed(10, 10, 20), workload="node-evaluation")["rows"][0]
+        without = node_table(self._mixed(10, 10, 0), workload="node-evaluation")["rows"][0]
+        assert with_cancels["bad"] == without["bad"] == 10
+        assert with_cancels["trials"] == without["trials"] == 20
+        assert with_cancels["rate"] == without["rate"]
+
+    def test_the_hang_metric_keeps_them_because_there_they_are_the_evidence(self):
+        """Not an inconsistency. A cancellation that held its allocation and
+        computed nothing IS a hang -- 340 of the 1,094 in a real history are -- and
+        dropping them would gut the metric that is the default."""
+        from slurmpast.diagnose import looks_like_noop
+
+        jobs = list(_placements("midway3-0100", 0, 10))
+        hung = [
+            jobs[0]._replace(
+                job_id="h%d" % index,
+                state="CANCELLED by 1",
+                exit_code=0,
+                steps=(),
+                total_cpu_alloc=0.1,
+            )
+            for index in range(10)
+        ]
+        assert all(looks_like_noop(j) for j in hung), "the fixture must actually hang"
+        table = node_table(jobs + hung, workload="node-evaluation", metric="hang", min_samples=5)
+        row = table["rows"][0]
+        assert row["trials"] == 20, "the hang metric counts every placement"
+        assert row["bad"] == 10, row
+
+    def test_a_cancellation_that_did_compute_still_counts_for_hangs(self):
+        """The other control on that: it ran, it did not hang, and that is
+        evidence too."""
+        jobs = list(_placements("midway3-0100", 0, 10))
+        cancelled = [
+            jobs[0]._replace(job_id="k%d" % index, state="CANCELLED by 1", exit_code=0)
+            for index in range(10)
+        ]
+        table = node_table(
+            jobs + cancelled, workload="node-evaluation", metric="hang", min_samples=5
+        )
+        assert table["rows"][0]["trials"] == 20

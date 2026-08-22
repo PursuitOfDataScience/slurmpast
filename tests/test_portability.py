@@ -2138,8 +2138,15 @@ class TestTheNoNodesSentinelIsNotANodeName:
 
         assert expand_nodelist("None assigned") == []
         assert expand_nodelist("") == []
-        jobs = [self._job("None assigned"), self._job("midway3-0602")]
-        table = node_table(jobs, workload=None, metric="failure", min_samples=1)
+        # The comparison job is FAILED, not CANCELLED: the failure metric censors
+        # cancellations from the denominator now, and a fixture of two cancelled
+        # jobs would produce an empty table for a reason that has nothing to do
+        # with the sentinel this class is about. The sentinel job stays CANCELLED,
+        # because that is what all 38 real ones are.
+        real = self._job("midway3-0602")._replace(state="FAILED", exit_code=1)
+        table = node_table(
+            [self._job("None assigned"), real], workload=None, metric="failure", min_samples=1
+        )
         assert [r["node"] for r in table["rows"]] == ["midway3-0602"]
 
 

@@ -264,6 +264,37 @@ def _bad(job):
     return job.failed
 
 
+def _informative(job, metric):
+    """Whether this placement says anything about the node, for ``metric``.
+
+    A cancellation is the case that differs. ``_bad`` has always excluded it from
+    the numerator -- "ambiguous" -- while it stayed in the denominator, which
+    scores it as a placement the node handled fine. That is not exclusion; it is
+    counting an unknown as a success, and it is the one thing this module does
+    that the rest of it argues against. `index` states the position:
+
+        "a cancelled run is neither [completed nor flagged] ... a deliberate kill
+        and an abandoned one are identical in accounting"
+
+    Everything else here works hard not to over-claim -- Fisher exact, a
+    Benjamini-Hochberg correction, Wilson intervals, MIN_SAMPLES -- and then padded
+    the denominator with rows it had itself called uninformative. On a real 90-day
+    history 7.3% of placements are cancellations, and censoring them moves 7 of 9
+    rows: midway3-0330 from 12.3% to 20.0%, midway3-0376 from 21.8% to 26.6%, and
+    two nodes below MIN_SAMPLES, which is the honest answer when the informative
+    sample really is that small.
+
+    **The hang metric keeps them, and that is not an inconsistency.** There a
+    cancellation is often the evidence itself: 340 of those 1,094 satisfy
+    `looks_like_noop`, a job that held its allocation and computed nothing until
+    someone killed it. Dropping those would throw away the primary signal for the
+    metric that is the default.
+    """
+    if metric == "hang":
+        return True
+    return not job.cancelled
+
+
 class Workload(str):
     """The stratum a node comparison holds fixed: one person's piece of work.
 
@@ -347,6 +378,8 @@ def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
 
     totals, hits = {}, {}
     for job in records:
+        if not _informative(job, metric):
+            continue
         flagged = predicate(job)
         for node in expand_nodelist(job.node_list):
             totals[node] = totals.get(node, 0) + 1
