@@ -1,5 +1,6 @@
 import pytest
 
+from slurmpast import duration
 from slurmpast.duration import (
     format_bytes,
     format_duration,
@@ -138,3 +139,53 @@ class TestFormatting:
     def test_zero_is_distinguishable_from_none(self):
         assert format_percent(0.0) == "0.0%"
         assert format_percent(None) == "n/a"
+
+
+class TestAValueThatIsNotANumberIsNotAMeasurement:
+    """`float("NaN")` and `float("1e999")` are floats Python builds happily.
+
+    This module's opening rule is that a sentinel must yield None, "never 0.0 --
+    a 0.0 here silently becomes 'this job used no time', which is a lie". A NaN is
+    the same lie told about every job at once, because it propagates: one record
+    whose Elapsed did not parse turned `gpu_hours_total` and `core_hours_total`
+    for a whole history into `nan`, destroying every OTHER job's figure, and then
+    raised ValueError out of `format_duration` on the job screen.
+
+    Found by fuzzing the parser, not by reading it.
+    """
+
+    NOT_NUMBERS = ["NaN", "nan", "inf", "Infinity", "-inf", "1e999", "-1e999", "1e400"]
+
+    @pytest.mark.parametrize("text", NOT_NUMBERS)
+    def test_no_parser_returns_one_or_raises(self, text):
+        for parse in (duration.parse_duration, duration.parse_bytes, duration.parse_cpu_freq):
+            assert parse(text) is None, "%s(%r)" % (parse.__name__, text)
+
+    @pytest.mark.parametrize("text", NOT_NUMBERS)
+    def test_the_int_reader_in_sacct_agrees(self, text):
+        """`int(float("inf"))` raises OverflowError, which is not a ValueError, so
+        `except ValueError` did not catch it and the whole query died."""
+        from slurmpast.sacct import _int
+
+        assert _int(text) is None
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_no_formatter_raises_or_prints_one(self, value):
+        assert duration.format_duration(value) == "n/a"
+        assert duration.format_bytes(value) == "n/a"
+        assert duration.format_percent(value) == "n/a"
+        assert duration.format_cpu_freq(value) == "n/a"
+        assert duration.format_mem_flag(value) is None
+
+    def test_real_values_are_untouched(self):
+        """The control: the guard must not reject anything finite, including the
+        zero and the negative that other rules here deliberately allow through."""
+        assert duration.parse_duration("01:52:49") == 6769.0
+        assert duration.parse_duration("00:00.539") == 0.539
+        assert duration.parse_duration("62-22:51:15") == 5439075.0
+        assert duration.parse_bytes("53741792K") == 53741792 * 1024
+        assert duration.parse_bytes("0") == 0
+        assert duration.parse_cpu_freq("3.10M") == 3.1e9
+        assert duration.format_duration(0.52) == "0.52s"
+        assert duration.format_bytes(0) == "0 B"
+        assert duration.format_percent(0.0) == "0.0%"

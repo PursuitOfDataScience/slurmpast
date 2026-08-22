@@ -13,8 +13,17 @@ any machine.
 that `assets/demo.gif` was *never committed at all*: README pointed at
 `raw.githubusercontent.com/.../assets/demo.gif` from the very first commit and
 that URL has always 404'd. A build step nobody can run is a build step that does
-not happen, so this one uses what a dev install already brings in — Textual to
-drive the app, `cairosvg` to rasterize, Pillow to assemble.
+not happen, so this one uses installable Python packages only — Textual to drive
+the app, `cairosvg` to rasterize, Pillow to assemble:
+
+    pip install -e ".[assets]"
+
+Those last two live in their own extra rather than in `dev`, because cairosvg pulls
+a native cairo and CI installs `[dev]` six times over without ever rendering a GIF.
+They were in NO extra at all for several rounds while this docstring claimed a dev
+install brought them in, so the command above failed with ModuleNotFoundError on
+exactly the clean checkout it is written for — the same shape of failure as the tape
+it replaced.
 
 The rasterizing step pins a locally-installed monospace face. Textual's SVG export
 names Fira Code and reaches for it over a CDN, which is not there offline; without
@@ -79,8 +88,17 @@ BEATS = [
 ]
 
 
+# Named once so both import sites report the same remedy, and reported rather than
+# raised: this file exists because a build step nobody can run does not happen, and
+# a bare ModuleNotFoundError does not tell a contributor what to install.
+_INSTALL_HINT = 'the GIF generator needs `pip install -e ".[assets]"` (%s is missing)'
+
+
 def _rasterize(svg: str) -> bytes:
-    import cairosvg
+    try:
+        import cairosvg
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise SystemExit(_INSTALL_HINT % "cairosvg") from exc
 
     # The @font-face block points at a CDN. Dropping it stops cairosvg trying to
     # fetch a font it cannot reach and silently falling back to a proportional one.
@@ -91,7 +109,10 @@ def _rasterize(svg: str) -> bytes:
 
 
 async def main() -> int:
-    from PIL import Image
+    try:
+        from PIL import Image
+    except ImportError as exc:  # pragma: no cover - depends on the environment
+        raise SystemExit(_INSTALL_HINT % "pillow") from exc
 
     from slurmpast.demo import DEMO_SITE, history
     from slurmpast.site import reset_cache, site

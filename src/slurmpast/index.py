@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterable, Sequence
 from typing import NamedTuple
 
 from .diagnose import looks_like_noop
+from .duration import plural
 from .model import Job
 from .patterns import find_memory_search, find_repeat_failures, goodput, group_key, usable
 
@@ -342,6 +343,19 @@ def filter_jobs(jobs: Iterable[Job], mode: str = "all", query: str = "") -> list
     return out
 
 
+# What the free-text search actually matches, per screen. Named so the box that
+# takes the query and the help that describes it are built from the same list
+# rather than from three separate guesses -- there were three, and none was right:
+# the placeholder promised "name, job id, state, node or date", the help said
+# "name, job id, state or node", and `filter_jobs` below matches partition too.
+#
+# The two lists genuinely differ, and that is the point. A group is a workload
+# rollup, so it has no single job id, state or node to match -- typing one on the
+# overview found nothing while the box invited it. See render.search_hint.
+GROUP_SEARCH_FIELDS: tuple[str, ...] = ("name", "partition", "date")
+JOB_SEARCH_FIELDS: tuple[str, ...] = ("name", "job id", "state", "partition", "node", "date")
+
+
 def filter_groups(
     groups: Iterable[GroupStats], mode: str = "all", query: str = ""
 ) -> list[GroupStats]:
@@ -499,9 +513,11 @@ class History:
         runs = sum(g.total for g in hidden)
         # "of the resource" matched nothing the reader had been told; the ordering
         # note above the table calls the same quantity "compute used".
-        return "%d more workloads (%d runs) holding %.1f%% of the compute" % (
+        return "%d more workload%s (%d run%s) holding %.1f%% of the compute" % (
             len(hidden),
+            "" if len(hidden) == 1 else "s",
             runs,
+            "" if runs == 1 else "s",
             100.0 * share,
         )
 
@@ -510,10 +526,19 @@ class History:
         stats = self.stats
         idle = self.idle_gpu_hours
         if idle is not None:
-            return "%.0f GPU-hours, %.0f of them in allocations that never computed" % (
+            # Guarded like the overview's twin: a history whose whole GPU spend
+            # rounds to one hour said "1 GPU-hours, 1 of them", and the pronoun
+            # refers back to the total rather than to the idle count.
+            return "%.0f %s, %.0f of %s in allocations that never computed" % (
                 idle[1],
+                plural(idle[1], "GPU-hour"),
                 idle[0],
+                "it" if round(idle[1]) == 1 else "them",
             )
         if stats["failed"]:
-            return "%d of %d jobs failed" % (stats["failed"], stats["jobs"])
-        return "%d jobs, nothing flagged" % stats["jobs"]
+            return "%d of %d job%s failed" % (
+                stats["failed"],
+                stats["jobs"],
+                "" if stats["jobs"] == 1 else "s",
+            )
+        return "%d job%s, nothing flagged" % (stats["jobs"], "" if stats["jobs"] == 1 else "s")

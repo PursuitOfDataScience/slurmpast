@@ -218,7 +218,7 @@ def _memory_rules(job, add):
             from .site import maxrss_caveat
 
             detail += (
-                " Note MaxRSS reports %s against a %s per-node limit -- above the hard limit, "
+                " Note MaxRSS reports %s against a %s per-node limit — above the hard limit, "
                 "which is impossible for a working set: %s. Do not size --mem from it."
                 % (format_bytes(rss), format_bytes(limit), maxrss_caveat())
             )
@@ -281,10 +281,32 @@ def _memory_rules(job, add):
     # "what does this message mean here?", fairly.
 
 
-# States whose own outcome already accounts for a near-zero CPU total, so that
-# "the allocation did nothing, find the blocking call" would be a second, wrong
-# story told on top of the right one. See _cpu_rules.
-_NOOP_ALREADY_EXPLAINED = frozenset(["OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED"])
+# States whose own outcome already accounts for a near-zero CPU total, so that any
+# reading of that total is a second, wrong story told on top of the right one.
+#
+# This governed one rule and needed to govern three. Suppressing the noop finding
+# alone did not remove the wrong advice -- it moved it: `_cpu_rules` returns only
+# on the branch that *fires*, so a NODE_FAIL fell straight through to
+# `cpu-overrequest` and got "Most allocated cores were idle. Try --cpus-per-task=1"
+# printed two findings above "a CPU or memory total near zero here is missing data,
+# not a measurement". `gpu-suspect-idle` infers from the same figure and did the
+# same. The guard now covers every rule that reads CPU utilization, which is what
+# the sentence above always meant.
+#
+# BOOT_FAIL and DEADLINE are here because they were in neither this set nor
+# `_exit_rules`: the node never came up, or the scheduler enforced --deadline, and
+# the only thing on screen was "Allocation did essentially nothing -- find the
+# blocking call". Both are counted by `Job.failed`, graded "crit" by
+# `theme.STATE_HEALTH` and queried by `--failed`; `diagnose` was the one module
+# that had never heard of them. Each now gets a finding of its own below, the same
+# way CANCELLED, NODE_FAIL and PREEMPTED do.
+#
+# CANCELLED is deliberately NOT here. Its own finding says the *outcome* is
+# ambiguous, not that the CPU total is unreadable, so a cancelled run that used one
+# of sixteen cores is still evidence about the request.
+_CPU_TIME_ALREADY_EXPLAINED = frozenset(
+    ["OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE"]
+)
 
 
 def _cpu_rules(job, add):
@@ -306,7 +328,12 @@ def _cpu_rules(job, add):
     #
     # Each of the three gets a finding of its own in _exit_rules that names what
     # actually happened. TIMEOUT is handled by the wholesale return above.
-    if looks_like_noop(job) and job.base_state not in _NOOP_ALREADY_EXPLAINED:
+    if job.base_state in _CPU_TIME_ALREADY_EXPLAINED:
+        # Every rule below reads the same CPU total, so the whole function stops
+        # here rather than only the noop branch. See the note on the set.
+        return
+
+    if looks_like_noop(job):
         add(
             Finding(
                 CRITICAL,
@@ -365,7 +392,7 @@ def _cpu_rules(job, add):
 # CRITICAL finding here made `slurmpast <jobid>` exit 1 on a run the tool had just
 # called not a failure -- asserting through the exit code what the palette
 # deliberately declines to assert in colour. Same suppression, same reason, as
-# _NOOP_ALREADY_EXPLAINED above.
+# _CPU_TIME_ALREADY_EXPLAINED above.
 _SIGKILL_ALREADY_EXPLAINED = frozenset(
     ["OUT_OF_MEMORY", "TIMEOUT", "CANCELLED", "PREEMPTED", "NODE_FAIL"]
 )
@@ -400,10 +427,42 @@ def _exit_rules(job, log_text, add):
                 "node-failed",
                 "The node failed under this job",
                 "Slurm ended this as NODE_FAIL, so the job did not choose to stop and its "
-                "last accounting sample may never have been taken -- a CPU or memory total "
+                "last accounting sample may never have been taken — a CPU or memory total "
                 "near zero here is missing data, not a measurement.",
                 "Not your code: resubmit. If one node keeps doing this, the nodes screen "
                 "tests whether it fails more than the rest.",
+            )
+        )
+
+    if state == "BOOT_FAIL":
+        add(
+            Finding(
+                WARNING,
+                "boot-failed",
+                "The node never came up for this job",
+                "Slurm ended this as BOOT_FAIL, so the allocation was made and the node "
+                "failed to boot into it. Nothing in the record is a measurement of your "
+                "work, because none of it ran.",
+                "Not your code: resubmit. If one node keeps doing this, the nodes screen "
+                "tests whether it fails more than the rest.",
+            )
+        )
+
+    if state == "DEADLINE":
+        add(
+            Finding(
+                # CRITICAL, like both TIMEOUT findings: the job was cut off by a
+                # limit before it finished, and `model.py` already groups the two
+                # ("DEADLINE belongs here for the same reason TIMEOUT does").
+                # BOOT_FAIL above is a WARNING, like NODE_FAIL, for the opposite
+                # reason -- nothing the submitter did caused it.
+                CRITICAL,
+                "deadline",
+                "Killed at its --deadline, not its time limit",
+                "Slurm ended this as DEADLINE: the wall-clock moment given by --deadline "
+                "arrived, which is a different limit from --time and is not extended by "
+                "raising it.",
+                "Move or drop --deadline, or submit earlier. A longer --time changes nothing here.",
             )
         )
 
@@ -448,15 +507,38 @@ def _exit_rules(job, log_text, add):
 
     if not lowered:
         if code not in (None, 0) and state == "FAILED":
+            # Whether a rule above has already named this exact status. 127 is the
+            # shell's "command not found" and 137 is 128+9, and each has a finding
+            # of its own a few lines up -- so the generic sentence below, which says
+            # the status names nothing, contradicted the finding directly above it
+            # in the same report:
+            #
+            #   [FAIL] A command in the script was not found (exit 127)
+            #   [WARN] An exit status does not name a cause: exit 127 is
+            #          indistinguishable from a CUDA OOM ...
+            #
+            # That is the same self-contradiction the note below records fixing
+            # *within* one finding, reappearing between two. The log is still worth
+            # asking for on these -- it says which command, and where -- so the
+            # finding stays and only its claim changes.
+            named_above = code in (127, 137) or signal == 9
             # Named for the code actually recorded. Hardcoding "Exit 1" put a
             # finding on screen whose title said "Exited 3" and whose evidence
             # discussed exit 1 -- self-contradictory in the same paragraph.
-            if code == 1:
+            if named_above:
+                title = "Exited %d, and no log to confirm it" % code
+                detail = (
+                    "The status is named above. What it does not say is which command "
+                    "produced it or how far the run got, and that is in the stderr text."
+                )
+            elif code == 1:
+                title = "Exited 1, but no log was found to explain it"
                 detail = (
                     "Exit 1 is the generic Python-exception status and is "
                     "indistinguishable from a CUDA OOM without the stderr text."
                 )
             else:
+                title = "Exited %d, but no log was found to explain it" % code
                 detail = (
                     "An exit status does not name a cause: exit %d is indistinguishable "
                     "from a CUDA OOM, a killed worker or a bad argument without the "
@@ -466,7 +548,7 @@ def _exit_rules(job, log_text, add):
                 Finding(
                     WARNING,
                     "exit-nonzero-nolog",
-                    "Exited %d, but no log was found to explain it" % code,
+                    title,
                     detail,
                     "Pass --log-dir, or set a predictable --error= path.",
                 )
@@ -479,7 +561,7 @@ def _exit_rules(job, log_text, add):
                 CRITICAL,
                 "cuda-oom",
                 "GPU ran out of memory",
-                "Device-side allocation failure in the log. This is NOT host memory -- "
+                "Device-side allocation failure in the log. This is NOT host memory — "
                 "raising --mem changes nothing.",
                 "Lower batch size, enable gradient checkpointing, or shard the model. "
                 "Consider a card with more HBM.",
@@ -493,7 +575,7 @@ def _exit_rules(job, log_text, add):
                 "Collective communication fault",
                 "NCCL markers in the log. A collective timeout is usually a symptom: one rank "
                 "diverged, died, or is slow, and the others block on it.",
-                "Compare ranks rather than trusting the reported rank -- the one that reports "
+                "Compare ranks rather than trusting the reported rank — the one that reports "
                 "the timeout is typically the victim, not the cause.",
             )
         )
@@ -503,7 +585,7 @@ def _exit_rules(job, log_text, add):
                 CRITICAL,
                 "import-error",
                 "Python could not import a dependency",
-                "Import failure in the log -- the environment differs from where it was tested.",
+                "Import failure in the log — the environment differs from where it was tested.",
                 "Pin the environment: record the conda env and a pip freeze hash with the run.",
             )
         )
@@ -536,6 +618,12 @@ def _gpu_rules(job, add):
         return
     if looks_like_noop(job):
         return
+    # `gpu-suspect-idle` below infers idleness from `cpu_utilization`, so it is
+    # subject to the same states that make that figure unreadable. The *measured*
+    # branch above it is not -- `gres/gpuutil` is sampled while the job runs and
+    # says what the cards actually did, however the run ended -- so this guard sits
+    # here rather than at the top.
+    cpu_readable = job.base_state not in _CPU_TIME_ALREADY_EXPLAINED
 
     # Where the site runs AutoDetect=nvml, Slurm gathered gres/gpuutil and there
     # is nothing to infer. Prefer the measurement over the proxy: the CPU-based
@@ -551,7 +639,7 @@ def _gpu_rules(job, add):
                     "%d GPU(s) held for %s at %s average utilization, as recorded by Slurm."
                     % (job.gpu_count, format_duration(job.elapsed), format_percent(measured)),
                     "This is a measurement, not an inference. Either the work is not on the "
-                    "device or the device is waiting on input -- check the dataloader before "
+                    "device or the device is waiting on input — check the dataloader before "
                     "asking for more cards.",
                 )
             )
@@ -563,14 +651,14 @@ def _gpu_rules(job, add):
                     "GPUs were only partly busy",
                     "%s average utilization across %d device(s) over %s."
                     % (format_percent(measured), job.gpu_count, format_duration(job.elapsed)),
-                    "Raise the work per step -- batch size, sequence length, or fewer "
-                    "grad-accumulation micro-steps -- until the card is the bottleneck.",
+                    "Raise the work per step — batch size, sequence length, or fewer "
+                    "grad-accumulation micro-steps — until the card is the bottleneck.",
                 )
             )
         return
 
     util = job.cpu_utilization
-    if util is None:
+    if util is None or not cpu_readable:
         return
     # A CUDA process must burn host CPU to launch kernels. Very low CPU with GPUs
     # held is a strong hint the GPUs were never driven -- but it is a hint, so
@@ -642,7 +730,7 @@ def _io_rules(job, add):
     rate = job.io_rate
     detail = "read %s, wrote %s" % (format_bytes(read), format_bytes(write))
     if rate:
-        detail += " -- %s/s sustained over %s" % (format_bytes(rate), format_duration(job.elapsed))
+        detail += " — %s/s sustained over %s" % (format_bytes(rate), format_duration(job.elapsed))
 
     if rate and rate >= IO_RATE_LOUD:
         add(

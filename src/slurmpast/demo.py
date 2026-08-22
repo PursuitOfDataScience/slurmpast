@@ -16,6 +16,8 @@ mistake a demo screenshot for a measurement.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from .sacct import parse
 
 # The synthetic cluster's own configuration, in `scontrol show config` form so it
@@ -49,6 +51,9 @@ FIRST_JOB_ID = 5100001
 # Minutes between consecutive synthetic submissions. 58 jobs at this spacing span
 # 00:00 to 12:35, so no series can run past midnight into the next day's records.
 _SUBMIT_SPACING_MINUTES = 13
+# What every synthetic job waited in the queue. Written into `Reserved` and used to
+# place `Submit` before `Start`, so the two agree on screen.
+_QUEUE_WAIT_SECONDS = 1
 
 
 def _time_of_day(jid):
@@ -97,7 +102,22 @@ def _job(
     min_cpu=None,
 ):
     gres = ",gres/gpu=%d" % gpus if gpus else ""
-    stamp = "2026-07-%02dT%s" % (min(day, 28), _time_of_day(jid))
+    started = datetime.fromisoformat("2026-07-%02dT%s" % (min(day, 28), _time_of_day(jid)))
+    stamp = started.isoformat()
+    # Submit one second before Start, because `Reserved` below says the job waited
+    # one second and a reader can subtract the two timestamps on screen. They were
+    # the same string, so the job screen showed "submitted 03:54:00, started
+    # 03:54:00, queued for 1.0s" -- three rows, two of which contradict the third.
+    submitted = (started - timedelta(seconds=_QUEUE_WAIT_SECONDS)).isoformat()
+    # End is Start plus Elapsed, which is the one thing it has to be. It was a flat
+    # "23:59:00" on the job's own day, so every one of the 58 synthetic jobs carried
+    # an End that its own ElapsedRaw contradicts -- job 5100019 read "started
+    # 2026-07-19T03:54:00, ended 2026-07-19T23:59:00" two rows under a TIME gauge
+    # saying it ran 00:30:26 of a 00:30:00 limit. Twenty hours on screen against
+    # thirty minutes, in a demo whose whole claim is that nobody should be able to
+    # mistake it for a measurement OR for something Slurm could not produce. It is
+    # also baked into `assets/screenshot-job.svg`, which the README shows.
+    ended = (started + timedelta(seconds=float(elapsed))).isoformat()
     alloc = _row(
         JobID=str(jid),
         JobName=name,
@@ -109,12 +129,12 @@ def _job(
         State=state,
         ExitCode=exit_code,
         Flags="SchedBackfill" if jid % 7 == 0 else "SchedMain",
-        Submit=stamp,
+        Submit=submitted,
         Start=stamp,
-        End="2026-07-%02dT23:59:00" % min(day, 28),
+        End=ended,
         ElapsedRaw=str(int(elapsed)),
         TimelimitRaw=str(limit_min),
-        Reserved="00:00:01",
+        Reserved="00:00:%02d" % _QUEUE_WAIT_SECONDS,
         ReqMem="0n",
         ReqCPUS=str(cpus),
         AllocTRES="billing=%d,cpu=%d%s,mem=%s,node=1" % (cpus, cpus, gres, mem),

@@ -16,7 +16,7 @@ import pytest
 
 pytest.importorskip("textual")
 
-from slurmpast import tui  # noqa: E402
+from slurmpast import render, tui  # noqa: E402
 from slurmpast.demo import history  # noqa: E402
 from slurmpast.index import History, sort_label  # noqa: E402
 
@@ -1106,3 +1106,704 @@ class TestCountsAreSpelledForTheirNumber:
         line = self._nodes_line(text)
         assert "1 node below" in line, line
         assert "1 nodes" not in line
+
+
+class TestEveryCountIsSpelledForItsNumber:
+    """The ten the class above missed.
+
+    `TestCountsAreSpelledForTheirNumber` pinned the two counts on the node screen
+    and stopped there, so the same `"" if n == 1 else "s"` idiom stayed missing
+    from nine other sentences across five modules -- every one of them reachable,
+    and each reproduced here by running the code that emits it rather than by
+    reading the format string.
+
+    Each case carries its control: the plural spelling has to be untouched, or a
+    fix that simply deleted the "s" would pass.
+    """
+
+    @staticmethod
+    def _job(jid, state, name="w", elapsed=3600.0, cpu=1e5, node="n1", tl=1800.0, mem="16G"):
+        from slurmpast.model import Job, Step
+
+        return Job(
+            job_id=str(jid),
+            name=name,
+            user="me",
+            partition="test",
+            state=state,
+            elapsed=elapsed,
+            timelimit=tl,
+            node_list=node,
+            alloc_tres="cpu=8,mem=" + mem,
+            nnodes=1,
+            ntasks=1,
+            alloc_cpus=8,
+            start="2026-07-01T0%d:00:00" % (jid % 10),
+            end="2026-07-01T09:00:00",
+            steps=(Step(step_id="%d.0" % jid, total_cpu=cpu, cpu_time=elapsed, max_rss=10**9),),
+        )
+
+    def _noop(self, jid, elapsed):
+        # Over NOOP_MIN_ELAPSED with under NOOP_CPU_SECONDS of CPU: an allocation
+        # that held resources and computed nothing.
+        return self._job(jid, "COMPLETED", elapsed=elapsed, cpu=0.5)
+
+    def test_one_idle_allocation_is_not_one_allocations(self):
+        from slurmpast.patterns import summarize
+
+        one = " ".join(f.evidence for f in summarize([self._noop(1, 4000.0)]))
+        assert "1 allocation ran over" in one, one
+        assert "1 allocations" not in one
+        two = " ".join(
+            f.evidence for f in summarize([self._noop(1, 4000.0), self._noop(2, 5000.0)])
+        )
+        assert "2 allocations ran over" in two, two
+
+    def test_one_quick_kill_is_not_one_were_killed(self):
+        from slurmpast.patterns import summarize
+
+        # One long idle allocation and one killed inside the 15-minute window.
+        jobs = [self._noop(1, 4000.0), self._noop(2, 800.0)]
+        one = " ".join(f.evidence for f in summarize(jobs))
+        assert "1 was killed within 15 minutes" in one, one
+        assert "1 were killed" not in one
+        assert "that one was already noticed" in one, one
+        two = " ".join(f.evidence for f in summarize(jobs + [self._noop(3, 700.0)]))
+        assert "2 were killed within 15 minutes" in two, two
+        assert "those were already noticed" in two
+
+    def test_a_dominant_state_of_one_is_not_one_were(self):
+        """Five failures across five distinct states leave every state on a count
+        of one, and the dominant one is still named."""
+        from slurmpast.patterns import find_repeat_failures
+
+        states = ["FAILED", "TIMEOUT", "OUT_OF_MEMORY", "NODE_FAIL", "BOOT_FAIL"]
+        spread = [self._job(i, s) for i, s in enumerate(states, start=1)]
+        text = " ".join(f.evidence for f in find_repeat_failures(spread))
+        assert "1 was " in text, text
+        assert "1 were " not in text
+        same = [self._job(i, "FAILED") for i in range(1, 6)]
+        assert "5 were FAILED" in " ".join(f.evidence for f in find_repeat_failures(same))
+
+    def test_one_hidden_repeat_group_is_not_one_groups(self):
+        from slurmpast.patterns import find_repeat_failures
+
+        jobs, jid = [], 100
+        for name in ("alpha", "beta", "gamma", "delta", "epsilon"):
+            for _ in range(5):
+                jid += 1
+                jobs.append(self._job(jid, "FAILED", name=name))
+        titles = " ".join(f.title for f in find_repeat_failures(jobs))
+        assert "1 further group shows" in titles, titles
+        assert "1 further groups" not in titles
+        # Control: two hidden groups keep the plural, and the verb agrees.
+        jobs += [self._job(jid + n, "FAILED", name="zeta") for n in range(1, 6)]
+        assert "2 further groups show" in " ".join(f.title for f in find_repeat_failures(jobs))
+
+    def test_one_computing_timeout_is_not_were_cut_off(self):
+        from slurmpast.sizing import walltime_advice
+
+        hung = [self._job(i, "TIMEOUT", elapsed=1800.0, cpu=0.5) for i in range(1, 5)]
+        one = walltime_advice([*hung, self._job(9, "TIMEOUT", elapsed=1800.0, cpu=1e4)])
+        assert "The other 1 did compute, and was cut off" in one.caution, one.caution
+        two = walltime_advice(
+            [
+                *hung,
+                self._job(9, "TIMEOUT", elapsed=1800.0, cpu=1e4),
+                self._job(10, "TIMEOUT", elapsed=1800.0, cpu=1e4),
+            ]
+        )
+        assert "The other 2 did compute, and were cut off" in two.caution, two.caution
+
+    def test_one_placement_is_not_one_placements(self):
+        from slurmpast.nodes import node_table
+        from slurmpast.render import nodes_baseline
+
+        one = nodes_baseline(node_table([self._job(1, "FAILED")]))
+        assert "over 1 placement;" in one, one
+        assert "1 placements" not in one
+        three = nodes_baseline(node_table([self._job(i, "FAILED") for i in range(1, 4)]))
+        assert "over 3 placements" in three, three
+
+    def test_one_node_below_the_threshold_reads_as_one(self):
+        from slurmpast.nodes import node_table
+        from slurmpast.render import nodes_empty_reason
+
+        table = node_table([self._job(1, "FAILED")])
+        one = nodes_empty_reason(table, "failure", None)
+        assert "1 seen, and it is below it" in one, one
+        assert "1 seen, all below it" not in one
+        two = node_table([self._job(1, "FAILED"), self._job(2, "FAILED", node="n2")])
+        assert "2 seen, all below it" in nodes_empty_reason(two, "failure", None)
+
+    def test_a_single_run_workload_is_not_one_runs(self):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_sizing
+
+        text = render_sizing(History([self._job(1, "OUT_OF_MEMORY")]), style=Style(enabled=False))
+        assert "· 1 run" in text, text
+        assert "· 1 runs" not in text
+        pair = History([self._job(1, "OUT_OF_MEMORY"), self._job(2, "OUT_OF_MEMORY")])
+        assert "· 2 runs" in render_sizing(pair, style=Style(enabled=False))
+
+    def test_the_headline_counts_one_job_as_one_job(self):
+        from slurmpast.index import History
+
+        assert History([self._job(1, "FAILED")]).headline() == "1 of 1 job failed"
+        assert History([self._job(1, "COMPLETED")]).headline() == "1 job, nothing flagged"
+        two = History([self._job(1, "FAILED"), self._job(2, "COMPLETED")])
+        assert two.headline() == "1 of 2 jobs failed"
+
+    def test_one_hidden_workload_is_not_one_workloads(self):
+        from slurmpast.index import History
+
+        pair = History(
+            [self._job(1, "COMPLETED", name="alpha"), self._job(2, "COMPLETED", name="beta")]
+        )
+        one = pair.tail_summary(shown=1)
+        assert one.startswith("1 more workload (1 run)"), one
+        assert "workloads" not in one
+        # The control. `gamma` runs twice so it sorts first and is the one shown;
+        # the two single-run workloads behind it are the tail.
+        trio = History(
+            [
+                self._job(1, "COMPLETED", name="alpha"),
+                self._job(2, "COMPLETED", name="beta"),
+                self._job(3, "COMPLETED", name="gamma"),
+                self._job(4, "COMPLETED", name="gamma"),
+            ]
+        )
+        assert trio.tail_summary(shown=1).startswith("2 more workloads (2 runs)")
+
+
+class TestALongValueIsCutTheSameWayOnBothSurfaces:
+    """`wrap` breaks at spaces, and a job name has none.
+
+    So the plain job screen's per-row budget did nothing for the one value most
+    likely to blow it: a 68-character name came out of the wrapper as one token and
+    the row went to 89 cells on an 80-column terminal. The dashboard had always
+    clipped it -- `JobScreen.cell` calls `_clip` for anything `render.PATH_ROWS`
+    does not declare a path -- so the two surfaces disagreed about the same row of
+    the same screen, and only the pasted one was wrong.
+    """
+
+    LONG = "nemotron-batch-h200-tokenize-shards-stage3-retry-17-experimental-arm"
+
+    def _job(self, name=None, work_dir=""):
+        from slurmpast.model import Job, Step
+
+        return Job(
+            job_id="1",
+            name=name or self.LONG,
+            user="me",
+            partition="test",
+            state="FAILED",
+            elapsed=3600.0,
+            timelimit=1800.0,
+            node_list="n1",
+            alloc_tres="cpu=8,mem=16G",
+            nnodes=1,
+            ntasks=1,
+            alloc_cpus=8,
+            work_dir=work_dir,
+            start="2026-07-01T01:00:00",
+            end="2026-07-01T02:00:00",
+            steps=(Step(step_id="1.0", total_cpu=1e4, cpu_time=3600.0, max_rss=10**9),),
+        )
+
+    @staticmethod
+    def _row(text, label):
+        return next(line for line in text.splitlines() if line.strip().startswith(label + " "))
+
+    def test_the_plain_name_row_fits_an_eighty_column_terminal(self, monkeypatch):
+        import shutil
+
+        from slurmpast.report import Style, render_job
+
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((80, 24)))
+        text, _ = render_job(self._job(), style=Style(enabled=False))
+        row = self._row(text, "name")
+        assert len(row.rstrip()) <= 80, "%d cells: %r" % (len(row.rstrip()), row)
+        assert "…" in row, "a cut cell has to say it was cut: %r" % row
+
+    def test_a_name_that_fits_is_untouched(self, monkeypatch):
+        """The control. Every ordinary name renders byte for byte as before."""
+        import shutil
+
+        from slurmpast.report import Style, render_job
+
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((80, 24)))
+        text, _ = render_job(self._job(name="cot-exp"), style=Style(enabled=False))
+        row = self._row(text, "name")
+        assert row.strip().endswith("cot-exp")
+        assert "…" not in row
+
+    def test_a_workdir_still_overruns_on_purpose(self, monkeypatch):
+        """`PATH_ROWS` keeps its exemption: "--plain exists to be pasted, and a path
+        you cannot copy whole is no use in a ticket"."""
+        import shutil
+
+        from slurmpast.render import PATH_ROWS
+        from slurmpast.report import Style, render_job
+
+        assert "workdir" in PATH_ROWS
+        deep = "/scratch/midway3/a-long-login/projects/very/deep/tree/goes/on/and/on/here"
+        monkeypatch.setattr(shutil, "get_terminal_size", lambda *a: os.terminal_size((80, 24)))
+        text, _ = render_job(self._job(work_dir=deep), style=Style(enabled=False))
+        row = self._row(text, "workdir")
+        assert deep in row, "the path must survive whole: %r" % row
+        assert "…" not in row
+
+    @pytest.mark.asyncio
+    async def test_the_dashboard_cuts_it_the_same_way(self):
+        job = self._job()
+        app = make_app([job], no_logs=True)
+        async with app.run_test(size=(80, 44)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(job))
+            await pilot.pause()
+            body = "\n".join(
+                "".join(segment.text for segment in strip)
+                for strip in app.screen._compositor.render_strips()
+            )
+        assert self.LONG not in body, "the dashboard should have cut it"
+        assert "…" in body
+        assert not [line for line in body.splitlines() if len(line.rstrip()) > 80]
+
+
+class TestAGaugedDetailRowIsDrawnOnBothSurfaces:
+    """`job_sections` gives a detail row three values -- label, value, gauge -- and
+    the plain renderer read the first two and stopped.
+
+    `row[2]` was consumed nowhere in `report.py`, so `slowest task` came out as a
+    bar in the app and a bare percentage in a paste:
+
+        dashboard : slowest task   ███████████▎░░  80.0% below average (task 3 …)
+        --plain   : slowest task   80.0% below average (task 3 …)
+
+    `pair_rows` already gives a gauged row a line of its own -- "rows which carry a
+    gauge still take a line to themselves" -- so the plain layout was reserving the
+    room for a bar it then declined to draw. Exactly one row type carries a gauge
+    and the demo has exactly one job that exercises it, which is why three rounds
+    of width and drift sweeps went past it: round six's "the demo's own values are
+    short", in its narrowest form yet.
+    """
+
+    JOB_ID = "5100056"  # the one multi-task run in the synthetic history
+
+    @staticmethod
+    def _row(text, label="slowest task"):
+        matches = [ln for ln in text.splitlines() if label in ln and "consumed" not in ln]
+        assert matches, "no %r row in:\n%s" % (label, text)
+        return matches[0]
+
+    def _job(self):
+        return next(j for j in history() if j.job_id == self.JOB_ID)
+
+    def test_the_fixture_still_has_a_gauged_detail_row(self):
+        """If the demo ever loses its multi-task job this whole class goes vacuous,
+        so it says so rather than passing quietly."""
+        gauged = [
+            (title, row[0])
+            for title, rows in render.job_sections(self._job(), summarized=True)
+            for row in rows
+            if row[2] is not None
+        ]
+        assert gauged, "no detail row carries a gauge any more"
+
+    def test_the_plain_report_draws_it(self):
+        from slurmpast.report import Style, render_job
+
+        text, _ = render_job(self._job(), style=Style(enabled=False), no_logs=True)
+        row = self._row(text)
+        assert "█" in row, row
+        assert "80.0% below average" in row
+
+    @pytest.mark.asyncio
+    async def test_the_dashboard_draws_the_same_width_of_bar(self):
+        job = self._job()
+        app = make_app([job], no_logs=True)
+        async with app.run_test(size=(150, 60)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(job))
+            await pilot.pause()
+            await pilot.pause()
+            dash = "\n".join(
+                "".join(seg.text for seg in strip)
+                for strip in app.screen._compositor.render_strips()
+            )
+        from slurmpast.report import Style, render_job
+
+        plain, _ = render_job(job, style=Style(enabled=False), no_logs=True)
+
+        def bar_cells(line):
+            return sum(1 for ch in line if ch in "█░▏▎▍▌▋▊▉")
+
+        assert bar_cells(self._row(dash)) == render.DETAIL_BAR_WIDTH
+        assert bar_cells(self._row(plain)) == render.DETAIL_BAR_WIDTH
+
+    def test_ascii_mode_reaches_this_bar_too(self):
+        """A bar is the thing `--ascii` was built for, and the first version of this
+        fix left the argument off -- putting block glyphs back into output that had
+        just been made pure ASCII."""
+        from slurmpast.report import Style, render_job
+
+        text, _ = render_job(self._job(), style=Style(enabled=False), no_logs=True, ascii_mode=True)
+        row = self._row(text)
+        assert "#" in row, row
+        assert not any(ord(ch) > 127 for ch in text)
+
+    def test_an_ungauged_row_gains_no_bar(self):
+        """The control: only the row that carries a gauge gets one."""
+        from slurmpast.report import Style, render_job
+
+        text, _ = render_job(self._job(), style=Style(enabled=False), no_logs=True)
+        assert "█" not in self._row(text, "peak on")
+
+
+class TestTheDashboardWrapsEveryLineOfAFinding:
+    """The title was the one line of the three that nothing wrapped.
+
+    `report` learned to wrap it -- "A title is a sentence ... and this was the one
+    line of the three going out at whatever length it happened to be" -- and the
+    dashboard did not, so Textual soft-wrapped it and dropped the tail to column 1,
+    out from under the tag that introduces it:
+
+           WARN  Peak memory reads above the limit, yet nothing was
+         OOM-killed
+                 32.5 GiB against a 32.0 GiB per-node limit, so it is not ...
+
+    `TestTheDashboardWrapsToTheTerminalItIsOn` above measures the same widget and
+    was green throughout, because it opens `cot-exp`, whose longest finding title
+    is 47 cells. The one that breaks is 61, and it is on the OOM jobs.
+    """
+
+    # 61 cells, the longest title `diagnose` produces, and 8 cells of chrome in
+    # front of it -- so it needs a 69-cell screen to fit on one line.
+    LONG_TITLE = "Peak memory reads above the limit, yet nothing was OOM-killed"
+
+    @staticmethod
+    def _body_spy(monkeypatch, seen):
+        from textual.widgets import Static
+
+        original = Static.update
+
+        def spy(self, renderable="", *args, **kwargs):
+            if getattr(self, "id", None) == "body":
+                seen["body"] = getattr(renderable, "plain", str(renderable))
+            return original(self, renderable, *args, **kwargs)
+
+        monkeypatch.setattr(Static, "update", spy)
+
+    def _jobs_with_a_long_title(self):
+        from slurmpast.diagnose import diagnose
+
+        jobs = [
+            job
+            for job in history()
+            if any(f.title == self.LONG_TITLE for f in diagnose(job).findings)
+        ]
+        assert jobs, "the demo no longer produces the %d-cell title" % len(self.LONG_TITLE)
+        return jobs
+
+    def test_the_fixture_still_carries_the_long_title(self):
+        """If `diagnose` ever shortens it this class goes vacuous, so it says so."""
+        assert len(self.LONG_TITLE) == 61
+        self._jobs_with_a_long_title()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("width", [60, 68, 74, 100])
+    async def test_no_line_of_the_job_screen_overruns(self, width, monkeypatch):
+        seen = {}
+        self._body_spy(monkeypatch, seen)
+        job = self._jobs_with_a_long_title()[0]
+        app = make_app([job], no_logs=True)
+        async with app.run_test(size=(width, 60)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(job))
+            await pilot.pause()
+            await pilot.pause()
+        over = [ln for ln in seen["body"].splitlines() if len(ln) > width]
+        assert not over, "%d cells on a %d-cell screen: %r" % (
+            max(len(ln) for ln in over),
+            width,
+            over[0],
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_wrapped_title_hangs_under_itself(self, monkeypatch):
+        """The point of wrapping it here rather than leaving it to Textual: a soft
+        wrap restarts at column 0, which is what took the block apart."""
+        seen = {}
+        self._body_spy(monkeypatch, seen)
+        job = self._jobs_with_a_long_title()[0]
+        app = make_app([job], no_logs=True)
+        async with app.run_test(size=(60, 60)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(job))
+            await pilot.pause()
+            await pilot.pause()
+        lines = seen["body"].splitlines()
+        head = next(i for i, ln in enumerate(lines) if "Peak memory reads" in ln)
+        tail = lines[head + 1]
+        assert "OOM-killed" in tail, tail
+        # Under the title, not under the tag and not at column 0.
+        assert tail.startswith(" " * tui._FINDING_TITLE_INDENT), repr(tail)
+        assert tail[tui._FINDING_TITLE_INDENT] != " ", repr(tail)
+
+    @pytest.mark.asyncio
+    async def test_a_wide_screen_still_gets_it_on_one_line(self):
+        """The control. Wrapping must not break a title that already fitted."""
+        job = self._jobs_with_a_long_title()[0]
+        app = make_app([job], no_logs=True)
+        async with app.run_test(size=(120, 60)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(job))
+            await pilot.pause()
+            await pilot.pause()
+            text = "\n".join(
+                "".join(seg.text for seg in strip)
+                for strip in app.screen._compositor.render_strips()
+            )
+        assert self.LONG_TITLE in text
+
+
+class TestAGaugedRowCountsItsOwnBar:
+    """The dashboard's budget for a detail value was
+    ``4 + PAIR_LABEL_WIDTH + 1`` -- the indent and the label column.
+
+    The row then drew a 14-cell bar and a 2-cell gap in front of the value, and
+    those 16 cells were in no sum anywhere, so a gauged row went 16 past the edge
+    and Textual dropped the tail to column 1. At 80 columns, not merely a narrow
+    one:
+
+        slowest task     ███████████▎░░  80.0% below average (task 3 on
+    midway3-0372)
+
+    The same row under `--plain` had counted the bar since round five ("Continuation
+    hangs past the bar as well as the label"). Both go through
+    `render.pair_value_budget` now.
+    """
+
+    JOB_ID = "5100056"  # the one multi-task run: the only gauged detail row
+
+    def _job(self):
+        return next(j for j in history() if j.job_id == self.JOB_ID)
+
+    def test_the_budget_subtracts_the_bar(self):
+        without = render.pair_value_budget(100, 0)
+        with_bar = render.pair_value_budget(100, render.DETAIL_BAR_WIDTH + render.DETAIL_BAR_GAP)
+        assert without - with_bar == render.DETAIL_BAR_WIDTH + render.DETAIL_BAR_GAP
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("width", [68, 74, 80, 100])
+    async def test_the_gauged_row_fits(self, width, monkeypatch):
+        from textual.widgets import Static
+
+        seen = {}
+        original = Static.update
+
+        def spy(self, renderable="", *args, **kwargs):
+            if getattr(self, "id", None) == "body":
+                seen["body"] = getattr(renderable, "plain", str(renderable))
+            return original(self, renderable, *args, **kwargs)
+
+        monkeypatch.setattr(Static, "update", spy)
+        job = self._job()
+        app = make_app([job], no_logs=True)
+        async with app.run_test(size=(width, 60)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(job))
+            await pilot.pause()
+            await pilot.pause()
+        rows = [ln for ln in seen["body"].splitlines() if "slowest task" in ln]
+        assert rows, seen["body"]
+        assert len(rows[0]) <= width, "%d cells on a %d-cell screen: %r" % (
+            len(rows[0]),
+            width,
+            rows[0],
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_node_name_survives_rather_than_being_cut(self, monkeypatch):
+        """Fitting it by clipping would be no fix: which task on which node is the
+        entire content of the row. It wraps, and hangs past the bar -- the shape
+        `--plain` has always drawn."""
+        from textual.widgets import Static
+
+        seen = {}
+        original = Static.update
+
+        def spy(self, renderable="", *args, **kwargs):
+            if getattr(self, "id", None) == "body":
+                seen["body"] = getattr(renderable, "plain", str(renderable))
+            return original(self, renderable, *args, **kwargs)
+
+        monkeypatch.setattr(Static, "update", spy)
+        job = self._job()
+        app = make_app([job], no_logs=True)
+        async with app.run_test(size=(74, 60)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(job))
+            await pilot.pause()
+            await pilot.pause()
+        lines = seen["body"].splitlines()
+        index = next(i for i, ln in enumerate(lines) if "slowest task" in ln)
+        block = lines[index] + lines[index + 1].strip()
+        assert "midway3-0372" in block, lines[index : index + 2]
+        hang = 4 + render.PAIR_LABEL_WIDTH + 1 + render.DETAIL_BAR_WIDTH + render.DETAIL_BAR_GAP
+        assert lines[index + 1].startswith(" " * hang), repr(lines[index + 1])
+        assert lines[index + 1][hang] != " ", repr(lines[index + 1])
+
+    @pytest.mark.asyncio
+    async def test_a_sentence_value_keeps_its_second_half(self, monkeypatch):
+        """The same budget clipped rather than wrapped, so the row that explains
+        why a GPU figure is missing lost the half naming the fix:
+
+            utilization  not gathered by this cluster (needs AutoDetect=nvml in g…
+
+        `--plain` wrapped it and kept `gres.conf`.
+        """
+        from textual.widgets import Static
+
+        seen = {}
+        original = Static.update
+
+        def spy(self, renderable="", *args, **kwargs):
+            if getattr(self, "id", None) == "body":
+                seen["body"] = getattr(renderable, "plain", str(renderable))
+            return original(self, renderable, *args, **kwargs)
+
+        monkeypatch.setattr(Static, "update", spy)
+        job = self._job()
+        app = make_app([job], no_logs=True)
+        async with app.run_test(size=(80, 60)) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(job))
+            await pilot.pause()
+            await pilot.pause()
+        body = seen["body"]
+        assert "gres.conf" in body, body
+        assert "…" not in body.split("utilization")[1].splitlines()[0]
+
+
+class TestTheSizingCaveatReachesEverySurface:
+    """`Advice.caution` is commented "what would make this advice wrong".
+
+    `--sizing` has printed it since it was added and `--sizing --json` carries it
+    in `_asdict()`. `WorkloadScreen` never read the field at all, so the dashboard
+    was the one surface of three handing over a directive with the caveat removed
+    -- six of the demo's ten actionable lines have one:
+
+        --mem=3G           MaxRSS sums RSS across the process tree ... upper bound
+        --cpus-per-task=2  This is a GPU workload: cores may be there to feed
+                           dataloader workers, and cutting them can starve the GPU
+
+    The second is the one that matters: the app told you to cut a GPU job from six
+    cores to two and dropped the sentence saying that can starve the card.
+
+    Not solved by pointing at `slurmpast --sizing for why` -- this block already
+    rejected that once, in its own comment: "a bare number with no basis, and for
+    the reason a different command in a different program. The reason belongs
+    where the number is."
+    """
+
+    @staticmethod
+    def _cautioned():
+        """(group, advice) pairs the dashboard shows that carry a caveat."""
+        from slurmpast.sizing import recommend
+
+        h = History(history())
+        out = []
+        for group in h.groups:
+            for advice in recommend(group.jobs):
+                if advice.actionable and advice.caution:
+                    out.append((group, advice))
+        assert out, "the demo no longer produces a cautioned recommendation"
+        return out
+
+    def test_the_fixture_still_has_the_gpu_core_caveat(self):
+        """The sharpest instance, named so it cannot quietly leave the fixture."""
+        cautions = [a.caution for _, a in self._cautioned()]
+        assert any("starve the GPU" in c for c in cautions), cautions
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("width", [60, 74, 100, 140])
+    async def test_the_workload_banner_carries_it(self, width, monkeypatch):
+        from textual.widgets import Static
+
+        seen = {}
+        original = Static.update
+
+        def spy(self, renderable="", *args, **kwargs):
+            if getattr(self, "id", None) == "summary":
+                seen["summary"] = getattr(renderable, "plain", str(renderable))
+            return original(self, renderable, *args, **kwargs)
+
+        monkeypatch.setattr(Static, "update", spy)
+        group, advice = self._cautioned()[0]
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(width, 44)) as pilot:
+            await pilot.pause()
+            index = [g.label for g in app.screen._rows].index(group.label) + 1
+            await pilot.press(str(index))
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+        banner = seen["summary"]
+        assert advice.suggestion in banner, banner
+        # Wrapped, so match on words rather than on the whole sentence.
+        head = advice.caution.split()[0:4]
+        assert " ".join(head) in " ".join(banner.split()), banner
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("width", [60, 70, 74, 80, 100, 140])
+    async def test_it_does_not_overrun_the_screen(self, width, monkeypatch):
+        """The caveat is three lines of prose landing in a banner that had none, at
+        an indent of 32. Held to the same rule as everything else on the screen."""
+        from textual.widgets import Static
+
+        seen = {}
+        original = Static.update
+
+        def spy(self, renderable="", *args, **kwargs):
+            if getattr(self, "id", None) == "summary":
+                seen["summary"] = getattr(renderable, "plain", str(renderable))
+            return original(self, renderable, *args, **kwargs)
+
+        monkeypatch.setattr(Static, "update", spy)
+        group, _ = self._cautioned()[0]
+        app = make_app(history(), no_logs=True)
+        async with app.run_test(size=(width, 44)) as pilot:
+            await pilot.pause()
+            index = [g.label for g in app.screen._rows].index(group.label) + 1
+            await pilot.press(str(index))
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+        over = [ln for ln in seen["summary"].splitlines() if len(ln) > width]
+        assert not over, "%d cells on a %d-cell screen: %r" % (
+            max(len(ln) for ln in over),
+            width,
+            over[0],
+        )
+
+    def test_the_plain_view_still_has_it_and_uses_the_shared_mark(self):
+        """The control, and the drift guard: one marker, both surfaces."""
+        from slurmpast.report import Style, render_sizing
+
+        text = render_sizing(History(history()), style=Style(enabled=False))
+        _, advice = self._cautioned()[0]
+        assert ("        %s" % render.CAUTION_MARK) in text
+        assert advice.caution.split(".")[0][:40] in " ".join(text.split())
+
+    def test_json_has_carried_it_all_along(self):
+        """The third surface, asserted so the pair above is a trio rather than a
+        coincidence."""
+        from slurmpast.sizing import recommend
+
+        h = History(history())
+        payloads = [a._asdict() for g in h.groups for a in recommend(g.jobs)]
+        assert any(p["caution"] for p in payloads), payloads[:2]

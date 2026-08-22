@@ -1,5 +1,196 @@
 # slurmpast — audit and resolution
 
+> **Round twenty, 2026-08-21, continuing the same request. No defects.** The first
+> round of the streak to find nothing, from two angles chosen because neither had
+> been tried and both cover ground everything else depends on. 1471 tests before,
+> **1473 after** -- the two are the property tests this round wrote for what it
+> checked by hand.
+>
+> **`fit_columns`, over 40,000 generated specs.** Every table on every surface goes
+> through it, and it was pinned only by the four specs this codebase happens to
+> declare. Its docstring makes six promises; all six hold at generated widths,
+> paddings, content caps and `fill_to` values. The generator is checked for
+> vacuity, because a green fuzz whose assertions never ran is worth nothing:
+> 9,737 trials dropped a column, 22,308 grew a flex column, 14,987 could reach
+> `fill_to` and 4,377 hit the floor case where the table legitimately cannot fit.
+>
+> **Every reproduction from rounds fourteen to nineteen, re-run.** 34 of them,
+> driven the way each was first observed rather than through the tests written
+> afterwards -- round six's method, applied to six rounds instead of one. None
+> still reproduces.
+
+> **Round nineteen, 2026-08-21, continuing the same request.** One defect, and it
+> is the fifth instance of this repo's named failure mode: a fix applied to one of
+> the two modules that make the claim. 1438 tests before, **1471 after**; all four
+> gates clean.
+>
+> Round eighteen asked whether two findings on one job contradict each other. This
+> round asked it one level up -- whether a **cross-run** finding contradicts the
+> **per-job** finding it sits above on the workload screen -- and then whether
+> `sizing`'s numbers are right at all.
+>
+> `sizing` came back clean, and the way it came back clean is worth as much as the
+> defect: 569 actionable suggestions over 400 generated workloads with a planted
+> peak, and not one lands below what the workload was measured to need. That
+> invariant is the module's whole reason for existing and nothing had ever asserted
+> it; it is a property test now.
+
+> **Round eighteen, 2026-08-21, continuing the same request.** Four defects, from
+> the first angle none of the previous rounds used: not *does a view survive its
+> input* but **does one finding contradict the finding printed above it**.
+> 1411 tests before, **1438 after**; all four gates clean.
+>
+> Found by enumerating every finding set `diagnose` can produce over 12,000
+> synthetic jobs built from (state, exit code, signal) triples sacct actually
+> records, then reading the pairs. 267 distinct finding sets, 69 distinct pairs,
+> four of them saying opposite things about the same job.
+>
+> The statistics were the round's other target and came back clean: Fisher exact
+> agrees with scipy to 8e-13 over 5,986 comparisons, Wilson with statsmodels to
+> 9e-06 over 20,099 intervals (the gap is z=1.96 against the exact quantile,
+> invisible at one decimal), and Benjamini-Hochberg exactly over 3,000 random
+> families.
+
+> **Round seventeen, 2026-08-21, continuing the same request.** One defect, in the
+> two screens a reader spends all their time in, and reachable by pressing one key.
+> 1396 tests before, **1411 after**; all four gates clean.
+>
+> Round sixteen fixed an empty grid on the node screen. This round asked the
+> obvious next question -- *what do the other tables do when they have no rows?* --
+> and the answer was worse, because theirs needs no unusual history at all: filter
+> to `failed` on a week that went well, or mistype a search.
+>
+> The rest of the round is negative: every plain renderer and every screen was
+> driven through eleven degenerate histories (empty, one job, no name, no node, no
+> timestamps, no TRES, every field blank) at 90 columns. No crash, no overrun, one
+> finding. Recorded so the next round starts somewhere else.
+
+> **Round sixteen, 2026-08-21, continuing the same request.** Three defects, all
+> found by driving the app with a *small* history rather than the 58-job demo.
+> 1375 tests before, **1396 after**; all four gates clean.
+>
+> The demo is why they survived sixteen rounds: it has 58 jobs, eight workloads and
+> a node that eats them, so no count in it is ever 1 and no view of it is ever
+> empty. Every reproduction below is a history of one or five jobs -- which is what
+> a first-time user has, and what `--demo <jobid>` shows them.
+>
+> `logs.py` was the other half of this round and produced nothing: twelve documented
+> behaviours driven against a real filesystem, all twelve correct. Recorded so the
+> next round does not re-run them.
+
+> **Round fifteen, 2026-08-21, continuing the same request.** Three defects and a
+> test that could not have caught any of them. 1357 tests before, **1375 after**;
+> all four gates clean, assets regenerated.
+>
+> Round fourteen swept the two *rendering* surfaces against each other. This one
+> adds the third -- `--json` -- and asks a different question of all three: not "do
+> they word it the same" but **"does each of them carry the same warnings"**. The
+> answer was no, and the worst case is the dashboard telling you to cut a GPU job
+> from six cores to two with the sentence "cutting them can starve the GPU" removed.
+
+> **Round fourteen, 2026-08-21, continuing the same request.** Seven defects, all
+> of them the dashboard doing on its own what `render.py` exists to do for both
+> surfaces -- plus a key that answered on four screens out of six. 1314 tests
+> before, **1357 after**; all four gates clean, assets regenerated.
+>
+> `CLAUDE.md` says "`render.py` exists so the dashboard and `--plain` cannot
+> drift", and round seven enforced that for whole sentences. This round is what the
+> sentence-level sweep cannot see: the *fragments* under its 25-character floor and
+> the *arithmetic* neither file shares. Two of four fragments had already come
+> apart, and one of them had quietly disabled `--ascii` on the glyph it points at.
+
+> **Round thirteen, 2026-08-21, continuing the same request.** One defect: the
+> search box invited three things the landing screen cannot match, so typing any of
+> them returned an empty list. 1308 tests before, **1314 after**; all four gates
+> clean.
+>
+> Same root cause as most of this streak -- one feature described in three places
+> and behaving like none of them -- but reached from a new direction: comparing a
+> promise the UI makes against what the code behind it actually does.
+
+> **Round twelve, 2026-08-21, continuing the same request.** One defect, in the
+> build tooling rather than the app: the GIF generator declared none of the packages
+> it imports, while its own docstring claimed a dev install brought them in. 1304
+> tests before, **1308 after**; all four gates clean.
+>
+> Mostly negative results again, and four of them are structural checks worth not
+> repeating: `compress_nodelist` is a clean inverse of `expand_nodelist` over 4,000
+> fuzzed hostlists, the job-LIST table agrees cell for cell across both surfaces,
+> and every value `goodput()` and `node_table()` compute is reachable -- two that
+> looked dead turned out to be surfaced wholesale by `--json`.
+
+> **Round eleven, 2026-08-21, continuing the same request.** One defect, and it is
+> the third instance of the same root cause -- a value `render.py` supplies that only
+> one of the two front ends consumes. 1299 tests before, **1304 after**; all four
+> gates clean, assets regenerated.
+>
+> The round is mostly negative results, and they are worth as much: the dashboard
+> survived 2,400 random keypresses across sixty sessions without a crash, the layout
+> engine holds its contract at every width from 10 to 260 cells, and a field-by-field
+> diff of the job post-mortem across both surfaces on seven jobs found exactly the
+> one disagreement below. Those are recorded so the next round does not re-run them.
+>
+> Round eight's `--ascii` test caught a regression in this round's own fix on its
+> first run, which is the best argument for it that could be made.
+
+> **Round ten, 2026-08-21, continuing the same request.** Four defects, found by
+> fuzzing the parser rather than reading it and by cross-checking the three surfaces
+> against each other. 1269 tests before, **1299 after**; `ruff`, `ruff format` and
+> `mypy` clean at both ends.
+>
+> The first is the worst thing found across these four rounds: a single record whose
+> `Elapsed` did not parse turned the GPU-hour and core-hour totals for an entire
+> history into `nan` -- destroying every *other* job's figure -- and then raised
+> `ValueError` out of the job screen. The second is this suite's named failure mode
+> caught in the act: a test called `test_one_job_is_not_reported_as_one_jobs` has
+> been green for rounds while the landing screen said "1 jobs in 1 workload",
+> because it navigates away from that screen before it looks.
+
+> **Round nine, 2026-08-21, continuing the same request.** Into the two modules the
+> previous two rounds never opened: `demo.py` and the state table in `sacct.py`.
+> Three defects, one of them visible in the README's own lead image. 1260 tests
+> before, **1269 after**; `ruff`, `ruff format` and `mypy` clean at both ends, and
+> the committed assets regenerated.
+>
+> The demo one is the round's lesson. Every one of the 58 synthetic jobs carried an
+> `End` that its own `Elapsed` contradicts -- twenty hours on screen against thirty
+> minutes, two rows apart -- and the whole suite passed, because nothing had ever
+> asserted the demo's clock agrees with itself. Round five caught the sibling of it
+> in `_time_of_day` and did not look at `End`. That is this suite's named failure
+> mode, "tests that assert less than they appear to", in the fixture the screenshots
+> and the GIF are cut from.
+
+> **Round eight, 2026-08-21, from the round-seven tree.** A second pass over the
+> same request, into the parts round seven did not reach. Four defects, all of them
+> a flag or a screen that half-works. 1221 tests before, **1260 after**; `ruff`,
+> `ruff format` and `mypy` clean at both ends.
+>
+> Two are the same shape round seven found, in places it did not look: `--ascii` was
+> accepted and discarded by five of the six plain views, and `HelpScreen` was the one
+> surface rounds five, six and seven all skipped when they wrapped the prose -- so
+> the screen whose job is explaining the app was the last one still breaking its own
+> layout. The third is a cross-surface disagreement of exactly round seven's kind,
+> found by driving both front ends with a job name long enough to matter.
+
+> **Round seven, 2026-08-21, from `b178312`.** Asked to evaluate the codebase and
+> fix what it found, with the app and the UI working and no major changes wanted --
+> so: polish. Thirteen defects, no new features, no behaviour moved. All four gates
+> were run for real, before and after: 1195 tests before, **1221 after**, `ruff`,
+> `ruff format` and `mypy` clean at both ends.
+>
+> The theme is one rule of this repo's own that had gone unenforced. `CLAUDE.md`
+> says "`render.py` exists so the dashboard and `--plain` cannot drift"; seven
+> sentences were still written out in both front ends, and one pair had already come
+> apart -- `--plain` ended the exclude disclaimer at "trades availability for
+> reliability." while the dashboard went on ", and that is your call.". Nothing on
+> either screen could show a reader that, because only one of the two is ever on
+> screen at a time. The other twelve are what a sweep for the same shape turned up:
+> nine unguarded singular/plurals, two guessed wrap widths in the module whose own
+> docstring says not to guess them, and a version boundary the code states carefully
+> in two places and contradicts in three.
+>
+> Every one was reproduced by running the code, and each fix ships with its control.
+
 > **Round six, 2026-08-05, from `4f12dc1`.** Filed as issue #5. Round five's ten
 > defects, its documentation set and all six of its minor items re-verified as
 > genuinely fixed — by running each reproduction again, not by reading the entries
@@ -36,6 +227,1740 @@
 > upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
 > was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
 > and its control. `ruff`, `ruff format` and `mypy` clean.
+
+---
+
+## Round twenty — the layout engine, and six rounds re-verified
+
+Nothing found. Both halves are recorded in full, because a round that finds nothing
+is only worth anything if the next one can tell what it actually looked at.
+
+### The layout engine, as a property
+
+`render.fit_columns` chooses which columns fit and how wide each gets. Four specs
+in this codebase use it (`OVERVIEW_COLUMNS`, `JOB_COLUMNS`, `STEP_COLUMNS`,
+`NODE_COLUMNS`) and those four were the whole of its coverage -- every width test
+in the suite asserts about a *rendered view*, so the arithmetic was pinned by
+example rather than by rule. Its docstring makes six promises. Over 40,000
+generated specs:
+
+```
+a column is never narrower than its own header          holds
+labels come back in display order, as a subsequence     holds
+drop=0 is never dropped; lowest drop number goes first  holds
+the table fits, or every survivor is undroppable        holds
+fill_to is landed on exactly, or was already exceeded   holds
+with no fill_to, a fixed column never grows             holds
+```
+
+The fourth is the `table_floor` case and the fifth needed care: 4,438 trials ended
+wider than `fill_to`, which is correct -- `fill_to` spreads spare cells and never
+shrinks -- and separating those from a real underfill is the whole difficulty of
+asserting it. There were no real underfills.
+
+### Six rounds re-verified against their own reproductions
+
+Round six re-verified round five "by running each reproduction again, not by
+reading the entries". Six rounds have now accumulated, and their tests could all
+be green while the behaviour regressed underneath a shared helper. So all 34 were
+re-run from a script that knows nothing about the test suite:
+
+```
+round 14   ? opens the help on all six screens                          6/6 ok
+           title wraps at 68, gauged row fits 80, sentence keeps its half   ok
+           arrow / CI cell / nodes heading identical on both surfaces       ok
+           --ascii reaches the arrow; no ' -- ' left in any view            ok
+round 15   workload banner carries the caveat; --json carries live          ok
+           README and docs state the real JSON count                        ok
+round 16   empty node grid hidden; "1 GPU-hour total, 1 of it never used"   ok
+round 17   empty overview explains itself and hides its grid                ok
+round 18   no sizing advice on any of the four interrupted states           ok
+           exit 127 and 137 agree with the findings above them              ok
+           BOOT_FAIL and DEADLINE each have a finding                       ok
+round 19   patterns names the split; all-hung wording unchanged             ok
+
+34 reproductions re-run, 0 still reproduce
+```
+
+### What this round says about the state of the codebase
+
+Seven rounds, and the count runs **7, 3, 3, 1, 4, 1, 0**. The shape of what was
+found changed with it: rounds fourteen to seventeen were about how things are
+drawn, eighteen and nineteen about what the tool asserts, and twenty found nothing
+in either. The three things every surface rests on are now pinned by properties
+rather than examples -- `fit_columns` here, `sizing`'s never-advise-below-the-peak
+invariant in nineteen, and `nodes`' statistics against scipy and statsmodels in
+eighteen.
+
+Released as **0.6.0** on that basis.
+
+---
+
+## Round nineteen — the same conclusion, qualified in one module and not the other
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | The patterns screen asserted "raising the limit will not help" of every timeout on the strength of half of them | `patterns.py` `find_repeat_failures` | `TestTheRepeatFailureActionNamesTheSplitToo` |
+
+### 1. Four hangs speaking for four runs that were working
+
+A workload of eight timeouts: four hung on 0.5 CPU-seconds, four burned 29:50 of a
+30:00 limit doing real work. Three surfaces, on one screen:
+
+```
+workload banner (cross-run)
+  → 4 of these consumed under 10 CPU-seconds — they hung rather than ran out of
+    time. Raising the limit will not help; fix the blocking call.
+
+open any of the other four (per-job)
+  [FAIL] Ran out of wall clock while working
+         Hit the 00:30:00 limit having used 07:46:40 of CPU (97.2%) — it was
+         making progress.
+       → Raise --time well above the limit that cut it off.
+```
+
+The banner sits directly above the rows those jobs are in.
+
+**`sizing` had already found and fixed exactly this**, at the same
+half-of-the-timeouts threshold, and its comment says why in the language this
+round could not improve on:
+
+> "The veto stands ... but it may not speak for every timeout in the group. The
+> threshold is half, so four hangs among eight timeouts fired it, and 'These runs
+> were blocked, not slow' was then asserted of the other four as well: runs that
+> had burned 29:50 of a 30:00 limit doing real work. `looks_like_noop` needs CPU
+> under 10s, so those are never hangs by this module's own definition. **Name the
+> split, and keep what they proved.**"
+
+`patterns.find_repeat_failures` draws the same conclusion from the same split and
+did none of that. So the fix landed on the module a reader reaches through
+`--sizing` and not on the one they reach through `p`, `--patterns`, or the banner
+above every workload.
+
+Fixed by sharing rather than copying -- the fifth time "fixed only on one side" has
+been recorded here, so a sixth copy of the sentence was not the answer.
+`hung_split_note` lives in `patterns` and `sizing` imports it, because `sizing`
+already imports from `patterns` and the reverse would be a cycle:
+
+```
+mixed 4/4  → 4 of these consumed under 10 CPU-seconds — they hung rather than ran
+             out of time. Raising the limit will not help those; fix the blocking
+             call. The other 4 did compute, and were cut off at 00:30:00 — so once
+             the blocking call is fixed, the limit has to be at least that.
+
+all 8 hung → ... Raising the limit will not help; fix the blocking call.
+```
+
+"those" appears only where there is another group for it to exclude: at 14 of 14 it
+qualifies nothing and reads as a hedge, so the demo's own wording -- and the
+screenshots and the GIF cut from it -- are byte-identical.
+
+### The negative result: `sizing`'s numbers, and the trap under them
+
+The module header states an asymmetry: *"Over-requesting narrows which nodes can
+host the job ... Under-requesting kills the run."* Every individual rule is tested;
+the promise they exist to keep was not. 400 generated workloads with a planted peak
+for walltime, memory and per-task cores:
+
+```
+569 actionable suggestions checked, 0 below what the workload needed
+```
+
+`--time`, `--mem` and `--cpus-per-task` all clear their measured peak, and a
+`lower` verdict always lowers while a `raise` always raises. Pinned as a property
+test.
+
+**The trap, recorded because it is invisible and cost this round an hour.** The
+first version of that check reported *thirteen* violations, all of them its own
+fixture's. `Job.cpu_time` is
+
+```python
+max(cpu_time_alloc, elapsed * cpu_count, *[s.cpu_time for s in work_steps])
+```
+
+so a synthetic run built by `_replace`-ing three fields on a demo job keeps that
+job's denominator in **two** places -- the allocation row and the step -- and every
+utilization derived from it is wrong. Fourteen runs of differing length all
+reported `cpu_time = 10956.0`. Build the rows and parse them; do not `_replace` a
+real job. The property test asserts its own denominator before asserting anything
+else, for that reason.
+
+### Also checked, nothing found
+
+* Every cross-run finding against every per-job finding it can co-occur with, over
+  700 generated workloads: 21 pairs, one contradiction (above). `memory-search`
+  against `host-oom` is the near miss -- "--mem is not the deciding variable"
+  against "Raise --mem" -- but they cannot appear together, `sizing` already
+  carries the caveat on its `--mem` advice, and giving a per-job rule its
+  workload's history is a feature rather than a correction.
+* No verdict disagreement between `sizing` and `patterns` on any split: wherever
+  `patterns` says the limit will not help, `sizing` returns `unknown` rather than a
+  number.
+
+---
+
+## Round eighteen — findings that argued with each other
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | Suppressing the noop finding on an interrupted run moved the wrong advice instead of removing it | `diagnose.py` `_cpu_rules`, `_gpu_rules` | `TestNoFindingContradictsTheOneAboveIt` |
+| 2 | `BOOT_FAIL` and `DEADLINE` were in no rule at all, so a node that never booted was told to find its blocking call | `diagnose.py` `_exit_rules` | `TestTheTwoStatesDiagnoseHadNeverHeardOf` |
+| 3 | "An exit status does not name a cause: exit 127 ..." printed under "A command in the script was not found (exit 127)" | `diagnose.py` `_exit_rules` | `TestTheExitCodeFindingsAgreeWithEachOther` |
+
+### 1. A guard that made its own problem worse
+
+`_cpu_rules` states the principle its guard exists for:
+
+> "'Find the blocking call' is advice about the user's own code, and it is only
+> honest when nothing else already explains the missing CPU time."
+
+`_NOOP_ALREADY_EXPLAINED` held `OUT_OF_MEMORY`, `NODE_FAIL`, `PREEMPTED`, and the
+comment beneath it records the fix as done: "Both are now suppressed there and
+explained here."
+
+They were not. The `return` sits on the branch that *fires*:
+
+```python
+if looks_like_noop(job) and job.base_state not in _NOOP_ALREADY_EXPLAINED:
+    add(Finding(... "Allocation did essentially nothing" ...))
+    return                      # <- only reached when the finding was ADDED
+...
+if util < LOW_CPU_UTIL and cores > 1:
+    add(Finding(... "Most allocated cores were idle" ...))
+```
+
+So a suppressed state fell straight through to the next rule, and the reader got a
+different piece of the same wrong advice:
+
+```
+[WARN] Most allocated cores were idle
+       Utilization 1.0% of 16 cores, i.e. about 0.2 cores of real work.
+       → Try --cpus-per-task=1, unless those cores feed dataloader workers.
+
+[WARN] The node failed under this job
+       Slurm ended this as NODE_FAIL ... a CPU or memory total near zero here is
+       missing data, not a measurement.
+```
+
+An instruction computed from a number, two findings above the sentence saying the
+number is not a measurement. The same on `PREEMPTED`, whose finding says "how far
+it got says nothing about whether the job was healthy". `gpu-suspect-idle` infers
+from the same `cpu_utilization` and did the same thing.
+
+The guard now stops the whole function, is named `_CPU_TIME_ALREADY_EXPLAINED` for
+what it governs, and covers all three rules. The *measured* GPU branch is
+deliberately left outside it: `gres/gpuutil` is sampled while the job runs and says
+what the cards did however the run ended -- only the CPU-based inference is
+suppressed.
+
+**`CANCELLED` is deliberately not in the set,** and the test says so: its finding
+calls the *outcome* ambiguous, not the CPU total unreadable, so a cancelled run
+that used one core of sixteen is still evidence about the request.
+
+### 2. Two states `diagnose` had never heard of
+
+`BOOT_FAIL` and `DEADLINE` are counted by `Job.failed`, graded "crit" by
+`theme.STATE_HEALTH`, coloured red by `report._STATE_COLOR` and queried by
+`--failed`. `diagnose.py` contained neither string. So the whole post-mortem for a
+node that failed to boot was:
+
+```
+[FAIL] Allocation did essentially nothing
+       00:30:00 of wall clock, 0.10s of CPU. Nothing was computed.
+       → Find the blocking call. If this allocation is a deliberate reservation,
+         mark it so and this rule will stay quiet.
+```
+
+-- the exact sentence the comment above says must only appear "when nothing else
+already explains the missing CPU time", on a job where the scheduler has explained
+it in the state field. And a *short* BOOT_FAIL, too brief for any rule to trip,
+said **"nothing to flag"**.
+
+Each now gets a finding of its own, in the same mould as the three beside it. This
+is the one place in this round that adds rather than corrects, and the reason is
+that suppression alone would have made the short case worse: BOOT_FAIL would have
+gone from wrong to silent.
+
+Severities follow their siblings, and they decide `slurmpast <jobid>`'s exit code:
+`DEADLINE` is CRITICAL like both TIMEOUT findings (`model.py` already groups the
+two -- "DEADLINE belongs here for the same reason TIMEOUT does"), `BOOT_FAIL` is a
+WARNING like `NODE_FAIL`, because nothing the submitter did caused it.
+
+### 3. A sentence that was true of exit 1 and false of the two codes the tool names
+
+```
+[FAIL] A command in the script was not found (exit 127)
+       The shell could not locate an executable.
+
+[WARN] Exited 127, but no log was found to explain it
+       An exit status does not name a cause: exit 127 is indistinguishable from a
+       CUDA OOM, a killed worker or a bad argument without the stderr text.
+```
+
+127 is the shell's "command not found" and 137 is 128+9; each has a rule a few
+lines above that names it exactly. The generic sentence denies what the finding
+directly above it just asserted.
+
+This is the same self-contradiction the code's own comment records fixing *within*
+one finding -- "a finding whose title said 'Exited 3' and whose evidence discussed
+exit 1" -- reappearing between two, because that fix generalised the sentence
+rather than asking whether it was still true.
+
+The log is still worth asking for on these, so the finding stays and only its claim
+changes:
+
+```
+[WARN] Exited 127, and no log to confirm it
+       The status is named above. What it does not say is which command produced
+       it or how far the run got, and that is in the stderr text.
+       → Pass --log-dir, or set a predictable --error= path.
+```
+
+Exit 1 keeps its own more specific line, and every unnamed status keeps the generic
+one, which is true of them.
+
+### The negative result: the statistics
+
+`nodes.py` implements a one-sided Fisher exact test, a Wilson score interval and
+Benjamini-Hochberg by hand, because the analysis modules may not import a
+third-party package. Nothing had ever checked them against a reference.
+
+```
+Fisher one-sided   5,986 comparisons vs scipy.stats.fisher_exact   max diff 7.7e-13
+Wilson 95%        20,099 intervals   vs statsmodels proportion_confint  max diff 9.2e-06
+Benjamini-Hochberg 3,000 families    vs statsmodels multipletests    0 disagreements
+```
+
+The Wilson gap is `Z = 1.96` against the exact normal quantile 1.959964 -- 0.001
+percentage points on a figure printed to one decimal, and the constant is named and
+commented. Not a defect. Recorded so nobody re-derives it.
+
+---
+
+## Round seventeen — a column header over nothing, twice more
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | The overview and job list drew a bare header when a filter or search matched nothing, and the overview suppressed the count that would explain it | `tui.py` `OverviewScreen`, `JobListScreen` | `TestATableThatMatchedNothingSaysSo` |
+
+### 1. Two tables with no empty state, and a guard that hid the reason
+
+Round sixteen's fix was to the node screen, whose empty branch needs a history
+where nothing failed. These two need one keypress. Filter the overview to problems
+on a week that went well:
+
+```
+before
+  slurmpast — last 7 days  ·  failed, timed out, or idle
+  last 7 days · 33 jobs in 6 workloads · 100.0% completed
+  #     JOB NAME     PARTITION  RUNS  FLAGGED  CPU / GPU-HOURS  LAST RUN
+  <nothing>
+```
+
+A column header over blank space, a count of 33 above it, and not one word about
+the filter that emptied it. Search is the same, on both screens.
+
+**And the overview could not say "showing 0".** That clause is guarded:
+
+```python
+if shown and shown != total_groups:      # <- `shown and`
+```
+
+Zero is falsy, so the one count that an empty table cannot speak for was the one
+count suppressed -- while "showing 4" printed fine. The guard is now
+`shown != total_groups`.
+
+The wording is `render.nothing_matches`, shared so the two screens cannot explain
+the same empty table differently, and it names both what narrowed and which key
+undoes it:
+
+```
+after
+  last 7 days · 33 jobs in 6 workloads · 100.0% completed · showing 0
+    no workload matches the failed, timed out, or idle filter — f widens it.
+
+  all jobs · 0 jobs · search: zzz
+    no job matches the search "zzz" — escape clears it.
+```
+
+Both grids are hidden on that branch, as the node table now is. Checked that
+`enter`, `f`, `s`, `/`, a digit, the arrows, `y`, `Y` and `?` all still work with
+the grid hidden -- `on_mount` focuses that table, so this had to be verified rather
+than assumed -- and that a table with rows still gets its grid and says nothing.
+
+This is not a new principle. `PatternsScreen` has had it all along ("That is a real
+answer, not an empty screen: these detectors stay silent rather than manufacture a
+finding"), and `index.filter_jobs` writes the rule down in its own comment, about
+the date search that was added *because a user hit it*:
+
+> "Typing what you can plainly see and getting an empty list is the worst kind of
+> empty result -- it reads as missing data."
+
+Three of the four table surfaces now follow it. The fourth, `--plain`, never
+reaches an empty table: `cli._load` raises `SacctError` and exits 2 with "no jobs
+for &lt;user&gt; since &lt;window&gt;", which is the same answer in the shape a pipe takes.
+
+### The negative results
+
+Eleven degenerate histories -- empty, one job, one completed job, and one job each
+with no name, no partition, no node list, no timestamps, no elapsed, no timelimit,
+no steps, no TRES, and every field blank at once -- through all six plain renderers
+and all seven screens at 90 columns. No exception, no width overrun, and one
+finding, above.
+
+Worth naming because it bounds the axis: after four rounds of cross-surface and
+degenerate-input sweeps, the remaining defects are not in *whether* a view survives
+its inputs. They are in what it says about them.
+
+---
+
+## Round sixteen — what a history of one job looks like
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | The nodes screen drew an empty grid under the sentence explaining there was nothing to show | `tui.py` `NodesScreen.refresh_rows` | `TestAnEmptyNodeTableIsNotDrawn` |
+| 2 | "1 GPU-hours total, 1 of them never used" on the overview, both surfaces | `report.py:479`, `tui.py:932` | `TestOneGpuHourIsNotOneGpuHours` |
+| 3 | Four more unguarded plurals round seven's sweep left behind | `index.py`, `patterns.py` x2, `tui.py` | `TestEveryCountedNounAgreesWithItsCount` |
+
+### 1. The empty grid its own comment forbids
+
+`NodesScreen.refresh_rows` carries this, immediately above the branch:
+
+> `# Two ways this table has nothing to say, and an empty grid says neither.`
+
+It then sets `rows = []` and leaves the `DataTable` mounted, so a history with no
+bad outcome -- every run completed, which is the good case -- rendered:
+
+```
+node reliability — hang rate
+  controlled for workload: only midtrain counted (placement is not random)
+  baseline 0.0% over 14 placements
+  No hangs recorded for midtrain in this window, so there is nothing to attribute
+  to a node.
+NODE                    N        RATE      95% CI          VERDICT
+ no node is worse than the rest; nothing to exclude.
+```
+
+A bare header over nothing, which reads as a table that failed to load rather than
+as a table with nothing in it -- and then a second sentence answering a question
+the first has just said cannot be asked. `report.render_nodes` returns before
+drawing any of it; the screen now does the same, with `table.display` and an empty
+exclude note. Verified that `m`, `c`, `?` and `q` still work with the grid hidden
+(`on_mount` focuses that table), and that a history *with* rows still gets both.
+
+Worth naming precisely: `node_table` **does** return a row here. It is
+`nodes_empty_reason` that says the row is not worth showing, which is why
+`rows = []` beside a live widget was possible at all.
+
+### 2. "1 GPU-hours total"
+
+The overview's summary clause, written out in both front ends as
+`"%.0f GPU-hours total"` and guarded in neither -- below the 25-character floor of
+the sweep that catches duplicated sentences, exactly as round fourteen's arrow was.
+One run of one card that hung is one GPU-hour, and it is the first thing anyone
+tries:
+
+```
+before   1 job in 1 workload · 0.0% completed · 1 GPU-hours total, 1 of them never used
+after    1 job in 1 workload · 0.0% completed · 1 GPU-hour total, 1 of it never used
+```
+
+Two disagreements in one clause. The pronoun is the subtler one: it refers back to
+the **total**, not to the idle count, so one hour of which one was wasted is "1 of
+it". `render.gpu_hours_total` and `idle_hours_note(idle, total)` now, shared.
+
+### 3. Four the last plural sweep missed, and three it would have got wrong
+
+Round seven fixed nine unguarded plurals. A rescan found twenty-one candidates;
+**four are reachable and were reproduced by constructing the history**, and the
+rest are guarded. Both halves matter -- a scan that reports a guarded site is a
+scan nobody runs twice.
+
+Reachable:
+
+```
+index.py:528    History.headline    1 GPU-hours, 1 of them in allocations that never computed
+patterns.py:162 repeat failures     1 GPU-hours consumed by the failures.
+patterns.py:366 noop summary        Together they held 1 GPU-hours.
+tui.py:972,977  pasted overview row ... | 1 problems | ... | 1 GPU-hours | ...
+```
+
+Not reachable, checked rather than assumed:
+
+* `diagnose.py:347` `"Utilization %s of %d cores"` -- the rule is gated on
+  `cores > 1`, so "of 1 cores" cannot be printed.
+* `render.held_back_note` and `nodes_correction_note` spell both forms out already
+  (round seven fixed exactly these).
+* `report.py:531` `"1 GPU-hour = %d CPU-hours"` -- the constant is 16.
+* `patterns.py:147`, `nodes.py:537`, `render.py:703` -- each needs a sample size
+  above 1 to fire at all.
+
+The rule is `duration.plural(count, word)`, in `duration` rather than `render`
+because three of the four sites are in `index` and `patterns`, which may not import
+`render` -- it pulls in rich, and `CLAUDE.md` requires the analysis modules to stay
+third-party-free. It agrees with the **printed digit**, not the float: 1.4 GPU-hours
+renders as "1" through `%.0f` and takes the singular, the same "prints as" rule
+`bar_cells` applies to a gauge.
+
+### The negative result: `logs.py`
+
+Opened for the first time in sixteen rounds and driven against a real filesystem
+rather than read. Twelve documented behaviours, twelve correct:
+
+```
+slurm-<jid>.out found by name              StdOut pattern expanded and found
+%x-%j in a logs/ subdirectory              SubmitLine -o expanded and found
+job 60 does not claim 1060-train.out       --wrap's own -o is not an output path
+array element finds the %A master file     --comment absolute path used
+dangling .err skipped for the .out         --comment prose ignored
+two jobs never handed the same file        a name match blocks a timing guess
+```
+
+Recorded so the next round spends its time elsewhere.
+
+---
+
+## Round fifteen — three surfaces, and the warnings only two of them carry
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | The dashboard printed sizing advice with the caveat that says when it is wrong stripped out | `tui.py` `WorkloadScreen.extra_summary` | `TestTheSizingCaveatReachesEverySurface` |
+| 2 | `--json` could not say whether an open record was a live job or a dead one | `cli.py` `_job_json` | `TestTheJsonPayloadKeepsItsPromise` |
+| 3 | The test the docs cite for (2) counts name mentions, and the docs' value count was wrong | `tests/test_audit.py`, `README.md`, `docs/details.md` | same class |
+
+Minor: `--steps` was the only scoped flag whose `--help` line did not name its scope.
+
+### 1. Advice with the safety note taken off
+
+`sizing.Advice` carries a `caution` field, commented in the source as **"what would
+make this advice wrong"**. Three surfaces render that advice. Only two render the
+caveat:
+
+```
+--sizing          prints it, marked `!`, since it was added
+--sizing --json   carries it, in `Advice._asdict()`
+dashboard         never read the field at all
+```
+
+Six of the ten actionable recommendations the demo produces carry one:
+
+```
+cot-exp             --mem=3G           MaxRSS sums RSS across the process tree ... upper bound
+cot-exp             --cpus-per-task=2  This is a GPU workload: cores may be there to feed
+                                       dataloader workers, and cutting them can starve the GPU
+att-speed-#         --mem=50G          MaxRSS ... upper bound
+att-speed-#         --cpus-per-task=9  ... can starve the GPU
+tokenize-shards     --mem=15G          MaxRSS ... upper bound
+rc-tok-github_code  --mem=42G          the same request both failed and succeeded, so --mem is
+                                       not the deciding variable
+```
+
+Side by side on `cot-exp`, before:
+
+```
+--sizing                              dashboard
+  --mem  lower to 3G                    next run  --mem=3G          the most any run used ...
+    the most any run used was 1.9 GiB.            --cpus-per-task=2  the busiest run used ...
+    ! MaxRSS sums RSS across the
+      process tree ... upper bound.
+  --cpus-per-task  lower to 2
+    the busiest run used 1.0 of 6.
+    ! This is a GPU workload: cores
+      may be there to feed dataloader
+      workers, and cutting them can
+      starve the GPU even though they
+      look idle.
+```
+
+The GPU one is the reason this is first rather than last. The dashboard hands over
+`--cpus-per-task=2` for a job holding a card, with the basis ("the busiest run used
+1.0 of 6 cores per task") and without the sentence saying that reading is expected
+and acting on it can starve the card. A reader of the app gets a *worse*
+recommendation than a reader of the pipe, from the same measurement.
+
+It is now under the basis, in the warning hue, wrapped to the terminal and
+indented under the flag. Pointing at `slurmpast --sizing` for the reason was
+already considered and rejected in this block's own comment -- "a bare number with
+no basis, and for the reason a different command in a different program. The reason
+belongs where the number is" -- so the caveat goes where the number is. The marker
+is `render.CAUTION_MARK`, shared, for the reason round fourteen shared the arrow.
+
+Costs the banner up to five lines on a cautioned workload. Checked at 60, 70, 74,
+80, 100 and 140 columns: no overrun, and the table still gets thirteen rows on the
+30-row terminal the screenshots are cut at.
+
+### 2. `--json` could not tell a running job from a dead record
+
+`cli._mark_open_records` asks squeue about anything unfinished and writes a
+**tri-state** answer onto the job -- deliberately three values, per the model's own
+comment: *"'no answer' and 'no such job' are different claims and only one of them
+is a measurement."* Both text surfaces spend it on the finding's action sentence.
+The JSON payload carried only `open_ended_record`, which is `true` in all three:
+
+```
+job.live     outcome.open_ended_record   the only thing that differed
+---------    -------------------------   --------------------------------------------
+True         true                        "squeue confirms it is still there ..."
+False        true                        "squeue has never heard of it ..."
+None         true                        "Confirm against squeue."
+```
+
+So the one consumer that cannot read English could not distinguish a job running
+this second from one that died in March -- and `timing.elapsed_seconds` is measured
+to *now* for both, which is precisely the artefact the distinction exists to flag.
+Round six's headline defect was a queued array job reported as dead: the same
+distinction, going the other way.
+
+`outcome.live` now carries it, tri-state as stored.
+
+### 3. The test the documentation points at
+
+`docs/details.md` said, of that payload:
+
+> Nothing is captured and then hidden; **a test fails if a field is read but never
+> surfaced.**
+
+`test_every_captured_field_is_exposed_somewhere` is the test it means. What it
+asserts is that each annotated field name appears **more than twice** in the
+concatenated text of `src/slurmpast/*.py`. `Job.live` appears four times -- once
+declared, three times inside `diagnose` -- so it passed while being surfaced
+nowhere a machine could read. The check cannot tell "rendered to a reader" from
+"mentioned three times", and it never opens `_job_json` at all.
+
+Kept, renamed `..._is_read_somewhere`, and its docstring now says what it is: a
+catch for a field nothing reads at all, and nothing more.
+`TestTheJsonPayloadKeepsItsPromise` is the real one -- it parses `_job_json`, collects every `job.x` and
+`s.x` it reads, and holds every `Job` and `Step` value to that set. Thirteen job
+values and three step values are exempt, **listed by name with what supersedes
+each**, so the next one that is not emitted has to be argued for in the list rather
+than dropped:
+
+```
+alloc_cpus, ncpus            -> shape.cpus          (Job.cpu_count falls back across them)
+alloc_nodes, nnodes          -> shape.nodes
+ntasks                       -> shape.tasks
+total_cpu_alloc + 3 siblings -> cpu.total_seconds and friends
+req_mem_bytes                -> memory.limit_bytes + memory.req_mem_raw
+cores_busy, cpu_freq_hz      -> derived from emitted numbers
+fs_disk_bytes                -> deprecated alias of filesystem.read_bytes
+```
+
+**And the count in the prose was wrong.** Both `README.md` and `docs/details.md`
+said "174 values per job", pinned by nothing. It was never a property of a job: 174
+is `95 job-level values + 2 steps x 40`, i.e. the floor over the demo, where the
+real range is 174-189 depending on how many steps and findings a job has. Both now
+read **"95 values per job, plus 40 for every step"**, and the same test computes
+both figures from `_job_json` and fails if either drifts -- the guard the test badge
+already has, after `tests-1029` sat stale in the README for two rounds.
+
+### Minor: one flag that did not say where it applies
+
+Four of the five scoped flags name their scope in `--help`; `--steps` did not.
+
+```
+--metric {failure,hang}   what --nodes measures (default: hang)
+--all-workloads           skip the workload control in --nodes (confounded)
+--sort ...                workload ordering (default: cost)
+-n LIMIT                  rows in plain output
+--steps                   per-step accounting              <- reaches one view, says nothing
+```
+
+Measured across twelve modes, `--steps` changes the output of exactly one:
+`slurmpast <jobid> --plain`. It is accepted and silently ignored everywhere else,
+including `--plain` over a list, which is the natural thing to try. Now reads
+"per-step accounting, on a named job". No behaviour change -- `--json` has always
+emitted steps unconditionally, and the dashboard's `y`/`Y` copy includes them.
+
+---
+
+## Round fourteen — one block, drawn twice, measured twice
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `?` opened the help on four screens of six and did nothing on the other two | `tui.py` `PatternsScreen`, `NodesScreen` | `TestTheHelpIsReachableFromEveryScreen` |
+| 2 | The dashboard never wrapped a finding title, so it broke to column 1 | `tui.py` `JobScreen`/`PatternsScreen` | `TestTheDashboardWrapsEveryLineOfAFinding` |
+| 3 | A gauged detail row overran by exactly the width of its own bar | `tui.py` `JobScreen.cell` | `TestAGaugedRowCountsItsOwnBar` |
+| 4 | ...and clipped a sentence that `--plain` keeps whole | `tui.py` `JobScreen.cell` | `test_a_sentence_value_keeps_its_second_half` |
+| 5 | The action arrow was `→` in the app and `->` in a pipe, and `--ascii` reached neither | `report.py:430,654`, `tui.py:1622,1701` | `TestTheFragmentsBothSurfacesDrawComeFromOnePlace` |
+| 6 | Three more fragments written out twice: the CI cell, the severity tag, the nodes heading | `report.py`, `tui.py`, `render.py` | same class |
+| 7 | Seventeen user-facing sentences spelled the em dash `--`, where the fold cannot reach it | `diagnose.py`, `patterns.py`, `sizing.py`, `sacct.py` | `TestTheProseSpellsPunctuationOneWay` |
+
+Each was reproduced by running the code, and every fix was re-run against a
+deliberately reverted tree to confirm its test fails without it.
+
+### 1. The help documented a screen it could not be opened from
+
+`HelpScreen` carries sixteen rows, and two of them are written for one screen in
+particular:
+
+```
+("m", "on the nodes screen: measure hangs or failures"),
+("c", "on the nodes screen: drop the workload control (confounded)"),
+```
+
+The nodes screen was one of the two that could not open it. Measured by pressing
+`?` on each screen in turn:
+
+```
+overview      -> HelpScreen        opens
+workload      -> HelpScreen        opens
+job list      -> HelpScreen        opens
+job           -> HelpScreen        opens
+patterns      -> PatternsScreen    *** nothing ***
+nodes         -> NodesScreen       *** nothing ***
+```
+
+The binding was written out on each screen that had it -- three copies of
+`Binding("question_mark", "help", ...)` and three copies of a two-line
+`action_help` -- which is exactly how two screens came to be without it. It moves
+onto the mixin every screen already inherits, beside `y` and `Y`, so a new screen
+gets it rather than remembering it. The mixin is `ScreenChrome` now, not
+`ClipboardMixin`: it does two things and the name said one.
+
+The round-eight test that should have caught this is the lesson.
+`TestTheHelpScreenNamesEveryVisibleKey` iterates `tui.NodesScreen.BINDINGS` and
+asserts the help documents each of them -- it walks past the nodes screen to check
+the help mentions it, and never asks whether the reader can get there. Green
+throughout. That is this suite's named failure mode, "tests that assert less than
+they appear to", for the fourth round running.
+
+### 2. The one line of three that nothing wrapped
+
+Round seven wrapped the finding title in `report.py` and said why: "A title is a
+sentence ... and this was the one line of the three going out at whatever length
+it happened to be." The dashboard was not touched, so Textual soft-wrapped it
+instead -- and a soft wrap restarts at column 0, which is the whole failure the
+hard wrap exists to prevent. The job screen at 68 columns:
+
+```
+   WARN  Peak memory reads above the limit, yet nothing was
+ OOM-killed
+         32.5 GiB against a 32.0 GiB per-node limit, so it is not
+         this job's footprint: MaxRSS sums RSS across the process
+```
+
+The evidence and the action below it hang correctly at column 8; the title's own
+tail is at column 1, out from under the tag that introduces it. 61 cells is the
+longest title `diagnose` produces, so this breaks below 74 columns and is fixed
+above it.
+
+`TestTheDashboardWrapsToTheTerminalItIsOn` measures exactly this widget and was
+green, because it opens `cot-exp`, whose longest title is 47 cells. The title
+that breaks is on the OOM jobs.
+
+### 3. A row that did not count its own bar
+
+`JobScreen.cell` budgeted a detail value at `4 + PAIR_LABEL_WIDTH + 1` -- the
+indent and the label column. The row then drew a 14-cell bar and a 2-cell gap in
+front of the value, and those 16 cells appeared in no sum anywhere:
+
+```
+80 columns, before:
+     slowest task     ███████████▎░░  80.0% below average (task 3 on
+ midway3-0372)
+
+80 columns, after:
+     slowest task     ███████████▎░░  80.0% below average (task 3 on
+                                      midway3-0372)
+```
+
+81 cells on an 80-cell terminal. Not a narrow-terminal case -- the canonical one.
+`report.py` had counted the bar since round five ("Continuation hangs past the bar
+as well as the label"), and this is the same row of the same screen.
+
+Both go through `render.pair_value_budget` now. Fitting it by clipping would have
+been no fix: which task on which node is the entire content of the row.
+
+### 4. ...and the same budget threw away half a sentence
+
+The dashboard clipped an over-long value to one line; `--plain` wrapped it. Same
+row, same job, two answers:
+
+```
+dashboard : utilization  not gathered by this cluster (needs AutoDetect=nvml in g…
+--plain   : utilization  not gathered by this cluster (needs AutoDetect=nvml in
+                         gres.conf)
+```
+
+`gres.conf` is the actionable half. Clipping is deliberate for a *path* -- "`p`
+shows it in full, and --plain always does, because a path you cannot copy whole is
+no use in a ticket" -- and `render.PATH_ROWS` exists to say which rows those are.
+This one is not among them; it is prose, and prose wraps. `render.pair_value_lines`
+now decides, for both surfaces, and keeps the path exemption verbatim.
+
+### 5. Two arrows, and a flag that could reach neither
+
+The action line of a finding was written out four times -- twice in `report.py`,
+twice in `tui.py` -- and the two files had drifted:
+
+```
+tui.py:1622,1701   "→ " if index == 0 else "  "
+report.py:430,654  "-> " if index == 0 else "   "
+```
+
+One element of one finding, two glyphs, and nothing on either screen from which a
+reader could tell, because only one of the two is ever in front of them.
+
+The expensive part is the second-order effect. `ascii_fold` maps Unicode
+punctuation onto a one-cell ASCII stand-in, once, on the finished text of a plain
+view, and `--ascii` exists to ask for that. The plain arrow was *already* ASCII, so
+there was nothing to fold:
+
+```
+before   --patterns          ->  --mem is not the deciding variable: ...
+         --patterns --ascii  ->  --mem is not the deciding variable: ...   (identical)
+
+after    --patterns          →  --mem is not the deciding variable: ...
+         --patterns --ascii  >  --mem is not the deciding variable: ...
+```
+
+That is round five's "two flags that were accepted and thrown away" and round
+eight's `--ascii` finding, a third time, on the one glyph both of those rounds
+looked straight at. `render.ACTION_ARROW` is two cells so the fold stays
+one-cell-for-one-cell, which is what lets it run after the wrapping that measured
+those cells.
+
+### 6. Three more fragments written twice
+
+`TestTheTwoSurfacesCannotDriftApart` (round seven) calls a literal prose at 25
+characters and sweeps `report.py` against `tui.py` for duplicates. Everything
+shorter is invisible to it, and that is where the rest of this round lives:
+
+| fragment | `report.py` | the other copy |
+|---|---|---|
+| 95% CI cell | `"%.1f - %.1f%%"` | `tui.py` `"%.1f – %.1f%%"` |
+| severity tag | `_SEV = {..., "FAIL"), ...}` | `render.severity_chip`'s own dict |
+| nodes heading | `"node reliability (%s rate)"` | `tui.py` `"node reliability — %s rate"` |
+
+Two of the three had already come apart. The CI column shows `75.7 - 100.0%` in a
+pipe and `75.7 – 100.0%` in the app, for the same interval of the same row; the
+heading over the same table reads two ways, and the parenthesis reads as an aside
+where the metric is the subject. The severity tag agreed -- by luck, with two
+hand-maintained copies of three words.
+
+`render.ci_range`, `render.severity_tag` and `render.nodes_title` now. Under
+`--ascii` the en dash folds back to the hyphen, so piped output is byte-identical
+to what it always was.
+
+### 7. One punctuation mark, two spellings
+
+Seventeen user-facing sentences spelled the em dash `--` against thirty that
+spelled it `—`, and `diagnose.py` did both inside one `Finding`:
+
+```
+diagnose.py:221  " Note MaxRSS reports %s against a %s per-node limit -- above ..."
+diagnose.py:234  "Raise --mem, or cut what multiplies per-worker footprint — workers, ..."
+```
+
+An ASCII spelling is invisible to `ascii_fold`, so those sentences read the same in
+both modes while everything around them changes -- and they cannot be restyled from
+one place later. Counted over the non-docstring string constants of the fourteen
+modules that render anything, which is the set that can reach a screen:
+
+```
+literals spelling it      before   after
+  '—'                         30      47
+  ' -- '                      17       0
+```
+
+Seventeen converted, thirty already right, and none of the seventeen had one
+already. Rendering every demo view and every post-mortem afterwards finds no ` -- `
+left on any surface.
+
+Comments and docstrings are untouched and deliberately exempt: this repo writes
+them in ASCII and none of them reaches a screen. The test scans non-docstring
+string constants only, for that reason.
+
+### The test gap this round found rather than fixed
+
+`--steps` draws the fourth table in this codebase and no width test ever built it.
+`TestPlainOutputFitsATerminal._views` builds five views and none of them passes
+`show_steps`, and its sibling renders every demo job without it -- so three tables
+are measured at six widths each and the fourth at none. It happens to behave: it
+goes through `STEP_COLUMNS` like the others and bottoms out at its own floor of 67
+(indented by four inside the post-mortem, not the two `table_floor` assumes). Pinned
+now, so that stays a fact rather than a coincidence.
+
+---
+
+## Open (round fourteen)
+
+**The memory walk keeps its ASCII arrow.** `patterns.py:235` joins the `--mem`
+series with `" -> "`, and `docs/details.md:99` writes the same walk with `→`. Left
+as it is, and named rather than silently kept: `ascii_fold` maps `→` to `>`, so
+under `--ascii` the walk would read `32.0 GiB > 17.0 GiB` -- a comparison operator
+in the middle of a sequence, and a false one in exactly the case the finding exists
+to report, where the series moves both directions. The action arrow does not have
+that problem because it sits at the start of a line where nothing can be read as
+its left operand. The two are different things and now look different on purpose.
+
+---
+
+## Round thirteen — a search box that invited what it could not find
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | The overview's search promised job id, state and node, and matched none | `tui.py:448,470`, `index.py:344` | `TestTheSearchBoxPromisesWhatItMatches` |
+
+### 1. Three descriptions, none of them right
+
+One feature, described in three places:
+
+```
+tui.py:448   placeholder="filter by name, job id, state, node or date…"
+tui.py:470   ("/", "search — name, job id, state or node"),
+index.py:303 Search matches job id, name, state, partition, node list and timestamps
+```
+
+The placeholder omits partition, the help omits partition *and* date, and only the
+docstring is complete — for the job list. The expensive part is that the same
+placeholder appeared on the **overview**, whose search runs `filter_groups`, which
+matches an entirely different set. Measured:
+
+```
+field          query                  job list       overview
+job id         '5100001'              1 jobs         NO MATCH
+name           'cot-exp'              20 jobs        1 groups
+state          'TIMEOUT'              14 jobs        NO MATCH
+partition      'test'                 58 jobs        8 groups
+node           'midway3-0602'         8 jobs         NO MATCH
+date           '07-01'                1 jobs         1 groups
+```
+
+Three of the five things the box invited, on the landing screen, returning nothing.
+And `filter_jobs` already names this exact failure in its own comment, about the
+date search that was added *because a user hit it*:
+
+> "Typing what you can plainly see and getting an empty list is the worst kind of
+> empty result -- it reads as missing data."
+
+The two field sets genuinely differ and should: a workload rollup has no single job
+id, state or node to match against. What was wrong was the invitation, so the
+invitation is now derived from the behaviour. `index` names
+`GROUP_SEARCH_FIELDS` and `JOB_SEARCH_FIELDS` beside the functions that use them,
+`render.search_hint` turns either into English, and both the placeholder and the
+help row are built from it:
+
+```
+job-list placeholder: filter by name, job id, state, partition, node or date…
+overview placeholder: filter by name, partition or date…
+help / row          : search — the overview matches name, partition or date;
+                      a job list also matches job id, state or node
+```
+
+The help row is longer than the one it replaced and wraps to two lines inside the
+box, which is only survivable because round eight taught that box to wrap -- checked
+at 70 and 100 columns, no overrun.
+
+**The other resolution, and why not.** The alternative is to make the overview
+search its member jobs, so a job id or a node finds the workload containing it. That
+is arguably what the placeholder's author intended, and it is a better feature. It
+is also a behaviour change to the thing the request said not to change, and it costs
+something real: `filter_groups` runs on every keystroke, and folding 6,574 jobs'
+ids, states and node lists into a per-group haystack is materially more work than
+the four short strings it joins today. Recorded rather than done; the escape hatch
+already exists, since `a` opens the flat list where the full search works.
+
+The test is behavioural rather than textual: for every field a screen advertises, a
+real value of that field must return a non-empty result on that screen. Its control
+asserts the three the overview cannot match are absent from its promise *and* still
+return nothing — so the fix cannot be satisfied by quietly widening the promise
+back.
+
+### Consequence for the numbers
+
+None. Two placeholders and one help row change; no measurement, no filter
+behaviour, no exit code.
+
+---
+
+## Round twelve — a build step nobody could run, again
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `tools/demo_gif.py` imported two undeclared packages and said otherwise | `pyproject.toml`, `tools/demo_gif.py`, `README.md` | `TestTheToolsDeclareWhatTheyImport` |
+
+### 1. The failure it was written to prevent
+
+`tools/demo_gif.py` exists because the thing before it could not be run. Its
+docstring says so:
+
+> `assets/demo.tape` needs `vhs`, `ttyd` and `ffmpeg`, none of which are installable
+> everywhere, and the result was that `assets/demo.gif` was *never committed at
+> all* ... **A build step nobody can run is a build step that does not happen**, so
+> this one uses what a dev install already brings in — Textual to drive the app,
+> `cairosvg` to rasterize, Pillow to assemble.
+
+It imports `cairosvg` and `PIL`. Neither was in `[dev]`, or in any other extra, or
+in the core dependencies:
+
+```
+ dev = ['pytest>=7', 'pytest-asyncio>=0.23', 'pytest-cov>=4', 'ruff>=0.15,<0.17',
+        'mypy>=2.3,<3', 'build>=1.0', 'twine>=5.0']
+  cairosvg in dev extras: False
+  pillow   in dev extras: False
+```
+
+So `pip install -e ".[dev]"` -- what all three CI jobs run, and what a contributor
+reads as the setup step -- leaves `python tools/demo_gif.py` raising
+`ModuleNotFoundError`. That is the tape's failure reproduced in Python: a build step
+nobody can run, guarded by a sentence asserting they can. It only worked here
+because this environment happens to carry both packages for unrelated reasons,
+which is precisely the condition under which nobody notices.
+
+Both imports are inside functions, so the failure was also a bare traceback with no
+remedy in it -- in a repo whose CLI goes to some length to give "a one-line
+explanation and exit 2, never a traceback".
+
+Three changes, all small:
+
+* a **separate `assets` extra** holding `cairosvg>=2.5` and `pillow>=9`. Separate
+  from `dev` deliberately: cairosvg pulls a native cairo, and CI installs `[dev]`
+  six times over -- four Python versions plus the oldest-Textual and coverage jobs
+  -- without ever rendering a GIF. Putting it in `dev` would make every one of
+  those builds carry a native dependency to do nothing.
+* the docstring **corrected** to name the extra instead of claiming `dev` covers
+  it, and the README's regenerate line changed to
+  `pip install -e ".[assets]" && python tools/demo_gif.py`.
+* both import sites now **report rather than raise**:
+
+```
+$ python tools/demo_gif.py          # with the two packages blocked
+the GIF generator needs `pip install -e ".[assets]"` (pillow is missing)
+$ echo $?
+1
+```
+
+Verified both ways -- the generator still produces its 15-frame GIF, and with the
+modules blocked it exits 1 with that line and no traceback.
+
+The test walks every file in `tools/`, collects its non-stdlib non-local imports,
+and fails on any that no dependency group declares -- with `PIL` mapped to the
+`pillow` distribution, since the import name and the package name differ, which is
+part of why this was easy to miss. Its control is `screenshots.py`, which genuinely
+does run on a plain dev install: the sweep has to tell the two files apart rather
+than flag both.
+
+### Checked and found sound
+
+* **`compress_nodelist` is a true inverse of `expand_nodelist`.** 18 hand-picked
+  shapes plus 4,000 fuzzed hostlists across 11 prefix styles, mixed zero-pad widths,
+  suffixed names, digitless names and disjoint runs: every one round-trips to the
+  same set. The expansion side was differential-tested against `scontrol show
+  hostnames` when it was written; the compression side had no such check and now
+  has one measured.
+* **The job-list table agrees across both surfaces** on all 58 rows and all 11
+  shared columns. (Three attempts: two regex-based checkers gave false positives
+  because STARTED and ENDED are single-space-separated and each value contains a
+  space. The third compares alignment-independently -- every dashboard cell must
+  appear in the plain row -- and finds nothing. Recorded because the first two
+  "failures" were entirely mine.)
+* **Nothing `goodput()` or `node_table()` computes is dead.** `gpu_noop_fraction`
+  and the node table's `metric` are referenced exactly once each in the source,
+  which reads as dead weight; both are emitted wholesale by `--json`
+  (`"summary": history.stats`, and the node table dumped entire), so both reach a
+  reader. Confirmed by running `--json` and looking, not by grepping.
+* **`pyproject` metadata** otherwise checks out: the Textual floor matches CI's
+  oldest-supported job, `rich` is declared rather than borrowed transitively, both
+  console scripts resolve, and the classifiers match `requires-python`.
+
+### Consequence for the numbers
+
+None. Nothing in the app changed -- this round touched packaging metadata, one
+tool's docstring and error handling, and one README line. `assets/demo.gif` was
+regenerated as a by-product of verifying the generator still runs; it is
+byte-equivalent in content to round eleven's.
+
+---
+
+## Round eleven — a gauge only one surface drew
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | A gauged detail row drew its bar in the app and not in `--plain` | `report.py:269` | `TestAGaugedDetailRowIsDrawnOnBothSurfaces` |
+
+### 1. `row[2]` was consumed nowhere in report.py
+
+`render.job_sections` hands each detail row three values -- label, value, gauge --
+and the plain renderer read the first two and stopped. `row[2]` appeared nowhere in
+the module, so:
+
+```
+dashboard : slowest task     ███████████▎░░  80.0% below average (task 3 on midway3-0372)
+--plain   : slowest task     80.0% below average (task 3 on midway3-0372)
+```
+
+The layout already knew about the gauge. `pair_rows`' own docstring says rows
+"which carry a gauge still take a line to themselves", and that is why this row was
+never paired -- so the plain renderer was reserving a full line for a bar it then
+declined to draw. The three headline gauges in the same function are drawn here
+already, via `resource_rows(..., flat=True)`; only the detail rows were skipped.
+
+Exactly one row type carries a gauge, and the synthetic history has exactly one
+multi-task job that produces it. That is why three consecutive rounds of width
+sweeps, drift sweeps and prose sweeps went straight past it -- round six's "the
+demo's own values are short", in its narrowest form yet: one row, on one job, in
+one section.
+
+Both surfaces now take the bar's width and gap from `render.DETAIL_BAR_WIDTH` and
+`DETAIL_BAR_GAP` rather than the dashboard's own hardcoded `14`, the wrap budget
+shrinks by what the bar costs, and a wrapped continuation hangs past the bar as
+well as the label so the sentence stays under itself. Plain uses `flat=True` like
+its three headline gauges -- whole cells, because an eighth-block tip with no
+background reads as a notch -- so the two differ in tip precision and in nothing
+else, which is the same difference `test_the_plain_report_uses_the_flat_bar`
+already pins for the block above.
+
+**The fix shipped broken and a test caught it.** The first version omitted
+`ascii_mode`, so `--ascii` -- made good on only three rounds ago -- put `█` and `░`
+straight back into output that had just been asserted pure ASCII.
+`TestAsciiIsHonouredByEveryTextView` failed on the first run. Recorded because it is
+the clearest evidence in this file that the tests from earlier rounds are doing
+work, rather than merely accumulating.
+
+### Checked and found sound
+
+Four sweeps that turned up nothing, so the next round can skip them:
+
+* **60 random key sessions, 40 keypresses each** -- 2,400 presses over the full
+  binding set including `escape`, `q`, digits, `/`, `w`, `r`, `M` and the modal
+  keys, at five terminal widths and three heights. No crash, no unhandled
+  exception.
+* **`fit_columns` holds its contract** for all four specs at every `available`
+  from 10 to 260 and both padding values: it never exceeds the width it was given
+  unless the never-dropped columns cannot fit -- which is the documented
+  `table_floor` behaviour -- and `fill_to` lands on exactly the requested total
+  rather than short.
+* **The job post-mortem agrees field for field across both surfaces** on seven
+  jobs spanning TIMEOUT, OUT_OF_MEMORY, FAILED, CANCELLED and three clean runs:
+  every shared label carries the same value, and the row sets are identical. The
+  gauge above was the single disagreement, and it was found this way rather than by
+  reading.
+* **The parse fuzzer is quiet again.** The same 5,500-case sweep that found round
+  ten's NaN and OverflowError now completes with zero failures.
+
+### Consequence for the numbers
+
+None. One row of `--plain <jobid>` gains a 14-cell bar in front of a percentage it
+already printed; nothing else moves. `assets/screenshot-job.svg` and
+`assets/demo.gif` are regenerated, though the screenshot's job is single-task and
+so unaffected by this change -- they were rebuilt to keep the whole set current with
+the tree rather than because this round staled them.
+
+---
+
+## Round ten — a NaN that spread, and a test that looked away
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | One unreadable record turned a whole history's totals into `nan`, then raised | `duration.py`, `sacct.py` | `TestOneBadRecordCannotPoisonTheRest`, `TestAValueThatIsNotANumberIsNotAMeasurement` |
+| 2 | `1 jobs in 1 workload` on both overview surfaces | `report.py:422`, `tui.py:814` | `TestSingularPlural` |
+| 3 | The package docstring named 6 of the 10 third-party-free modules | `__init__.py` | `test_the_package_docstring_lists_every_module_the_guarantee_covers` |
+| 4 | `Constraints` called "field 32 of 107" -- two different denominators | `sacct.py:38` | — (comment only) |
+
+### 1. A value that is not a number is not a measurement
+
+Found by fuzzing `parse()` with malformed rows, which is how it should have been
+found: nothing here is reachable by reading the happy path.
+
+`float("NaN")` and `float("1e999")` are floats Python builds happily, and three of
+the four parsers let them through or died on them:
+
+```
+NaN     parse_duration -> nan      parse_bytes -> None                   _int -> None
+inf     parse_duration -> inf      parse_bytes -> RAISED OverflowError   _int -> RAISED OverflowError
+1e999   parse_duration -> inf      parse_bytes -> RAISED OverflowError   _int -> RAISED OverflowError
+```
+
+Only `parse_cpu_freq` was safe, and by accident -- its plausible-clock range check
+rejects a NaN because every comparison with one is False.
+
+`OverflowError` is not a `ValueError`, so `except ValueError` in `sacct._int` and
+`duration.parse_bytes` did not catch it: one `inf` in `Priority`, `ReqCPUS`,
+`NNodes` or any byte field took the **entire query** down with a traceback. Trap 9
+at the top of `sacct.py` is the rule that breaks -- "a wedged accounting database
+must not wedge the tool".
+
+The NaN is worse, because it does not stay where it started:
+
+```
+=== healthy only ===
+  stats total    : 4.0 | core-hours 8.0
+  job screen     : rendered
+
+=== healthy + one NaN Elapsed ===
+  elapsed values : [3600.0, nan]
+  stats total    : nan | core-hours nan
+  job screen RAISED: ValueError: cannot convert float NaN to integer
+```
+
+One unreadable record and the healthy job's 4.0 GPU-hours is gone from the total,
+which now reads `nan`. That is the exact failure `duration.py`'s opening rule was
+written against -- "Each must yield None, never 0.0 -- a 0.0 here silently becomes
+'this job used no time', which is a lie" -- except a NaN tells the lie about every
+job at once, and then the job screen refuses to render at all. Seven of the fifteen
+formatter-by-value combinations raised; the rest printed `nan%`, `inf TiB` and
+`-infs`.
+
+Closed at the parse boundary, which is where this module already handles sentinels:
+every parser returns None for a non-finite result, `_int` catches `OverflowError`,
+and every formatter renders one as the absent value rather than raising. The control
+asserts the guard rejects nothing finite -- including the `0` and the negative that
+other rules here deliberately allow through.
+
+### 2. The test navigated away from the screen it was named for
+
+```
+--- --plain overview ---
+    1 jobs in 1 workload · 100.0% completed
+--- dashboard ---
+    OverviewScreen : w  ·  1 jobs in 1 workload  ·  100.0% completed
+    JobListScreen  : all jobs  ·  1 job    <- what the test reads
+```
+
+`%d jobs in %d workload%s`: the second count was guarded and the first was not, in
+one sentence, on the landing screen, in both front ends.
+
+`TestSingularPlural.test_one_job_is_not_reported_as_one_jobs` exists for precisely
+this. It presses `a` first -- which leaves the overview for the job list, whose
+sentence is a different one and was always correct -- and then asserts. Its sibling
+`test_one_workload_is_not_one_workloads` reads the overview and checks the
+`workload` half of the very same line, so the only half that was broken was the
+only half never looked at. Both screens are read now, and the plain renderer has
+its own check because it builds the sentence separately.
+
+Round seven fixed nine of these and this one survived, which is worth saying
+plainly: that round swept for the `"" if n == 1 else "s"` idiom being *absent*, and
+here it was present -- on the wrong count.
+
+### 3. A guarantee wider than the sentence promising it
+
+`__init__.py` said the analysis modules are "``sacct``, ``diagnose``, ``patterns``,
+``nodes``, ``index``, ``site``". `CLAUDE.md` and
+`test_the_analysis_layer_needs_no_third_party_package` both hold ten to that rule;
+the four unnamed were `model`, `sizing`, `logs` and `duration`. `sizing` is the
+module the README's own library example imports, so a reader checking whether it
+was safe on a login node was told nothing about it. Now derived from the same
+static read the enforcing test uses, so the list cannot fall behind again -- with
+a control asserting it does not over-claim one of the four renderers either.
+
+### 4. Two denominators in one clause
+
+`Constraints` is "field 32 of 107 here". It is field 32 of the **85** this module
+asks for; 107 is what Slurm offers. The number that matters for the sentence -- a
+pipe shifts every column after it -- is the position in the requested list, so a
+reader who went and counted Slurm's 107 would land somewhere else.
+
+### Checked and found sound
+
+Worth recording, because a round that only lists what it broke reads as if it
+looked nowhere else:
+
+* **The three surfaces agree on every overview number.** Runs, completed, flagged
+  and last-seen compared row by row across `--overview`, `--overview --json` and
+  the dashboard's DataTable: no mismatches.
+* **All six sort modes agree** across the library, the text view and the JSON, and
+  the dashboard's `s` cycle walks `SORTS` in order and wraps.
+* **The self-describing numbers are right**: `table_floor(JOB_COLUMNS)` is 74 and
+  `NODE_COLUMNS` 41, exactly as `render.table_floor` claims, and `_FIELDS` is 85.
+* **The TUI has no overrun** at 80, 100 or 120 columns on any of eight screens,
+  driven with a 68-character workload name, a 45-character node name and a
+  40-character partition.
+
+### Consequence for the numbers
+
+For a history whose fields all parse, nothing changes. For one containing a value
+that is not finite, the change is large and in the right direction: that record now
+reports `n/a` instead of `nan`, every other record's totals survive it, and the job
+screen renders instead of raising. `--plain` and the dashboard both say "1 job"
+where they said "1 jobs".
+
+---
+
+## Round nine — the demo's clock, and a state that meant two things
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | Every synthetic job's `End` contradicted its own `Elapsed` | `demo.py:112` | `TestTheDemoClockAgreesWithItself` |
+| 2 | `OUT_OF_ME+` was recognised in one module and mis-handled by six | `sacct.py:188` | `TestATruncatedStateMeansWhatItSays` |
+| 3 | `Submit` equalled `Start` while `Reserved` claimed a one-second wait | `demo.py:113` | `test_submit_is_before_start_by_the_queue_wait_it_reports` |
+
+### 1. A demo of something Slurm cannot produce
+
+`_job` wrote `End="2026-07-%02dT23:59:00"` -- a flat end-of-day stamp, whatever the
+job actually did. So on the job screen:
+
+```
+  ● TIME   ██████████████████       101.4%   · 00:30:26 of the 00:30:00 limit
+  ...
+  timing
+    submitted        2026-07-19T03:54:00             started          2026-07-19T03:54:00
+    ended            2026-07-19T23:59:00             queued for       1.0s
+```
+
+Twenty hours and five minutes between the two timestamps, three rows under a gauge
+saying the job ran thirty minutes and was killed for it. All 58 records were like
+this; measured by parsing the demo and differencing:
+
+```
+timestamp inconsistencies: 58
+    ('elapsed != end-start', '5100001', 'cot-exp', 1826.0, 86340.0)
+```
+
+`demo.py`'s own docstring is the standard it fails: "Nobody should be able to
+mistake a demo screenshot for a measurement." A screenshot nobody can mistake for
+a measurement is not the same as one that contradicts itself, and this is the
+second kind. `_time_of_day` two functions above states the general rule -- "a demo
+whose clock disagrees with its ids is a demo of something Slurm cannot produce" --
+which round five wrote while fixing the *submission* clock and never applied to
+`End`.
+
+`End` is now `Start + Elapsed`, and a 42-hour allocation is allowed to cross
+midnight rather than being clamped back into its own day. The control asserts
+exactly that, because clamping is the wrong fix that would satisfy the main test.
+
+**The wrong timestamp was published.** `assets/screenshot-job.svg` carried the
+`23:59` and the README displays it. Both it and `assets/demo.gif` are regenerated
+from `tools/screenshots.py` and `tools/demo_gif.py`; the job frame now reads
+`started 03:54:00 / ended 04:24:26`, which is the 00:30:26 the gauge claims. Two
+of the five SVGs changed and three came back byte-identical, which is the
+generator being deterministic rather than three being skipped.
+
+### 2. One spelling, two meanings
+
+sacct cuts a state name to the column width and marks it with `+`, so
+`OUT_OF_MEMORY` can read `OUT_OF_ME+`. The codebase knew that in exactly one
+place: `_TERMINAL_STATES` listed it, and it appeared nowhere else in `src/`,
+`tests/` or `docs/`. Run the parser on one and the record is correctly treated as
+closed and then mis-handled by everything after:
+
+```
+OUT_OF_MEMORY  failed=True   findings=['host-oom']  memory-search=True   mem advice=raise
+OUT_OF_ME+     failed=False  findings=[]            memory-search=False  mem advice=unknown
+```
+
+So a cgroup OOM kill counted as neither a failure nor a completion -- out of
+`GroupStats.failed`, out of `problems`, out of `fail_rate`'s denominator -- drew no
+`host-oom` finding, and was invisible to both the memory-bisection detector and the
+`--mem` floor in `sizing.memory_advice`. That is the same shape as `Job.failed`
+omitting DEADLINE, which round three fixed and `model.py` still explains.
+
+Folded at the parse boundary now, which is where `_ALIASES` already undoes a field
+Slurm renamed, and the truncated entry is gone from `_TERMINAL_STATES` because it
+no longer reaches it. The `by <uid>` suffix survives the fold -- `Job.state` carries
+it and `base_state` drops it, and both are read.
+
+**Stated plainly:** this tool queries with `--parsable2`, which does not truncate,
+so the spelling does not arrive from its own query. It arrives from a replayed or
+injected runner, which `Sacct(runner=...)` exists to support. The entry was in the
+codebase already; the defect is that one spelling of one state meant two different
+things in one codebase, and that is worth closing whichever query produced it.
+
+### 3. A queue wait the timestamps denied
+
+`Reserved="00:00:01"` while `Submit` and `Start` were the same string, so the job
+screen read "submitted 03:54:00, started 03:54:00, queued for 1.0s" -- three rows,
+two of which contradict the third. `Submit` is now one second before `Start`, from
+the same named constant that writes `Reserved`.
+
+### Considered and not changed
+
+**Job ids ascend while dates jump backwards between series.** Real, and measured:
+four boundaries, e.g. 5100020 is 2026-07-20 and 5100021 is 2026-07-05. Slurm hands
+out ids in submission order, so this is the same invariant `_time_of_day` names.
+Left alone: no screen shows both sides of a boundary, so nothing contradicts itself
+on screen, and fixing it means re-dating the whole synthetic history -- which
+changes the LAST RUN column, the workload ordering, and every committed asset.
+That is a rewrite of the demo narrative, not polish. Recorded here so the next
+round does not have to re-find it.
+
+**`REVOKED` and `SPECIAL_EXIT` are graded by nothing.** Both are terminal states
+this parser accepts, and `theme.STATE_HEALTH` has no entry for either, so they
+render with no judgement. For REVOKED that is right. For SPECIAL_EXIT it is a
+judgement call the repo has not made, and making one silently is what the **Open**
+section below exists to prevent.
+
+### Consequence for the numbers
+
+`--demo` changes: every synthetic `End` and `Submit` moves, so the ENDED column and
+the timing rows differ, and the two regenerated assets with them. No real
+measurement changes.
+
+For a real history, one thing can: a record whose State arrives truncated as
+`OUT_OF_ME+` now counts as a failure, draws `host-oom`, and feeds the memory
+detectors -- so `slurmpast <jobid>` on such a record exits 1 where it exited 0, and
+a workload holding them can gain a `memory-search` finding and a `--mem` floor it
+did not have. On any history whose states are spelled in full, nothing moves.
+
+---
+
+## Round eight — the flag and the screen that half-worked
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `--ascii` changed nothing in five of the six plain views | `cli.py`, `report.py` | `TestAsciiIsHonouredByEveryTextView` |
+| 2 | The help box overran its own frame, and the terminal below 80 columns | `tui.py` `HelpScreen` | `TestTheHelpScreenIsWrappedLikeEveryOtherScreen` |
+| 3 | A long job name overran `--plain` where the dashboard clipped it | `report.py:262` | `TestALongValueIsCutTheSameWayOnBothSurfaces` |
+| 4 | `p` meant something else on a job screen; `m` and `c` were in no help at all | `tui.py` `_HELP_KEYS` | `TestTheHelpScreenNamesEveryVisibleKey` |
+
+### 1. A flag accepted and thrown away, for the third time
+
+```
+$ diff <(slurmpast --demo --overview) <(slurmpast --demo --ascii --overview)
+$ echo $?
+0
+```
+
+Byte-identical, and the same for `--plain`, `--patterns`, `--nodes` and `--sizing`.
+`cli.main` passed `ascii_mode` to `render_job` and to `tui.run` and to nothing
+else, so five of the six plain renderers never learned the flag had been given.
+That is round five's #7 and #8 -- "Two flags that were accepted and thrown away" --
+recurring on a third.
+
+Underneath it a second, narrower thing: even in `render_job`, which *did* receive
+the flag, `ascii_mode` only ever reached `render.bar` and `render.health_dot`. So a
+terminal that could not draw `●` got the ASCII fallback for that and then an em
+dash and a middle dot anyway:
+
+```
+$ slurmpast --demo --ascii 5100019 | grep -c '[^ -~]'
+2
+```
+
+Both halves are closed by one shared `render.ascii_fold`, applied once per view to
+its finished text -- the flag has to reach the sentences as well as the glyphs, and
+the sentences are assembled in a dozen places.
+
+Every substitution is deliberately **one cell for one cell** (`—`→`-`, `·`→`|`,
+`…`→`.`, `→`→`>`), because the fold runs after wrapping and after `clip` has
+reserved its marker cell; a two-character replacement would push a row that had
+just been measured to fit back over the width it fits. A test asserts every line
+keeps its exact length through the fold.
+
+Not applied to the dashboard, and the help now says so rather than promising more
+than the flag can do: Textual draws the frame in box characters whatever we pass,
+so folding our prose there would buy a reader nothing they could see. `--plain` is
+the surface that gets piped somewhere with an opinion about encoding.
+
+The control is the one that matters: a fold applied to nothing would satisfy
+"output is pure ASCII" on any view that was already ASCII. So the flag is asserted
+to change a view **exactly when** that view had something to fold -- stated as an
+equivalence, because `--patterns` on the demo history genuinely holds no foldable
+character and demanding a difference there would pin the fixture rather than the
+flag.
+
+### 2. The screen that explains the app was the one nobody wrapped
+
+Rounds five, six and seven each wrapped the prose on some surface and wrote down
+why. `HelpScreen` was on none of their lists, and it had all three symptoms at
+once. Its box is `width: 78` with a round border and `padding: 1 2`, so the content
+gets 72 cells:
+
+```
+ 75    a              every job in one flat list, ignoring the workload grouping  <-- OVERFLOWS by 3
+ 74    Y              copy the whole view (a job screen copies the full report)   <-- OVERFLOWS by 2
+```
+
+Textual soft-wrapped both and dropped the continuation at column 2, out from under
+the description it continues -- "the orphan at column 0 that `_prose_width` exists
+to prevent", on the screen that documents `_prose_width`'s own keys:
+
+```
+│    a              every job in one flat list, ignoring the workload        │
+│  grouping                                                                  │
+```
+
+A third line was worse, because its length is not ours to know: the clip path is
+interpolated from `_clip_path()`, so it is 78 cells on the machine this was found
+on and unbounded in general. That is round six's folded-workload-name trap
+("the demo's own values are short") in a new place. It now gets its own line, so
+the sentence around it always reads whole, and the path itself is the same
+deliberate overrun `report.py` already accepts for one -- "a path you cannot copy
+whole is no use in a ticket".
+
+And `width: 78` is a floor as well as a ceiling in Textual, so below an 80-column
+terminal the box was drawn wider than the screen and simply cut, with no marker:
+
+```
+### terminal 70
+    │    n              which nodes your jobs fail on, controlled for work
+```
+
+No right border, no `…`, nothing saying the line had been cut -- the one thing
+`render.clip` exists to prevent. The box is now measured, less `_SCROLLBAR` for the
+reason `_text_width` gives (the help is taller than a short terminal, so the modal
+grows a scrollbar and a box sized to the full width loses its border to it), and
+rebuilt on resize. Above 80 columns the cap binds first and nothing changed.
+
+### 3. The same row, cut two ways
+
+`report.py` wraps a solitary detail value to a budget, and `wrap` breaks at spaces.
+A job name has none:
+
+```
+--- PLAIN (COLUMNS=80) ---
+  len=89      name             nemotron-batch-h200-tokenize-shards-stage3-retry-17-experimental-arm
+--- DASHBOARD (80) ---
+  len=79       name             nemotron-batch-h200-tokenize-shards-stage3-retry-17-expe…
+```
+
+The dashboard had always clipped it -- `JobScreen.cell` calls `_clip` for anything
+`render.PATH_ROWS` does not declare a path -- so the two surfaces disagreed about
+the same row of the same screen, and the one meant for pasting was the wrong one.
+Both now go through `render.clip`, so a cut cell says it was cut.
+
+`PATH_ROWS` keeps its exemption and a test says so: `workdir` still overruns on
+purpose, because `--plain` exists to be pasted.
+
+### 4. A key that meant two things, and two keys that were documented nowhere
+
+`HelpScreen` is reachable from the job screen, and from there it said:
+
+```
+p              what keeps failing the same way, across runs
+```
+
+`JobScreen` binds `p` to `toggle_paths`, `show=False`. So a reader on that screen
+got neither the patterns screen the help promised nor any hint in the footer of
+what they had actually done. The row names both meanings now.
+
+`m` and `c` are the only two bindings shown in a footer -- the nodes screen's --
+and absent from the help entirely, and `c` undoes the workload control the `n` line
+directly above advertises. Both added. A test walks every screen's `BINDINGS` and
+fails on any `show=True` key the help does not mention, so the next one cannot slip
+through either.
+
+### A test of round seven's, narrowed
+
+Round seven added an AST sweep banning a hand-computed width in any `render.wrap`
+call in `tui.py`. It matched on `max(...)`, which is too blunt: `HelpScreen` clamps
+its own already-measured box width that way, legitimately. It now bans deriving the
+width from `size.width` at the call site, which is what `_prose_width` exists to do
+once and correctly -- and it carries a control asserting the sweep still recognises
+the exact spelling it was written to ban, since narrowing a sweep is the change
+most likely to leave it matching nothing.
+
+### Considered and not changed
+
+**The dashboard's prose is still Unicode under `--ascii`.** Deliberate, argued
+above, and now said in `--help` rather than left as a silent shortfall.
+
+**`_clip_path()` creates a directory as a side effect of rendering the help.**
+Real, and left: it is `exist_ok=True`, it is pre-existing, and changing when a
+cache directory appears is a behaviour change this round was not asked for.
+
+**`PatternsScreen` exposes no `Text` attribute for tests** the way `NodesScreen`
+does, so its assertion reads the compositor instead. Noted rather than fixed --
+adding one is a change to a screen that works.
+
+### Consequence for the numbers
+
+None. `--ascii` output changes, which is the point; without the flag every view is
+byte-identical, and a test pins that every line keeps its exact length through the
+fold. Nothing else moves a measurement, a threshold, an exit code or a sort order.
+
+---
+
+## Round seven — polish
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | Two front ends drew the same sentence and had already drifted | `report.py`, `tui.py` | `TestTheTwoSurfacesCannotDriftApart` |
+| 2 | `1 nodes were tested` | `render.py:669` | `test_the_note_pluralises_the_table_size_too` |
+| 3 | `after correcting for 1 tested` | `report.py:684`, `tui.py:1715` | `test_the_exclude_header_names_the_noun_at_one_node_too` |
+| 4 | `1 allocations ran over 00:05:00` | `patterns.py:355` | `test_one_idle_allocation_is_not_one_allocations` |
+| 5 | `1 were killed within 15 minutes, so those were` | `patterns.py:364` | `test_one_quick_kill_is_not_one_were_killed` |
+| 6 | `1 were FAILED` | `patterns.py:147` | `test_a_dominant_state_of_one_is_not_one_were` |
+| 7 | `1 further groups show` | `patterns.py:197` | `test_one_hidden_repeat_group_is_not_one_groups` |
+| 8 | `The other 1 did compute, and were cut off` | `sizing.py:201` | `test_one_computing_timeout_is_not_were_cut_off` |
+| 9 | `over 1 placements`, `1 seen, all below it` | `render.py:604,643` | `test_one_placement_is_not_one_placements` |
+| 10 | `test · 1 runs`, `1 of 1 jobs failed`, `1 more workloads (1 runs)` | `report.py:763`, `index.py:502,518` | three in `TestEveryCountIsSpelledForItsNumber` |
+| 11 | The node screen guessed its chrome instead of measuring it | `tui.py:1734,1748` | `TestTheNodeScreenMeasuresItsChromeRatherThanGuessing` |
+| 12 | One `--help` example's description sat a column left of the other eight | `cli.py:29` | `TestTheHelpExamplesLineUp` |
+| 13 | `StdOut`/`StdErr` dated to Slurm 21.08 in three places, 24.05 in two | `model.py`, `cli.py`, `docs/details.md` | `TestTheStdOutBoundaryIsOneNumber` |
+
+### 1. A sentence written twice is a sentence that will differ
+
+`CLAUDE.md`: "`render.py` exists so the dashboard and `--plain` cannot drift. A
+change to one surface that the other also draws belongs in `render.py`, not in
+both." Three sentences had been moved there and given a docstring each saying why
+(`nodes_baseline`, `nodes_empty_reason`, `held_back_note`). Seven had not:
+
+```
+$ python - <<'EOF'    # prose literals present in both files, docstrings excluded
+... shared prose literals between report.py and tui.py: 7
+EOF
+  report.py:[700]  tui.py:[1733]  '%d further node%s scored worse too, left off the line: ...'
+  report.py:[607]  tui.py:[1641]  '(placement is not random)'
+  report.py:[403]  tui.py:[740]   ', %.0f of them never used'
+  report.py:[608]  tui.py:[1642]  'controlled for workload: only %s counted %s'
+  report.py:[572]  tui.py:[1549]  'no cross-run pattern met its evidence threshold.'
+  report.py:[707]  tui.py:[1741]  'no node is worse than the rest; nothing to exclude.'
+  report.py:[684]  tui.py:[1715]  'worse than every other node, after correcting for %d tested:'
+```
+
+An eighth was in the same block and did **not** appear in that list, because the
+two copies were no longer the same string:
+
+```
+report.py:692  "not applied for you — excluding nodes trades availability for reliability.",
+tui.py:1723    "not applied for you — excluding nodes trades availability for "
+tui.py:1724    "reliability, and that is your call.",
+```
+
+One sentence, one block of one view, two texts. It is invisible from either side:
+whichever surface you are looking at renders exactly one of them.
+
+All eight now come from `render.py`. The shorter wording is what survived --
+"not applied for you" has already said whose call it is, which is the same trim
+this file records three times over for other lines. `WORKLOAD_CONTROL_ASIDE` is
+exported rather than buried because both surfaces emphasise it separately from
+the rest of its sentence.
+
+Two tests, because the two halves fail independently: an AST sweep asserting no
+prose literal appears in both modules, and a rendering check on each front end
+asserting the shared string is what actually reaches the screen. The sweep alone
+would pass if both surfaces stopped drawing the sentence.
+
+### 2-10. Nine counts that read wrong at one
+
+Everything in this codebase carries the `"" if n == 1 else "s"` idiom, and round
+six's `TestCountsAreSpelledForTheirNumber` pinned two instances of it -- then
+stopped. Nine more were reachable, one of them printed by `--demo` itself:
+
+```
+$ slurmpast --demo --nodes
+  worse than every other node, after correcting for 1 tested:
+```
+
+`held_back_note` is the sharpest of the nine, because the same sentence
+pluralises its other count correctly and not this one:
+
+```python
+>>> held_back_note(1, 1)
+'1 interval clears the baseline on its own — but about one in twenty does that by
+ chance and 1 nodes were tested, so on its own that is not yet evidence.'
+```
+
+The rest, each reproduced by running the code that emits it:
+
+```
+1 allocations ran over 00:05:00 while consuming under 10 CPU-seconds.
+2 allocations ran over 00:05:00 ... 1 were killed within 15 minutes, so those were already noticed
+5 of 5 runs of w in test failed; 1 were FAILED.
+1 further groups show the same repeat-failure pattern
+The other 1 did compute, and were cut off at 00:30:00
+baseline 100.0% over 1 placements; 1 node below threshold omitted
+No node reached the 10 placements a comparison needs — 1 seen, all below it.
+w  test · 1 runs
+1 of 1 jobs failed  /  1 jobs, nothing flagged
+1 more workloads (1 runs) holding 50.0% of the compute
+```
+
+Two are worth naming beyond the missing "s". `1 were FAILED` needs five failures
+across five distinct states to reach, which is the least likely of the nine and
+the only one that changes a verb rather than a noun. And "1 seen, all below it"
+is not fixed by pluralisation at all -- "all" is the wrong quantifier for one --
+so it reads "1 seen, and it is below it" now.
+
+Every control asserts the plural spelling is untouched: a fix that simply deleted
+the "s" would otherwise pass.
+
+### 11. The module that had been burned by this guessed anyway
+
+`tui._prose_width` exists because "screen width minus a constant" is wrong, and
+its docstring spends nine lines on the measurement:  "``#body`` is 96 wide inside
+a 100-cell screen. Two cells is enough: a finding wrapped to 90 was drawn at
+8 + 90 = 98, Textual soft-wrapped the overflow, and the reader got ... the orphan
+at column 0 that ``_prose_width`` exists to prevent, surviving inside it because
+the chrome was guessed rather than read."
+
+Two `render.wrap` calls on the node screen were still spelling the guess out:
+
+```
+screen=100  _text_width=98 | _prose_width(2)=96 vs size.width-6=94 | _prose_width(4)=94 vs size.width-8=92
+```
+
+Consistently two cells narrow, at every terminal size, because the constants
+double-count the scrollbar `_text_width` has already taken off. The direction is
+safe -- these two lines wrapped early rather than overrunning -- which is why
+nothing caught them, and it is still two sentences wrapping differently from
+every other sentence on their own screen. The test is an AST sweep: no
+`render.wrap` in `tui.py` may take a hand-computed `max(...)` width.
+
+### 12. One space
+
+`RawDescriptionHelpFormatter` prints the epilog literally, so the alignment is
+whatever the string says:
+
+```
+ 35  '  slurmpast                        dashboard over the last 7 days'
+ 34  '  slurmpast -S now-30days         ... over the last 30 days'
+ 35  '  slurmpast 51170455               post-mortem for one job'
+```
+
+Invisible in the source, plain on screen. Pinned by measuring the column every
+example's description starts at and asserting there is one of them.
+
+### 13. A version boundary the code had already researched
+
+`logs.py` opens with the boundary table and is explicit about the trap:
+
+> 1. **StdOut/StdErr, from Slurm 24.05.** Absent in 20.11, 21.08, 22.05, 23.02 and
+>    23.11; present in 24.05. (21.08 is the release that added ``SubmitLine`` and
+>    ``AccountingStoreFlags=job_script`` -- not these fields.)
+
+`sacct.py` agrees ("SubmitLine from 21.08, StdOut/StdErr only from 24.05"), and so
+does `report.py`. Three other places said 21.08 anyway -- `model.py`'s field
+comment, `cli.py`'s JSON comment, and the compatibility table in
+`docs/details.md`, which is the one a reader consults to find out what works on
+the Slurm they have. Five releases were being told they have a field they do not.
+
+The test anchors on the code rather than grepping for the number, because 21.08 is
+the *right* answer three lines away in the same files -- `render.py`'s "submitted
+as" row is dated from `SubmitLine`, correctly, and a sweep over the bare version
+would have demanded that be broken too. It has its own control saying so.
+
+### Documentation
+
+**README's Textual range.** It read "Textual 0.89–8.2" against a `pyproject` pin
+of `textual>=0.86,<9` and a CI job named `oldest-textual` that installs
+`textual==0.86.*`. The floor was understated by three releases. Now read out of
+the pin by a test that also checks the CI job installs the same number, so the
+three cannot part again.
+
+**Test badge.** 1195 → 1221, which `test_the_test_badge_matches_the_suite`
+already enforces.
+
+### Considered and not changed
+
+**The job table overruns a terminal narrower than 74 columns.** Real, and already
+recorded: `render.table_floor` computes it per spec, `report.PLAIN_MIN_WIDTH`'s
+comment says it is "a floor on the *layout*, NOT a promise that every view fits 60
+cells", and `TestPlainOutputFitsATerminal` asserts against the floor rather than a
+constant. Not a defect, by the codebase's own account of it.
+
+**`--demo` still ignores `-S` and `-E`.** The standing **Open** entry below. Left
+alone, and not re-litigated.
+
+**The dashboard's patterns screen adds a paragraph the plain report does not**
+("That is a real answer, not an empty screen ..."). The shared *sentence* now comes
+from `render`; the extra paragraph stays, because vertical room is exactly the kind
+of thing that legitimately differs between a dashboard and a pipe -- the same
+argument `nodes_empty_reason` makes for taking `widen` as a parameter.
+
+**`--json` on the list branch computes a per-job severity and then discards it.**
+Traced and left: the text branch on the same path does the same thing deliberately,
+and the comment above it says so. Changing it would move behaviour, which this
+round was asked not to do.
+
+### Consequence for the numbers
+
+None. Nothing here changes a measurement, a threshold, an exit code or a sort
+order. Thirteen fixes, all of them wording, wrapping, alignment or a comment --
+the widest-reaching is that eight sentences now have one home instead of two, and
+they render byte-identically on both surfaces except the one that had drifted,
+where `--plain`'s spelling won.
 
 ---
 
@@ -756,6 +2681,64 @@ entry was refusing, replaced by the smallest change that keeps the idiom intact.
 ---
 
 ## Consequence for the numbers
+
+**Round twenty.** Nothing changes. Two tests were added and no source file was
+touched.
+
+**Round nineteen.** One sentence, on one branch: a `repeat-failure` finding whose
+workload mixes hung and computing timeouts gains the split clause and the word
+"those". A workload where every timeout hung -- which is what the demo has, and
+what most real ones have -- is unchanged word for word, so the assets are
+byte-identical. No measurement, no verdict, no exit code, no JSON field.
+
+**Round eighteen.** This one moves an exit code. `slurmpast <jobid>` on a
+**BOOT_FAIL** now exits 0 where it exited 1: its only finding used to be a CRITICAL
+`noop-allocation` and is now a WARNING `boot-failed`, matching `NODE_FAIL`, which
+has always exited 0. **DEADLINE** is unchanged at 1, by way of a CRITICAL finding
+that names the deadline instead of one that blamed the script. Any CI step keying
+off that code sees the BOOT_FAIL change.
+
+Beyond that: four `NODE_FAIL`/`PREEMPTED`/`BOOT_FAIL`/`DEADLINE` post-mortems lose
+the `cpu-overrequest` and `gpu-suspect-idle` findings entirely -- deliberately,
+they were computed from a figure the same report calls missing data -- and the
+`exit-nonzero-nolog` title and evidence change for exit 127, exit 137 and signal 9.
+No measurement moves, and `--json` gains no field.
+
+**Round seventeen.** Presentation only, and only on a branch that previously showed
+nothing: two screens gain a sentence where a filter or search matches nothing, the
+overview's summary gains "showing 0" where it printed no clause at all, and two
+grids are hidden when they have no rows. Nothing changes on a table with rows,
+which is why the committed assets are byte-identical.
+
+**Round sixteen.** Presentation only; no measurement, no exit code, no JSON field.
+Six sentences change wording where a count is 1 -- the overview summary, the footer
+headline, two pattern findings and two cells of the pasted overview row -- and the
+nodes screen stops drawing a table on the branch where it has no rows. Nothing
+changes on a history large enough for any count to exceed 1, which is why the demo
+and the committed assets are byte-identical.
+
+**Round fifteen.** One addition and one correction that a consumer may be reading.
+`--json` gains `outcome.live` per job, so a payload is 95 job-level values where it
+was 94 -- additive, nothing renamed or removed. The documented totals in `README.md`
+and `docs/details.md` change with it, and are now pinned by a test. On screen, the
+workload screen's banner grows by up to five lines where a recommendation carries a
+caveat; no measurement or exit code moves.
+
+**Round fourteen.** No measurement changes and no exit code moves; every fix is
+presentation. Three things a reader or a script might be matching on do change in
+`--plain`, all of them in the Unicode form only -- under `--ascii` the output is
+byte-identical to what it was:
+
+```
+                   before                       after        --ascii
+action arrow       "        -> "                "        → "  "        > "
+95% CI cell        "75.7 - 100.0%"              "75.7 – 100.0%"  "75.7 - 100.0%"
+nodes heading      "node reliability (hang rate)"  "node reliability — hang rate"
+```
+
+Seventeen sentences also swap ` -- ` for ` — `, which shortens each by one cell.
+Anything grepping the plain output for those literals should pass `--ascii`, which
+is what that flag is for, or match the `--json` field instead.
 
 **Round five.** Two findings change what the tool *reports*, not how it renders.
 Round five's #2 removes a CRITICAL from every `CANCELLED`, `TIMEOUT`, `PREEMPTED`,

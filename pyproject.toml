@@ -68,6 +68,22 @@ dev = [
   "build>=1.0",
   "twine>=5.0",
 ]
+# What `tools/demo_gif.py` needs to rebuild the README's lead image, kept apart
+# from `dev` on purpose: cairosvg pulls a native cairo, and CI installs `[dev]`
+# on four Python versions plus two extra jobs without ever rendering a GIF.
+#
+# Declared at all because it was not, and `demo_gif.py` said it was: "this one
+# uses what a dev install already brings in -- Textual to drive the app,
+# `cairosvg` to rasterize, Pillow to assemble". Neither was in any extra, so
+# `pip install -e ".[dev]"` -- what CI runs and what the README implies -- left
+# the generator raising ModuleNotFoundError. That is the exact failure its own
+# docstring says it exists to prevent: "A build step nobody can run is a build
+# step that does not happen", which is how the vhs tape it replaced ended up
+# shipping a README pointing at a GIF that was never committed.
+assets = [
+  "cairosvg>=2.5",
+  "pillow>=9",
+]
 
 [tool.setuptools.dynamic]
 version = { attr = "slurmpast._version.__version__" }

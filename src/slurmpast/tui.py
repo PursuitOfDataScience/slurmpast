@@ -31,9 +31,11 @@ from textual.widgets import DataTable, Footer, Header, Input, Static
 
 from . import render, theme
 from .diagnose import diagnose, looks_like_noop
-from .duration import format_bytes, format_duration, format_percent, humanize_window
+from .duration import format_bytes, format_duration, format_percent, humanize_window, plural
 from .index import (
     FILTERS,
+    GROUP_SEARCH_FIELDS,
+    JOB_SEARCH_FIELDS,
     SORTS,
     GroupStats,
     History,
@@ -75,14 +77,19 @@ DataTable > .datatable--cursor { background: $primary 30%; }
 # but it fails silently on some terminals and needs `set -g set-clipboard on`
 # inside tmux. So every copy is ALSO written to a file and the notification names
 # it; that way the feature never half-works with no way to tell.
-_COPY_BINDINGS = [
-    # Both hidden from the footer, listed under `?`. Ten entries do not fit an
+_SCREEN_BINDINGS = [
+    # All three hidden from the footer, listed under `?`. Ten entries do not fit an
     # 80-column footer and Textual truncates the tail, so every label that earns a
     # slot costs a later one its place: with "Copy row" shown, `r Reload` and
     # `w Time range` fell off the end at 100 columns entirely. Copying is a power
     # move you go looking for; a time range is something you need told.
     Binding("y", "copy_row", "Copy row", show=False),
     Binding("Y", "copy_view", "Copy view", show=False),
+    # `?` belongs here, with the pair every screen shares, and not repeated on each
+    # screen -- which is how two of the five came to be without it. `HelpScreen`
+    # documents `m` and `c` as "on the nodes screen: ...", and the nodes screen was
+    # one of the two that could not open it.
+    Binding("question_mark", "help", "Help", show=False),
 ]
 
 
@@ -124,10 +131,17 @@ def _clip_path() -> str:
     return os.path.join(directory, "clip.txt")
 
 
-class ClipboardMixin:
-    """``y`` copies the focused row, ``Y`` the whole view.
+class ScreenChrome:
+    """What every screen does identically: copy, and open the help.
 
-    Subclasses provide the text; this handles delivery and the notification.
+    ``y`` copies the focused row, ``Y`` the whole view -- subclasses provide the
+    text and this handles delivery and the notification. ``?`` opens
+    :class:`HelpScreen`.
+
+    ``action_help`` lives here because it was written out on three screens and
+    omitted from the other two, so `?` was dead on the patterns and nodes screens
+    while `HelpScreen` carried two rows explaining the nodes screen's own keys.
+    Paired with ``_SCREEN_BINDINGS``: one list, one action, five screens.
     """
 
     @property
@@ -136,7 +150,7 @@ class ClipboardMixin:
 
         Deliberately NOT an ``app: SlurmpastApp`` annotation. That overrides
         ``MessagePump.app``, and mypy reports the clash once per subclass -- the
-        error lands on the ``class X(ClipboardMixin, Screen)`` line, not on the
+        error lands on the ``class X(ScreenChrome, Screen)`` line, not on the
         annotation, so it cannot even be suppressed where it is written. A
         separate accessor narrows the type with no override and no suppression,
         and reads explicitly at each use.
@@ -159,6 +173,9 @@ class ClipboardMixin:
 
     def action_copy_view(self) -> None:
         self._deliver(self.clipboard_view(), "view")
+
+    def action_help(self) -> None:
+        self.sp.push_screen(HelpScreen())
 
     def _deliver(self, text: str, what: str) -> None:
         if not text:
@@ -287,6 +304,72 @@ def _prose_width(screen, indent: int) -> int:
     indent that separates evidence from its heading gone.
     """
     return max(_MIN_PROSE_WIDTH, _text_width(screen) - indent)
+
+
+# Cells before a finding's title: two of indent, the four-cell severity tag and
+# the two spaces after it. The plain renderer reserves the same, spelled from the
+# tag it drew (``2 + len(tag) + 3``) -- one space either side of the brackets it
+# adds and this one does not.
+_FINDING_TITLE_INDENT = 2 + 4 + 2
+
+
+def _empty_reason(screen, noun: str) -> str:
+    """:func:`render.nothing_matches`, filled in from what this screen narrowed by.
+
+    A screen knows its own filter and search; the wording is shared so the overview
+    and the job list cannot explain the same empty table differently.
+    """
+    mode = getattr(screen, "filter_mode", "all")
+    label = "" if mode == "all" else dict(FILTERS).get(mode, mode)
+    return render.nothing_matches(
+        noun, filter_label=label, search=getattr(screen, "search_text", "")
+    )
+
+
+def _finding_lines(screen, body, finding) -> None:
+    """One finding appended to ``body``: chip, title, evidence, action.
+
+    Written out twice here and twice in `report.py`, and the four copies had come
+    apart in two places. The arrow was "→ " on this side and "-> " on that, for the
+    same line of the same finding -- now `render.ACTION_ARROW`, so ``--ascii`` is
+    what chooses between the two alphabets rather than which file the code is in.
+
+    And the title was the one line of the three that nothing wrapped. `report` had
+    learned to ("A title is a sentence -- 'Peak memory reads above the limit, yet
+    nothing was OOM-killed' is 61 cells"); this had not, so Textual soft-wrapped it
+    and dropped ``OOM-killed`` to column 1, out from under the tag, on any terminal
+    below 74 columns. The continuation hangs under the title instead, which is what
+    the tag width is reserved for.
+    """
+    body.append("  ")
+    body.append_text(render.severity_chip(finding.severity))
+    body.append("  ")
+    for index, line in enumerate(
+        render.wrap(finding.title, _prose_width(screen, _FINDING_TITLE_INDENT))
+    ):
+        prefix = "" if index == 0 else " " * _FINDING_TITLE_INDENT
+        body.append("%s%s\n" % (prefix, line), style="bold %s" % theme.INK)
+    # Measured against the terminal, not the old fixed 86 / 82. See _prose_width:
+    # 8 cells of indent over an 86-cell wrap is 94, so below ~96 columns every
+    # finding was hard-wrapped and then soft-wrapped again, dropping its tail to
+    # column 0.
+    for line in render.wrap(finding.evidence, _prose_width(screen, 8)):
+        body.append("        %s\n" % line, style=theme.DIM)
+    if finding.action:
+        for index, line in enumerate(
+            render.wrap(finding.action, _prose_width(screen, render.ACTION_INDENT))
+        ):
+            body.append(
+                "        %s%s\n"
+                % (render.ACTION_ARROW if index == 0 else render.ACTION_HANG, line),
+                style=theme.ACCENT if index == 0 else theme.DIM,
+            )
+    body.append("\n")
+
+
+def indent_room(screen, indent: int) -> int:
+    """Cells left for text on ``screen`` after ``indent`` of leading space."""
+    return _prose_width(screen, indent)
 
 
 def _sync_columns(table: DataTable, spec, current, content=None, available=None):
@@ -444,11 +527,112 @@ def _dismiss_search(screen, table_id: str) -> bool:
 
 
 class SearchBar(Input):
-    def __init__(self) -> None:
-        super().__init__(placeholder="filter by name, job id, state, node or date…", id="search")
+    """The free-text filter, told what its own screen can match.
+
+    The placeholder was one fixed string on both screens and promised more than
+    either delivered: on the overview a job id, a state and a node all returned
+    nothing, because a workload rollup has none of the three to match against.
+    Built from the screen's field list now, so the invitation and the behaviour
+    cannot part again. See render.search_hint.
+    """
+
+    def __init__(self, fields=JOB_SEARCH_FIELDS) -> None:
+        super().__init__(placeholder="filter by %s…" % render.search_hint(fields), id="search")
+
+
+# The help box, and the chrome CSS charges it: a round border either side and
+# `padding: 1 2`. Named rather than counted at the call site so the wrap width and
+# the CSS cannot say different numbers.
+_HELP_BOX_WIDTH = 78
+_HELP_BOX_CHROME = 6
+# Cells the key column occupies, indent included: `"  %-14s "`. A wrapped
+# description hangs to this so it stays under the text it continues rather than
+# restarting in the key column.
+_HELP_KEY_WIDTH = 17
+
+# One row per key, in the order a reader meets them. Two of these are the reason
+# this screen had to be wrapped at all: at 72 cells of content the `a` row ran 3
+# over and the `Y` row 2, so Textual soft-wrapped both and dropped the orphan at
+# column 2 -- the two-column layout broken on the one screen whose whole job is
+# explaining the app.
+_HELP_KEYS = (
+    ("enter / →", "open the selected row"),
+    ("q / escape / ←", "back, or quit from the overview"),
+    ("1-9…", "jump straight to a row by number"),
+    # Both sets, because one help screen covers every screen and they differ: a
+    # workload rollup has no single job id, state or node to match on.
+    (
+        "/",
+        "search — the overview matches %s; a job list also matches %s"
+        % (
+            render.search_hint(GROUP_SEARCH_FIELDS),
+            render.search_hint(tuple(f for f in JOB_SEARCH_FIELDS if f not in GROUP_SEARCH_FIELDS)),
+        ),
+    ),
+    ("f", "cycle filter: all → problems → failed → idle"),
+    ("s", "cycle sort"),
+    ("n", "which nodes your jobs fail on, controlled for workload"),
+    # Both shown in the nodes screen's own footer and, until now, in no help at
+    # all -- the only two visible bindings this list left out, and the pair that
+    # undoes the control the `n` line above advertises.
+    ("m", "on the nodes screen: measure hangs or failures"),
+    ("c", "on the nodes screen: drop the workload control (confounded)"),
+    # `p` means something else entirely on a job screen, where this help is also
+    # reachable: JobScreen binds it to `toggle_paths`, and it is `show=False`, so a
+    # reader pressing it there got neither the patterns screen this line promised
+    # nor any hint of what they had actually done.
+    (
+        "p",
+        "what keeps failing the same way, across runs — on a job screen, "
+        "the full log paths instead",
+    ),
+    ("a", "every job in one flat list, ignoring the workload grouping"),
+    ("y", "copy the selected row to the clipboard"),
+    ("Y", "copy the whole view (a job screen copies the full report)"),
+    ("w", "how far back to look: 1 day → 7 → 30 → 12 weeks → 52"),
+    ("r", "reload the same window from sacct"),
+    ("?", "this help"),
+)
+
+_HELP_NOTES = (
+    "A row on the overview is one workload: every run whose job name matches once "
+    'digits are folded to "#", so cot-exp1 and cot-exp2 share a row. Its counts and '
+    "hour totals cover all of those runs. Open a row to see the real job names.",
+    "FLAGGED counts runs this tool marks for a look: they failed, or they held the "
+    "allocation without computing. One number, because those two overlap — open the "
+    "row to see which. It says what was flagged, not that it was your mistake; a "
+    "failure can be expected. COMPLETED plus FLAGGED can be less than RUNS: a "
+    "cancelled run is neither, since a deliberate kill and an abandoned one are "
+    "identical in accounting.",
+    "Groups are ranked by resources burned, not run count: a 5-run group that cost "
+    "400 GPU-hours outranks 400 two-second probes.",
+    "Selecting text: just drag. Mouse capture is off by default, so your terminal "
+    "handles selection exactly as it does elsewhere. Press M to hand the mouse to "
+    "the app instead (enables clicking and wheel scrolling, disables drag-select), "
+    "or start --mouse.",
+)
 
 
 class HelpScreen(ModalScreen[None]):
+    """The keys, wrapped to the box they are drawn in.
+
+    Every other surface learned this in rounds five to seven -- `report._prose_width`
+    ("These were hardcoded at 72, 82 and 84, so a finding hard-broke mid-sentence"),
+    then `tui._prose_width`, then the node screen's last two `render.wrap` calls.
+    This screen was missed by all three, and it had all three symptoms at once:
+
+    * two key rows overran the 72 cells the box actually offers and Textual dropped
+      the continuation at column 2, out from under the description it continues;
+    * the clip-path line is built from `_clip_path()`, so its length is site
+      controlled -- 78 cells on the machine this was found on and unbounded in
+      general, which is round six's folded-workload-name trap in a new place;
+    * `width: 78` is a floor as well as a ceiling in Textual, so below an
+      80-column terminal the box was drawn wider than the screen and simply cut,
+      with no marker -- the one thing `render.clip` exists to prevent.
+
+    So the width is measured, not assumed, and the body is rebuilt on resize.
+    """
+
     BINDINGS: ClassVar = [
         Binding("escape", "dismiss", "Back"),
         Binding("q", "dismiss", "Back"),
@@ -458,62 +642,81 @@ class HelpScreen(ModalScreen[None]):
         BASE_CSS
         + """
     HelpScreen { align: center middle; }
-    #help-box { width: 78; height: auto; border: round $primary; background: $panel; padding: 1 2; }
+    #help-box { height: auto; border: round $primary; background: $panel; padding: 1 2; }
     """
     )
 
+    def __init__(self) -> None:
+        super().__init__()
+        # Retained so tests read what was composed rather than the widget, as
+        # NodesScreen does: `Static.renderable` exists in textual 0.89 and not 8.x.
+        self.help_text = Text()
+
     def compose(self) -> ComposeResult:
-        body = Text()
-        for key, description in (
-            ("enter / →", "open the selected row"),
-            ("q / escape / ←", "back, or quit from the overview"),
-            ("1-9…", "jump straight to a row by number"),
-            ("/", "search — name, job id, state or node"),
-            ("f", "cycle filter: all → problems → failed → idle"),
-            ("s", "cycle sort"),
-            ("n", "which nodes your jobs fail on, controlled for workload"),
-            ("p", "what keeps failing the same way, across runs"),
-            ("a", "every job in one flat list, ignoring the workload grouping"),
-            ("y", "copy the selected row to the clipboard"),
-            ("Y", "copy the whole view (a job screen copies the full report)"),
-            ("w", "how far back to look: 1 day → 7 → 30 → 12 weeks → 52"),
-            ("r", "reload the same window from sacct"),
-            ("?", "this help"),
-        ):
-            body.append("  %-14s " % key, style="bold %s" % theme.ACCENT)
-            body.append(description + "\n", style=theme.INK)
-        body.append(
-            "\n  A row on the overview is one workload: every run whose job name\n"
-            '  matches once digits are folded to "#", so cot-exp1 and cot-exp2\n'
-            "  share a row. Its counts and hour totals cover all of those runs.\n"
-            "  Open a row to see the real job names.\n"
-            "\n  FLAGGED counts runs this tool marks for a look: they failed, or\n"
-            "  they held the allocation without computing. One number, because\n"
-            "  those two overlap — open the row to see which. It says what was\n"
-            "  flagged, not that it was your mistake; a failure can be expected.\n"
-            "  COMPLETED plus FLAGGED can be less than RUNS: a cancelled run is\n"
-            "  neither, since a deliberate kill and an abandoned one are\n"
-            "  identical in accounting.\n",
-            style=theme.FAINT,
-        )
-        body.append(
-            "\n  Groups are ranked by resources burned, not run count: a 5-run\n"
-            "  group that cost 400 GPU-hours outranks 400 two-second probes.\n",
-            style=theme.FAINT,
-        )
-        body.append(
-            "\n  Selecting text: just drag. Mouse capture is off by default, so\n"
-            "  your terminal handles selection exactly as it does elsewhere.\n"
-            "  Press M to hand the mouse to the app instead (enables clicking\n"
-            "  and wheel scrolling, disables drag-select), or start --mouse.\n"
-            # The real path, not a hardcoded ~/.cache: it follows XDG_CACHE_HOME,
-            # so naming the default was wrong wherever that is set.
-            "  y / Y also copy via OSC 52 and write %s.\n" % (_clip_path() or "a cache file"),
-            style=theme.FAINT,
-        )
         with Vertical(id="help-box"):
-            yield Static(Text("slurmpast — keys", style="bold %s" % theme.ACCENT))
-            yield Static(body)
+            yield Static(Text("slurmpast — keys", style="bold %s" % theme.ACCENT), id="help-title")
+            yield Static(id="help-body")
+
+    def on_mount(self) -> None:
+        self.render_body()
+
+    def on_resize(self) -> None:
+        if self.is_mounted:
+            self.render_body()
+
+    def box_width(self) -> int:
+        """The box's width: what it asks for, or the terminal if that is narrower.
+
+        Less ``_SCROLLBAR``, for the reason ``_text_width`` gives: the help is
+        taller than a short terminal, so the modal grows a scrollbar, and a box
+        sized to the full width then loses its right border to it. Above 80 columns
+        the cap binds first and the box is unchanged.
+        """
+        screen = self.size.width or self.app.size.width or _HELP_BOX_WIDTH
+        return max(_MIN_PROSE_WIDTH, min(_HELP_BOX_WIDTH, screen - _SCROLLBAR))
+
+    def render_body(self) -> None:
+        width = self.box_width()
+        self.query_one("#help-box", Vertical).styles.width = width
+        text = Text()
+        inner = max(_MIN_PROSE_WIDTH, width - _HELP_BOX_CHROME)
+        # The description column, or the whole line on a terminal too narrow to
+        # hold a two-column layout at all -- below that the hanging indent costs
+        # more than the alignment buys.
+        hanging = _HELP_KEY_WIDTH if inner > _HELP_KEY_WIDTH + 20 else 0
+        for key, description in _HELP_KEYS:
+            lines = render.wrap(description, max(_MIN_PROSE_WIDTH, inner - hanging))
+            text.append(
+                "  %-14s " % key if hanging else "  %s\n    " % key, style="bold %s" % theme.ACCENT
+            )
+            text.append(lines[0] + "\n", style=theme.INK)
+            for line in lines[1:]:
+                text.append(" " * hanging + line + "\n", style=theme.INK)
+        for note in _HELP_NOTES:
+            text.append("\n")
+            for line in render.wrap(note, inner - 2):
+                text.append("  " + line + "\n", style=theme.FAINT)
+        # The path gets its own line rather than being appended to the sentence.
+        # It is interpolated from `_clip_path()`, so its length is site controlled
+        # -- 78 cells on the machine this was found on, and unbounded in general --
+        # and a path has no spaces to wrap at, so leaving it inline broke the
+        # sentence around it. On its own line the sentence always reads whole, and
+        # the path is the same deliberate overrun `report.py` already accepts for
+        # one: "a path you cannot copy whole is no use in a ticket."
+        text.append("\n")
+        path = _clip_path()
+        for line in render.wrap(
+            "y / Y also copy via OSC 52, and write the same text to:"
+            if path
+            else "y / Y copy via OSC 52. No cache directory could be created, so nothing "
+            "is written to disk.",
+            inner - 2,
+        ):
+            text.append("  " + line + "\n", style=theme.FAINT)
+        if path:
+            text.append("  " + path + "\n", style=theme.FAINT)
+        self.help_text = text
+        self.query_one("#help-body", Static).update(text)
 
 
 # Both table specs live in render.py, because --plain draws these same two tables
@@ -523,11 +726,11 @@ class HelpScreen(ModalScreen[None]):
 _OVERVIEW_COLUMNS = render.OVERVIEW_COLUMNS
 
 
-class OverviewScreen(ClipboardMixin, CentredContent, Screen[Any]):
+class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
     """Workload groups, ranked. The landing screen."""
 
     BINDINGS: ClassVar = [
-        *_COPY_BINDINGS,
+        *_SCREEN_BINDINGS,
         Binding("q", "app.quit", "Quit"),
         Binding("escape", "app.quit", "Quit", show=False),
         Binding("enter", "open", "Open"),
@@ -544,7 +747,6 @@ class OverviewScreen(ClipboardMixin, CentredContent, Screen[Any]):
         # let `w Time range` fall off the end at 100 columns.
         Binding("a", "all_jobs", "All jobs", show=False),
         Binding("r", "app.reload", "Reload"),
-        Binding("question_mark", "help", "Help", show=False),
         *_digit_bindings("digit"),
     ]
     CSS = BASE_CSS
@@ -572,7 +774,7 @@ class OverviewScreen(ClipboardMixin, CentredContent, Screen[Any]):
         with Vertical(id="content"):
             yield Static(id="summary")
             with Horizontal(id="searchbar"):
-                yield SearchBar()
+                yield SearchBar(GROUP_SEARCH_FIELDS)
             yield DataTable(
                 id="groups",
                 cursor_type="row",
@@ -630,6 +832,14 @@ class OverviewScreen(ClipboardMixin, CentredContent, Screen[Any]):
         )
         self._rows = groups
         self.summary_text = self._summary(history, shown=len(groups))
+        # An empty grid is not an answer. See render.nothing_matches, and the node
+        # screen, which learned the same thing one round earlier: a column header
+        # over blank space reads as a table that failed to load.
+        if not groups:
+            self.summary_text.append("\n")
+            for line in render.wrap(_empty_reason(self, "workload"), _prose_width(self, 2)):
+                self.summary_text.append("  %s\n" % line, style=theme.HEALTH_COLOR["ok"])
+        table.display = bool(groups)
         summary.update(self.summary_text)
         table.clear()
         ascii_mode = self.sp.ascii_mode
@@ -709,7 +919,12 @@ class OverviewScreen(ClipboardMixin, CentredContent, Screen[Any]):
         # it appears is the title bar, which is exactly where a change goes unseen.
         text.append(self.sp.window, style="bold %s" % theme.ACCENT)
         text.append("  ·  ", style=theme.FAINT)
-        text.append("%d jobs" % stats["jobs"], style="bold %s" % theme.INK)
+        # Pluralised, like the `workload%s` beside it: a one-job history read
+        # "1 jobs in 1 workload" on the landing screen. See report.render_overview.
+        text.append(
+            "%d job%s" % (stats["jobs"], "" if stats["jobs"] == 1 else "s"),
+            style="bold %s" % theme.INK,
+        )
         text.append(
             " in %d workload%s" % (total_groups, "" if total_groups == 1 else "s"),
             style=theme.DIM,
@@ -735,15 +950,18 @@ class OverviewScreen(ClipboardMixin, CentredContent, Screen[Any]):
             # "total" and "of them" are both load-bearing: "783 GPU-hours" alone
             # was read as a per-job figure, and a bare "18 never computed" did not
             # say 18 of what.
-            text.append("%.0f GPU-hours total" % idle[1], style=theme.GPU_COLOR)
+            text.append(render.gpu_hours_total(idle[1]), style=theme.GPU_COLOR)
             text.append(
-                ", %.0f of them never used" % idle[0],
+                render.idle_hours_note(idle[0], idle[1]),
                 style=theme.HEALTH_COLOR["warn"],
             )
 
         # Last: the facts about the history come first, then what the view is
         # currently doing to them.
-        if shown and shown != total_groups:
+        # `shown != total_groups`, not `shown and shown != total_groups`. Zero is
+        # the count that most needs saying -- it is the one an empty table cannot
+        # speak for -- and the truthiness guard suppressed exactly that one.
+        if shown != total_groups:
             text.append("  ·  ", style=theme.FAINT)
             text.append("showing %d" % shown, style=theme.ACCENT)
 
@@ -775,12 +993,15 @@ class OverviewScreen(ClipboardMixin, CentredContent, Screen[Any]):
                 "%d completed" % group.completed,
                 # The breakdown too: a pasted row has no width limit and no
                 # drill-down, so it carries what the table sends you elsewhere for.
-                "%d problems" % group.problems,
+                # Guarded, like every other count this codebase prints: a
+                # single-run workload pasted "1 problems ... 1 GPU-hours".
+                "%d %s" % (group.problems, plural(group.problems, "problem")),
                 "%d failed" % group.failed,
                 "%d never ran" % group.noop,
                 # Units named here: a pasted row has no column header above it.
-                "%s CPU-hours" % render.hours_text(group.core_hours),
-                "%s GPU-hours" % render.hours_text(group.gpu_hours),
+                "%s %s"
+                % (render.hours_text(group.core_hours), plural(group.core_hours, "CPU-hour")),
+                "%s %s" % (render.hours_text(group.gpu_hours), plural(group.gpu_hours, "GPU-hour")),
                 group.last_seen or "",
             ]
         )
@@ -836,9 +1057,6 @@ class OverviewScreen(ClipboardMixin, CentredContent, Screen[Any]):
         history: History | None = self.sp.history
         if history is not None:
             self.sp.push_screen(JobListScreen(history.usable_jobs, "all jobs"))
-
-    def action_help(self) -> None:
-        self.sp.push_screen(HelpScreen())
 
     # Reactive watchers fire when the initial value is set, which happens before
     # on_mount has added the columns; refreshing then writes N values into a
@@ -903,11 +1121,11 @@ def _job_clipboard_cells(job) -> list[str]:
     ]
 
 
-class JobListScreen(ClipboardMixin, CentredContent, Screen[Any]):
+class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
     """A list of jobs -- inside one workload, or flat across everything."""
 
     BINDINGS: ClassVar = [
-        *_COPY_BINDINGS,
+        *_SCREEN_BINDINGS,
         Binding("q", "app.pop_screen", "Back"),
         Binding("escape", "app.pop_screen", "Back", show=False),
         Binding("left", "app.pop_screen", "Back", show=False),
@@ -915,7 +1133,6 @@ class JobListScreen(ClipboardMixin, CentredContent, Screen[Any]):
         Binding("right", "open", "Open", show=False),
         Binding("slash", "search", "Search"),
         Binding("f", "cycle_filter", "Filter"),
-        Binding("question_mark", "help", "Help", show=False),
         *_digit_bindings("digit"),
     ]
     CSS = BASE_CSS
@@ -1026,6 +1243,8 @@ class JobListScreen(ClipboardMixin, CentredContent, Screen[Any]):
         if cursor and cursor < len(jobs):
             table.move_cursor(row=cursor)
 
+        table.display = bool(jobs)
+
         summary = Text()
         summary.append(self._title, style="bold %s" % theme.INK)
         summary.append(
@@ -1064,6 +1283,12 @@ class JobListScreen(ClipboardMixin, CentredContent, Screen[Any]):
         if self.search_text:
             summary.append("  ·  search: ", style=theme.FAINT)
             summary.append(self.search_text, style=theme.ACCENT)
+        if not jobs:
+            # Same treatment as the overview and the node table: say why, and do
+            # not leave a column header standing over nothing.
+            summary.append("\n")
+            for line in render.wrap(_empty_reason(self, "job"), _prose_width(self, 2)):
+                summary.append("  %s\n" % line, style=theme.HEALTH_COLOR["ok"])
         extra = self.extra_summary()
         if extra is not None:
             summary.append("\n")
@@ -1132,9 +1357,6 @@ class JobListScreen(ClipboardMixin, CentredContent, Screen[Any]):
     def action_search(self) -> None:
         self.query_one("#searchbar").add_class("visible")
         self.query_one("#search", Input).focus()
-
-    def action_help(self) -> None:
-        self.sp.push_screen(HelpScreen())
 
     def watch_filter_mode(self) -> None:
         if self.is_mounted:
@@ -1233,22 +1455,39 @@ class WorkloadScreen(JobListScreen):
                 rest, indent = lines, 12
             for extra in rest:
                 banner.append("\n" + " " * indent + extra, style=theme.DIM)
+            # `Advice.caution` -- "what would make this advice wrong" -- which this
+            # screen did not read at all. `--sizing` has printed it since it was
+            # added and `--sizing --json` carries it, so the dashboard was the one
+            # surface of three handing over a directive with the caveat removed:
+            # six of the demo's ten actionable lines have one, including both
+            # "cut --cpus-per-task on a GPU workload" recommendations, whose caveat
+            # is that doing so can starve the card. Under the basis, in the warning
+            # hue, because the reason belongs where the number is -- the same call
+            # this block already made about the basis itself.
+            if item.caution:
+                mark = render.CAUTION_MARK
+                for offset, line in enumerate(
+                    render.wrap(item.caution, max(20, indent_room(self, indent) - len(mark)))
+                ):
+                    banner.append(
+                        "\n" + " " * indent + (mark if offset == 0 else render.CAUTION_HANG) + line,
+                        style=theme.HEALTH_COLOR["warn"],
+                    )
         return banner if banner.plain else None
 
     def action_patterns(self) -> None:
         self.sp.push_screen(PatternsScreen(self._group))
 
 
-class JobScreen(ClipboardMixin, Screen[Any]):
+class JobScreen(ScreenChrome, Screen[Any]):
     """The post-mortem for one job."""
 
     BINDINGS: ClassVar = [
-        *_COPY_BINDINGS,
+        *_SCREEN_BINDINGS,
         Binding("q", "app.pop_screen", "Back"),
         Binding("escape", "app.pop_screen", "Back", show=False),
         Binding("left", "app.pop_screen", "Back", show=False),
         Binding("p", "toggle_paths", "Full path", show=False),
-        Binding("question_mark", "help", "Help", show=False),
     ]
     CSS = BASE_CSS
 
@@ -1305,9 +1544,6 @@ class JobScreen(ClipboardMixin, Screen[Any]):
     def action_toggle_paths(self) -> None:
         self._show_paths = not self._show_paths
         self.render_body()
-
-    def action_help(self) -> None:
-        self.sp.push_screen(HelpScreen())
 
     def _path_budget(self, prefix: int) -> int:
         """Cells a path may fill on a full-width line before it has to be elided.
@@ -1388,29 +1624,49 @@ class JobScreen(ClipboardMixin, Screen[Any]):
 
             def cell(label, value, gauge, pad, colour=colour):
                 """One label/value pair. ``pad`` right-fills for a paired line."""
-                # A 118-character workdir wrapped to column 0, leaving the label
-                # looking empty with an orphaned line of path beneath it. Shortened
-                # here only -- `p` shows it in full, and --plain always does,
-                # because a path you cannot copy whole is no use in a ticket.
-                if not self._show_paths:
-                    # A paired cell must fit its column; a row on its own gets the
-                    # rest of the line rather than a constant.
-                    budget = pad or self._path_budget(4 + render.PAIR_LABEL_WIDTH + 1)
+                # The gauge counts against the value's room. It did not, and that
+                # is the whole of the `slowest task` bug: the budget was
+                # `4 + PAIR_LABEL_WIDTH + 1`, the row then drew a 14-cell bar and a
+                # 2-cell gap in front of the value, and 16 cells the arithmetic
+                # never saw put the row past the edge -- at 80 columns, not merely
+                # a narrow one. `render.pair_value_budget` is the same sum the
+                # plain renderer does, which had counted the bar all along.
+                bar_cells = 0 if gauge is None else render.DETAIL_BAR_WIDTH + render.DETAIL_BAR_GAP
+                budget = pad or render.pair_value_budget(_text_width(self), bar_cells)
+                lines = [value]
+                if label in render.PATH_ROWS:
+                    # A 118-character workdir wrapped to column 0, leaving the label
+                    # looking empty with an orphaned line of path beneath it.
+                    # Shortened middle-out rather than wrapped -- `p` shows it in
+                    # full and --plain always does, because a path you cannot copy
+                    # whole is no use in a ticket. Only the rows render.py declares
+                    # to *be* paths: the old test was `"/" in value`, which is also
+                    # true of `submitted as` -- a command line, not a path.
+                    if not self._show_paths and len(value) > budget:
+                        lines = [_elide(value, keep=budget)]
+                elif pad:
+                    # A paired cell is cut, not wrapped: the pair beside it owns the
+                    # rest of the line, and a wrap would take the row it sits on.
                     if len(value) > budget:
-                        # Middle-out only for the rows render.py declares to *be*
-                        # paths. The test used to be `"/" in value`, which is also
-                        # true of `submitted as` -- a command line, not a path --
-                        # and mangled it. Everything else is cut at the end, where
-                        # the head carries the meaning.
-                        value = (
-                            _elide(value, keep=budget)
-                            if label in render.PATH_ROWS
-                            else _clip(value, budget)
-                        )
+                        lines = [_clip(value, budget)]
+                else:
+                    # Wrapped, exactly as `--plain` wraps the same row. This surface
+                    # clipped instead, so `utilization  not gathered by this cluster
+                    # (needs AutoDetect=nvml in g…` threw away the half of the
+                    # sentence naming what to do about it, while a paste of the same
+                    # job kept it.
+                    lines = render.pair_value_lines(label, value, budget)
                 body.append("    %-*s " % (render.PAIR_LABEL_WIDTH, label), style=theme.FAINT)
                 if gauge is not None:
-                    body.append_text(render.bar(gauge, colour, width=14, ascii_mode=ascii_mode))
-                    body.append("  ")
+                    body.append_text(
+                        render.bar(
+                            gauge,
+                            colour,
+                            width=render.DETAIL_BAR_WIDTH,
+                            ascii_mode=ascii_mode,
+                        )
+                    )
+                    body.append(" " * render.DETAIL_BAR_GAP)
                 # Values carry their section's hue. The palette already spreads
                 # these across the wheel so no two read alike even under
                 # red-green colour blindness; printing every value in one ink
@@ -1420,7 +1676,12 @@ class JobScreen(ClipboardMixin, Screen[Any]):
                     style = theme.HEALTH_COLOR["crit"]
                 elif "not recorded" in value:
                     style = theme.FAINT
-                body.append("%-*s" % (pad, value) if pad else value, style=style)
+                body.append("%-*s" % (pad, lines[0]) if pad else lines[0], style=style)
+                # Continuations hang past the label AND the bar, so the sentence
+                # stays under itself instead of restarting beneath the gauge.
+                hang = " " * (4 + render.PAIR_LABEL_WIDTH + 1 + bar_cells)
+                for extra in lines[1:]:
+                    body.append("\n%s%s" % (hang, extra), style=style)
 
             # Two pairs per line where both values are short: one row per line
             # used about 40 of 120 columns and ran the screen off the bottom. One
@@ -1473,34 +1734,19 @@ class JobScreen(ClipboardMixin, Screen[Any]):
         if not findings:
             body.append("  nothing to flag.\n", style=theme.HEALTH_COLOR["ok"])
         for finding in findings:
-            body.append("  ")
-            body.append_text(render.severity_chip(finding.severity))
-            body.append("  %s\n" % finding.title, style="bold %s" % theme.INK)
-            # Measured against the terminal, not the old fixed 86 / 82. See
-            # _prose_width: 8 cells of indent over an 86-cell wrap is 94, so below
-            # ~96 columns every finding was hard-wrapped and then soft-wrapped
-            # again, dropping its tail to column 0.
-            for line in render.wrap(finding.evidence, _prose_width(self, 8)):
-                body.append("        %s\n" % line, style=theme.DIM)
-            if finding.action:
-                for index, line in enumerate(render.wrap(finding.action, _prose_width(self, 10))):
-                    body.append(
-                        "        %s%s\n" % ("→ " if index == 0 else "  ", line),
-                        style=theme.ACCENT if index == 0 else theme.DIM,
-                    )
-            body.append("\n")
+            _finding_lines(self, body, finding)
 
         self.query_one("#body", Static).update(body)
 
 
-class PatternsScreen(ClipboardMixin, Screen[Any]):
+class PatternsScreen(ScreenChrome, Screen[Any]):
     """Cross-run findings: the things no single job can show."""
 
     BINDINGS: ClassVar = [
         Binding("q", "app.pop_screen", "Back"),
         Binding("escape", "app.pop_screen", "Back", show=False),
         Binding("left", "app.pop_screen", "Back", show=False),
-        *_COPY_BINDINGS,
+        *_SCREEN_BINDINGS,
     ]
     CSS = BASE_CSS
 
@@ -1546,7 +1792,7 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
         )
         if not findings:
             body.append(
-                "  no cross-run pattern met its evidence threshold.\n",
+                "  %s\n" % render.patterns_empty(),
                 style=theme.HEALTH_COLOR["ok"],
             )
             body.append(
@@ -1555,30 +1801,18 @@ class PatternsScreen(ClipboardMixin, Screen[Any]):
                 style=theme.FAINT,
             )
         for finding in render.sort_findings(findings):
-            body.append("  ")
-            body.append_text(render.severity_chip(finding.severity))
-            body.append("  %s\n" % finding.title, style="bold %s" % theme.INK)
-            # From the terminal, as on the job screen. See _prose_width.
-            for line in render.wrap(finding.evidence, _prose_width(self, 8)):
-                body.append("        %s\n" % line, style=theme.DIM)
-            if finding.action:
-                for index, line in enumerate(render.wrap(finding.action, _prose_width(self, 10))):
-                    body.append(
-                        "        %s%s\n" % ("→ " if index == 0 else "  ", line),
-                        style=theme.ACCENT if index == 0 else theme.DIM,
-                    )
-            body.append("\n")
+            _finding_lines(self, body, finding)
         self.query_one("#body", Static).update(body)
 
 
-class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
+class NodesScreen(ScreenChrome, CentredContent, Screen[Any]):
     """Per-node reliability, workload-controlled."""
 
     BINDINGS: ClassVar = [
         Binding("q", "app.pop_screen", "Back"),
         Binding("escape", "app.pop_screen", "Back", show=False),
         Binding("left", "app.pop_screen", "Back", show=False),
-        *_COPY_BINDINGS,
+        *_SCREEN_BINDINGS,
         Binding("m", "cycle_metric", "Metric"),
         Binding("c", "toggle_control", "Control"),
     ]
@@ -1630,7 +1864,7 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
         table_data = node_table(history.usable_jobs, workload=workload, metric=self.metric)
 
         summary = Text()
-        summary.append("node reliability — %s rate\n" % self.metric, style="bold %s" % theme.INK)
+        summary.append("%s\n" % render.nodes_title(self.metric), style="bold %s" % theme.INK)
         # Wrapped from the terminal, like the findings on the job and patterns
         # screens. A folded workload name (`nemotron-batch-h#-tokenize-shards-
         # stage#-retry-#`) took this past 110 cells; Textual soft-wrapped it, so
@@ -1638,8 +1872,8 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
         # note under the heading. `report.render_nodes` draws the same line and is
         # wrapped the same way.
         if workload:
-            aside = "(placement is not random)"
-            sentence = "controlled for workload: only %s counted %s" % (workload, aside)
+            aside = render.WORKLOAD_CONTROL_ASIDE
+            sentence = render.nodes_workload_control(workload)
             for line in render.wrap(sentence, _prose_width(self, 2)):
                 head, marker, tail = line.partition(aside)
                 summary.append("  " + head, style=theme.DIM)
@@ -1677,6 +1911,14 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
         # legitimately differs between the two surfaces -- and the only part the
         # reader can act on.
         empty_reason = render.nodes_empty_reason(table_data, self.metric, workload, widen="w")
+        # And the grid itself goes with them. Setting `rows = []` left the DataTable
+        # mounted, so the sentence was followed by a bare header --
+        # `NODE  N  RATE  95% CI  VERDICT` over nothing -- which is precisely the
+        # "empty grid" the comment above says says neither thing, and reads as a
+        # table that failed to load rather than as a table with nothing in it.
+        # `report.render_nodes` returns before drawing anything on this branch;
+        # this is that early return, in the shape a mounted widget takes.
+        table.display = not empty_reason
         if empty_reason:
             rows = []
             summary.append("\n")
@@ -1694,9 +1936,7 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
                 "RATE": Text(
                     "%.1f%%" % (100 * row["rate"]), style=theme.HEALTH_COLOR.get(grade, theme.DIM)
                 ),
-                "95% CI": Text(
-                    "%.1f – %.1f%%" % (100 * row["ci_low"], 100 * row["ci_high"]), style=theme.FAINT
-                ),
+                "95% CI": Text(render.ci_range(row["ci_low"], row["ci_high"]), style=theme.FAINT),
                 "VERDICT": Text(row["verdict"], style=theme.HEALTH_COLOR.get(grade, theme.FAINT)),
             }
             table.add_row(*(cells[label] for label, _ in self._layout))
@@ -1704,7 +1944,14 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
         excl = compress_nodelist(suggest_exclude(table_data))
         tested = table_data["tested_nodes"]
         note = Text()
-        if excl:
+        if empty_reason:
+            # Nothing further to say. The `else` below would add "no node is worse
+            # than the rest; nothing to exclude" underneath a sentence that has
+            # just explained there is nothing to compare -- two lines saying no,
+            # the second answering a question the first said could not be asked.
+            # The plain report reaches neither.
+            note = Text()
+        elif excl:
             # Wrapped, like the tail note below it and like the plain report's twin.
             # These two were bare strings inside a block that only renders when a
             # node is genuinely worse than the rest -- which the demo did not
@@ -1712,7 +1959,7 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
             # is 96 cells and soft-wrapped its last word to column 0.
             note.append("\n")
             for line in render.wrap(
-                "worse than every other node, after correcting for %d tested:" % tested,
+                render.nodes_correction_note(tested),
                 _prose_width(self, 2),
             ):
                 note.append("  %s\n" % line, style=theme.DIM)
@@ -1720,8 +1967,7 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
             # broken across two lines is not a paste.
             note.append("    #SBATCH --exclude=%s\n" % excl, style="bold %s" % theme.ACCENT)
             for line in render.wrap(
-                "not applied for you — excluding nodes trades availability for "
-                "reliability, and that is your call.",
+                render.nodes_exclude_disclaimer(),
                 _prose_width(self, 4),
             ):
                 note.append("    %s\n" % line, style=theme.FAINT)
@@ -1730,23 +1976,21 @@ class NodesScreen(ClipboardMixin, CentredContent, Screen[Any]):
             left_out = excluded_tail(table_data)
             if left_out:
                 for line in render.wrap(
-                    "%d further node%s scored worse too, left off the line: excluding this "
-                    "many trades away more of the partition than a paste-ready suggestion "
-                    "should." % (left_out, "" if left_out == 1 else "s"),
-                    max(40, self.size.width - 8),
+                    render.nodes_excluded_tail_note(left_out),
+                    _prose_width(self, 4),
                 ):
                     note.append("    %s\n" % line, style=theme.FAINT)
         else:
             note.append(
-                "\n  no node is worse than the rest; nothing to exclude.\n",
+                "\n  %s\n" % render.nodes_nothing_to_exclude(),
                 style=theme.FAINT,
             )
         # Why the CI column can disagree with the verdict beside it. Same sentence as
         # the plain-text report, from render, so the two screens cannot drift.
-        if table_data["held_back"]:
+        if table_data["held_back"] and not empty_reason:
             for line in render.wrap(
                 render.held_back_note(table_data["held_back"], tested),
-                max(40, self.size.width - 6),
+                _prose_width(self, 2),
             ):
                 note.append("  %s\n" % line, style=theme.FAINT)
         self.exclude_text = note

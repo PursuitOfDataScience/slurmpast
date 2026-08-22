@@ -3,10 +3,16 @@
 A post-mortem for finished jobs. ``slurmate`` builds the request, ``slurmwatch``
 watches the run, this reads the wreckage.
 
-The analysis modules (``sacct``, ``diagnose``, ``patterns``, ``nodes``,
-``index``, ``site``) import no third-party package, so they are usable as a
-library on a login node without a UI framework. Textual is only pulled in by
-``tui``.
+The analysis modules -- ``sacct``, ``model``, ``diagnose``, ``patterns``,
+``nodes``, ``index``, ``sizing``, ``logs``, ``site`` and ``duration`` -- import no
+third-party package, so they are usable as a library on a login node without a UI
+framework. ``rich`` and ``textual`` are reached for only by ``render``, ``report``,
+``theme`` and ``tui``, which is what
+``test_the_analysis_layer_needs_no_third_party_package`` enforces.
+
+Four of the ten were missing from this list, ``sizing`` among them -- the module
+the README's own library example imports. The guarantee always covered them; only
+the sentence promising it was short.
 
 Nothing here is specific to one cluster. Field names, output delimiters and
 timestamp formats are negotiated with the local ``sacct``; what a measurement

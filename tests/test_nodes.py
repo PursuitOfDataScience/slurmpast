@@ -547,6 +547,20 @@ class TestTheScreenExplainsAWithheldVerdict:
         assert held_back_note(1, 20).startswith("1 interval clears the baseline on its own")
         assert held_back_note(3, 20).startswith("3 intervals clear the baseline on their own")
 
+    def test_the_note_pluralises_the_table_size_too(self):
+        """The half of the sentence the count-of-intervals check above never read.
+
+        One node clearing MIN_SAMPLES while the rest fall short is the ordinary
+        shape of a short window, and it produced "1 nodes were tested" -- inside a
+        sentence that takes care to write "1 interval" rather than "1 intervals".
+        """
+        from slurmpast.render import held_back_note
+
+        assert "1 node was tested" in held_back_note(1, 1)
+        assert "1 nodes" not in held_back_note(1, 1)
+        # The control: above one, nothing changes.
+        assert "20 nodes were tested" in held_back_note(1, 20)
+
     def test_the_exclude_header_names_the_family_it_corrected_over(self):
         from slurmpast.index import History
         from slurmpast.report import Style, render_nodes
@@ -555,8 +569,21 @@ class TestTheScreenExplainsAWithheldVerdict:
             "midway3-0600", 12, 218, job_id_base=5000
         )
         text = render_nodes(History(jobs), metric="failure", style=Style(enabled=False))
-        assert "after correcting for 2 tested" in text
+        assert "after correcting for 2 nodes tested" in text
         assert "#SBATCH --exclude=midway3-0385" in text
+
+    def test_the_exclude_header_names_the_noun_at_one_node_too(self):
+        """ "after correcting for 1 tested" is what `--demo` printed: an unfinished
+        clause, and the noun is supplied two lines further down the same screen by
+        `held_back_note`."""
+        from slurmpast.render import nodes_correction_note
+
+        assert nodes_correction_note(1) == (
+            "worse than every other node, after correcting for 1 node tested:"
+        )
+        assert nodes_correction_note(7) == (
+            "worse than every other node, after correcting for 7 nodes tested:"
+        )
 
 
 class TestEmptyTablesSayWhyNotNothing:

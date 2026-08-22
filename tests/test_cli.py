@@ -535,3 +535,75 @@ class TestTheDemoContainsTheShapesItAdvertises:
     def test_the_healthy_workload_still_draws_no_findings(self, capsys):
         assert run("--demo", "--plain", "--no-color", "5100021") == 0
         assert "nothing to flag" in capsys.readouterr().out
+
+
+class TestAsciiIsHonouredByEveryTextView:
+    """`--ascii` was accepted and thrown away by five of the six plain views.
+
+    `cli` passed `ascii_mode` to `render_job` and to `tui.run` and to nothing else,
+    so `--ascii --overview` and `--overview` were byte-identical -- round five's
+    "#7 & 8. Two flags that were accepted and thrown away", on a third flag. And in
+    the one view that did receive it, the flag only ever reached the bar and the
+    health dot, so a terminal that could not draw `●` got the fallback for that and
+    an em dash and a middle dot anyway.
+    """
+
+    VIEWS = ["--plain", "--overview", "--patterns", "--nodes", "--sizing"]
+
+    @pytest.mark.parametrize("view", [*VIEWS, "5100019", "5100056"])
+    def test_the_output_is_pure_ascii(self, view, capsys):
+        run("--demo", "--ascii", "--no-color", view)
+        out = capsys.readouterr().out
+        assert out.strip(), "the view should have rendered something"
+        offenders = sorted({ch for ch in out if ord(ch) > 127})
+        assert not offenders, "%s leaked %r under --ascii" % (view, offenders)
+
+    @pytest.mark.parametrize("view", [*VIEWS, "5100019"])
+    def test_the_flag_changes_exactly_the_views_that_had_something_to_fold(self, view, capsys):
+        """The control that matters most here: a fold applied to nothing would
+        satisfy the test above on any view that is ASCII already.
+
+        Stated as an equivalence rather than a flat "it changed", because
+        `--patterns` on the demo history genuinely holds no foldable character and
+        asserting a difference there would pin the fixture, not the flag."""
+        run("--demo", "--no-color", view)
+        plain = capsys.readouterr().out
+        run("--demo", "--ascii", "--no-color", view)
+        folded = capsys.readouterr().out
+        had_unicode = any(ord(ch) > 127 for ch in plain)
+        assert (plain != folded) == had_unicode, view
+
+    def test_at_least_one_view_is_genuinely_folded(self, capsys):
+        """And the fixture does exercise the fold somewhere, so the equivalence
+        above cannot be satisfied by a flag that does nothing at all."""
+        changed = []
+        for view in self.VIEWS:
+            run("--demo", "--no-color", view)
+            plain = capsys.readouterr().out
+            run("--demo", "--ascii", "--no-color", view)
+            if plain != capsys.readouterr().out:
+                changed.append(view)
+        assert changed, "no demo view exercises the fold"
+
+    @pytest.mark.parametrize("view", [*VIEWS, "5100019"])
+    def test_folding_does_not_change_any_line_width(self, view, capsys):
+        """Every substitution is one cell for one cell, deliberately: the fold runs
+        after wrapping and after `clip` has reserved its marker cell, so a
+        two-character replacement would push a fitted row back over the width it
+        was just measured to."""
+        run("--demo", "--no-color", view)
+        plain = capsys.readouterr().out.splitlines()
+        run("--demo", "--ascii", "--no-color", view)
+        folded = capsys.readouterr().out.splitlines()
+        assert len(plain) == len(folded)
+        for before, after in zip(plain, folded, strict=True):
+            assert len(before) == len(after), (before, after)
+
+    def test_the_help_says_what_the_flag_can_promise(self):
+        """Not "instead of Unicode" flatly: Textual draws the dashboard's frame in
+        box characters whatever this flag says, so only the piped surface can
+        actually come out ASCII."""
+        text = cli.build_parser().format_help()
+        # The options section, not the usage line, where every flag also appears.
+        entry = text.split("--ascii", 2)[-1]
+        assert "text output" in entry[:140], entry[:140]

@@ -35,8 +35,8 @@ to be right on a cluster nobody here has seen.
 
 7. **``|`` occurs inside field values, and ``--parsable2`` does not escape it.**
    ``--constraint="v100|a100"`` is Slurm's documented OR syntax, and it lands
-   verbatim in ``Constraints`` -- field 32 of 107 here, so a single pipe shifts
-   every memory, CPU and disk column after it. Slurm has offered
+   verbatim in ``Constraints`` -- field 32 of the 85 asked for below, so a single
+   pipe shifts every memory, CPU and disk column after it. Slurm has offered
    ``--delimiter`` since at least 17.11, so the separator is an ASCII control
    character no shell would put in an argument.
 
@@ -55,6 +55,7 @@ to be right on a cluster nobody here has seen.
 from __future__ import annotations
 
 import getpass
+import math
 import os
 import re
 import subprocess
@@ -185,10 +186,44 @@ DEFAULT_TIMEOUT = 300.0
 _TERMINAL_STATES = frozenset(
     [
         "COMPLETED", "FAILED", "TIMEOUT", "OUT_OF_MEMORY", "CANCELLED", "NODE_FAIL",
-        "BOOT_FAIL", "DEADLINE", "PREEMPTED", "REVOKED", "SPECIAL_EXIT", "OUT_OF_ME+",
+        "BOOT_FAIL", "DEADLINE", "PREEMPTED", "REVOKED", "SPECIAL_EXIT",
     ]
 )
 # fmt: on
+
+# sacct cuts a state name to its column width and marks the cut with `+`, so
+# OUT_OF_MEMORY can arrive as OUT_OF_ME+. Folded back here, at the parse boundary,
+# because this list is where sacct's spellings stop being sacct's problem -- the
+# same job `_ALIASES` does for a renamed field.
+#
+# It used to be recognised in exactly one place: `OUT_OF_ME+` sat in
+# `_TERMINAL_STATES` above and appeared nowhere else in the codebase, so a record
+# carrying it was correctly treated as closed and then mis-handled by everything
+# downstream. Verified by running the parser on one:
+#
+#     OUT_OF_MEMORY  failed=True   findings=['host-oom']  memory-search=True
+#     OUT_OF_ME+     failed=False  findings=[]            memory-search=False
+#
+# -- so the kill counted as neither a failure nor a completion, drew no finding,
+# and was invisible to both the memory-bisection detector and the --mem floor in
+# `sizing.memory_advice`. Whichever query produced the truncation, one spelling of
+# one state cannot mean two things in one codebase.
+_TRUNCATED_STATES = {"OUT_OF_ME+": "OUT_OF_MEMORY"}
+
+
+def _canonical_state(value):
+    """A state with sacct's column truncation undone. Other spellings pass through.
+
+    The ``by <uid>`` suffix sacct appends to CANCELLED is preserved: `Job.state`
+    carries it, `Job.base_state` drops it, and both are read.
+    """
+    if not value:
+        return value
+    head, separator, tail = value.partition(" ")
+    canonical = _TRUNCATED_STATES.get(head)
+    if canonical is None:
+        return value
+    return canonical + separator + tail
 
 
 class SacctError(RuntimeError):
@@ -257,7 +292,7 @@ def _run(args):
         proc.kill()
         proc.communicate()
         raise SacctError(
-            "%s did not answer within %.0fs -- the accounting database may be "
+            "%s did not answer within %.0fs — the accounting database may be "
             "unreachable. Narrow the window with -S, or raise SLURMPAST_TIMEOUT."
             % (args[0], _timeout())
         ) from None
@@ -382,9 +417,15 @@ def _int(value):
     if not value:
         return None
     try:
-        return int(float(value))
+        number = float(value)
     except ValueError:
         return None
+    # `int(float("inf"))` raises OverflowError, which `except ValueError` does not
+    # catch -- so an "inf" or a "1e999" in ReqCPUS, Priority, NNodes or any other
+    # counted field came out of the parser as a traceback. Trap 9 at the top of
+    # this module is the rule it broke: a wedged accounting database must not wedge
+    # the tool.
+    return int(number) if math.isfinite(number) else None
 
 
 def _seconds(raw, formatted):
@@ -466,7 +507,7 @@ def parse(text, fields=None, delimiter="|"):
                 Step(
                     step_id=raw_id,
                     name=get(row, "JobName"),
-                    state=get(row, "State"),
+                    state=_canonical_state(get(row, "State")),
                     exit_code=exit_code,
                     signal=signal,
                     elapsed=_seconds(get(row, "ElapsedRaw"), get(row, "Elapsed")),
@@ -510,7 +551,7 @@ def parse(text, fields=None, delimiter="|"):
 
         req_mem = get(row, "ReqMem")
         end_raw = get(row, "End")
-        state = get(row, "State")
+        state = _canonical_state(get(row, "State"))
         derived_code, _ = _parse_exit(get(row, "DerivedExitCode"))
 
         # TimelimitRaw is in MINUTES, unlike every other *Raw field.

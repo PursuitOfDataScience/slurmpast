@@ -427,3 +427,200 @@ class TestAnOpenRecordSaysWhatSqueueAnswered:
         and only one of the two is a measurement."""
         job = healthy_job._replace(state="RUNNING", open_ended=True, live=None)
         assert "Confirm against squeue" in find(diagnose(job), "open-record").action
+
+
+def _interrupted(base, state, cpu=300.0, **kw):
+    """``base`` re-stated as a run something outside the job ended.
+
+    Half an hour of wall clock on sixteen cores. ``cpu`` is the CPU-second total:
+    the default 300 is 1.0% utilization -- low enough to trip every "you
+    over-requested" rule and far too high to look like a hang, which is the shape
+    that exposed the contradiction. Pass a fraction for the hang shape instead.
+    """
+    step = base.steps[0] if base.steps else None
+    fields = {
+        "state": state,
+        "exit_code": 0,
+        "signal": 0,
+        "elapsed": 1800.0,
+        "timelimit": 3600.0,
+        "total_cpu_alloc": cpu,
+        "alloc_tres": "cpu=16,mem=64G,node=1",
+        "alloc_cpus": 16,
+    }
+    if step is not None:
+        fields["steps"] = (step._replace(max_rss=1_000_000, total_cpu=cpu, elapsed=1800.0),)
+    fields.update(kw)
+    return base._replace(**fields)
+
+
+class TestNoFindingContradictsTheOneAboveIt:
+    """`_cpu_rules` states the rule its own guard was written for:
+
+        "'Find the blocking call' is advice about the user's own code, and it is
+        only honest when nothing else already explains the missing CPU time."
+
+    The guard suppressed the noop finding for OUT_OF_MEMORY, NODE_FAIL and
+    PREEMPTED -- and then fell straight through to the next rule, because the
+    `return` sits on the branch that *fires*. So the wrong advice was not removed,
+    it was replaced:
+
+        [WARN] Most allocated cores were idle
+               Utilization 1.0% of 16 cores, i.e. about 0.2 cores of real work.
+               → Try --cpus-per-task=1, unless those cores feed dataloader workers.
+
+        [WARN] The node failed under this job
+               ... a CPU or memory total near zero here is missing data, not a
+               measurement.
+
+    Two findings apart: an instruction computed from a number, and the statement
+    that the number is not a measurement. `gpu-suspect-idle` infers from the same
+    figure and did the same thing.
+    """
+
+    # Every rule that reads `cpu_utilization`, and so every rule the guard has to
+    # cover. Named here so a new one has to be added to the set or to this list.
+    CPU_DERIVED = {"noop-allocation", "cpu-overrequest", "gpu-suspect-idle"}
+
+    @pytest.mark.parametrize("state", ["NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE"])
+    @pytest.mark.parametrize("cpu", [0.1, 300.0], ids=["hang-shaped", "low-but-real"])
+    def test_no_sizing_advice_is_offered_for_a_run_cut_short(self, healthy_job, state, cpu):
+        """Both shapes, because the guard only ever covered one. At 0.1 CPU-seconds
+        the noop rule was suppressed and the run fell through to `cpu-overrequest`;
+        at 300 the noop rule never fired and `cpu-overrequest` was reached
+        directly. The old guard stopped neither."""
+        verdict = diagnose(_interrupted(healthy_job, state, cpu=cpu))
+        offered = codes(verdict) & self.CPU_DERIVED
+        assert not offered, "%s at %s CPU-seconds still gets %s" % (state, cpu, sorted(offered))
+
+    @pytest.mark.parametrize("state", ["NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "DEADLINE"])
+    def test_and_something_says_what_actually_happened(self, healthy_job, state):
+        """Suppression alone is not the fix -- it was what left BOOT_FAIL with
+        "nothing to flag" on a job whose node never booted."""
+        verdict = diagnose(_interrupted(healthy_job, state))
+        assert verdict.findings, "%s says nothing at all" % state
+
+    def test_the_gpu_measurement_survives_the_guard(self, healthy_job):
+        """The control on the GPU half. `gres/gpuutil` is sampled while the job
+        runs, so it says what the cards did however the run ended -- only the
+        CPU-based *inference* is suppressed."""
+        job = _interrupted(
+            healthy_job, "NODE_FAIL", cpu=0.1, alloc_tres="cpu=16,mem=64G,node=1,gres/gpu=4"
+        )
+        assert job.gpu_count == 4
+        assert "gpu-suspect-idle" not in codes(diagnose(job))
+
+    def test_a_completed_run_still_gets_its_advice(self, healthy_job):
+        """The control that matters most: the guard must not silence the rule on
+        the runs it was written for."""
+        job = _interrupted(healthy_job, "COMPLETED")
+        assert "cpu-overrequest" in codes(diagnose(job))
+
+    def test_cancelled_is_deliberately_not_in_the_set(self, healthy_job):
+        """Its finding says the *outcome* is ambiguous, not that the CPU total is
+        unreadable, so a cancelled run that used one core of sixteen is still
+        evidence about the request. Recorded as a decision, not an omission."""
+        from slurmpast.diagnose import _CPU_TIME_ALREADY_EXPLAINED
+
+        assert "CANCELLED" not in _CPU_TIME_ALREADY_EXPLAINED
+        assert "cpu-overrequest" in codes(diagnose(_interrupted(healthy_job, "CANCELLED")))
+
+
+class TestTheExitCodeFindingsAgreeWithEachOther:
+    """`exit-nonzero-nolog` said, of any code it was handed:
+
+        "An exit status does not name a cause: exit 127 is indistinguishable from
+        a CUDA OOM, a killed worker or a bad argument without the stderr text."
+
+    printed directly beneath a finding that had just named it:
+
+        "A command in the script was not found (exit 127)"
+
+    127 is the shell's "command not found" and 137 is 128+9; each has a rule of its
+    own a few lines above. The generic sentence is true of exit 1 and false of both.
+
+    This is the same self-contradiction the code's own comment records fixing
+    *within* one finding -- "a finding whose title said 'Exited 3' and whose
+    evidence discussed exit 1" -- reappearing between two, because the fix was to
+    generalise the sentence rather than to ask whether it was still true.
+    """
+
+    @staticmethod
+    def _failed(base, code, signal=0):
+        return base._replace(state="FAILED", exit_code=code, signal=signal)
+
+    @pytest.mark.parametrize("code,named", [(127, "command-not-found"), (137, "sigkill")])
+    def test_the_status_is_not_called_meaningless_when_a_rule_named_it(
+        self, healthy_job, code, named
+    ):
+        verdict = diagnose(self._failed(healthy_job, code))
+        assert named in codes(verdict), codes(verdict)
+        nolog = find(verdict, "exit-nonzero-nolog")
+        assert nolog is not None, "the log is still worth asking for"
+        assert "does not name a cause" not in nolog.evidence, nolog.evidence
+        assert "indistinguishable" not in nolog.evidence, nolog.evidence
+        assert "named above" in nolog.evidence, nolog.evidence
+        assert "no log to confirm it" in nolog.title, nolog.title
+
+    def test_the_advice_is_unchanged_because_the_log_is_still_wanted(self, healthy_job):
+        nolog = find(diagnose(self._failed(healthy_job, 127)), "exit-nonzero-nolog")
+        assert "--log-dir" in nolog.action
+
+    @pytest.mark.parametrize("code", [1, 2, 3, 42])
+    def test_an_unnamed_status_keeps_the_sentence_that_is_true_of_it(self, healthy_job, code):
+        """The control. Nothing above named these, so the generic wording stands --
+        and exit 1 keeps its own more specific line."""
+        nolog = find(diagnose(self._failed(healthy_job, code)), "exit-nonzero-nolog")
+        assert "but no log was found to explain it" in nolog.title
+        assert "indistinguishable" in nolog.evidence
+        if code == 1:
+            assert "generic Python-exception status" in nolog.evidence
+
+
+class TestTheTwoStatesDiagnoseHadNeverHeardOf:
+    """`BOOT_FAIL` and `DEADLINE` are counted by `Job.failed`, graded "crit" by
+    `theme.STATE_HEALTH`, coloured red by `report._STATE_COLOR` and queried by
+    `--failed`. `diagnose` mentioned neither, so the only thing on screen was the
+    generic noop rule:
+
+        [FAIL] Allocation did essentially nothing
+               → Find the blocking call.
+
+    -- sending the reader to debug their own code for a node that never booted. At
+    45 seconds it said "nothing to flag" instead, which is worse.
+    """
+
+    def test_boot_fail_says_the_node_never_came_up(self, healthy_job):
+        finding = find(diagnose(_interrupted(healthy_job, "BOOT_FAIL")), "boot-failed")
+        assert finding is not None
+        assert "BOOT_FAIL" in finding.evidence
+        assert "Not your code" in finding.action
+
+    def test_deadline_distinguishes_itself_from_the_time_limit(self, healthy_job):
+        finding = find(diagnose(_interrupted(healthy_job, "DEADLINE")), "deadline")
+        assert finding is not None
+        assert "--deadline" in finding.evidence
+        assert "A longer --time changes nothing" in finding.action
+
+    def test_a_short_boot_fail_is_no_longer_silent(self, healthy_job):
+        """The case that said "nothing to flag": too short for any rule to fire."""
+        job = _interrupted(healthy_job, "BOOT_FAIL", elapsed=45.0)
+        assert "boot-failed" in codes(diagnose(job))
+
+    def test_the_severities_match_the_states_they_are_siblings_of(self, healthy_job):
+        """DEADLINE is CRITICAL like both TIMEOUT findings -- `model.py` groups the
+        two ("DEADLINE belongs here for the same reason TIMEOUT does") -- and
+        BOOT_FAIL is a WARNING like NODE_FAIL, because nothing the submitter did
+        caused it. The pair decides `slurmpast <jobid>`'s exit code."""
+        deadline = find(diagnose(_interrupted(healthy_job, "DEADLINE")), "deadline")
+        boot = find(diagnose(_interrupted(healthy_job, "BOOT_FAIL")), "boot-failed")
+        node = find(diagnose(_interrupted(healthy_job, "NODE_FAIL")), "node-failed")
+        assert deadline.severity == CRITICAL
+        assert boot.severity == node.severity
+        assert boot.severity != CRITICAL
+
+    def test_neither_still_says_find_the_blocking_call(self, healthy_job):
+        for state in ("BOOT_FAIL", "DEADLINE"):
+            verdict = diagnose(_interrupted(healthy_job, state))
+            for finding in verdict.findings:
+                assert "blocking call" not in finding.action, (state, finding.code)

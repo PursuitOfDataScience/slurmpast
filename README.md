@@ -8,7 +8,7 @@
   <a href="https://pypi.org/project/slurmpast/"><img src="https://img.shields.io/pypi/v/slurmpast.svg" alt="PyPI"></a>
   <a href="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/tests-1195-brightgreen.svg" alt="1195 tests">
+  <img src="https://img.shields.io/badge/tests-1473-brightgreen.svg" alt="1473 tests">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
 </p>
 
@@ -19,7 +19,7 @@
 <p align="center">
   <sub>Recorded against <code>slurmpast --demo</code>, which is why the header reads
   <code>synthetic demo data</code> throughout. Regenerate with
-  <code>python tools/demo_gif.py</code>.</sub>
+  <code>pip install -e ".[assets]" &amp;&amp; python tools/demo_gif.py</code>.</sub>
 </p>
 
 ```bash
@@ -137,8 +137,8 @@ for advice in recommend(history.groups[0].jobs):
     print(advice.flag, advice.verdict, advice.suggestion)
 ```
 
-`--json` emits everything — 174 values per job.
+`--json` emits everything — 95 values per job, plus 40 for every step.
 
 ---
 
-Slurm 20.11.8 · Python 3.10–3.13 · Textual 0.89–8.2 · MIT
+Slurm 20.11.8 · Python 3.10–3.13 · Textual 0.86–8.2 · MIT
