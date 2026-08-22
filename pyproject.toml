@@ -67,6 +67,10 @@ dev = [
   "mypy>=2.3,<3",  # >=2.3: 2.2 added the MRO override check CI tripped on
   "build>=1.0",
   "twine>=5.0",
+  # `tomllib` is stdlib from 3.11 and the floor here is 3.10, so the one test that
+  # reads pyproject.toml needs a backfill on the oldest supported interpreter --
+  # and nothing local catches that, because a local gate runs on one version.
+  "tomli>=1.1; python_version < '3.11'",
 ]
 # What `tools/demo_gif.py` needs to rebuild the README's lead image, kept apart
 # from `dev` on purpose: cairosvg pulls a native cairo, and CI installs `[dev]`

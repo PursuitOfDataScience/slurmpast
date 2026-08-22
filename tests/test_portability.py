@@ -1729,9 +1729,22 @@ class TestTheToolsDeclareWhatTheyImport:
 
     @staticmethod
     def _project():
+        """``(repo root, the [project] table)``.
+
+        ``tomllib`` is stdlib from 3.11 and this package declares
+        ``requires-python = ">=3.10"``, so on the floor version this test -- whose
+        subject is precisely "declare what you import" -- did not declare what it
+        imports. Local gates run on one interpreter and could not see it; CI's
+        py3.10 and oldest-Textual jobs both failed on it. ``tomli`` is the
+        conventional backfill and is now in the dev extra, guarded by a marker so
+        3.11+ does not install it.
+        """
         import pathlib
 
-        import tomllib
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10
+            import tomli as tomllib
 
         root = pathlib.Path(__file__).resolve().parent.parent
         return root, tomllib.loads((root / "pyproject.toml").read_text())["project"]
@@ -1929,3 +1942,117 @@ class TestTheProseSpellsPunctuationOneWay:
         )
         assert em > 20, em
         assert _ASCII_FOLD["—"] == "-"
+
+
+class TestNothingImportsPastTheDeclaredPythonFloor:
+    """`requires-python = ">=3.10"`, and one test imported a module that arrived
+    in 3.11.
+
+    `TestTheToolsDeclareWhatTheyImport` reads `pyproject.toml` with `tomllib` --
+    stdlib from 3.11 -- so the test whose subject is "declare what you import" did
+    not, on the oldest interpreter this package claims to support. Four of its
+    assertions died with `ModuleNotFoundError` in CI's py3.10 and oldest-Textual
+    jobs, having passed every local gate: a local run is one interpreter, and this
+    is the class of defect that costs nothing to catch and cannot be caught there.
+
+    `sys.stdlib_module_names` is the *running* interpreter's, so it cannot answer
+    "was this in 3.10". The table below is the alternative and is deliberately
+    small: the stdlib additions between this floor and the newest version CI runs.
+    A module missing from it is not a false pass -- CI still runs 3.10 -- it is one
+    round-trip through CI instead of a local failure, which is what this exists to
+    save.
+    """
+
+    # module -> the version it entered the stdlib.
+    ADDED_IN = {
+        "tomllib": (3, 11),
+        "dbm.sqlite3": (3, 13),
+        "annotationlib": (3, 14),
+        "compression": (3, 14),
+    }
+
+    @classmethod
+    def _floor(cls):
+        import re
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        spec = re.search(
+            r'requires-python\s*=\s*"[>=~^]*([\d.]+)"', (root / "pyproject.toml").read_text()
+        )
+        assert spec, "pyproject no longer declares requires-python"
+        return tuple(int(part) for part in spec.group(1).split("."))
+
+    @staticmethod
+    def _guarded_imports(tree):
+        """Names imported inside a `try:` -- a backfill, not an unguarded import."""
+        import ast
+
+        safe = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Import):
+                    safe.update(alias.name for alias in inner.names)
+                elif isinstance(inner, ast.ImportFrom) and inner.module:
+                    safe.add(inner.module)
+        return safe
+
+    def test_no_module_newer_than_the_floor_is_imported_unguarded(self):
+        import ast
+
+        floor = self._floor()
+        late = {name: added for name, added in self.ADDED_IN.items() if added > floor}
+        assert late, "the floor has moved past every module in the table; prune it"
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        offenders = []
+        for path in sorted(
+            list((root / "src" / "slurmpast").glob("*.py"))
+            + list((root / "tests").glob("*.py"))
+            + list((root / "tools").glob("*.py"))
+        ):
+            tree = ast.parse(path.read_text())
+            guarded = self._guarded_imports(tree)
+            for node in ast.walk(tree):
+                names = []
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                    names = [node.module]
+                for name in names:
+                    if name in late and name not in guarded:
+                        offenders.append(
+                            "%s:%d imports %s (stdlib from %s, floor is %s)"
+                            % (
+                                path.name,
+                                node.lineno,
+                                name,
+                                ".".join(map(str, late[name])),
+                                ".".join(map(str, floor)),
+                            )
+                        )
+        assert not offenders, "; ".join(offenders)
+
+    def test_the_one_backfill_there_is_is_declared(self):
+        """The control on the fix: `tomllib` is guarded *and* `tomli` is in the dev
+        extra behind a marker, so 3.10 installs it and 3.11+ does not."""
+        root = pathlib.Path(__file__).resolve().parent.parent
+        text = (root / "pyproject.toml").read_text()
+        assert "tomli>=" in text
+        assert "python_version < '3.11'" in text
+        source = (root / "tests" / "test_portability.py").read_text()
+        assert "except ModuleNotFoundError:" in source
+        assert "import tomli as tomllib" in source
+
+    def test_it_would_have_caught_the_one_that_shipped(self):
+        """The control that matters: an unguarded `import tomllib` is reported."""
+        import ast
+
+        tree = ast.parse("import pathlib\nimport tomllib\n")
+        guarded = self._guarded_imports(tree)
+        assert "tomllib" not in guarded
+        wrapped = ast.parse(
+            "try:\n    import tomllib\nexcept ModuleNotFoundError:\n    import tomli as tomllib\n"
+        )
+        assert "tomllib" in self._guarded_imports(wrapped)

@@ -1,5 +1,23 @@
 # slurmpast — audit and resolution
 
+> **Round twenty-one, 2026-08-22.** One defect, and CI found it rather than any
+> local gate: `tests/test_portability.py` imported `tomllib`, stdlib from **3.11**,
+> in a package declaring `requires-python = ">=3.10"`. Four assertions died with
+> `ModuleNotFoundError` on the py3.10 and oldest-Textual jobs after passing every
+> local run -- because a local run is one interpreter.
+>
+> The irony is worth keeping: the test that failed is
+> `TestTheToolsDeclareWhatTheyImport`, whose entire subject is declaring what you
+> import. `tomli` is in the dev extra behind a `python_version < '3.11'` marker
+> now, the import is guarded, and `TestNothingImportsPastTheDeclaredPythonFloor`
+> makes the class catchable locally: it parses every module in `src/`, `tests/` and
+> `tools/` for unguarded imports of stdlib modules that postdate the declared
+> floor. Its control asserts it reports the exact line that shipped.
+>
+> **The lesson, recorded because it generalises past this repo:** four green gates
+> on one interpreter is not the same as CI. The gates verify the code; the version
+> matrix verifies the *declaration*, and only the second can see a floor violation.
+
 > **Round twenty, 2026-08-21, continuing the same request. No defects.** The first
 > round of the streak to find nothing, from two angles chosen because neither had
 > been tried and both cover ground everything else depends on. 1471 tests before,
