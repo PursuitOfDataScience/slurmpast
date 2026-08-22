@@ -2141,3 +2141,70 @@ class TestTheNoNodesSentinelIsNotANodeName:
         jobs = [self._job("None assigned"), self._job("midway3-0602")]
         table = node_table(jobs, workload=None, metric="failure", min_samples=1)
         assert [r["node"] for r in table["rows"]] == ["midway3-0602"]
+
+
+class TestAnUnexpandedArrayIdCanBeLookedUp:
+    """sacct prints `49046820_[1-20%10]` and then refuses it.
+
+    That is the spelling of a pending array in sacct's own `JobID` column under
+    `--parsable2`, and in `squeue`, which is where anyone copies a job id from. The
+    tool handed it straight to `sacct -j` and got a fatal error, so the one command
+    a reader would reach for did not work on any throttled pending array:
+
+        $ slurmpast '49046820_[1-20%10]'
+        slurmpast: sacct: fatal: Bad job array element specified: 49046820
+
+    Verified against the live scheduler rather than reasoned about:
+
+        sacct -j '49046820_[1-20%10]'   fatal
+        sacct -j '49046820_[1-20]'      fatal   -- the brackets, not the %throttle
+        sacct -j 49046820               49046820_[1-20%10]|PENDING
+        sacct -j 49046820_4             accepted (a real element)
+        sacct -j 53833807.batch         accepted (a step id)
+
+    Found only by running against the cluster: no user's own history contains a
+    pending array belonging to someone else, and the demo has none at all.
+    """
+
+    def test_an_unexpanded_range_reduces_to_the_master(self):
+        from slurmpast.sacct import queryable_job_id
+
+        assert queryable_job_id("49046820_[1-20%10]") == "49046820"
+        assert queryable_job_id("53601970_[0-4%2]") == "53601970"
+        # The throttle is not the problem, so a plain range folds too.
+        assert queryable_job_id("49046820_[1-20]") == "49046820"
+
+    def test_every_other_spelling_is_left_alone(self):
+        """The control. sacct accepts all of these, so touching them could only
+        break a lookup that works."""
+        from slurmpast.sacct import queryable_job_id
+
+        for value in ("12345", "49046820_4", "500+1", "53833807.batch", "53833807.extern", ""):
+            assert queryable_job_id(value) == value, value
+
+    def test_the_query_is_built_from_the_reduced_id(self):
+        """End to end through `Sacct.jobs`, with the runner captured: what reaches
+        sacct is what sacct will answer."""
+        from slurmpast.sacct import Sacct
+
+        seen = []
+
+        def runner(args):
+            seen.append(args)
+            return ""
+
+        sacct = Sacct(runner=runner)
+        sacct.jobs(["49046820_[1-20%10]", "53363721_4"])
+        # The first call is `sacct --helpformat`, the field negotiation.
+        queries = [args for args in seen if "-j" in args]
+        assert queries, seen
+        asked = queries[0][queries[0].index("-j") + 1]
+        assert asked == "49046820,53363721_4", asked
+        assert "[" not in asked
+
+    def test_the_id_the_reader_typed_is_what_gets_echoed_back(self):
+        """The reduction is a query detail. An error names what they asked for."""
+        from slurmpast.cli import main
+
+        code = main(["49046820_[1-20%10]", "--demo", "--plain", "--no-color"])
+        assert code == 2

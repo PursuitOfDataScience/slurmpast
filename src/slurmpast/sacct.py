@@ -659,6 +659,37 @@ def parse(text, fields=None, delimiter="|"):
     ]
 
 
+# An array that has not been expanded yet: `49046820_[1-20%10]`, or `_[0-4]` without
+# a throttle. Anchored, and the brackets are required -- `49046820_4` is a real
+# element and sacct takes it.
+_UNEXPANDED_ARRAY = re.compile(r"^(\d+)_\[")
+
+
+def queryable_job_id(value: str) -> str:
+    """A job id ``sacct -j`` will actually accept.
+
+    sacct prints an unexpanded array as ``49046820_[1-20%10]`` -- in its own JobID
+    column under ``--parsable2``, and squeue prints the same, which is where anyone
+    copies it from -- and then refuses that exact string:
+
+        $ sacct -j '49046820_[1-20%10]' -X -o JobID
+        sacct: fatal: Bad job array element specified: 49046820
+        $ sacct -j 49046820 -X -o JobID
+        49046820_[1-20%10]
+
+    So the tool handed straight through what sacct had just printed and got a fatal
+    error on it. Verified against the live scheduler: it is the brackets, not the
+    ``%throttle`` -- ``_[1-20]`` fails the same way -- and everything else passes,
+    including ``.batch`` and ``.extern`` step ids and a plain ``_4`` element.
+
+    Reduced to the master, which is the only spelling sacct answers. For a pending
+    array that returns the one unexpanded row the caller asked about; the bracketed
+    form does not survive expansion, so there is no completed array to over-fetch.
+    """
+    match = _UNEXPANDED_ARRAY.match(value)
+    return match.group(1) if match else value
+
+
 class Sacct:
     """Queries sacct, adapting the request to what the local Slurm accepts."""
 
@@ -705,7 +736,7 @@ class Sacct:
         ids = [str(j) for j in job_ids if str(j).strip()]
         if not ids:
             return []
-        return self._query(["-j", ",".join(ids)])
+        return self._query(["-j", ",".join(queryable_job_id(i) for i in ids)])
 
     def history(
         self, user=None, since=None, until=None, states=None, partition=None, all_users=False

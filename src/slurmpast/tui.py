@@ -1289,7 +1289,13 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
         table.display = bool(jobs)
 
         summary = Text()
-        summary.append(self._title, style="bold %s" % theme.INK)
+        # Clipped, not wrapped: this is the head of a one-line summary that goes on
+        # to carry the counts, so a title that wrapped would push them onto a line
+        # of their own. A folded workload name can be one word -- the longest on a
+        # real cluster is 123 characters with no space in it -- and `wrap` hands a
+        # single word back whole, which is what put it past the edge. The plain
+        # renderer's twin takes the same rule through `render.wrap_or_clip`.
+        summary.append(render.clip(self._title, _prose_width(self, 2)), style="bold %s" % theme.INK)
         summary.append(
             "  ·  %d job%s" % (len(jobs), "" if len(jobs) == 1 else "s"), style=theme.DIM
         )

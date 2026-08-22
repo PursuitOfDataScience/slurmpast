@@ -1,5 +1,16 @@
 # slurmpast — audit and resolution
 
+> **Round twenty-four, 2026-08-22.** Real data, widened from one user to the whole
+> cluster: 471 users, 486,882 jobs in two days, and states, id shapes and string
+> lengths no single account contains. Two defects. 1498 tests before, **1514
+> after**; all four gates clean.
+>
+> The cluster is where the *shapes* live. A pending throttled array is spelled
+> `49046820_[1-20%10]`, which sacct prints in its own JobID column and then refuses
+> in `-j`. The longest job name is 123 characters with no space in it. Neither
+> exists in one user's history and neither could be invented by a fixture author
+> who had not seen sacct emit it.
+
 > **Round twenty-three, 2026-08-22.** Real data again, pushed harder: all 15,085
 > jobs through the post-mortem renderer, and the dashboard driven against 930 real
 > workloads. Two defects -- one a sentinel rendered as a hostname, one the slowest
@@ -271,6 +282,89 @@
 > upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
 > was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
 > and its control. `ruff`, `ruff format` and `mypy` clean.
+
+---
+
+## Round twenty-four — the shapes only a whole cluster has
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `slurmpast '49046820_[1-20%10]'` died: sacct prints that id and will not accept it | `sacct.py` `Sacct.jobs` | `TestAnUnexpandedArrayIdCanBeLookedUp` |
+| 2 | A 123-character workload name with no spaces overran `--sizing` at every width and broke the workload title mid-name | `report.py`, `tui.py` | `TestAWorkloadNameWithNoSpacesInIt` |
+
+### 1. An id sacct prints and then rejects
+
+A pending array with a throttle is `49046820_[1-20%10]`. That is what sacct writes
+in `JobID` under `--parsable2`, and what `squeue` shows -- so it is what anyone
+copies. Handed back to sacct:
+
+```
+$ slurmpast '49046820_[1-20%10]'
+slurmpast: sacct: fatal: Bad job array element specified: 49046820
+```
+
+Established against the live scheduler rather than reasoned about:
+
+```
+sacct -j '49046820_[1-20%10]'   fatal
+sacct -j '49046820_[1-20]'      fatal      <- the brackets, not the %throttle
+sacct -j 49046820               49046820_[1-20%10]|PENDING
+sacct -j 49046820_4             accepted   (a real element)
+sacct -j 53833807.batch         accepted   (a step id)
+```
+
+`queryable_job_id` reduces an unexpanded range to the master, which is the only
+spelling sacct answers, and leaves every other form alone. The bracketed form does
+not survive expansion, so there is no completed array to over-fetch.
+
+Two real records now resolve that could not before, and both exercise round
+eighteen's new findings on genuine data: a `DEADLINE` array reporting "Killed at
+its --deadline, not its time limit", and a `NODE_FAIL` reporting "The node failed
+under this job".
+
+### 2. A name that `wrap` cannot break
+
+`wrap` breaks at spaces. The longest job name on this cluster is 123 characters and
+contains none:
+
+```
+nf-NFCORE_RNASEQ_RNASEQ_FASTQ_QC_TRIM_FILTER_SETSTRANDEDNESS_FASTQ_SUBSAMPLE_FQ_
+SALMON_SALMON_INDEX_(genome.transcripts.fa)
+```
+
+`--sizing`'s workload header was **125 cells at 60, 74, 80, 100 and 120 columns** --
+it wraps, and a single word comes back from the wrapper whole. The dashboard's
+workload title did the same and Textual soft-wrapped it mid-name to column 0.
+
+`report` documents this failure exactly, for a *detail value*: "a 68-character job
+name is one word, so it came out of the wrapper unchanged and the row went to 89
+cells on an 80-column terminal." It was fixed there with a clip and left in two
+other places -- the sixth "fixed only on one side" in this record. So the rule is
+named once now, `render.wrap_or_clip`, and `pair_value_lines` is expressed in terms
+of it rather than repeating it.
+
+The dashboard title is clipped rather than wrapped: it heads a one-line summary
+that goes on to carry the counts, and wrapping it would push them onto a line of
+their own. The counts themselves can still take that line past the width and
+soft-wrap -- the overview's summary already does this with a long window string,
+it is accepted behaviour on these screens, and the test says so rather than
+quietly asserting less.
+
+### The negative results
+
+* **`expand_nodelist` on a real 264-character, 63-node allocation** --
+  `midway3-[0002,0008,0012-0015,...]` -- expands and round-trips through
+  `compress_nodelist` exactly. Round twelve fuzzed that over 4,000 synthetic
+  hostlists; this is the first real one.
+* **Every job-id shape the cluster produces** through `base_job_id`,
+  `numeric_job_id` and `job_identifiers`: unexpanded arrays with and without a
+  throttle, real elements, heterogeneous components, step ids, and the
+  column-truncated `53601970_[0+`. No exception, and every one resolves to a
+  sensible master.
+* **The `_[0+` truncation is a display artifact, not a defect.** sacct's default
+  column width truncates JobID exactly as it truncates `OUT_OF_ME+`; slurmpast
+  queries with `--parsable2`, which does not. Checked because the two look alike
+  and one of them *was* a defect.
 
 ---
 
@@ -2911,6 +3005,12 @@ entry was refusing, replaced by the smallest change that keeps the idiom intact.
 ---
 
 ## Consequence for the numbers
+
+**Round twenty-four.** `slurmpast <unexpanded array id>` starts working where it
+exited 2; nothing that worked before changes, since every other id form is passed
+through untouched. A workload name too long to wrap is now clipped with `…` in the
+`--sizing` header and the dashboard's workload title, where it used to overrun.
+No measurement, no verdict, no exit code, and the demo is unaffected.
 
 **Round twenty-three.** `shape.node_list` in `--json` becomes `""` instead of
 `"None assigned"` for a job that never held an allocation, and the post-mortem drops
