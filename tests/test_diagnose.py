@@ -692,3 +692,115 @@ class TestMentioningNcclIsNotAnNcclFault:
         assert "nccl" not in _NCCL_MARKERS
         for marker in _NCCL_MARKERS:
             assert len(marker) > 8, marker
+
+
+class TestTheTracebackTailEndsWhereTheTracebackEnds:
+    """ "Traceback tail from the log" was showing the tail of the *file*.
+
+    Scanning backwards for the last `Traceback` header is right -- a log can hold
+    several and the one that killed the job is the last. Taking everything from
+    there to EOF was not: a traceback is frequently not the last thing in the
+    file. A wrapper retries, torchrun prints its own summary, a shell banner
+    follows, slurmstepd adds a line. The trim then kept the header, an ellipsis,
+    and the last four lines of the file:
+
+        Traceback (most recent call last):
+          ...
+        Validation data: disabled (no held-out file provided)
+        Wall time: 999999s, will save checkpoint at 999819s
+        ------------------------------------------------------------
+
+    Measured on 27,435 readable logs on this machine: 486 contain a traceback and
+    **173 of them -- 36% -- rendered a tail that was not the traceback**. One
+    finished on `slurmstepd: error: Detected 1 oom-kill event(s)` while the
+    traceback's own last line, the one naming the failure, was
+    `torch.distributed.elastic.multiprocessing.errors.ChildFailedError:`.
+
+    Only real logs show it. Every fixture in this suite puts the traceback last,
+    which is the 64% case that always worked.
+    """
+
+    TRACEBACK = (
+        "Traceback (most recent call last):\n"
+        '  File "/x/train.py", line 42, in <module>\n'
+        "    main()\n"
+        '  File "/x/train.py", line 30, in main\n'
+        "    model.step()\n"
+        "RuntimeError: something broke\n"
+    )
+    AFTER = (
+        "=== job exit 1 | Tue Aug 18 08:06:30 CDT 2026 ===\n"
+        "Validation data: disabled (no held-out file provided)\n"
+        "Wall time: 999999s, will save checkpoint at 999819s\n"
+        "------------------------------------------------------------\n"
+    )
+
+    def _tail(self, text):
+        from slurmpast.diagnose import _traceback_tail
+
+        return _traceback_tail(text)
+
+    def test_output_after_the_traceback_is_not_shown_as_the_traceback(self):
+        tail = self._tail("startup\n" + self.TRACEBACK + self.AFTER)
+        assert tail.splitlines()[-1] == "RuntimeError: something broke", tail
+        assert "Wall time" not in tail
+        assert "exit 1 | Tue" not in tail
+
+    def test_a_traceback_at_the_end_of_the_file_is_unchanged(self):
+        """The 75% case, which always worked and must keep working."""
+        tail = self._tail("startup\n" + self.TRACEBACK)
+        assert tail.splitlines()[0].startswith("Traceback")
+        assert tail.splitlines()[-1] == "RuntimeError: something broke"
+
+    def test_the_last_traceback_wins_when_there_are_several(self):
+        first = self.TRACEBACK.replace("something broke", "the first one")
+        text = first + "retrying\n" + self.TRACEBACK + self.AFTER
+        tail = self._tail(text)
+        assert "the first one" not in tail
+        assert tail.splitlines()[-1] == "RuntimeError: something broke"
+
+    def test_a_torchrun_rank_prefix_does_not_hide_the_frames(self):
+        """torchrun prefixes every line, so the indentation that tells a frame from
+        the exception line sits behind `[rank0]: `. Without stripping it the first
+        frame looks unindented and the traceback is cut to one line.
+
+        The header is matched through the same strip, and that half is load-bearing
+        on its own: of 27,435 real logs on this machine, three carry only a
+        prefixed traceback, and the rule did not fire on them at all -- a job that
+        died on `AttributeError: '_OpNamespace' '_moe_C' object has no attribute
+        'grouped_topk'` produced no traceback finding whatsoever.
+        """
+        prefixed = "".join("[rank0]: %s\n" % line for line in self.TRACEBACK.splitlines())
+        tail = self._tail(prefixed + self.AFTER)
+        assert tail.splitlines()[-1].endswith("RuntimeError: something broke"), tail
+        assert len(tail.splitlines()) > 2, tail
+
+    def test_a_torchrun_only_traceback_is_found_at_all(self, healthy_job):
+        """The other half of the same strip, and a separate symptom: when *every*
+        copy of the traceback is rank-prefixed, the backward header scan used to
+        match nothing, so there was no finding at all -- not a truncated one.
+
+        Three real logs on this machine are shaped exactly this way. torchrun
+        usually prints its own wrapper traceback unprefixed beside the worker's,
+        which is why the other 50 were found; these three are the ones where it
+        did not.
+        """
+        prefixed = "".join("[rank0]: %s\n" % line for line in self.TRACEBACK.splitlines())
+        job = healthy_job._replace(state="FAILED", exit_code=1)
+        verdict = diagnose(job, log_text="startup\n" + prefixed + self.AFTER)
+        finding = find(verdict, "traceback")
+        assert finding is not None, "a rank-prefixed traceback is still a traceback"
+        assert "RuntimeError: something broke" in finding.evidence
+
+    def test_no_traceback_is_still_nothing(self):
+        assert self._tail("just some output\nand more\n") == ""
+        assert self._tail("") == ""
+
+    def test_the_finding_shows_it(self, healthy_job):
+        """End to end, since the evidence is what a reader sees."""
+        job = healthy_job._replace(state="FAILED", exit_code=1)
+        verdict = diagnose(job, log_text="startup\n" + self.TRACEBACK + self.AFTER)
+        finding = find(verdict, "traceback")
+        assert finding is not None
+        assert "RuntimeError: something broke" in finding.evidence
+        assert "Wall time" not in finding.evidence

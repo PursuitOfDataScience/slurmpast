@@ -1,5 +1,23 @@
 # slurmpast — audit and resolution
 
+> **Round twenty-eight, 2026-08-22.** One defect with two halves, and it is the
+> largest-impact finding of the streak by share of affected output: a finding
+> headed "Traceback tail from the log" was showing the tail of the **file**. 1535
+> tests before, **1542 after**; all four gates clean.
+>
+> Round twenty-seven read real log contents for the first time and found a fault
+> invented from a word. This round stayed in the same vein and asked the opposite
+> question -- not "does the marker match something harmless?" but "when a rule does
+> fire, is the evidence it prints the evidence it promises?" Of 27,435 readable
+> logs, 486 hold a Python traceback and **173 of them (36%) rendered something
+> that was not one**.
+>
+> Two measurements in this round were wrong before they were right, and both were
+> corrected by re-running rather than by re-reading. The first probe compared a
+> list's length against a string's character count and reported 1%; the second
+> claimed no real log needs the rank-prefix half of the fix, on a scan that had
+> missed 25,000 files. The numbers below are the ones a re-run reproduces.
+
 > **Round twenty-seven, 2026-08-22.** One defect, from the first pass over real log
 > *contents* rather than real job records: a CRITICAL "Collective communication
 > fault" manufactured from the word NCCL. 1524 tests before, **1535 after**; all
@@ -323,6 +341,90 @@
 > and its control. `ruff`, `ruff format` and `mypy` clean.
 
 ---
+
+## Round twenty-eight — a traceback tail that was the file's tail
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `_traceback_tail` took `lines[start:]` to EOF, so anything printed after the traceback became the "traceback tail" a reader was shown | `diagnose.py:638` | `TestTheTracebackTailEndsWhereTheTracebackEnds` |
+| 1b | the same function's header scan did not strip torchrun's `[rankN]: ` prefix, so a log whose every traceback is prefixed produced no finding at all | `diagnose.py:638` | `test_a_torchrun_only_traceback_is_found_at_all` |
+
+### 1. 173 of 486 real tracebacks rendered as something else
+
+A traceback is frequently *not* the last thing in a log file. A wrapper retries,
+torchrun prints its own summary, a shell banner follows, slurmstepd appends the
+kill notice. The function scanned backwards for the last `Traceback` header --
+correct, the one that killed the job is the last -- and then took everything from
+there to the end of the file. The six-line trim kept the header, an ellipsis, and
+the last four lines **of the file**.
+
+On `report/4-train.err`, the rule promised a traceback and delivered the shell's
+epilogue:
+
+```
+before   Traceback (most recent call last):
+           ...
+         slurmstepd: error: Detected 1 oom-kill event(s) in StepId=53371939.batch cgroup.
+
+after    Traceback (most recent call last):
+           ...
+         torch.distributed.elastic.multiprocessing.errors.ChildFailedError:
+```
+
+The line the reader needed -- the one naming what the process actually raised --
+was the line the trim discarded.
+
+Measured across every readable log on this machine:
+
+```
+log files read                                : 27435
+  containing a traceback                      : 486
+  where the rendered tail CHANGED             : 173  (36%)
+  where the old code found no traceback at all: 3
+```
+
+A traceback ends at its exception line: the first line after the header carrying
+no leading whitespace, because frames are indented and the exception line is not.
+
+### 1b. And three logs where the rule never fired
+
+The same fix needs `[rankN]: ` stripped before the indentation test, or torchrun's
+prefix makes the first frame look unindented and cuts the tail to one line. The
+backward header scan needed the identical strip for a separate reason, found by
+writing the test for the first half: when *every* copy of the traceback is
+prefixed, the scan matches nothing and there is **no finding at all**.
+
+torchrun normally prints its own wrapper traceback unprefixed beside the worker's,
+which is why 50 of the 53 prefixed logs were found anyway. Three were not, and one
+of them died on a line a reader would have wanted immediately:
+
+```
+[rank0]: AttributeError: '_OpNamespace' '_moe_C' object has no attribute 'grouped_topk'
+```
+
+Stripping in one of the two tests and not the other is the shape this record has
+now named eight times. Both halves cost one call.
+
+### Consequence for the numbers
+
+No rate, interval or ranking moves -- this is evidence text, not statistics. What
+changes is what 173 of 486 traceback findings display, and whether 3 logs produce
+a traceback finding at all. A reader who acted on the old evidence was reading the
+end of the file under a heading that said otherwise.
+
+### What was verified and not changed
+
+* Every fixture in the suite puts the traceback last, which is the 64% case that
+  always worked; two of the seven new tests pin it and pass against the reverted
+  tree, which is what makes them controls rather than decoration.
+* The backward scan itself is right and was left alone. A log holding several
+  tracebacks should show the last, and a chained `During handling of the above
+  exception` block is not reached because the scan already landed past it.
+* `cuda-oom` and `import-error` markers were re-checked over the same corpus and
+  are clean: every hit is a FAILED job.
+* Round twenty-seven's narrowed `_NCCL_MARKERS` holds up on the wider corpus --
+  the surviving hits are genuine, three of them ending on `NCCL WARN Cuda failure
+  'CUDA driver version is insufficient for CUDA runtime version'`.
 
 ## Round twenty-seven — a fault invented from the word NCCL
 

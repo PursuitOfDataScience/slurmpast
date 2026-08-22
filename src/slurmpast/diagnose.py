@@ -624,19 +624,69 @@ def _exit_rules(job, log_text, add):
         add(Finding(INFO, "traceback", "Traceback tail from the log", tail, ""))
 
 
+def _strip_rank(line):
+    """``[rank0]: File "x.py"`` -> ``File "x.py"``.
+
+    torchrun prefixes every line of every worker's output, so indentation -- which
+    is how a traceback's frames are told from its exception line -- is behind the
+    prefix rather than at the start of the line.
+    """
+    head, sep, tail = line.partition("]:")
+    return tail[1:] if sep and head.lstrip().startswith("[rank") and tail.startswith(" ") else line
+
+
 def _traceback_tail(log_text, max_lines=6):
-    """Last Python traceback in the log, trimmed."""
+    """Last Python traceback in the log, trimmed -- and ending where it ends.
+
+    Scanning backwards for the last ``Traceback`` header is right: a log can hold
+    several, and the one that killed the job is the last. Taking ``lines[start:]``
+    was not, because a traceback is frequently *not* the last thing in the file --
+    a wrapper retries, torchrun prints its own summary, slurmstepd adds a line. The
+    trim then kept the header, an ellipsis, and the last four lines **of the file**,
+    so a finding titled "Traceback tail from the log" showed:
+
+        Traceback (most recent call last):
+          ...
+        Validation data: disabled (no held-out file provided)
+        Wall time: 999999s, will save checkpoint at 999819s
+        ------------------------------------------------------------
+
+    -- the startup banner of a later retry, under a heading promising a traceback.
+    Measured on this machine: of 27,435 readable logs, 486 hold a traceback and
+    **173 of those (36%) rendered a tail that was not it**. One ended on
+    ``slurmstepd: error: Detected 1 oom-kill event(s)`` where the traceback's own
+    last line was ``ChildFailedError:``.
+
+    A traceback ends at its exception line: the first line after the header that
+    carries no leading whitespace. Frames are indented, ``[rank0]:`` prefixes are
+    stripped first so that test still works under torchrun, and a chained
+    ``During handling of the above exception`` block is not reached because the
+    backward scan already landed on the final segment.
+
+    The header is matched through the same strip, which is load-bearing separately:
+    three of those logs carry *only* a prefixed traceback, and before this the rule
+    did not fire on them at all -- no finding, from a file whose last line reads
+    ``[rank0]: AttributeError: '_OpNamespace' '_moe_C' object has no attribute
+    'grouped_topk'``. Stripping in one of the two tests and not the other is the
+    shape that has produced eight defects in this record; both cost one call.
+    """
     if not log_text:
         return ""
     lines = log_text.splitlines()
     start = None
     for idx in range(len(lines) - 1, -1, -1):
-        if lines[idx].strip().startswith("Traceback (most recent call last)"):
+        if _strip_rank(lines[idx]).strip().startswith("Traceback (most recent call last)"):
             start = idx
             break
     if start is None:
         return ""
-    chunk = [ln.rstrip() for ln in lines[start:] if ln.strip()]
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        body = _strip_rank(lines[idx])
+        if body.strip() and not body[:1].isspace():
+            end = idx + 1  # the exception line closes the traceback
+            break
+    chunk = [ln.rstrip() for ln in lines[start:end] if ln.strip()]
     if len(chunk) > max_lines:
         chunk = [chunk[0], "  ..."] + chunk[-(max_lines - 2) :]
     return "\n".join(chunk)
