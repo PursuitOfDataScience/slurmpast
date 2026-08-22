@@ -70,7 +70,7 @@ Two were entirely invisible with a narrow `--format`: **disk writes** (one run
 read 112 GB and wrote 139 GB) and the **user/kernel CPU split** (791 of 6,582
 jobs exceed 30% kernel time — syscall overhead no other tool surfaces).
 
-`--json` emits all of it — 95 values per job, plus 40 for every step. Nothing is
+`--json` emits all of it — 96 values per job, plus 40 for every step. Nothing is
 captured and then hidden: a test reads `cli._job_json` itself and holds every
 `Job` and `Step` value to it, so a measurement that does not reach the payload
 has to be argued for by name in that test's exemption list rather than dropped.

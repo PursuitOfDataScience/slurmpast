@@ -1,5 +1,27 @@
 # slurmpast — audit and resolution
 
+> **Round twenty-nine, 2026-08-22.** One defect and the exemption that hid it: the
+> machine-readable surface published a clock speed that reads 1000x wrong, on 85%
+> of the real jobs carrying the field. 1542 tests before, **1547 after**; all four
+> gates clean.
+>
+> Round twenty-eight asked whether a rule's *evidence* matches its promise. This
+> round asked the same of a surface: `_job_json` opens "Deliberately exhaustive: if
+> the tool read it, this emits it", and `docs/details.md` repeats it. Checking
+> every `Job` value against the payload turned up one gap -- and the reason it had
+> never been caught is the sharper half of the finding.
+>
+> Sixth "tests that assert less than they appear to", and the first that was
+> *deliberate*: `TestTheJsonPayloadKeepsItsPromise` carries an allow-list written
+> so "the next value that is not emitted has to be argued for here instead of
+> passing quietly". One of its entries was an argument that was simply false, and
+> it silenced exactly the finding the class exists to surface.
+>
+> Two further things were checked and are sound: every number 20,905 real jobs put
+> into a finding reproduces from the record, and no finding's text shows an
+> unfilled placeholder, a stray `None`, a percentage over 100 or a negative
+> quantity.
+
 > **Round twenty-eight, 2026-08-22.** One defect with two halves, and it is the
 > largest-impact finding of the streak by share of affected output: a finding
 > headed "Traceback tail from the log" was showing the tail of the **file**. 1535
@@ -341,6 +363,95 @@
 > and its control. `ruff`, `ruff format` and `mypy` clean.
 
 ---
+
+## Round twenty-nine — a machine surface that published the ambiguity
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | `--json` emitted the raw `AveCPUFreq` string and withheld the resolved hertz, so a consumer read 3 MHz where the dashboard showed 3.00 GHz | `cli.py:473` | `TestTheResolvedClockIsMachineReadable` |
+| 2 | the exhaustiveness test exempted `cpu_freq_hz` as "recoverable from `cpu.frequency`", which it is not | `tests/test_audit.py` | same class; the exemption is gone |
+
+### 1. 17,503 of 20,550 real jobs published a figure that reads 1000x low
+
+`duration.parse_cpu_freq` exists precisely because this field cannot be read as
+printed. Its own docstring:
+
+> Slurm's magnitude suffix is applied to a kHz base in some code paths and a Hz
+> base in others, so the string alone is ambiguous by a factor of 1000.
+
+It resolves that by trying both readings and keeping whichever lands in a
+plausible clock range, and returns `None` when neither does. `render.py:1215`
+builds the dashboard's "avg clock" row from the resolved number. The payload
+emitted the string.
+
+```
+jobs with an AveCPUFreq string      : 20550
+  string reads 1000x wrong          : 17503  (85%)
+  tool drops it as uninterpretable  :  2061
+  string and tool agree             :   986
+
+most common misreadings:
+    3984  3.00M -> tool says 3.00 GHz, the string reads as 3 MHz
+    3040  3M    -> tool says 3.00 GHz, the string reads as 3 MHz
+    1792  800K  -> tool says 800 MHz,  the string reads as 1 MHz
+```
+
+The 2,061 are worse than wrong, they are unanswerable: `385K` resolves to neither
+a plausible kHz nor Hz reading, so the dashboard omits the row entirely -- and the
+payload published `"385K"` with nothing to say it should not be believed.
+
+The fix is the rule the payload already states two lines further down, about
+`req_mem_raw` sitting beside `limit_bytes`: *"both are emitted so a consumer never
+has to guess which convention a figure is in."* `cpu.frequency_hz` now carries the
+resolved number, `null` where the tool will not vouch for it, and `cpu.frequency`
+keeps the raw string unchanged so nothing downstream breaks.
+
+### 2. The allow-list that silenced it
+
+`TestTheJsonPayloadKeepsItsPromise` reads `_job_json` with `ast` and holds every
+`Job` value to it, with exemptions "listed by name rather than inferred, so the
+next value that is not emitted has to be argued for here instead of passing
+quietly". Under the heading *Derived views of emitted numbers* -- "each is
+recoverable from something that is emitted, so emitting it as well would be the
+same number under two names" -- sat:
+
+```python
+"cpu_freq_hz": "cpu.frequency",
+```
+
+It is not recoverable from `cpu.frequency`, and on 85% of real jobs it is not the
+same number. The other four entries in that group were re-checked and are sound:
+`cores_busy` is `cpu.utilization x shape.cpus`, `fs_disk_bytes` is a documented
+alias of `read_bytes`, and the `*_alloc` spellings are the allocation-row fallback
+the emitted properties already read through.
+
+A mechanism for making omissions argue for themselves only works if the arguments
+are checked. This is the sixth "tests that assert less than they appear to" in
+this record and the first that was written deliberately rather than by oversight.
+
+### Consequence for the numbers
+
+`--json` grows one key per job, 95 to 96; README and `docs/details.md` both
+carried the old count and are updated. No text surface changes -- the dashboard
+and `--plain` were already right, which is what made the drift invisible.
+
+### What was verified and not changed
+
+* Every number quoted by a finding across 20,905 real jobs reproduces from the
+  job record: `walltime-slack`'s elapsed, limit and percentage, `timeout-real`'s
+  limit, `timeout-hang`'s elapsed. No finding fires with an elapsed above its own
+  limit.
+* No finding's rendered text on those jobs contains an unfilled `%s`/`{}`, a
+  stray `None`, a doubled space, a percentage over 100, a negative quantity, or
+  an empty parenthesis. 18 findings across 27,000 checks matched a
+  "dangling preposition" pattern; all 18 were the regex mis-reading a legitimate
+  sentence end.
+* `shape.req_cpu_freq_min`/`max` are raw strings too and stay that way: the tool
+  never resolves them anywhere, so unlike `AveCPUFreq` there is no better answer
+  being withheld.
+* The rest of the payload's raw/resolved pairs are consistent -- `state_raw` with
+  `state`, `job_id_raw` with `job_id`, `req_mem_raw` with `limit_bytes`,
+  `alloc_gres`/`alloc_tres` with `gpu.count`.
 
 ## Round twenty-eight — a traceback tail that was the file's tail
 

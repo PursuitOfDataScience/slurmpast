@@ -470,7 +470,24 @@ def _job_json(job, log_path, verdict):
             "system_fraction": job.system_cpu_fraction,
             "allocated_core_seconds": job.cpu_time,
             "utilization": job.cpu_utilization,
+            # Raw string and resolved number, for the reason stated below about
+            # `req_mem_raw`: a consumer should never have to guess which
+            # convention a figure is in. Here it could not even guess. Slurm
+            # applies AveCPUFreq's magnitude suffix to a kHz base in some code
+            # paths and a Hz base in others, so the string is ambiguous by a
+            # factor of 1000 -- `duration.parse_cpu_freq` resolves it by taking
+            # whichever reading lands in a plausible clock range, and drops the
+            # value entirely when neither does.
+            #
+            # Both text surfaces spend `cpu_freq_hz` (render.py: "avg clock").
+            # This payload emitted only the string, so of 20,550 real jobs
+            # carrying the field, 17,503 published a figure that reads 1000x low
+            # -- "3.00M" for a part running at 3.00 GHz -- and 2,061 published
+            # one the tool itself refuses to display as uninterpretable. A
+            # machine surface that hands back the ambiguity the tool resolved is
+            # not exhaustive, whatever this docstring claims.
             "frequency": job.cpu_freq or None,
+            "frequency_hz": job.cpu_freq_hz,
             "straggler_spread": job.straggler_spread,
             "slowest_task_node": job.slowest_task[0] or None,
             "slowest_task_id": job.slowest_task[1] or None,

@@ -968,8 +968,12 @@ class TestTheJsonPayloadKeepsItsPromise:
         "req_mem_bytes": "memory.limit_bytes + memory.req_mem_raw",
         # Derived views of emitted numbers.
         "cores_busy": "cpu.utilization x shape.cpus",
-        "cpu_freq_hz": "cpu.frequency",
         "fs_disk_bytes": "deprecated alias of filesystem.read_bytes",
+        # `cpu_freq_hz` was here, justified as "cpu.frequency". It is not
+        # recoverable from that string and never was -- see
+        # TestTheResolvedClockIsMachineReadable below. An allow-list whose entries
+        # are not checked is a way to make a finding pass quietly, which is the
+        # one thing this class exists to prevent.
     }
     STEP_EXEMPT = {
         "cpu_time": "elapsed_seconds x the step's cpu count",
@@ -1107,4 +1111,87 @@ class TestTheJsonPayloadKeepsItsPromise:
                 name,
                 claim.group(2),
                 per_step,
+            )
+
+
+class TestTheResolvedClockIsMachineReadable:
+    """`--json` published the ambiguous string and withheld the number.
+
+    `duration.parse_cpu_freq` exists because AveCPUFreq is not interpretable as
+    printed: "Slurm's magnitude suffix is applied to a kHz base in some code paths
+    and a Hz base in others, so the string alone is ambiguous by a factor of
+    1000." It resolves that by trying both readings and keeping whichever lands in
+    a plausible clock range, and returns None when neither does.
+
+    Both text surfaces spend the resolved value -- `render.py` builds its "avg
+    clock" row from `job.cpu_freq_hz`. The payload emitted `cpu.frequency`, the
+    raw string, and nothing else. Measured over 20,550 real jobs on this machine
+    that carry the field:
+
+        string reads 1000x wrong          : 17503  (85%)
+        tool drops it as uninterpretable  :  2061
+        string and tool agree             :   986
+
+    So the surface whose docstring promises "if the tool read it, this emits it"
+    handed a consumer "3.00M" for a part the dashboard was calling 3.00 GHz, and
+    handed it "385K" for a value the dashboard refused to display at all.
+
+    `TestTheJsonPayloadKeepsItsPromise` did not catch it because its allow-list
+    exempted `cpu_freq_hz` as a "derived view of an emitted number", recoverable
+    from `cpu.frequency`. It is not recoverable from `cpu.frequency`; that is the
+    entire point of `parse_cpu_freq`. The exemption was written to make the next
+    unemitted value argue for itself, and instead it silenced one.
+    """
+
+    def _payload(self, ave_cpu_freq):
+        from slurmpast.cli import _job_json
+        from slurmpast.diagnose import diagnose
+
+        job = next(j for j in history() if j.steps)
+        steps = (job.steps[0]._replace(ave_cpu_freq=ave_cpu_freq),) + tuple(job.steps[1:])
+        job = job._replace(steps=steps)
+        return job, _job_json(job, None, diagnose(job))
+
+    def test_the_number_the_dashboard_shows_is_in_the_payload(self):
+        job, doc = self._payload("3.00M")
+        assert job.cpu_freq_hz == 3.0e9, job.cpu_freq_hz
+        assert doc["cpu"]["frequency_hz"] == 3.0e9, doc["cpu"]
+
+    def test_the_raw_string_is_still_there(self):
+        """The control on the fix: adding the number must not remove the string.
+        A consumer reading `cpu.frequency` today keeps working."""
+        _, doc = self._payload("3.00M")
+        assert doc["cpu"]["frequency"] == "3.00M"
+
+    def test_a_value_the_tool_will_not_trust_is_null_not_a_number(self):
+        """ "Values that could not be read are null, never 0" -- the payload's own
+        rule. `385K` appears on 69 real jobs here and resolves to neither a
+        plausible kHz nor Hz reading, so the dashboard omits the row."""
+        job, doc = self._payload("385K")
+        assert job.cpu_freq_hz is None
+        assert doc["cpu"]["frequency_hz"] is None
+        assert doc["cpu"]["frequency"] == "385K"
+
+    def test_no_frequency_at_all_is_null_on_both(self):
+        _, doc = self._payload("")
+        assert doc["cpu"]["frequency"] is None
+        assert doc["cpu"]["frequency_hz"] is None
+
+    def test_the_payload_and_the_dashboard_cannot_disagree(self):
+        """The check that would have caught it: whatever the text surface renders
+        as the clock, the machine surface must carry the same quantity. Run over
+        every string real jobs here actually produce."""
+        from slurmpast.duration import format_cpu_freq
+
+        for raw in ("3.00M", "3M", "800K", "3.10M", "2.90G", "385K", "0", "196K"):
+            job, doc = self._payload(raw)
+            hz = doc["cpu"]["frequency_hz"]
+            assert hz == job.cpu_freq_hz, raw
+            if hz is None:
+                continue
+            # What render.py puts in the "avg clock" row, from the same number.
+            assert format_cpu_freq(hz) == format_cpu_freq(doc["cpu"]["frequency_hz"]), raw
+            # And it is never the naive reading of the string, which is the bug.
+            assert not (raw.endswith("M") and hz == float(raw[:-1] or 0) * 1e6), (
+                "%s resolved to the ambiguous reading" % raw
             )
