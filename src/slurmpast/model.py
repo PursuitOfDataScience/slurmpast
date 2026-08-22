@@ -218,9 +218,11 @@ class Job(NamedTuple):
     comment: str = ""
     admin_comment: str = ""
     layout: str = ""
-    # Recorded output paths, present from Slurm 21.08. Still *patterns*: sacct
-    # stores them as written, so ``%j`` and friends are unexpanded (until
-    # --expand-patterns in 24.05). See logs.expand_pattern.
+    # Recorded output paths, present from Slurm 24.05 -- 21.08 added SubmitLine
+    # (below), not these; see the boundary table at the top of logs.py. Still
+    # *patterns*: sacct stores them as written, so ``%j`` and friends are
+    # unexpanded (--expand-patterns shipped in the same release).
+    # See logs.expand_pattern.
     std_out: str = ""
     std_err: str = ""
     submit_line: str = ""

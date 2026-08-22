@@ -35,7 +35,7 @@ from typing import NamedTuple
 
 from .diagnose import looks_like_noop
 from .duration import format_bytes, format_duration
-from .patterns import numeric_job_id
+from .patterns import hung_split_note, numeric_job_id
 from .site import maxrss_caveat
 
 # Below this many usable observations there is no distribution to reason about.
@@ -191,17 +191,17 @@ def walltime_advice(jobs) -> Advice:
         # module's own definition. Name the split, and keep what they proved.
         basis = (
             "%d of %d timed-out run%s consumed almost no CPU before hitting the wall: "
-            "blocked, not slow -- a longer limit buys a longer hang."
+            "blocked, not slow — a longer limit buys a longer hang."
             % (len(hung), len(timeouts), "" if len(timeouts) == 1 else "s")
         )
         caution = "Fix the blocking call before changing --time."
-        computing_floor = max((j.timelimit for j in computing if j.timelimit), default=0)
-        if computing_floor:
-            caution += (
-                "  The other %d did compute, and were cut off at %s -- so once the blocking "
-                "call is fixed, the limit has to be at least that."
-                % (len(computing), format_duration(computing_floor))
-            )
+        # The same clause the patterns screen appends to the same conclusion. It
+        # lives in `patterns` because this module already imports from there and
+        # the reverse would be a cycle -- and because both were making the claim
+        # and only this one qualified it.
+        split = hung_split_note(len(computing), [j.timelimit for j in computing])
+        if split:
+            caution += "  " + split
         return Advice(
             flag="--time",
             verdict="unknown",
@@ -285,7 +285,7 @@ def walltime_advice(jobs) -> Advice:
     if computing:
         caution = (
             "%d run%s timed out while computing, so the requirement is at least the "
-            "limit that cut them off -- this is a floor, not a fit."
+            "limit that cut them off — this is a floor, not a fit."
             % (len(computing), "" if len(computing) == 1 else "s")
         )
     if hung:
@@ -389,7 +389,7 @@ def memory_advice(jobs) -> Advice:
             basis=basis,
             caution=(
                 "If the same request both failed and succeeded, --mem is not the "
-                "deciding variable -- look for what else changed."
+                "deciding variable — look for what else changed."
             ),
         )
 

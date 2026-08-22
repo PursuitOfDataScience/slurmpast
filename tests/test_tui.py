@@ -1470,3 +1470,253 @@ class TestTheNodesScreenSentencesAreShared:
 
         table = {"hits": 4, "rows": [{"node": "n1"}], "skipped_nodes": 0}
         assert nodes_empty_reason(table, "hang", "cot-exp") == ""
+
+
+class TestTheDashboardDrawsTheSharedSentences:
+    """The other half of `test_audit.TestTheTwoSurfacesCannotDriftApart`.
+
+    That one proves no sentence is written out twice in the source. This one
+    proves the dashboard actually puts the shared string on screen, so the two
+    together mean a change to `render.py` moves both surfaces and nothing else can.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_node_screen_uses_render_for_every_prose_line(self):
+        from slurmpast import render
+        from slurmpast.demo import history
+
+        app = make_app(list(history()), no_logs=True)
+        async with app.run_test(size=(120, 44)) as pilot:
+            await pilot.pause()
+            await pilot.press("n")
+            await pilot.pause()
+            assert isinstance(app.screen, tui.NodesScreen)
+            summary = " ".join(app.screen.summary_text.plain.split())
+            exclude = " ".join(app.screen.exclude_text.plain.split())
+
+        assert render.nodes_workload_control("cot-exp") in summary, summary
+        assert render.nodes_correction_note(1) in exclude, exclude
+        assert render.nodes_exclude_disclaimer() in exclude, exclude
+        # The clause that had drifted: the dashboard used to add ", and that is
+        # your call." to the end of it.
+        assert "that is your call" not in exclude
+
+    @pytest.mark.asyncio
+    async def test_the_patterns_screen_uses_the_shared_empty_sentence(self):
+        from slurmpast import render
+        from slurmpast.demo import history
+
+        clean = [j for j in history() if j.completed]
+        app = make_app(clean, no_logs=True)
+        async with app.run_test(size=(120, 44)) as pilot:
+            await pilot.pause()
+            await pilot.press("p")
+            await pilot.pause()
+            # From the compositor: `PatternsScreen` keeps no `Text` of its own, and
+            # `Static.renderable` exists in textual 0.89 and not in 8.x.
+            body = " ".join(
+                "".join(segment.text for segment in strip)
+                for strip in app.screen._compositor.render_strips()
+            )
+        assert render.patterns_empty() in " ".join(body.split()), body
+
+
+class TestTheNodeScreenMeasuresItsChromeRatherThanGuessing:
+    """`_prose_width` exists because "screen width minus a constant" is two cells
+    optimistic, and its docstring says so. Two `render.wrap` calls on the node
+    screen were still spelling out `self.size.width - 8` and `- 6` -- the guessed
+    chrome, in the one module that had already been burned by it, wrapping those
+    two lines two cells narrower than every other sentence on the same screen.
+    """
+
+    def test_no_wrap_on_the_node_screen_hardcodes_a_width(self):
+        import ast
+        import pathlib
+
+        source = pathlib.Path(tui.__file__).read_text()
+        tree = ast.parse(source)
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            target = getattr(node.func, "attr", None)
+            if target != "wrap":
+                continue
+            for argument in node.args[1:]:
+                # `_prose_width(screen, n)` is the sanctioned spelling, and a floor
+                # over an already-measured width is fine -- `HelpScreen` clamps its
+                # own box width that way. What is banned is deriving the width from
+                # `size.width` at the call site, which is the guess `_prose_width`
+                # exists to make once and correctly.
+                names = {
+                    ast.unparse(inner)
+                    for inner in ast.walk(argument)
+                    if isinstance(inner, ast.Attribute)
+                }
+                if any(name.endswith("size.width") for name in names):
+                    offenders.append(argument.lineno)
+        assert not offenders, "render.wrap given a hand-computed width at lines %s" % offenders
+
+    def test_the_sweep_still_recognises_the_spelling_it_bans(self):
+        """The control. A sweep that can no longer match anything proves nothing,
+        and narrowing it to `size.width` is exactly the change that could do that."""
+        import ast
+
+        tree = ast.parse("render.wrap(sentence, max(40, self.size.width - 8))")
+        call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and n.args[1:])
+        names = {
+            ast.unparse(inner)
+            for inner in ast.walk(call.args[1])
+            if isinstance(inner, ast.Attribute)
+        }
+        assert any(name.endswith("size.width") for name in names)
+
+    @pytest.mark.asyncio
+    async def test_the_two_lines_wrap_to_the_same_width_as_their_neighbours(self):
+        from slurmpast.demo import history
+
+        app = make_app(list(history()), no_logs=True)
+        async with app.run_test(size=(100, 44)) as pilot:
+            await pilot.pause()
+            await pilot.press("n")
+            await pilot.pause()
+            screen = app.screen
+            # What every other prose line on this screen is wrapped to.
+            assert tui._prose_width(screen, 2) == tui._text_width(screen) - 2
+            assert tui._prose_width(screen, 4) == tui._text_width(screen) - 4
+            # The guessed constants were two cells short of both.
+            assert tui._prose_width(screen, 2) != max(40, screen.size.width - 6)
+            assert tui._prose_width(screen, 4) != max(40, screen.size.width - 8)
+
+
+class TestTheHelpScreenIsWrappedLikeEveryOtherScreen:
+    """The one surface rounds five, six and seven all missed.
+
+    Each of those rounds wrapped the prose on some screen and said why; `HelpScreen`
+    was on none of their lists, and it had every symptom at once -- two rows over
+    the box's real width, a site-controlled path interpolated into a third, and a
+    fixed `width: 78` that a terminal narrower than 80 simply cut.
+    """
+
+    @staticmethod
+    async def _open(width, jobs):
+        app = make_app(jobs, no_logs=True)
+        return app
+
+    @pytest.mark.parametrize("width", [60, 70, 80, 100, 140])
+    @pytest.mark.asyncio
+    async def test_nothing_in_the_box_overruns_the_terminal(self, history_jobs, width):
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test(size=(width, 60)) as pilot:
+            await pilot.pause()
+            await pilot.press("question_mark")
+            await pilot.pause()
+            assert isinstance(app.screen, tui.HelpScreen)
+            painted = [
+                "".join(segment.text for segment in strip).rstrip()
+                for strip in app.screen._compositor.render_strips()
+            ]
+        over = [line for line in painted if len(line) > width]
+        assert not over, "help overran a %d-column terminal: %r" % (width, over[:2])
+
+    @pytest.mark.parametrize("width", [60, 70, 79])
+    @pytest.mark.asyncio
+    async def test_the_box_shrinks_to_a_terminal_narrower_than_it_wants(self, history_jobs, width):
+        """`width: 78` in CSS is a floor as well as a ceiling: below 80 columns the
+        box was drawn wider than the screen and cut, with no marker."""
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test(size=(width, 60)) as pilot:
+            await pilot.pause()
+            await pilot.press("question_mark")
+            await pilot.pause()
+            assert app.screen.box_width() <= width
+            painted = "\n".join(
+                "".join(segment.text for segment in strip)
+                for strip in app.screen._compositor.render_strips()
+            )
+        # The horizontal claim, and only that: the top rule has to carry both of
+        # its corners on one line, which it cannot if the box was cut off the
+        # right-hand edge. The bottom rule may legitimately be scrolled out of a
+        # short terminal -- the modal scrolls, which is why the scrollbar that
+        # `box_width` now allows for is there at all.
+        top = next((line for line in painted.splitlines() if "╭" in line), "")
+        assert top and "╮" in top, repr(top)
+
+    @pytest.mark.asyncio
+    async def test_a_wrapped_description_hangs_under_its_column(self, history_jobs):
+        """The two rows that overran were soft-wrapped by Textual to column 2, out
+        from under the description they continue."""
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test(size=(80, 60)) as pilot:
+            await pilot.pause()
+            await pilot.press("question_mark")
+            await pilot.pause()
+            lines = app.screen.help_text.plain.splitlines()
+
+        keyed = [line for line in lines if line.startswith("  a ")]
+        assert keyed, lines[:6]
+        # The continuation of the `a` row starts in the description column, not in
+        # the key column and not at the left margin.
+        index = lines.index(keyed[0])
+        continuation = lines[index + 1]
+        assert continuation.startswith(" " * tui._HELP_KEY_WIDTH), repr(continuation)
+        assert continuation.strip(), "the row should still wrap at 80 columns"
+
+    @pytest.mark.asyncio
+    async def test_the_interpolated_clip_path_gets_its_own_line(
+        self, history_jobs, tmp_path, monkeypatch
+    ):
+        """Its length is site-controlled, so inlining it broke the sentence around
+        it -- round six's folded-workload-name trap in a new place."""
+        long_root = tmp_path.joinpath(*("a-long-scratch-path-segment",) * 6)
+        long_root.mkdir(parents=True)
+        monkeypatch.setenv("XDG_CACHE_HOME", str(long_root))
+        app = make_app(history_jobs, no_logs=True)
+        async with app.run_test(size=(80, 70)) as pilot:
+            await pilot.pause()
+            await pilot.press("question_mark")
+            await pilot.pause()
+            lines = [line.rstrip() for line in app.screen.help_text.plain.splitlines()]
+
+        sentence = [line for line in lines if "OSC 52" in line]
+        assert len(sentence) == 1, sentence
+        # The sentence stands alone and stays inside the box; the path follows it.
+        assert len(sentence[0]) <= 80 - tui._HELP_BOX_CHROME
+        assert str(long_root) in "\n".join(lines)
+        assert str(long_root) not in sentence[0]
+
+
+class TestTheHelpScreenNamesEveryVisibleKey:
+    """`m` and `c` are shown in the nodes screen's own footer and appeared in no
+    help at all, and `p` meant something else entirely on a job screen -- where
+    this help is reachable, and where the only line describing `p` was wrong."""
+
+    def test_every_footer_binding_is_documented(self):
+        documented = {key for key, _ in tui._HELP_KEYS}
+        # The key column holds spellings like "enter / →"; split them back out,
+        # except for "/" itself, which is a key rather than a separator.
+        spellings = set(documented)
+        for entry in documented:
+            if entry != "/":
+                spellings.update(part.strip() for part in entry.split("/"))
+        missing = []
+        for screen in (tui.OverviewScreen, tui.JobListScreen, tui.NodesScreen, tui.JobScreen):
+            for binding in screen.BINDINGS:
+                if not getattr(binding, "show", False):
+                    continue
+                key = binding.key.replace("question_mark", "?").replace("slash", "/")
+                if key in ("escape", "left", "right"):
+                    continue
+                if key not in spellings:
+                    missing.append("%s: %s" % (screen.__name__, key))
+        assert not missing, "shown in a footer and absent from the help: %s" % missing
+
+    def test_the_p_row_names_both_of_its_meanings(self):
+        row = dict(tui._HELP_KEYS)["p"]
+        assert "across runs" in row
+        assert "job screen" in row, row
+
+    def test_the_nodes_screen_keys_are_there(self):
+        keys = dict(tui._HELP_KEYS)
+        assert "nodes screen" in keys["m"]
+        assert "nodes screen" in keys["c"]

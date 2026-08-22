@@ -17,6 +17,7 @@ from .duration import (
     format_cpu_freq,
     format_duration,
     format_percent,
+    plural,
 )
 from .model import Job, severity_rank
 from .nodes import MIN_SAMPLES
@@ -144,10 +145,50 @@ def state_text(state: str, ascii_mode: bool = False):
     return text
 
 
+# The four-cell tag a finding is announced with, and the one place it is spelled.
+# `report._SEV` carried a second copy of these three labels beside its ANSI colour
+# names, so "FAIL"/"WARN"/"INFO" were written twice in two files -- agreeing today,
+# with nothing to keep them agreeing tomorrow. Four cells exactly, including the
+# `----` fallback, because the plain renderer indents a wrapped title by
+# ``len(tag) + 2`` and a five-cell tag would step that hang out of line.
+SEVERITY_TAG = {"critical": "FAIL", "warning": "WARN", "info": "INFO"}
+SEVERITY_TAG_UNKNOWN = "----"
+
+
+def severity_tag(severity: str) -> str:
+    """``FAIL`` / ``WARN`` / ``INFO``, or ``----`` for a severity neither knows."""
+    return SEVERITY_TAG.get(severity, SEVERITY_TAG_UNKNOWN)
+
+
 def severity_chip(severity: str):
     grade = theme.SEVERITY_HEALTH.get(severity, "none")
-    label = {"critical": "FAIL", "warning": "WARN", "info": "INFO"}.get(severity, "----")
-    return Text(label, style="bold %s" % theme.HEALTH_COLOR.get(grade, theme.FAINT))
+    return Text(
+        severity_tag(severity), style="bold %s" % theme.HEALTH_COLOR.get(grade, theme.FAINT)
+    )
+
+
+# What a finding's action line is introduced with, and how far its continuations
+# hang so they sit under the text rather than under the arrow.
+#
+# Written out four times before this -- twice in `report.py`, twice in `tui.py` --
+# and the two files had drifted to different glyphs: the dashboard drew "→ " and
+# `--plain` drew "-> ", for the same element of the same finding. Nothing on
+# either screen could show a reader that, because only one of the two is ever in
+# front of them. Worse, the plain spelling was already ASCII, so `--ascii` -- the
+# flag whose entire job is choosing between these two alphabets -- had nothing to
+# change and `ascii_fold` never saw it.
+#
+# Two cells, so the fold stays one-cell-for-one-cell: "→ " becomes "> ".
+ACTION_ARROW = "→ "
+ACTION_HANG = "  "
+# Cells an action line spends before its text: eight of indent plus the arrow.
+ACTION_INDENT = 8 + len(ACTION_ARROW)
+
+# And the same pair for a sizing caveat -- `Advice.caution`, "what would make this
+# advice wrong". Here for the reason the arrow is: two surfaces draw this block, and
+# until now only one of them drew this part of it at all.
+CAUTION_MARK = "! "
+CAUTION_HANG = "  "
 
 
 class Column(NamedTuple):
@@ -374,6 +415,17 @@ def register_alignment(*specs) -> None:
 # own line rather than being truncated or wrapped mid-pair.
 PAIR_LABEL_WIDTH = 16
 PAIR_VALUE_WIDTH = 30
+# Bar width for a detail row that carries a gauge, and the gap after it. Narrower
+# than the three headline gauges (`theme.BAR_WIDTH`), because this one shares its
+# line with a label and a sentence rather than leading a block of its own.
+#
+# Named here because both surfaces draw the row and only one of them was: the
+# dashboard hardcoded `width=14` and the plain renderer never read `row[2]` at all,
+# so `slowest task` came out as a gauge in the app and a bare number in a paste.
+# `pair_rows` below already gives a gauged row a line of its own -- the plain
+# layout was reserving room for a bar it then did not draw.
+DETAIL_BAR_WIDTH = 14
+DETAIL_BAR_GAP = 2
 # What a line holding two pairs costs: four cells of indent and two between them.
 # Below it, pair one per line -- a paired row that wraps loses the label/value
 # alignment that made pairing readable. Shared, because both front ends draw this
@@ -601,9 +653,14 @@ def nodes_baseline(table) -> str:
     tail = ""
     if skipped:
         tail = "; %d node%s below threshold omitted" % (skipped, "" if skipped == 1 else "s")
-    return "baseline %s over %d placements%s" % (
+    # `placement%s` for the same reason `node%s` beside it already does: a window
+    # holding one job printed "baseline 100.0% over 1 placements" out of a sentence
+    # that pluralises its other count correctly.
+    trials = table["trials"]
+    return "baseline %s over %d placement%s%s" % (
         format_percent(table["baseline"]),
-        table["trials"],
+        trials,
+        "" if trials == 1 else "s",
         tail,
     )
 
@@ -639,9 +696,13 @@ def nodes_empty_reason(table, metric: str, workload: str | None, widen: str = "-
             " for %s" % workload if workload else "",
         )
     if not table["rows"]:
+        # "%d seen, all below it" reads as a plural claim, and one node below the
+        # threshold is the ordinary way to reach this branch on a short window.
+        skipped = table["skipped_nodes"]
+        seen = "1 seen, and it is below it" if skipped == 1 else "%d seen, all below it" % skipped
         return (
-            "No node reached the %d placements a comparison needs — %d seen, all below it. "
-            "A wider window (%s) is what fixes this." % (MIN_SAMPLES, table["skipped_nodes"], widen)
+            "No node reached the %d placements a comparison needs — %s. "
+            "A wider window (%s) is what fixes this." % (MIN_SAMPLES, seen, widen)
         )
     return ""
 
@@ -666,9 +727,230 @@ def held_back_note(count: int, tested: int) -> str:
         else "%d intervals clear the baseline on their own" % count
     )
     return (
-        "%s — but about one in twenty does that by chance and %d nodes were tested, "
-        "so on its own that is not yet evidence." % (subject, tested)
+        "%s — but about one in twenty does that by chance and %s tested, "
+        "so on its own that is not yet evidence." % (subject, _nodes_tested(tested))
     )
+
+
+def _nodes_tested(tested: int) -> str:
+    """``1 node was`` / ``20 nodes were``, for a sentence ending in "tested".
+
+    The count of nodes in the table is 1 whenever one node cleared MIN_SAMPLES and
+    the rest did not, which is the ordinary shape of a short window -- so "1 nodes
+    were tested" was reachable in both front ends, in the same sentence that takes
+    care to write "1 interval" rather than "1 intervals".
+    """
+    return "1 node was" if tested == 1 else "%d nodes were" % tested
+
+
+# --- sentences both front ends draw ---------------------------------------
+# Everything below is one sentence the dashboard and ``--plain`` both put on
+# screen, kept here for the reason this module exists: while each surface spelled
+# them out for itself the two drifted, and the drift is invisible from either side
+# alone. It had already happened -- ``--plain`` ended the exclude disclaimer at
+# "trades availability for reliability." and the dashboard went on ", and that is
+# your call.", one sentence rendered two ways in the same block of the same view.
+# The shorter wording is kept: "not applied for you" has already said whose call
+# it is.
+#
+# The pattern is the one ``nodes_baseline`` and ``held_back_note`` set above --
+# return the plain sentence, let each caller wrap it and colour it, since the wrap
+# width and the styling are the parts that legitimately differ.
+
+WORKLOAD_CONTROL_ASIDE = "(placement is not random)"
+
+
+def nodes_workload_control(workload: str) -> str:
+    """``controlled for workload: only cot-exp counted (placement is not random)``.
+
+    Both surfaces emphasise :data:`WORKLOAD_CONTROL_ASIDE` separately from the
+    rest, so it is exported rather than buried, and each front end still finds it
+    in the returned line to style it.
+    """
+    return "controlled for workload: only %s counted %s" % (workload, WORKLOAD_CONTROL_ASIDE)
+
+
+def nodes_title(metric: str) -> str:
+    """The heading over the node table, on both surfaces.
+
+    ``report`` wrote "node reliability (hang rate)" and the dashboard wrote
+    "node reliability — hang rate", which is the same heading over the same table
+    in two spellings; the parenthesis reads as an aside where the metric is the
+    subject. One string, and the em dash folds under ``--ascii`` like every other.
+    """
+    return "node reliability — %s rate" % metric
+
+
+def ci_range(low: float, high: float) -> str:
+    """The ``95% CI`` cell: two rates as a percentage range.
+
+    Both surfaces draw this column of this table and each formatted it itself --
+    ``"%.1f - %.1f%%"`` in `report`, ``"%.1f – %.1f%%"`` in `tui` -- so a hyphen
+    and an en dash stood in the same cell depending on which one you were looking
+    at. An en dash is what a numeric range takes, and it folds to the hyphen under
+    ``--ascii``, so the piped output is byte-identical to what it always was.
+    """
+    return "%.1f – %.1f%%" % (100 * low, 100 * high)
+
+
+def nodes_correction_note(tested: int) -> str:
+    """Why the ``--exclude`` line beneath it is offered at all.
+
+    "after correcting for %d tested" was the wording on both screens, which reads
+    as an unfinished clause at every count and as plainly wrong at one -- "after
+    correcting for 1 tested", which is what the demo prints. The noun was the
+    missing word, and :func:`held_back_note` two lines further down the same
+    screen already supplies it.
+    """
+    return "worse than every other node, after correcting for %s tested:" % (
+        "1 node" if tested == 1 else "%d nodes" % tested
+    )
+
+
+def nodes_exclude_disclaimer() -> str:
+    """The grey line under the paste-ready ``#SBATCH --exclude=``."""
+    return "not applied for you — excluding nodes trades availability for reliability."
+
+
+def nodes_excluded_tail_note(count: int) -> str:
+    """What the capped ``--exclude`` line left off, when it left anything off."""
+    return (
+        "%d further node%s scored worse too, left off the line: excluding this many "
+        "trades away more of the partition than a paste-ready suggestion should."
+        % (count, "" if count == 1 else "s")
+    )
+
+
+def nodes_nothing_to_exclude() -> str:
+    """The answer when no node is worse than the rest -- which is the good outcome."""
+    return "no node is worse than the rest; nothing to exclude."
+
+
+def nothing_matches(noun: str, filter_label: str = "", search: str = "") -> str:
+    """Why a table came out empty, and which key undoes it.
+
+    A table screen that filters to nothing drew its column header over blank space
+    and said nothing at all -- and on the overview it could not even say "showing
+    0", because that clause was guarded by ``if shown and ...``. The one count that
+    explains an empty screen was the one count suppressed.
+
+    `PatternsScreen` has had the right treatment all along ("That is a real answer,
+    not an empty screen") and `filter_jobs` states the rule in its own comment,
+    about the date search that was added because a user hit it: "Typing what you can
+    plainly see and getting an empty list is the worst kind of empty result -- it
+    reads as missing data."
+
+    Shared so the overview and the job list cannot word it differently, and so a
+    third screen that grows a filter inherits it.
+    """
+    reasons, keys = [], []
+    if search:
+        reasons.append('the search "%s"' % search)
+        keys.append("escape clears it")
+    if filter_label:
+        reasons.append("the %s filter" % filter_label)
+        keys.append("f widens it")
+    if not reasons:
+        # Nothing was narrowed, so there is genuinely nothing here. No key to
+        # offer: `w` is on the footer and is about the window, not this table.
+        return "no %s in this window." % noun
+    return "no %s matches %s — %s." % (noun, " and ".join(reasons), ", ".join(keys))
+
+
+def patterns_empty() -> str:
+    """Why the cross-run screen is empty. A real answer, not a blank."""
+    return "no cross-run pattern met its evidence threshold."
+
+
+def gpu_hours_total(hours: float) -> str:
+    """``184 GPU-hours total`` -- the denominator the idle figure is a share of.
+
+    "total" is load-bearing and measured: "783 GPU-hours" alone was read as a
+    per-job figure.
+
+    Here rather than in each front end because both wrote ``"%.0f GPU-hours total"``
+    themselves, which is below the 25-character floor of the sweep that catches
+    duplicated sentences -- and neither guarded the plural, so a history whose whole
+    GPU spend rounds to one hour said "1 GPU-hours total" on both. Round seven fixed
+    nine of these; this pair was in the one clause that only appears when the idle
+    share is material.
+    """
+    return "%.0f %s total" % (hours, plural(hours, "GPU-hour"))
+
+
+def idle_hours_note(idle_hours: float, total_hours: float) -> str:
+    """``, 91 of them never used`` -- the clause after :func:`gpu_hours_total`.
+
+    "of them" is load-bearing and measured: a bare "18 never computed" did not say
+    18 of what. Kept as a fragment, leading comma and all, because both surfaces
+    append it to a total they have already written.
+
+    The pronoun agrees with the *total*, not with the idle count, because that is
+    what it refers back to: one GPU-hour of which one was wasted is "1 of it never
+    used", not "1 of them".
+    """
+    pronoun = "it" if round(total_hours) == 1 else "them"
+    return ", %.0f of %s never used" % (idle_hours, pronoun)
+
+
+# The prose punctuation this codebase uses, and a one-cell ASCII stand-in for
+# each. One cell exactly, never two: these are folded after a line has been
+# wrapped and after `clip` has reserved its marker cell, so a two-character
+# replacement would push a fitted table row back over the width it was just
+# measured to.
+_ASCII_FOLD = {
+    "\u2014": "-",  # em dash
+    "\u2013": "-",  # en dash
+    "\u00b7": "|",  # middle dot, used as a separator between summary clauses
+    "\u2026": ".",  # ellipsis -- `clip`'s cut marker, which must stay one cell
+    "\u2192": ">",  # rightwards arrow
+    "\u2190": "<",  # leftwards arrow
+}
+_ASCII_TABLE = str.maketrans(_ASCII_FOLD)
+
+
+def ascii_fold(text: str) -> str:
+    """Prose punctuation to its ASCII stand-in, one cell for one cell.
+
+    ``--ascii`` says "ASCII glyphs instead of Unicode", and it was only ever wired
+    to the bar and the health dot -- so a terminal that cannot draw ``\u25cf`` got the
+    fallback for that and then an em dash and a middle dot anyway. Worse, the flag
+    reached exactly one of the six plain renderers: `cli` passed `ascii_mode` to
+    `render_job` and to `tui.run` and to nothing else, so ``--ascii --overview``
+    and ``--overview`` were byte-identical. That is round five's #7 and #8 again --
+    "Two flags that were accepted and thrown away" -- on a third flag.
+
+    Applied to the finished text of a plain view rather than at each call site,
+    because it has to catch the sentences too, not just the glyphs, and there is
+    exactly one place per view where the text is complete.
+
+    Deliberately NOT applied to the dashboard. Textual draws its own frame in box
+    characters whatever this flag says, so folding our prose there would buy a
+    reader nothing they could see -- the screen is Unicode either way. ``--plain``
+    is the surface that gets piped somewhere with an opinion about encoding, and it
+    is the one this makes good on.
+    """
+    return text.translate(_ASCII_TABLE)
+
+
+def search_hint(fields) -> str:
+    """``name, job id, state, partition, node or date`` -- an Oxford-free list.
+
+    One phrasing for the search box's placeholder and the help screen's ``/`` row,
+    built from `index.JOB_SEARCH_FIELDS` or `GROUP_SEARCH_FIELDS` rather than
+    written out. Three hand-maintained descriptions of one feature had drifted from
+    it and from each other, and the overview's was the expensive one: it invited a
+    job id, a state and a node on a screen that matches none of the three, so
+    typing one returned an empty list. That is the same failure `filter_jobs`
+    already names -- "typing what you can plainly see and getting an empty list is
+    the worst kind of empty result -- it reads as missing data."
+    """
+    items = list(fields)
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return "%s or %s" % (", ".join(items[:-1]), items[-1])
 
 
 def cpu_only_columns(columns):
@@ -772,6 +1054,36 @@ _COVERED_BY_GAUGES = frozenset(
 # came out as `sbatch --output=/…/%x-%j.out train.sh`, throwing away the
 # directory on the one row that records where the output went.
 PATH_ROWS = frozenset(["workdir"])
+
+
+def pair_value_budget(width: int, bar_cells: int = 0) -> int:
+    """Cells a single-pair value has, on a line of ``width`` carrying ``bar_cells``.
+
+    Four of indent, the label column and the space after it, then whatever a gauge
+    on the row took. The floor of 20 keeps a value legible on a terminal narrower
+    than the sum of its own chrome.
+    """
+    return max(20, width - 4 - PAIR_LABEL_WIDTH - 1 - bar_cells)
+
+
+def pair_value_lines(label: str, value: str, budget: int) -> list[str]:
+    """A row's value, wrapped to ``budget`` and hard-clipped where it cannot wrap.
+
+    ``wrap`` breaks at spaces and a value can have none -- a 68-character job name
+    is one word -- so anything still over budget afterwards is clipped. ``PATH_ROWS``
+    is the documented exemption: ``--plain`` exists to be pasted and a path you
+    cannot copy whole is no use in a ticket.
+
+    Here rather than in `report`, because the dashboard draws the same rows and did
+    something else with them: it clipped every over-long value to a single line, so
+    ``utilization  not gathered by this cluster (needs AutoDetect=nvml in g…`` lost
+    the half of the sentence naming the fix, while the same row under ``--plain``
+    wrapped and kept it. Neither surface should be deciding that on its own.
+    """
+    lines = wrap(value, budget)
+    if label not in PATH_ROWS:
+        lines = [line if len(line) <= budget else clip(line, budget) for line in lines]
+    return lines or [value]
 
 
 def job_sections(job, summarized: bool = False):

@@ -21,6 +21,40 @@ def find(findings, code):
     return None
 
 
+def _timeout(job_id, cpu_seconds, day_index, limit, elapsed):
+    """A TIMEOUT run that used ``cpu_seconds`` of CPU. Under 10s is a hang."""
+    day = "2026-06-%02d" % (day_index + 1)
+    return [
+        row(
+            JobID=job_id,
+            JobName="trainer",
+            State="TIMEOUT",
+            ExitCode="0:0",
+            Submit="%sT01:00:00" % day,
+            Start="%sT01:00:01" % day,
+            End="%sT01:30:01" % day,
+            ElapsedRaw=str(elapsed),
+            Elapsed="00:30:00",
+            Timelimit=limit,
+            ReqCPUS="1",
+            AllocTRES="cpu=1,mem=8G,node=1",
+            NodeList="n1",
+            NTasks="1",
+            TotalCPU="%d:%02d" % (int(cpu_seconds) // 60, int(cpu_seconds) % 60),
+        ),
+        row(
+            JobID="%s.batch" % job_id,
+            JobName="batch",
+            State="TIMEOUT",
+            ElapsedRaw=str(elapsed),
+            Elapsed="00:30:00",
+            NTasks="1",
+            TotalCPU="%d:%02d" % (int(cpu_seconds) // 60, int(cpu_seconds) % 60),
+            MaxRSS="1000K",
+        ),
+    ]
+
+
 class TestGrouping:
     def test_resource_magnitude_excluded_from_identity(self, oom_series):
         """Raising --mem must not fork the history you are trying to learn from."""
@@ -375,3 +409,87 @@ class TestAlreadyOomdMeansAlready:
     def test_a_success_after_an_oom_at_the_same_value_still_is(self):
         findings = find_memory_search(self._history(completed_first=False))
         assert "already OOM'd" in findings[0].evidence, findings[0].evidence
+
+
+class TestTheRepeatFailureActionNamesTheSplitToo:
+    """`sizing` and this module reach the same conclusion from the same split, at
+    the same half-of-the-timeouts threshold -- and only one of them qualified it.
+
+    `TestTheHangVetoDoesNotSpeakForEveryTimeout` in `test_sizing.py` is the same
+    defect, found and fixed in `sizing.py`, and its comment spells out the reason:
+
+        "The veto stands ... but it may not speak for every timeout in the group.
+        The threshold is half, so four hangs among eight timeouts fired it, and
+        'These runs were blocked, not slow' was then asserted of the other four as
+        well ... Name the split, and keep what they proved."
+
+    `find_repeat_failures` made the same claim of the same runs and did not. Four
+    hangs and four runs that burned 29:50 of a 30:00 limit produced, on the
+    patterns screen and in the workload banner above the rows:
+
+        → 4 of these consumed under 10 CPU-seconds — they hung rather than ran out
+          of time. Raising the limit will not help; fix the blocking call.
+
+    while opening any of the other four said "Ran out of wall clock while working
+    → Raise --time well above the limit that cut it off." One screen apart, and
+    the workload screen shows both at once.
+
+    "Fixed only on one side" is the shape `issues.md` has now named four times, so
+    the clause is shared rather than copied: `hung_split_note` lives here and
+    `sizing` imports it, because `sizing` already imports from this module and the
+    reverse would be a cycle.
+    """
+
+    @staticmethod
+    def _runs(hung, computing, limit="00:30:00", elapsed=1800):
+        rows = []
+        for index in range(hung):
+            rows += _timeout(("40%02d" % index), 0.5, index, limit, elapsed)
+        for index in range(computing):
+            rows += _timeout(("50%02d" % index), elapsed - 10, index + 20, limit, elapsed)
+        return parse(make_text(*rows))
+
+    def test_the_mixed_case_names_both_groups(self):
+        finding = find(find_repeat_failures(self._runs(4, 4)), "repeat-failure")
+        assert finding is not None
+        assert "4 of these consumed under 10 CPU-seconds" in finding.action
+        assert "will not help those" in finding.action, finding.action
+        assert "The other 4 did compute" in finding.action, finding.action
+        assert "00:30:00" in finding.action, finding.action
+
+    def test_an_all_hang_workload_keeps_the_unqualified_claim(self):
+        """The control. Where every timeout hung, "those" qualifies nothing and the
+        sentence is the one it always was."""
+        finding = find(find_repeat_failures(self._runs(8, 0)), "repeat-failure")
+        assert "Raising the limit will not help;" in finding.action, finding.action
+        assert "those" not in finding.action, finding.action
+        assert "The other" not in finding.action, finding.action
+
+    def test_the_demo_is_unchanged(self):
+        """14 of 14 cot-exp runs hung, so the screenshots and the GIF are too."""
+        from slurmpast.demo import history
+
+        actions = [
+            f.action
+            for f in find_repeat_failures(history())
+            if "hung rather than" in (f.action or "")
+        ]
+        assert actions, "the demo lost its hung workload"
+        assert "Raising the limit will not help; fix the blocking call." in actions[0]
+
+    def test_both_modules_spend_the_same_clause(self):
+        """The drift guard. Two modules, one sentence, and `sizing` is the importer
+        because the dependency only runs one way."""
+        import pathlib
+
+        from slurmpast.patterns import hung_split_note
+
+        assert hung_split_note(0, []) == ""
+        assert hung_split_note(2, [None, None]) == "", "no limit recorded, nothing to claim"
+        note = hung_split_note(1, [1800.0])
+        assert "The other 1 did compute, and was cut off at 00:30:00" in note
+
+        src = pathlib.Path(__file__).resolve().parent.parent / "src" / "slurmpast"
+        sizing = (src / "sizing.py").read_text()
+        assert "hung_split_note" in sizing
+        assert "did compute, and" not in sizing, "sizing writes the clause itself again"

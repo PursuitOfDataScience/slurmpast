@@ -26,7 +26,7 @@ from .sacct import Sacct, SacctError, live_job_ids
 EPILOG = """\
 examples:
   slurmpast                        dashboard over the last 7 days
-  slurmpast -S now-30days         ... over the last 30 days
+  slurmpast -S now-30days          ... over the last 30 days
   slurmpast 51170455               post-mortem for one job
   slurmpast --failed --plain       everything that died, as text
   slurmpast --patterns             what keeps failing, across runs
@@ -118,7 +118,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-dir", action="append", default=[], help="extra directory to search for job logs"
     )
     parser.add_argument("--no-logs", action="store_true", help="do not read job logs")
-    parser.add_argument("--steps", action="store_true", help="per-step accounting")
+    # Names its scope, as `--metric`, `--all-workloads`, `-n` and `--sort` all do:
+    # this one reaches exactly one view, and read as an unscoped "per-step
+    # accounting" it invites `--plain --steps` over a list, where it is accepted
+    # and does nothing.
+    parser.add_argument("--steps", action="store_true", help="per-step accounting, on a named job")
     parser.add_argument("--json", action="store_true", help="emit JSON")
     parser.add_argument(
         "--mouse",
@@ -131,7 +135,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="synthetic history — try it without Slurm, and drive the demo tape",
     )
-    parser.add_argument("--ascii", action="store_true", help="ASCII glyphs instead of Unicode")
+    parser.add_argument(
+        "--ascii",
+        action="store_true",
+        # Says "text output" because that is what it can honestly promise: the
+        # dashboard's frame is drawn by Textual in box characters whatever this
+        # flag says, so only the piped surface can actually come out ASCII.
+        help="ASCII instead of Unicode in text output (glyphs and punctuation)",
+    )
     parser.add_argument("--no-color", action="store_true", help="disable ANSI colour")
     parser.add_argument("--version", action="version", version="slurmpast " + __version__)
     return parser
@@ -379,8 +390,10 @@ def _job_json(job, log_path, verdict):
             "comment": job.comment or None,
             "admin_comment": job.admin_comment or None,
             "layout": job.layout or None,
-            # Recorded from Slurm 21.08; null on any older cluster. Patterns as
-            # stored, unexpanded -- see logs.expand_pattern for the resolved form.
+            # Recorded from Slurm 24.05; null on any older cluster -- 21.08 is
+            # when SubmitLine arrived, not these two. See the boundary table at
+            # the top of logs.py. Patterns as stored, unexpanded -- see
+            # logs.expand_pattern for the resolved form.
             "stdout_pattern": job.std_out or None,
             "stderr_pattern": job.std_err or None,
             "submit_line": job.submit_line or None,
@@ -396,6 +409,20 @@ def _job_json(job, log_path, verdict):
             "completed": job.completed,
             "cancelled": job.cancelled,
             "open_ended_record": job.open_ended,
+            # What squeue answered about an open record, tri-state as the model
+            # stores it: true = still queued or running, false = squeue has never
+            # heard of it so the record is stale, null = not asked or unreachable.
+            #
+            # Emitted because it was measured. `cli._mark_open_records` runs the
+            # query and writes the answer onto the job, both text surfaces spend it
+            # on the finding's action sentence, and this payload -- whose whole
+            # promise is "if the tool read it, this emits it" -- carried only
+            # `open_ended_record`, which is `true` in all three cases. So the one
+            # consumer that cannot read English had no way to tell a job running
+            # right now from one that died in March, and `timing.elapsed_seconds`
+            # is measured to *now* for both. Round six's headline defect was that
+            # same distinction going the other way.
+            "live": job.live,
         },
         "timing": {
             "submit": job.submit,
@@ -644,7 +671,11 @@ def main(argv=None) -> int:
         else:
             print(
                 report.render_nodes(
-                    history, metric=args.metric, controlled=not args.all_workloads, style=style
+                    history,
+                    metric=args.metric,
+                    controlled=not args.all_workloads,
+                    style=style,
+                    ascii_mode=args.ascii,
                 )
             )
         return 0
@@ -675,7 +706,11 @@ def main(argv=None) -> int:
                 )
             )
         else:
-            print(report.render_sizing(history, style=style, limit=args.limit, sort=args.sort))
+            print(
+                report.render_sizing(
+                    history, style=style, limit=args.limit, sort=args.sort, ascii_mode=args.ascii
+                )
+            )
         return 0
 
     if args.patterns:
@@ -691,7 +726,7 @@ def main(argv=None) -> int:
                 )
             )
         else:
-            print(report.render_patterns(history, style=style))
+            print(report.render_patterns(history, style=style, ascii_mode=args.ascii))
         return 0
 
     if args.overview:
@@ -735,7 +770,11 @@ def main(argv=None) -> int:
                 )
             )
         else:
-            print(report.render_overview(history, style=style, limit=args.limit, sort=args.sort))
+            print(
+                report.render_overview(
+                    history, style=style, limit=args.limit, sort=args.sort, ascii_mode=args.ascii
+                )
+            )
         return 0
 
     # Per-job. Explicit ids get full detail; a bare --plain/--failed gets a list
@@ -803,15 +842,19 @@ def main(argv=None) -> int:
             print(text)
             worst_critical |= any(f.severity == "critical" for f in verdict.findings)
     else:
-        print(report.render_overview(history, style=style, limit=args.limit, sort=args.sort))
+        print(
+            report.render_overview(
+                history, style=style, limit=args.limit, sort=args.sort, ascii_mode=args.ascii
+            )
+        )
         if matches:
             # The whole list, sliced by the renderer. Pre-slicing it here made
             # `render_list`'s own "… N more (raise --limit)" line unreachable, so
             # `-n 5` showed 5 of 28 problem jobs and said nothing about the other
             # 23 -- while the workload table directly above it named its own tail.
-            print(report.render_list(matches, style=style, limit=args.limit))
+            print(report.render_list(matches, style=style, limit=args.limit, ascii_mode=args.ascii))
             print("")
-        print(report.render_patterns(history, style=style))
+        print(report.render_patterns(history, style=style, ascii_mode=args.ascii))
         worst_critical = any(f.severity == "critical" for f in history.patterns)
 
     return 1 if worst_critical else 0

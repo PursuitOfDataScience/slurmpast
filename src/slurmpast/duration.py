@@ -12,6 +12,11 @@ _NOT_A_DURATION = frozenset(
     ["", "unlimited", "invalid", "partition_limit", "unknown", "none", "n/a", "*"]
 )
 
+# The same rule reaches values that are numeric but not finite. ``float("NaN")``
+# and ``float("1e999")`` are built happily by Python and are not measurements, so
+# every parser here returns None for them and every formatter renders them as the
+# absent value rather than raising -- see parse_duration.
+
 _UNITS = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4, "p": 1024**5}
 
 
@@ -52,6 +57,19 @@ def parse_duration(text):
     except ValueError:
         return None
 
+    if any(not math.isfinite(n) for n in nums):
+        # "NaN" and "inf" are floats Python is happy to build and this module must
+        # not return: a None is a missing measurement and everything downstream is
+        # written for it, while a NaN is a number that poisons whatever it touches.
+        # One record with an unparseable Elapsed turned `gpu_hours_total` and
+        # `core_hours_total` for a whole history into `nan` -- destroying every
+        # OTHER job's figure -- and then raised ValueError out of `format_duration`
+        # on the job screen. Same rule as the sentinel table at the top of this
+        # module, for the same reason: "a 0.0 here silently becomes 'this job used
+        # no time', which is a lie." A NaN is the same lie, told about every job at
+        # once.
+        return None
+
     if len(parts) == 3:
         hours, minutes, seconds = nums
     elif len(parts) == 2:
@@ -89,9 +107,13 @@ def parse_bytes(text):
     if not s:
         return None
     try:
-        return int(float(s) * mult)
+        value = float(s) * mult
     except ValueError:
         return None
+    # `int(float("inf"))` raises OverflowError, which is not a ValueError, so an
+    # "inf" or a "1e999" in any byte field came out of here as a traceback rather
+    # than as a missing reading.
+    return int(value) if math.isfinite(value) else None
 
 
 def mem_scope(text):
@@ -121,7 +143,7 @@ def format_duration(seconds):
     is "0.52s of CPU", and ``00:00:00`` would erase the single number this whole
     tool exists to surface.
     """
-    if seconds is None:
+    if seconds is None or not math.isfinite(float(seconds)):
         return "n/a"
     seconds = float(seconds)
     if seconds < 1:
@@ -139,7 +161,7 @@ def format_duration(seconds):
 
 def format_bytes(value):
     """Bytes -> GiB/MiB string. ``None`` renders as ``n/a``, never ``0``."""
-    if value is None:
+    if value is None or not math.isfinite(float(value)):
         return "n/a"
     value = float(value)
     for unit, scale in (("TiB", 1024**4), ("GiB", 1024**3), ("MiB", 1024**2)):
@@ -163,9 +185,25 @@ def format_mem_flag(value):
     to 52G would hand back a request the evidence says is too small. A sub-GiB
     result floors at ``1G`` rather than the ``0G`` Slurm reads as "no limit".
     """
-    if value is None:
+    if value is None or not math.isfinite(float(value)):
         return None
     return "%dG" % max(1, int(math.ceil(float(value) / float(1024**3))))
+
+
+def plural(count, word: str) -> str:
+    """``word`` with an ``s`` unless ``count`` *prints* as one.
+
+    Agreement follows the digit the reader sees rather than the float behind it:
+    1.4 GPU-hours renders as "1" through ``%.0f``, so it takes the singular. Same
+    rule ``bar_cells`` applies to a gauge -- "prints as" is the only definition
+    under which the word and the number beside it cannot disagree.
+
+    Here rather than in ``render`` because three of the four sites that needed it
+    are in ``index`` and ``patterns``, which may not import ``render`` (it pulls in
+    rich). ``duration`` is where the other formatters already live and imports
+    nothing outside the stdlib.
+    """
+    return word if round(count or 0) == 1 else word + "s"
 
 
 def format_percent(value):
@@ -174,7 +212,7 @@ def format_percent(value):
     Inherited from slurmwatch's number audit (finding A2): printing ``0%`` for a
     failed read is indistinguishable from a real measurement of zero.
     """
-    if value is None:
+    if value is None or not math.isfinite(float(value)):
         return "n/a"
     return "%.1f%%" % (100.0 * value)
 
@@ -226,7 +264,7 @@ def parse_cpu_freq(text):
 
 def format_cpu_freq(hz):
     """Hertz -> ``3.10 GHz`` / ``800 MHz``. ``None`` renders as ``n/a``."""
-    if hz is None:
+    if hz is None or not math.isfinite(float(hz)):
         return "n/a"
     if hz >= 1e9:
         return "%.2f GHz" % (hz / 1e9)

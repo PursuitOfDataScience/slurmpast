@@ -653,6 +653,30 @@ class TestPackageSurface:
         missing = [name for name in slurmpast.__all__ if not hasattr(slurmpast, name)]
         assert not missing
 
+    def test_the_package_docstring_lists_every_module_the_guarantee_covers(self):
+        """It named six of the ten, leaving out `sizing` -- which is the module the
+        README's own library example imports -- along with `model`, `logs` and
+        `duration`. The guarantee always covered them; the sentence promising it
+        was short, so a reader checking whether it was safe to import `sizing` on a
+        login node was told nothing."""
+        import slurmpast
+
+        promised = slurmpast.__doc__
+        renderers = {"tui", "theme", "render", "report"}
+        free = {
+            name[:-3]
+            for name, found in _third_party_imports().items()
+            if not found and name.endswith(".py")
+        }
+        free -= {"__init__", "__main__", "_version", "cli", "demo"}
+        missing = sorted(name for name in free if "``%s``" % name not in promised)
+        assert not missing, "third-party-free but not named in the docstring: %s" % missing
+        # And it must not promise one of the four that do reach for rich/textual.
+        overclaimed = sorted(
+            name for name in renderers if "``%s``" % name in promised.split("only by")[0]
+        )
+        assert not overclaimed, overclaimed
+
     def test_the_analysis_layer_needs_no_third_party_package(self):
         """The README promises this: usable as a library on a login node with no
         UI framework installed. Only the four rendering modules may reach for
@@ -1616,3 +1640,419 @@ def _counting_names_in(log):
         return original(self, directory)
 
     return counted
+
+
+class TestATruncatedStateMeansWhatItSays:
+    """`OUT_OF_ME+` is sacct's column-truncated `OUT_OF_MEMORY`.
+
+    It was recognised in exactly one place -- `sacct._TERMINAL_STATES` -- and
+    appeared nowhere else in the codebase, so a record carrying it was correctly
+    treated as closed and then mis-handled by everything downstream: counted as
+    neither a failure nor a completion, given no finding, and invisible to both the
+    memory-bisection detector and the `--mem` floor in `sizing.memory_advice`.
+
+    Whichever query produced the truncation, one spelling of one state cannot mean
+    two things in one codebase, so it is folded at the parse boundary -- the same
+    job `_ALIASES` does for a field Slurm renamed.
+    """
+
+    COMMON = {
+        "JobName": "tok",
+        "Partition": "test",
+        "User": "me",
+        "ExitCode": "0:125",
+        "End": "2026-01-01T00:10:00",
+        "Elapsed": "00:10:00",
+        "Timelimit": "01:00:00",
+        "AllocTRES": "cpu=8,mem=16G,node=1",
+        "NodeList": "n1",
+        "ReqCPUS": "8",
+    }
+
+    def _jobs(self, state, count=1, first=100):
+        return parse(
+            "\n".join(row(JobID=str(first + i), State=state, **self.COMMON) for i in range(count))
+        )
+
+    def test_the_truncated_spelling_reads_as_the_full_one(self):
+        job = self._jobs("OUT_OF_ME+")[0]
+        assert job.state == "OUT_OF_MEMORY"
+        assert job.base_state == "OUT_OF_MEMORY"
+        assert job.failed
+        assert not job.open_ended
+
+    def test_it_draws_the_same_finding(self):
+        from slurmpast.diagnose import diagnose
+
+        truncated = {f.code for f in diagnose(self._jobs("OUT_OF_ME+")[0]).findings}
+        full = {f.code for f in diagnose(self._jobs("OUT_OF_MEMORY")[0]).findings}
+        assert "host-oom" in truncated
+        assert truncated == full
+
+    def test_the_cross_run_detectors_see_it(self):
+        from slurmpast.patterns import find_memory_search
+        from slurmpast.sizing import memory_advice
+
+        jobs = self._jobs("OUT_OF_ME+", count=4)
+        assert [f.code for f in find_memory_search(jobs)] == ["memory-search"]
+        advice = memory_advice(jobs)
+        assert advice.verdict == "raise"
+        assert "4 OOM kills" in advice.observed
+
+    def test_the_cancelled_suffix_survives_the_fold(self):
+        """`Job.state` carries sacct's `by <uid>` and `base_state` drops it; both
+        are read, so folding must not eat either."""
+        from slurmpast.sacct import _canonical_state
+
+        assert _canonical_state("CANCELLED by 1234") == "CANCELLED by 1234"
+        assert _canonical_state("OUT_OF_ME+ by 1234") == "OUT_OF_MEMORY by 1234"
+
+    def test_an_unfamiliar_state_passes_through_untouched(self):
+        """The control. Only the one spelling already named in this module is
+        folded -- nothing guesses at what an unknown `+` was cut from."""
+        from slurmpast.sacct import _canonical_state
+
+        for state in ("COMPLETED", "REVOKED", "SPECIAL_EXIT", "SOME_NEW+", ""):
+            assert _canonical_state(state) == state
+
+
+class TestTheToolsDeclareWhatTheyImport:
+    """`tools/demo_gif.py` said a dev install brought in what it needs. It did not.
+
+    Its own docstring is the standard it failed: "A build step nobody can run is a
+    build step that does not happen" -- which is why it replaced the vhs tape in the
+    first place, and it then reproduced the same failure in Python. `cairosvg` and
+    `pillow` were in NO extra, so `pip install -e ".[dev]"` -- what CI runs and what
+    the README implies for a contributor -- left the command the README prints
+    raising ModuleNotFoundError.
+    """
+
+    @staticmethod
+    def _project():
+        """``(repo root, the [project] table)``.
+
+        ``tomllib`` is stdlib from 3.11 and this package declares
+        ``requires-python = ">=3.10"``, so on the floor version this test -- whose
+        subject is precisely "declare what you import" -- did not declare what it
+        imports. Local gates run on one interpreter and could not see it; CI's
+        py3.10 and oldest-Textual jobs both failed on it. ``tomli`` is the
+        conventional backfill and is now in the dev extra, guarded by a marker so
+        3.11+ does not install it.
+        """
+        import pathlib
+
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10
+            import tomli as tomllib
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        return root, tomllib.loads((root / "pyproject.toml").read_text())["project"]
+
+    @staticmethod
+    def _third_party(path, known_local):
+        """Top-level modules ``path`` imports that are neither stdlib nor local."""
+        import ast
+        import sys
+
+        stdlib = set(sys.stdlib_module_names)
+        found = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            roots = []
+            if isinstance(node, ast.Import):
+                roots = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                roots = [node.module.split(".")[0]]
+            for root in roots:
+                if root not in stdlib and root not in known_local:
+                    found.add(root)
+        return found
+
+    def test_every_third_party_import_in_tools_is_declared(self):
+        root, project = self._project()
+        declared = set()
+        for spec in list(project.get("dependencies", [])):
+            declared.add(spec.split(">")[0].split("<")[0].split("=")[0].strip().lower())
+        for group in project.get("optional-dependencies", {}).values():
+            for spec in group:
+                declared.add(spec.split(">")[0].split("<")[0].split("=")[0].strip().lower())
+        # `PIL` is the import name of the `pillow` distribution.
+        aliases = {"pil": "pillow"}
+        undeclared = {}
+        for path in sorted((root / "tools").glob("*.py")):
+            imports = self._third_party(path, known_local={"slurmpast"})
+            missing = sorted(
+                name for name in imports if aliases.get(name.lower(), name.lower()) not in declared
+            )
+            if missing:
+                undeclared[path.name] = missing
+        assert not undeclared, "imported by tools/ and declared nowhere: %s" % undeclared
+
+    def test_the_gif_generator_names_its_extra(self):
+        """And the extra it names has to exist, with both packages in it."""
+        root, project = self._project()
+        source = (root / "tools" / "demo_gif.py").read_text()
+        extras = project["optional-dependencies"]
+        assert 'pip install -e ".[assets]"' in source, "the docstring should name the extra"
+        assert "assets" in extras, extras.keys()
+        names = {s.split(">")[0].split("=")[0].strip().lower() for s in extras["assets"]}
+        assert {"cairosvg", "pillow"} <= names, names
+        # And it no longer claims `dev` is enough.
+        assert "what a dev install already brings in" not in source
+
+    def test_the_readme_names_the_install_step_too(self):
+        """The README is where a contributor reads the regenerate command, so the
+        command there has to be the one that works on a clean checkout."""
+        root, _ = self._project()
+        readme = (root / "README.md").read_text()
+        assert "tools/demo_gif.py" in readme
+        line = next(ln for ln in readme.splitlines() if "tools/demo_gif.py" in ln)
+        assert "[assets]" in line, line
+
+    def test_the_screenshot_tool_needs_nothing_extra(self):
+        """The control: `screenshots.py` really does run on a plain dev install, so
+        the sweep above is distinguishing the two rather than flagging both."""
+        root, _ = self._project()
+        imports = self._third_party(root / "tools" / "screenshots.py", known_local={"slurmpast"})
+        assert not (imports - {"textual", "rich"}), imports
+
+
+class TestTheProseSpellsPunctuationOneWay:
+    """``--ascii`` promises "ASCII instead of Unicode ... glyphs and punctuation".
+
+    It keeps that promise by folding: ``render.ascii_fold`` maps each mark this
+    codebase uses onto a one-cell ASCII stand-in, once, on the finished text of a
+    view. A sentence that spells the mark in ASCII to begin with is invisible to
+    that -- there is nothing to fold -- so it reads the same in both modes while
+    everything around it changes, and it cannot be restyled later from one place.
+
+    Seventeen user-facing sentences spelled the em dash ``--`` against thirty that
+    spelled it ``—``, and `diagnose.py` did both inside one `Finding`:
+
+        " Note MaxRSS reports %s against a %s per-node limit -- above the hard ..."
+        "Raise --mem, or cut what multiplies per-worker footprint — workers, ..."
+
+    Comments and docstrings are exempt and deliberately so: this repo writes them
+    in ASCII, and none of them reaches a screen.
+    """
+
+    # `-- ` inside these is an option, not punctuation: `--mem`, `--time`, `-S`.
+    MODULES = (
+        "cli.py",
+        "diagnose.py",
+        "duration.py",
+        "index.py",
+        "logs.py",
+        "model.py",
+        "nodes.py",
+        "patterns.py",
+        "render.py",
+        "report.py",
+        "sacct.py",
+        "site.py",
+        "sizing.py",
+        "tui.py",
+    )
+
+    @staticmethod
+    def _output_literals(path):
+        """Non-docstring string constants, i.e. the ones that can reach a screen."""
+        import ast
+
+        tree = ast.parse(path.read_text())
+        skip = set()
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and node.body
+                and ast.get_docstring(node, clean=False) is not None
+            ):
+                skip.add(id(node.body[0].value))
+        return [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in skip
+        ]
+
+    def test_no_user_facing_sentence_writes_the_em_dash_in_ascii(self):
+        root = pathlib.Path(__file__).resolve().parent.parent / "src" / "slurmpast"
+        offenders = []
+        for name in self.MODULES:
+            for value in self._output_literals(root / name):
+                # The dashboard's CSS is not prose and carries `/* -- */` comments.
+                if "{" in value and "}" in value:
+                    continue
+                if " -- " in value:
+                    offenders.append("%s: %r" % (name, value[:70]))
+        assert not offenders, "spell it — so --ascii can fold it: %s" % "; ".join(offenders)
+
+    def test_the_fold_actually_reaches_them(self):
+        """The control, end to end: every mark in the rendered views has an ASCII
+        stand-in, so ``--ascii`` output is ASCII and one cell wide per mark."""
+        from slurmpast.demo import history
+        from slurmpast.index import History
+        from slurmpast.render import _ASCII_FOLD, ascii_fold
+        from slurmpast.report import (
+            Style,
+            render_job,
+            render_nodes,
+            render_overview,
+            render_patterns,
+            render_sizing,
+        )
+
+        jobs = history()
+        h = History(jobs)
+        style = Style(enabled=False)
+
+        def views(ascii_mode):
+            return [
+                render_overview(h, style=style, ascii_mode=ascii_mode),
+                render_patterns(h, style=style, ascii_mode=ascii_mode),
+                render_nodes(h, style=style, ascii_mode=ascii_mode),
+                render_sizing(h, style=style, ascii_mode=ascii_mode),
+            ] + [
+                render_job(j, style=style, show_steps=True, no_logs=True, ascii_mode=ascii_mode)[0]
+                for j in jobs
+            ]
+
+        for unicode_form, folded in zip(views(False), views(True), strict=True):
+            assert folded.isascii(), [c for c in folded if not c.isascii()][:5]
+            # One cell for one cell, which is what lets the fold run last -- after
+            # the wrapping and the column fitting that measured those cells.
+            assert len(folded) == len(unicode_form)
+            # And the punctuation specifically: the glyph swaps above happen at
+            # the drawing site, the marks are what `ascii_fold` is for, and after
+            # it not one of them is left.
+            left = [c for c in ascii_fold(unicode_form) if c in _ASCII_FOLD]
+            assert not left, left[:5]
+
+    def test_the_mark_is_the_one_the_codebase_uses(self):
+        """Not a style opinion invented here: the em dash is what the prose already
+        spells, by better than two to one, and it is in the fold table."""
+        from slurmpast.render import _ASCII_FOLD
+
+        root = pathlib.Path(__file__).resolve().parent.parent / "src" / "slurmpast"
+        em = sum(
+            value.count("—")
+            for name in self.MODULES
+            for value in self._output_literals(root / name)
+        )
+        assert em > 20, em
+        assert _ASCII_FOLD["—"] == "-"
+
+
+class TestNothingImportsPastTheDeclaredPythonFloor:
+    """`requires-python = ">=3.10"`, and one test imported a module that arrived
+    in 3.11.
+
+    `TestTheToolsDeclareWhatTheyImport` reads `pyproject.toml` with `tomllib` --
+    stdlib from 3.11 -- so the test whose subject is "declare what you import" did
+    not, on the oldest interpreter this package claims to support. Four of its
+    assertions died with `ModuleNotFoundError` in CI's py3.10 and oldest-Textual
+    jobs, having passed every local gate: a local run is one interpreter, and this
+    is the class of defect that costs nothing to catch and cannot be caught there.
+
+    `sys.stdlib_module_names` is the *running* interpreter's, so it cannot answer
+    "was this in 3.10". The table below is the alternative and is deliberately
+    small: the stdlib additions between this floor and the newest version CI runs.
+    A module missing from it is not a false pass -- CI still runs 3.10 -- it is one
+    round-trip through CI instead of a local failure, which is what this exists to
+    save.
+    """
+
+    # module -> the version it entered the stdlib.
+    ADDED_IN = {
+        "tomllib": (3, 11),
+        "dbm.sqlite3": (3, 13),
+        "annotationlib": (3, 14),
+        "compression": (3, 14),
+    }
+
+    @classmethod
+    def _floor(cls):
+        import re
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        spec = re.search(
+            r'requires-python\s*=\s*"[>=~^]*([\d.]+)"', (root / "pyproject.toml").read_text()
+        )
+        assert spec, "pyproject no longer declares requires-python"
+        return tuple(int(part) for part in spec.group(1).split("."))
+
+    @staticmethod
+    def _guarded_imports(tree):
+        """Names imported inside a `try:` -- a backfill, not an unguarded import."""
+        import ast
+
+        safe = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Import):
+                    safe.update(alias.name for alias in inner.names)
+                elif isinstance(inner, ast.ImportFrom) and inner.module:
+                    safe.add(inner.module)
+        return safe
+
+    def test_no_module_newer_than_the_floor_is_imported_unguarded(self):
+        import ast
+
+        floor = self._floor()
+        late = {name: added for name, added in self.ADDED_IN.items() if added > floor}
+        assert late, "the floor has moved past every module in the table; prune it"
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        offenders = []
+        for path in sorted(
+            list((root / "src" / "slurmpast").glob("*.py"))
+            + list((root / "tests").glob("*.py"))
+            + list((root / "tools").glob("*.py"))
+        ):
+            tree = ast.parse(path.read_text())
+            guarded = self._guarded_imports(tree)
+            for node in ast.walk(tree):
+                names = []
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                    names = [node.module]
+                for name in names:
+                    if name in late and name not in guarded:
+                        offenders.append(
+                            "%s:%d imports %s (stdlib from %s, floor is %s)"
+                            % (
+                                path.name,
+                                node.lineno,
+                                name,
+                                ".".join(map(str, late[name])),
+                                ".".join(map(str, floor)),
+                            )
+                        )
+        assert not offenders, "; ".join(offenders)
+
+    def test_the_one_backfill_there_is_is_declared(self):
+        """The control on the fix: `tomllib` is guarded *and* `tomli` is in the dev
+        extra behind a marker, so 3.10 installs it and 3.11+ does not."""
+        root = pathlib.Path(__file__).resolve().parent.parent
+        text = (root / "pyproject.toml").read_text()
+        assert "tomli>=" in text
+        assert "python_version < '3.11'" in text
+        source = (root / "tests" / "test_portability.py").read_text()
+        assert "except ModuleNotFoundError:" in source
+        assert "import tomli as tomllib" in source
+
+    def test_it_would_have_caught_the_one_that_shipped(self):
+        """The control that matters: an unguarded `import tomllib` is reported."""
+        import ast
+
+        tree = ast.parse("import pathlib\nimport tomllib\n")
+        guarded = self._guarded_imports(tree)
+        assert "tomllib" not in guarded
+        wrapped = ast.parse(
+            "try:\n    import tomllib\nexcept ModuleNotFoundError:\n    import tomli as tomllib\n"
+        )
+        assert "tomllib" in self._guarded_imports(wrapped)

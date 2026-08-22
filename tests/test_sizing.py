@@ -27,6 +27,55 @@ def workload(name):
     return [j for j in history() if j.name == name]
 
 
+def _sized_run(job_id, day, elapsed, cpu_seconds, max_rss, cores, mem_gib, limit_seconds):
+    """One COMPLETED run whose every denominator is stated, not inherited.
+
+    `CPUTime` is written explicitly on both rows because `Job.cpu_time` takes the
+    largest of the allocation row, `elapsed x cores` and every work step -- so a
+    row that omits it inherits nothing, and a row that copies it from elsewhere
+    poisons every utilization derived from it.
+    """
+    cpu_time = elapsed * cores
+
+    def clock(seconds):
+        seconds = int(seconds)
+        return "%02d:%02d:%02d" % (seconds // 3600, seconds % 3600 // 60, seconds % 60)
+
+    return [
+        row(
+            JobID=job_id,
+            JobName="trainer",
+            State="COMPLETED",
+            ExitCode="0:0",
+            Submit="%sT01:00:00" % day,
+            Start="%sT01:00:01" % day,
+            End="%sT02:00:01" % day,
+            ElapsedRaw=str(elapsed),
+            Elapsed=clock(elapsed),
+            Timelimit=clock(limit_seconds),
+            ReqCPUS=str(cores),
+            AllocTRES="cpu=%d,mem=%dG,node=1" % (cores, mem_gib),
+            ReqTRES="cpu=%d,mem=%dG,node=1" % (cores, mem_gib),
+            ReqMem="%dG" % mem_gib,
+            NodeList="n1",
+            NTasks="1",
+            TotalCPU=clock(cpu_seconds),
+            CPUTime=clock(cpu_time),
+        ),
+        row(
+            JobID="%s.batch" % job_id,
+            JobName="batch",
+            State="COMPLETED",
+            ElapsedRaw=str(elapsed),
+            Elapsed=clock(elapsed),
+            NTasks="1",
+            TotalCPU=clock(cpu_seconds),
+            CPUTime=clock(cpu_time),
+            MaxRSS="%dK" % (max_rss // 1024),
+        ),
+    ]
+
+
 def _timeout_run(job_id, cpu_seconds, day, limit="01:00:00"):
     """A run cut off at its limit, having used `cpu_seconds` of CPU.
 
@@ -880,3 +929,105 @@ class TestTheHungTimeoutCautionParsesOnItsOwn:
         assert "this is a floor, not a fit" in caution, caution
         assert "further timeout" in caution, caution
         assert "left out of that floor" in caution, caution
+
+
+class TestNoSuggestionFallsBelowWhatTheWorkloadNeeded:
+    """The module header's own asymmetry, as a property over generated histories:
+
+        "Over-requesting narrows which nodes can host the job ... Under-requesting
+        kills the run."
+
+    Every individual rule is tested above; nothing tested the promise they exist to
+    keep. This generates 400 workloads with a known answer -- a planted peak for
+    walltime, memory and per-task cores -- and asserts no actionable suggestion
+    lands under it. 569 suggestions, none of them below.
+
+    **Build the runs, do not `_replace` a demo job.** `Job.cpu_time` is
+    ``max(cpu_time_alloc, elapsed x cores, *[s.cpu_time for s in work_steps])``, so
+    a synthetic run made by replacing three fields on a real one keeps that job's
+    denominator in two places and every utilization it computes is wrong. The first
+    version of this test reported thirteen violations that were all its own
+    fixture's. Recorded because the trap is invisible and the next property test
+    over `sizing` will walk into it.
+    """
+
+    CORES = 8
+    MEM_GIB = 64
+
+    def _workload(self, peak_seconds, peak_rss, peak_cores, runs=6):
+        """``runs`` completed jobs whose maxima are exactly the three peaks."""
+        rows = []
+        for index in range(runs):
+            # The last run carries every peak; the rest sit below it.
+            share = 1.0 if index == runs - 1 else 0.5
+            elapsed = int(peak_seconds * share)
+            cpu_seconds = peak_cores * elapsed if index == runs - 1 else peak_cores * elapsed * 0.5
+            rows += _sized_run(
+                job_id="70%02d" % index,
+                day="2026-06-%02d" % (index + 1),
+                elapsed=elapsed,
+                cpu_seconds=cpu_seconds,
+                max_rss=int(peak_rss * share),
+                cores=self.CORES,
+                mem_gib=self.MEM_GIB,
+                limit_seconds=peak_seconds * 4,
+            )
+        return parse(make_text(*rows))
+
+    def test_the_fixture_is_honest_about_its_own_denominator(self):
+        """Guard on the guard. If `cpu_time` is not `elapsed x cores` the planted
+        peak is not the peak and every assertion below is vacuous."""
+        jobs = self._workload(3600, 8 << 30, peak_cores=5)
+        for job in jobs:
+            assert job.cpu_time == job.elapsed * job.cpu_count, (
+                job.job_id,
+                job.cpu_time,
+                job.elapsed,
+                job.cpu_count,
+            )
+        busiest = max(j.cpu_utilization * j.cpus_per_task for j in jobs)
+        assert abs(busiest - 5.0) < 0.01, busiest
+
+    @pytest.mark.parametrize("peak_seconds", [300, 3600, 20000])
+    @pytest.mark.parametrize("peak_cores", [1, 3, 7])
+    @pytest.mark.parametrize("peak_gib", [1, 9, 40])
+    def test_no_actionable_suggestion_lands_under_the_peak(
+        self, peak_seconds, peak_cores, peak_gib
+    ):
+        from slurmpast.duration import parse_bytes, parse_duration
+
+        peak_rss = peak_gib << 30
+        jobs = self._workload(peak_seconds, peak_rss, peak_cores)
+        for advice in recommend(jobs):
+            if not advice.actionable:
+                continue
+            if advice.flag == "--time":
+                got = parse_duration(advice.suggestion)
+                assert got >= peak_seconds, (advice.suggestion, peak_seconds)
+            elif advice.flag == "--mem":
+                got = parse_bytes(advice.suggestion)
+                assert got >= peak_rss, (advice.suggestion, peak_gib)
+            elif advice.flag == "--cpus-per-task":
+                assert int(advice.suggestion) >= peak_cores, (advice.suggestion, peak_cores)
+
+    def test_a_lower_verdict_really_lowers_and_a_raise_really_raises(self):
+        """The other half: a verdict that points the wrong way is worse than none."""
+        from slurmpast.duration import parse_bytes, parse_duration
+
+        for peak_seconds, peak_cores, peak_gib in ((300, 1, 1), (20000, 7, 40)):
+            jobs = self._workload(peak_seconds, peak_gib << 30, peak_cores)
+            for advice in recommend(jobs):
+                if not advice.actionable:
+                    continue
+                if advice.flag == "--time":
+                    now, then = parse_duration(advice.requested), parse_duration(advice.suggestion)
+                elif advice.flag == "--mem":
+                    now, then = parse_bytes(advice.requested), parse_bytes(advice.suggestion)
+                else:
+                    now, then = self.CORES, int(advice.suggestion)
+                if now is None or then is None:
+                    continue
+                if advice.verdict == "lower":
+                    assert then < now, (advice.flag, advice.requested, advice.suggestion)
+                else:
+                    assert then > now, (advice.flag, advice.requested, advice.suggestion)

@@ -363,6 +363,41 @@ class TestPlainOutputFitsATerminal:
                     line,
                 )
 
+    @pytest.mark.parametrize("columns", ["60", "66", "74", "80", "100", "120"])
+    def test_no_step_table_row_overruns_the_terminal(self, monkeypatch, columns):
+        """`--steps`, which neither width test built.
+
+        The sibling above renders every demo job and never passes `show_steps`, so
+        the fourth table this codebase draws was measured at no width at all --
+        while the three in `_views` are measured at six. It happens to behave: it
+        goes through `STEP_COLUMNS` like the others and bottoms out at its own
+        floor. Pinned so that stays a fact rather than a coincidence, and so a
+        never-dropped column added to the spec moves the bar instead of quietly
+        breaking the promise.
+
+        Indented by four inside the post-mortem, not the two `table_floor`
+        assumes, which is what makes this floor 67 and not 65.
+        """
+        from slurmpast.demo import history
+        from slurmpast.render import STEP_COLUMNS, table_floor
+        from slurmpast.report import Style, render_job
+
+        monkeypatch.setenv("COLUMNS", columns)
+        floor = table_floor(STEP_COLUMNS, indent=4)
+        allowed = max(int(columns), floor)
+        drawn = 0
+        for job in history():
+            text, _ = render_job(job, style=Style(enabled=False), show_steps=True)
+            for line in self._table_lines(text):
+                drawn += 1
+                assert len(line) <= allowed, "%s: %d > %d -- %r" % (
+                    job.job_id,
+                    len(line),
+                    allowed,
+                    line,
+                )
+        assert drawn, "no step table was drawn -- the demo lost its steps"
+
     def test_a_gauge_row_keeps_its_detail_inline_where_there_is_room(self, monkeypatch):
         """The narrow-terminal form is a fallback, not the new shape.
 
@@ -1057,3 +1092,144 @@ class TestASharedSentenceKeepsWhatIsSurfaceSpecific:
         assert 'widen="w"' in inspect.getsource(tui.NodesScreen)
         # report relies on the default, so pin that the default is the flag.
         assert "--since" in report.nodes_empty_reason(self._no_rows_table(), "hang", None)
+
+
+class TestFitColumnsHoldsItsContractOnAnySpec:
+    """`fit_columns` is the one engine every table on every surface goes through,
+    and its behaviour was pinned only by the four specs this codebase happens to
+    declare. Its docstring makes six promises; this asserts all six over 40,000
+    generated specs at generated widths, paddings and content caps.
+
+    Nothing was found. That is the point of writing it down: the layout arithmetic
+    is now covered by a property rather than by examples, so a change to the drop
+    order or the fill spread has to break a rule rather than an instance.
+
+    The generator is checked for vacuity in `test_the_generator_exercises_every_branch`
+    below -- a green fuzz whose assertions never ran is worth nothing, and 4,377 of
+    the trials here are the floor case where the table legitimately cannot fit.
+    """
+
+    LABELS = (
+        "#",
+        "JOBID",
+        "NAME",
+        "STATE",
+        "STARTED",
+        "ENDED",
+        "WALL TIME",
+        "CPU TIME",
+        "CPUS BUSY",
+        "PEAK MEM",
+        "MEM%",
+        "GPU",
+        "NODE",
+        "95% CI",
+        "VERDICT",
+        "RATE",
+        "N",
+    )
+
+    @classmethod
+    def _cases(cls, count, seed=31):
+        """(spec, available, padding, content, fill_to) tuples."""
+        import random
+
+        from slurmpast.render import Column
+
+        rng = random.Random(seed)
+        for _ in range(count):
+            size = rng.randint(1, 8)
+            labels = rng.sample(cls.LABELS, size)
+            drops = list(range(1, size + 1))
+            rng.shuffle(drops)
+            spec = [
+                Column(
+                    label,
+                    rng.randint(1, 20),
+                    flex=rng.random() < 0.35,
+                    drop=drops[index] if rng.random() < 0.6 else 0,
+                    grow_to=rng.choice([0, 0, rng.randint(1, 40)]),
+                    align=rng.choice(["left", "right"]),
+                )
+                for index, label in enumerate(labels)
+            ]
+            available = rng.randint(1, 220)
+            fill_to = rng.choice([0, 0, available, rng.randint(1, 220)])
+            content = (
+                {c.label: rng.randint(0, 40) for c in spec if rng.random() < 0.7}
+                if rng.random() < 0.5
+                else None
+            )
+            yield spec, available, rng.choice([0, 1, 2, 3]), content, fill_to
+
+    def test_the_contract(self):
+        from slurmpast.render import fit_columns
+
+        for spec, available, padding, content, fill_to in self._cases(40000):
+            got = fit_columns(spec, available, padding=padding, content=content, fill_to=fill_to)
+            labels = [label for label, _ in got]
+            kept = set(labels)
+            by_label = {c.label: c for c in spec}
+            width = dict(got)
+
+            # "A column is never narrower than its own header."
+            for label, cells in got:
+                assert cells >= len(label), (label, cells)
+
+            # "Returns (label, width) in display order" -- a subsequence of the spec.
+            assert labels == [c.label for c in spec if c.label in kept]
+
+            # "drop=0 means never dropped", and the lowest number goes first.
+            dropped = [c for c in spec if c.label not in kept]
+            if len(spec) > 1:
+                assert all(c.drop for c in dropped), [c.label for c in dropped if not c.drop]
+            for gone in dropped:
+                for held in (c for c in spec if c.label in kept and c.drop):
+                    assert gone.drop <= held.drop, (gone.label, held.label)
+
+            # It fits, unless every remaining column is undroppable -- the
+            # `table_floor` case, which is a property of the spec.
+            total = sum(width.values()) + padding * len(got)
+            undroppable = [c for c in spec if not c.drop]
+            floor = sum(max(c.width, len(c.label)) for c in undroppable) + padding * max(
+                1, len(undroppable)
+            )
+            if len(got) > 1:
+                assert total <= available or total <= floor, (total, available, floor)
+
+            # "fill_to is the total width to spread whatever is still spare across"
+            # -- landed on exactly, unless the table was already wider than it.
+            if fill_to and available >= fill_to:
+                assert total == fill_to or total > fill_to, (total, fill_to)
+
+            # "zero leaves it unused": with no fill_to, a fixed column never grows.
+            if not fill_to:
+                for label, cells in got:
+                    column = by_label[label]
+                    if not column.flex:
+                        assert cells == max(column.width, len(label)), (label, cells)
+
+    def test_the_generator_exercises_every_branch(self):
+        """Vacuity check. Each of these was zero in an earlier draft of the
+        generator, which made the corresponding assertion above decorative."""
+        from slurmpast.render import fit_columns
+
+        seen = dict.fromkeys(
+            ["dropped", "flex grew", "fill reachable", "landed exactly", "floor overrun"], 0
+        )
+        for spec, available, padding, content, fill_to in self._cases(40000):
+            got = fit_columns(spec, available, padding=padding, content=content, fill_to=fill_to)
+            width = dict(got)
+            total = sum(width.values()) + padding * len(got)
+            if len(got) < len(spec):
+                seen["dropped"] += 1
+            if any(c.flex and width.get(c.label, 0) > max(c.width, len(c.label)) for c in spec):
+                seen["flex grew"] += 1
+            if fill_to and available >= fill_to:
+                seen["fill reachable"] += 1
+                if total == fill_to:
+                    seen["landed exactly"] += 1
+            if total > available:
+                seen["floor overrun"] += 1
+        for branch, count in seen.items():
+            assert count > 100, (branch, count, seen)

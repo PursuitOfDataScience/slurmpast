@@ -19,7 +19,7 @@ Two detectors here, both from observed sequences:
 import re
 
 from .diagnose import looks_like_noop
-from .duration import format_bytes, format_duration
+from .duration import format_bytes, format_duration, plural
 from .model import CRITICAL, INFO, WARNING, Finding
 
 REPEAT_MIN = 5
@@ -113,6 +113,38 @@ def usable(jobs):
     return [j for j in jobs if not j.open_ended and j.elapsed is not None]
 
 
+def hung_split_note(computing, limits_hit) -> str:
+    """``The other N did compute, and were cut off at HH:MM:SS ...``, or "".
+
+    Both this module and :mod:`slurmpast.sizing` conclude "the hangs dominate, so a
+    longer limit buys a longer hang" from the same split, at the same half-of-the
+    timeouts threshold. `sizing` learned that the veto "may not speak for every
+    timeout in the group" and says so; this module made the same claim of the same
+    runs and did not, so a workload of four hangs and four runs that burned 29:50
+    of a 30:00 limit was told, on the patterns screen, that raising the limit would
+    not help -- of all eight.
+
+    Here rather than in `sizing` because `sizing` already imports from this module
+    and the reverse would be a cycle. ``limits_hit`` is the timelimits the computing
+    runs were cut off at; the floor is the largest, because a limit that truncated a
+    run bounds its true runtime only from below.
+    """
+    if not computing:
+        return ""
+    floor = max((value for value in limits_hit if value), default=0)
+    if not floor:
+        return ""
+    return (
+        "The other %d did compute, and %s cut off at %s — so once the blocking call "
+        "is fixed, the limit has to be at least that."
+        % (
+            computing,
+            "was" if computing == 1 else "were",
+            format_duration(floor),
+        )
+    )
+
+
 def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
     """Groups that keep dying the same way.
 
@@ -144,30 +176,46 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
         hung = [j for j in failures if looks_like_noop(j)]
         wasted = sum(j.gpu_hours or 0.0 for j in failures)
 
-        evidence = "%d of %d runs of %s in %s failed; %d were %s." % (
+        evidence = "%d of %d runs of %s in %s failed; %d %s %s." % (
             len(failures),
             len(members),
             key[0],
             key[1],
             count,
+            # Reachable at one: `failures` is at least REPEAT_MIN, and five runs
+            # spread across five distinct failure states leave every state on a
+            # count of one, so the dominant one read "1 were FAILED".
+            "was" if count == 1 else "were",
             dominant,
         )
         if dominant == "TIMEOUT" and len(limits) == 1:
             evidence += " Every one used the same --time=%s." % limits.pop()
         if wasted > 1.0:
-            evidence += " %.0f GPU-hours consumed by the failures." % wasted
+            evidence += " %.0f %s consumed by the failures." % (
+                wasted,
+                plural(wasted, "GPU-hour"),
+            )
 
         if hung and len(hung) >= 0.5 * len(failures):
+            computing = [j for j in failures if j not in hung]
+            split = hung_split_note(len(computing), [j.timelimit for j in computing])
+            # "those" only where there is another group for it to exclude. The
+            # threshold is half, so this fires with as many runs computing as
+            # hanging -- but at 14 of 14 the qualifier qualifies nothing and reads
+            # as a hedge. See hung_split_note.
             action = (
-                "%d of these consumed under 10 CPU-seconds -- they hung rather than ran out "
-                "of time. Raising the limit will not help; fix the blocking call." % len(hung)
+                "%d of these consumed under 10 CPU-seconds — they hung rather than ran out "
+                "of time. Raising the limit will not help%s; fix the blocking call."
+                % (len(hung), " those" if split else "")
             )
+            if split:
+                action += " " + split
         elif dominant == "TIMEOUT":
             action = (
                 "Raise --time above that limit; a timeout's Elapsed only bounds runtime from below."
             )
         elif dominant == "OUT_OF_MEMORY":
-            action = "See the memory-search check -- the next increment is probably not the fix."
+            action = "See the memory-search check — the next increment is probably not the fix."
         else:
             action = "Stop resubmitting; the failure is deterministic. Reproduce interactively."
 
@@ -194,7 +242,8 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
             Finding(
                 INFO,
                 "repeat-failure-more",
-                "%d further groups show the same repeat-failure pattern" % len(hidden),
+                "%d further group%s show%s the same repeat-failure pattern"
+                % (len(hidden), "" if len(hidden) == 1 else "s", "s" if len(hidden) == 1 else ""),
                 "Together they account for %d more failed runs. Shown in full with a "
                 "narrower --since window, or per job with `slurmpast <jobid>`."
                 % sum(row[1] for row in hidden),
@@ -251,7 +300,7 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
 
         evidence = "%d OOM kills for %s with --mem walking %s." % (len(ooms), key[0], walk)
         if contradiction is not None:
-            evidence += " Job %s then COMPLETED at %s -- a value that had already OOM'd." % (
+            evidence += " Job %s then COMPLETED at %s — a value that had already OOM'd." % (
                 contradiction.job_id,
                 format_bytes(contradiction.mem_limit_bytes),
             )
@@ -264,7 +313,7 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
             )
         elif not monotone:
             action = (
-                "The search is not converging -- it moves both directions. Measure the real "
+                "The search is not converging — it moves both directions. Measure the real "
                 "working set once instead of bisecting, then request that plus a margin."
             )
         else:
@@ -352,18 +401,21 @@ def summarize(jobs):
     top, dead = find_noop_allocations(jobs)
     if dead:
         gpu_h = sum(j.gpu_hours or 0.0 for j in dead)
-        detail = "%d allocations ran over %s while consuming under 10 CPU-seconds." % (
+        detail = "%d allocation%s ran over %s while consuming under 10 CPU-seconds." % (
             len(dead),
+            "" if len(dead) == 1 else "s",
             format_duration(300),
         )
         if gpu_h > 1.0:
-            detail += " Together they held %.0f GPU-hours." % gpu_h
+            detail += " Together they held %.0f %s." % (gpu_h, plural(gpu_h, "GPU-hour"))
         quick = [j for j in dead if (j.elapsed or 0) <= 900]
         if quick:
-            detail += (
-                " %d were killed within 15 minutes, so those were already noticed; the "
-                "cost is concentrated in the long ones." % len(quick)
+            detail += " %d %s killed within 15 minutes, so %s already noticed; the " % (
+                len(quick),
+                "was" if len(quick) == 1 else "were",
+                "that one was" if len(quick) == 1 else "those were",
             )
+            detail += "cost is concentrated in the long ones."
         findings.append(
             Finding(
                 WARNING,

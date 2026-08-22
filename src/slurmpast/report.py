@@ -23,6 +23,13 @@ from .nodes import (
     suggest_exclude,
 )
 from .render import (
+    ACTION_ARROW,
+    ACTION_HANG,
+    ACTION_INDENT,
+    CAUTION_HANG,
+    CAUTION_MARK,
+    DETAIL_BAR_GAP,
+    DETAIL_BAR_WIDTH,
     HOURS_PAIR_LABEL,
     JOB_COLUMNS,
     NODE_COLUMNS,
@@ -31,17 +38,33 @@ from .render import (
     PAIR_VALUE_WIDTH,
     PAIRED_LINE_WIDTH,
     STEP_COLUMNS,
+    WORKLOAD_CONTROL_ASIDE,
+    ascii_fold,
+    bar,
+    ci_range,
     cores_text,
     cpu_only_columns,
     fit_columns,
+    gpu_hours_total,
     held_back_note,
     hours_pair_text,
     hours_text,
+    idle_hours_note,
     job_sections,
     nodes_baseline,
+    nodes_correction_note,
     nodes_empty_reason,
+    nodes_exclude_disclaimer,
+    nodes_excluded_tail_note,
+    nodes_nothing_to_exclude,
+    nodes_title,
+    nodes_workload_control,
     pair_rows,
+    pair_value_budget,
+    pair_value_lines,
+    patterns_empty,
     resource_rows,
+    severity_tag,
     stamp_short,
     text_table,
     wrap,
@@ -57,7 +80,10 @@ _CODES = {
     "cyan": "\033[36m",
     "grey": "\033[90m",
 }
-_SEV = {"critical": ("red", "FAIL"), "warning": ("yellow", "WARN"), "info": ("cyan", "INFO")}
+# Only the ANSI colour lives here now. The tag beside it was a second copy of
+# `render.SEVERITY_TAG`, which the dashboard reads through `render.severity_chip`
+# -- the same three words maintained in two files, agreeing by luck.
+_SEV_COLOR = {"critical": "red", "warning": "yellow", "info": "cyan"}
 _STATE_COLOR = {
     "COMPLETED": "green",
     "FAILED": "red",
@@ -179,6 +205,18 @@ def _pair_value_width():
     return PAIR_VALUE_WIDTH if _plain_width() >= PAIRED_LINE_WIDTH else 0
 
 
+def _fold(text, ascii_mode):
+    """``render.ascii_fold`` when ``--ascii`` asked for it, otherwise untouched.
+
+    One call per view, on the finished text: the flag has to reach the sentences
+    as well as the glyphs, and the sentences are assembled in a dozen places.
+    Folding last is also what keeps it width-safe -- every substitution is one
+    cell for one cell, applied after the wrapping and the column fitting that
+    measured those cells.
+    """
+    return ascii_fold(text) if ascii_mode else text
+
+
 class Style:
     def __init__(self, enabled=None, stream=None):
         stream = stream or sys.stdout
@@ -243,7 +281,27 @@ def render_job(
                 left = cell(group[0][0], group[0][1], PAIR_VALUE_WIDTH)
                 out.append("    %s  %s" % (left, cell(group[1][0], group[1][1], 0)))
                 continue
-            label, value = group[0][0], group[0][1]
+            label, value, gauge = group[0][0], group[0][1], group[0][2]
+            # The gauge the dashboard has always drawn on this row, and the plain
+            # renderer never did: it read `group[0][0]` and `[0][1]` and stopped, so
+            # `row[2]` was not consumed anywhere in this module. `slowest task` came
+            # out as a bar in the app and a bare percentage in a paste. `pair_rows`
+            # already gives a gauged row a line of its own, so the space was
+            # reserved for a bar this surface then declined to draw.
+            #
+            # Flat, like the three headline gauges at the top of this function: only
+            # the characters survive here, and an eighth-block tip with no
+            # background behind it reads as a notch rather than the end of a bar.
+            # `ascii_mode` for the same reason those three take it -- a bar is the
+            # one thing in this view `--ascii` was originally built for, and leaving
+            # it off here put "█" and "░" back into output that had just been made
+            # pure ASCII. Round eight's test caught it on the first run.
+            prefix = ""
+            if gauge is not None:
+                prefix = bar(
+                    gauge, "", width=DETAIL_BAR_WIDTH, ascii_mode=ascii_mode, flat=True
+                ).plain
+                prefix += " " * DETAIL_BAR_GAP
             # A value on its own line still has to fit the line. `pair_rows` only
             # decides how many pairs go on one; it makes no claim about the length
             # of the survivor, so a sentence-shaped value went out at its full
@@ -252,11 +310,21 @@ def render_job(
             # the terminal then wrapped it to column 0, away from its label.
             # Continuation lines hang under the value column so the pair still
             # reads as one.
-            budget = max(20, _plain_width() - 4 - PAIR_LABEL_WIDTH - 1)
-            lines = wrap(value, budget)
-            out.append("    %s" % cell(label, lines[0] if lines else value, 0))
+            # Both the budget and the wrapping live in `render` now: the dashboard
+            # draws this row too and was measuring it differently -- clipping where
+            # this wraps, and forgetting the bar entirely, which is what put a
+            # gauged row past an 80-column terminal.
+            #
+            # `PATH_ROWS` keeps the documented exemption: "`--plain` exists to be
+            # pasted, and a path you cannot copy whole is no use in a ticket", so
+            # `workdir` overruns on purpose, as the log path below does.
+            budget = pair_value_budget(_plain_width(), len(prefix))
+            lines = pair_value_lines(label, value, budget)
+            out.append("    %s" % cell(label, prefix + lines[0], 0))
+            # Continuation hangs past the bar as well as the label, so the sentence
+            # stays under itself instead of restarting beneath the gauge.
             for extra in lines[1:]:
-                out.append("    %s %s" % (" " * PAIR_LABEL_WIDTH, extra))
+                out.append("    %s %s%s" % (" " * PAIR_LABEL_WIDTH, " " * len(prefix), extra))
 
     if show_steps and job.steps:
         out.append("")
@@ -350,7 +418,8 @@ def render_job(
     else:
         out.append(style("  findings", "bold"))
         for finding in findings:
-            colour, tag = _SEV.get(finding.severity, ("bold", "----"))
+            colour = _SEV_COLOR.get(finding.severity, "bold")
+            tag = severity_tag(finding.severity)
             out.append("")
             # Wrapped like the evidence and the action beneath it. A title is a
             # sentence -- "Peak memory reads above the limit, yet nothing was
@@ -366,13 +435,16 @@ def render_job(
                 )
             for line in wrap(finding.evidence, _prose_width(8)):
                 out.append("        " + line)
-            for index, line in enumerate(wrap(finding.action, _prose_width(11))):
-                out.append("        %s%s" % (style("-> " if index == 0 else "   ", "grey"), line))
+            for index, line in enumerate(wrap(finding.action, _prose_width(ACTION_INDENT))):
+                out.append(
+                    "        %s%s"
+                    % (style(ACTION_ARROW if index == 0 else ACTION_HANG, "grey"), line)
+                )
     out.append("")
-    return "\n".join(out), verdict
+    return _fold("\n".join(out), ascii_mode), verdict
 
 
-def render_overview(history: History, style=None, limit=25, sort="cost"):
+def render_overview(history: History, style=None, limit=25, sort="cost", ascii_mode=False):
     style = style or Style()
     stats = history.stats
     groups = sort_groups(history.groups, sort)
@@ -384,8 +456,14 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
         # so it belongs on screen rather than in the reader's memory.
         out.append("  window %s" % style(history.window, "bold"))
     # Both counts on one line: "233 jobs rolled up into 41 workloads" is one fact.
-    line = "  %d jobs in %d workload%s · %s completed" % (
+    # Both halves pluralised. Only `workload%s` was, so a one-job history read
+    # "1 jobs in 1 workload" -- the two counts sit in one sentence and disagreed
+    # about their own grammar. `TestSingularPlural` names this exact case and has
+    # been green throughout, because it presses `a` first and then reads the JOB
+    # LIST screen's sentence, which is a different one and was always right.
+    line = "  %d job%s in %d workload%s · %s completed" % (
         stats["jobs"],
+        "" if stats["jobs"] == 1 else "s",
         len(history.groups),
         "" if len(history.groups) == 1 else "s",
         format_percent(stats["completion_rate"]),
@@ -399,8 +477,8 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
         # "total" and "of them" are both load-bearing: "783 GPU-hours" alone was
         # read as a per-job figure, and a bare "18 never computed" did not say 18
         # of what.
-        hours = " · %.0f GPU-hours total" % idle[1]
-        hours += style(", %.0f of them never used" % idle[0], "yellow")
+        hours = " · " + gpu_hours_total(idle[1])
+        hours += style(idle_hours_note(idle[0], idle[1]), "yellow")
         # Onto its own line when the pair will not fit. Three clauses joined
         # unconditionally reached 88 characters and wrapped on an 80-column
         # terminal, splitting the one figure this tool exists to report across a
@@ -511,10 +589,10 @@ def render_overview(history: History, style=None, limit=25, sort="cost"):
     if tail:
         out.append(style("  … " + tail, "grey"))
     out.append("")
-    return "\n".join(out)
+    return _fold("\n".join(out), ascii_mode)
 
 
-def render_list(jobs, style=None, limit=40):
+def render_list(jobs, style=None, limit=40, ascii_mode=False):
     """The same columns the dashboard's job list draws, sized to the terminal.
 
     This was laid out with hardcoded widths totalling 135 cells, so on a
@@ -561,19 +639,20 @@ def render_list(jobs, style=None, limit=40):
     out = text_table(layout, rows, style=style)
     if len(jobs) > limit:
         out.append(style("  … %d more (raise --limit)" % (len(jobs) - limit), "grey"))
-    return "\n".join(out)
+    return _fold("\n".join(out), ascii_mode)
 
 
-def render_patterns(history: History, style=None):
+def render_patterns(history: History, style=None, ascii_mode=False):
     style = style or Style()
     body = [""]
     findings = history.patterns
     if not findings:
-        body.append(style("  no cross-run pattern met its evidence threshold.", "green"))
+        body.append(style("  " + patterns_empty(), "green"))
         body.append("")
-        return "\n".join(_titled("cross-run patterns", body, style))
+        return _fold("\n".join(_titled("cross-run patterns", body, style)), ascii_mode)
     for finding in sorted(findings, key=lambda f: severity_rank(f.severity)):
-        colour, tag = _SEV.get(finding.severity, ("bold", "----"))
+        colour = _SEV_COLOR.get(finding.severity, "bold")
+        tag = severity_tag(finding.severity)
         for index, line in enumerate(wrap(finding.title, _prose_width(2 + len(tag) + 3))):
             body.append(
                 "  %s %s"
@@ -584,13 +663,15 @@ def render_patterns(history: History, style=None):
             )
         for line in wrap(finding.evidence, _prose_width(8)):
             body.append("        " + line)
-        for index, line in enumerate(wrap(finding.action, _prose_width(11))):
-            body.append("        %s%s" % (style("-> " if index == 0 else "   ", "grey"), line))
+        for index, line in enumerate(wrap(finding.action, _prose_width(ACTION_INDENT))):
+            body.append(
+                "        %s%s" % (style(ACTION_ARROW if index == 0 else ACTION_HANG, "grey"), line)
+            )
         body.append("")
-    return "\n".join(_titled("cross-run patterns", body, style))
+    return _fold("\n".join(_titled("cross-run patterns", body, style)), ascii_mode)
 
 
-def render_nodes(history: History, metric="hang", controlled=True, style=None):
+def render_nodes(history: History, metric="hang", controlled=True, style=None, ascii_mode=False):
     style = style or Style()
     jobs = history.usable_jobs
     workload = dominant_workload(jobs, metric=metric) if controlled else None
@@ -604,8 +685,8 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
     # cells on a 100-column terminal. Same shape as the node table of round three,
     # which survived for the same reason -- the demo's own values are short.
     if workload:
-        aside = "(placement is not random)"
-        sentence = "controlled for workload: only %s counted %s" % (workload, aside)
+        aside = WORKLOAD_CONTROL_ASIDE
+        sentence = nodes_workload_control(workload)
         out.extend(
             "  " + _emphasise(_emphasise(line, workload, style), aside, style, "grey")
             for line in wrap(sentence, _prose_width(2))
@@ -639,7 +720,7 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
     if empty:
         out.extend("  " + line for line in wrap(empty, _prose_width(2)))
         out.append("")
-        return "\n".join(_titled("node reliability (%s rate)" % metric, out, style))
+        return _fold("\n".join(_titled(nodes_title(metric), out, style)), ascii_mode)
     tested = table["tested_nodes"]
     # Through the shared spec, like the other three plain tables. This one was
     # hand-formatted at `"  %-16s %9s %10s %20s  %s"`, so it was the only table here
@@ -661,7 +742,7 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
                     "NODE": row["node"],
                     "N": "%d/%d" % (row["bad"], row["trials"]),
                     "RATE": "%.1f%%" % (100 * row["rate"]),
-                    "95% CI": "%.1f - %.1f%%" % (100 * row["ci_low"], 100 * row["ci_high"]),
+                    "95% CI": ci_range(row["ci_low"], row["ci_high"]),
                     "VERDICT": (
                         row["verdict"],
                         {"worse": "red", "better": "green"}.get(row["verdict"]),
@@ -681,7 +762,7 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
         # the block they are in only renders when a node is actually worse than
         # the rest -- which the demo did not produce, so nothing measured them.
         for line in wrap(
-            "worse than every other node, after correcting for %d tested:" % tested,
+            nodes_correction_note(tested),
             _prose_width(2),
         ):
             out.append("  " + line)
@@ -689,7 +770,7 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
         # broken across two lines is not a paste.
         out.append("    %s" % style("#SBATCH --exclude=" + excl, "bold"))
         for line in wrap(
-            "not applied for you — excluding nodes trades availability for reliability.",
+            nodes_exclude_disclaimer(),
             _prose_width(4),
         ):
             out.append("    " + style(line, "grey"))
@@ -697,14 +778,12 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
         left_out = excluded_tail(table)
         if left_out:
             for line in wrap(
-                "%d further node%s scored worse too, left off the line: excluding this many "
-                "trades away more of the partition than a paste-ready suggestion should."
-                % (left_out, "" if left_out == 1 else "s"),
+                nodes_excluded_tail_note(left_out),
                 _prose_width(4),
             ):
                 out.append("    " + style(line, "grey"))
     else:
-        out.append(style("  no node is worse than the rest; nothing to exclude.", "grey"))
+        out.append(style("  " + nodes_nothing_to_exclude(), "grey"))
     # Said whenever an interval on screen disagrees with the verdict beside it.
     # About one row in twenty clears the baseline by chance, so in a table this size
     # such a row is expected -- and without this line it reads as the tool
@@ -715,10 +794,10 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None):
         for line in wrap(held_back_note(table["held_back"], tested), _prose_width(2)):
             out.append("  " + style(line, "grey"))
     out.append("")
-    return "\n".join(_titled("node reliability (%s rate)" % metric, out, style))
+    return _fold("\n".join(_titled(nodes_title(metric), out, style)), ascii_mode)
 
 
-def render_sizing(history, style=None, limit=12, sort="cost"):
+def render_sizing(history, style=None, limit=12, sort="cost", ascii_mode=False):
     """Per-workload guidance for the next submission."""
     style = style or Style()
     intro = (
@@ -760,7 +839,7 @@ def render_sizing(history, style=None, limit=12, sort="cost"):
         # and neither is bounded, so this header reached 86 cells on an 80-column
         # terminal. `_emphasise` puts the styling back on whichever line kept each
         # token whole, since the wrap has to run on the plain sentence.
-        aside = "%s · %d runs" % (group.partition, group.total)
+        aside = "%s · %d run%s" % (group.partition, group.total, "" if group.total == 1 else "s")
         header = "%s  %s" % (group.label, aside)
         if len(header) + 2 <= _plain_width():
             # Unchanged where it fits, which is the ordinary case: `wrap` collapses
@@ -804,9 +883,13 @@ def render_sizing(history, style=None, limit=12, sort="cost"):
             for line in wrap(a.basis, _prose_width(8)):
                 out.append("        " + style(line, "grey"))
             if a.caution:
-                for index, line in enumerate(wrap(a.caution, _prose_width(10))):
+                for index, line in enumerate(wrap(a.caution, _prose_width(8 + len(CAUTION_MARK)))):
                     out.append(
-                        "        %s%s" % ("! " if index == 0 else "  ", style(line, "yellow"))
+                        "        %s%s"
+                        % (
+                            CAUTION_MARK if index == 0 else CAUTION_HANG,
+                            style(line, "yellow"),
+                        )
                     )
         for line in sbatch_lines(advice):
             out.append("    " + style(line, "bold"))
@@ -824,14 +907,16 @@ def render_sizing(history, style=None, limit=12, sort="cost"):
         )
         out.append("")
     elif hidden_groups:
-        tail = "… %d more workload%s (%d runs) also have advice, below the %d shown. " % (
+        tail = "… %d more workload%s (%d run%s) also ha%s advice, below the %d shown. " % (
             hidden_groups,
             "" if hidden_groups == 1 else "s",
             hidden_runs,
+            "" if hidden_runs == 1 else "s",
+            "s" if hidden_groups == 1 else "ve",
             limit,
         )
         tail += "Narrow --since, or ask about one with `slurmpast --sizing -p <partition>`."
         for line in wrap(tail, _prose_width(2)):
             out.append("  " + style(line, "grey"))
         out.append("")
-    return "\n".join(_titled("what to request next time", out, style))
+    return _fold("\n".join(_titled("what to request next time", out, style)), ascii_mode)
