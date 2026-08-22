@@ -264,6 +264,66 @@ def _bad(job):
     return job.failed
 
 
+class Workload(str):
+    """The stratum a node comparison holds fixed: one person's piece of work.
+
+    A job *name* is not that identity once a query spans users, and one flag away
+    is exactly where it stops being one -- ``-u alice,bob`` and ``--all-users``.
+    Measured on this cluster: over two days **25 job names are used by more than
+    one person**, `interactive` by eight of them and `ssd_lab_base` by six. Pooled
+    under one name, alice's twelve hangs on a node and bob's twelve clean runs on
+    the same node report 12/24 = 50% for a node that is 100% for alice and 0% for
+    bob -- so the module whose entire reason for existing is holding the workload
+    fixed was not holding it fixed.
+
+    `patterns.group_key` had this defect and it was fixed there, in these words:
+    "two people's unrelated ``run.sh`` on one partition became a single fabricated
+    workload". The fix never reached here.
+
+    **A ``str`` subclass, deliberately.** Its string value is what the screens
+    print, so every caller that interpolates or searches a workload keeps working
+    and the identity rides along in ``.name`` and ``.user``. A tuple type was
+    written first and broke 71 tests in one run: ``"only %s counted" % workload``
+    unpacks a tuple instead of formatting it, and ``workload in text`` raises. A
+    value whose whole job is to be displayed should be the thing displayed.
+
+    ``user=None`` means "any", which is what a bare name has always meant and is
+    correct for the single-user query that is the default -- so a caller passing a
+    plain string keeps exactly today's behaviour.
+
+    ``qualified`` puts the owner into the printed label, and is set only when the
+    history the workload was chosen from spans more than one user: "alice's
+    interactive" precisely where that distinction is load-bearing, "cot-exp"
+    otherwise.
+    """
+
+    __slots__ = ("name", "user")
+
+    # Annotated as well as slotted: `__slots__` reserves the storage, and mypy
+    # needs the declaration to know the attributes exist at all.
+    name: str
+    user: str | None
+
+    def __new__(cls, name, user=None, qualified=False):
+        label = "%s's %s" % (user, name) if (qualified and user) else str(name)
+        workload = super().__new__(cls, label)
+        workload.name = str(name)
+        workload.user = user
+        return workload
+
+    def matches(self, job) -> bool:
+        if normalize_name(job.name) != normalize_name(self.name):
+            return False
+        return self.user is None or job.user == self.user
+
+
+def as_workload(value):
+    """A :class:`Workload` from whatever a caller passed, or None."""
+    if value is None or isinstance(value, Workload):
+        return value
+    return Workload(str(value))
+
+
 def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
     """Per-node rates.
 
@@ -279,8 +339,9 @@ def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
     "the same workload" means everywhere else in the codebase.
     """
     records = usable(jobs)
+    workload = as_workload(workload)
     if workload:
-        records = [j for j in records if normalize_name(j.name) == normalize_name(workload)]
+        records = [j for j in records if workload.matches(j)]
 
     predicate = looks_like_noop if metric == "hang" else _bad
 
@@ -371,7 +432,12 @@ def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
         "trials": total_trials,
         "hits": total_hits,
         "metric": metric,
-        "workload": workload,
+        # The bare name, and the owner beside it rather than folded into a display
+        # label: a consumer of `--nodes --json` filtering on `workload` was reading
+        # a name before this and must keep reading one. The qualified "alice's
+        # interactive" form is for screens; see Workload.
+        "workload": workload.name if workload else None,
+        "workload_user": workload.user if workload else None,
         "tested_nodes": len(rows),
         "held_back": held_back,
         "skipped_nodes": sum(1 for n, t in totals.items() if t < min_samples),
@@ -421,17 +487,23 @@ def dominant_workload(jobs, metric=None):
     # times its size -- 120 runs of `routine-check` beating 200 runs spread over 200
     # distinct strings -- so the screen controlled on the wrong stratum and never
     # tested the sweep's genuinely bad node at all.
+    # Keyed by (name, user), not by name: see Workload. Under the single-user query
+    # that is the default this changes nothing, because the user is constant.
     counts, events = {}, {}
     for job in records:
-        name = normalize_name(job.name)
-        counts[name] = counts.get(name, 0) + 1
+        key = (normalize_name(job.name), job.user)
+        counts[key] = counts.get(key, 0) + 1
         if predicate is not None and predicate(job):
-            events[name] = events.get(name, 0) + 1
+            events[key] = events.get(key, 0) + 1
+    spans_users = len({job.user for job in records}) > 1
     if events:
         # Most events first, then most runs -- both feed the statistical power to
         # tell one node apart from another.
-        return max(events, key=lambda name: (events[name], counts[name]))
-    return max(counts.items(), key=lambda kv: kv[1])[0]
+        best = max(events, key=lambda key: (events[key], counts[key]))
+    else:
+        best = max(counts.items(), key=lambda kv: kv[1])[0]
+    name, user = best
+    return Workload(name, user, qualified=spans_users)
 
 
 def suggest_exclude(table, limit=8):

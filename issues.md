@@ -1,5 +1,19 @@
 # slurmpast — audit and resolution
 
+> **Round twenty-five, 2026-08-22.** One defect, and it is the most consequential
+> of the streak: the module whose entire reason for existing is holding a workload
+> fixed was not holding it fixed. It changes a *rate*, not wording. 1514 tests
+> before, **1520 after**; all four gates clean.
+>
+> `patterns.group_key` had this same defect and it was fixed there, in these words:
+> "two people's unrelated `run.sh` on one partition became a single fabricated
+> workload". `nodes.py` never got the fix. Seventh "fixed only on one side" in this
+> record, and the first to move a number a reader acts on.
+>
+> Found by running `--all-users --nodes` -- a combination in the README's own
+> examples -- against the real cluster and asking why a 486,882-job query had
+> reduced itself to 17 placements of one stranger's workload.
+
 > **Round twenty-four, 2026-08-22.** Real data, widened from one user to the whole
 > cluster: 471 users, 486,882 jobs in two days, and states, id shapes and string
 > lengths no single account contains. Two defects. 1498 tests before, **1514
@@ -282,6 +296,81 @@
 > upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
 > was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
 > and its control. `ruff`, `ruff format` and `mypy` clean.
+
+---
+
+## Round twenty-five — "controlled for workload" was controlling on a name
+
+| # | Problem | Where | Test |
+|---|---|---|---|
+| 1 | The node comparison held a job *name* fixed, not a workload, so a multi-user query pooled different people's unrelated jobs into one stratum | `nodes.py` `dominant_workload`, `node_table` | `TestTheWorkloadControlHoldsOnePersonsWork` |
+
+### 1. A confound the control did not control
+
+`nodes.py` exists to answer "which nodes eat my jobs", and its whole method is
+holding the workload fixed because placement is not random. It did that by
+comparing normalised job **names**:
+
+```python
+records = [j for j in records if normalize_name(j.name) == normalize_name(workload)]
+```
+
+A multi-user query is one flag away -- `-u alice,bob` and `--all-users`, both in
+the README's examples -- and on this cluster **25 job names are used by more than
+one person** over two days: `interactive` by eight of them, `ssd_lab_base` by six,
+`bc_jupyter` by four. Constructed from that shape:
+
+```
+alice: 12 runs of `interactive` on n1, all hung
+bob:   12 runs of `interactive` on n1, all clean
+alice: 12 runs of `interactive` on n2, all clean
+
+before   n1  12/24   50.0%  worse     <- neither person's rate
+after    n1  12/12  100.0%  worse     <- alice's, which is what was asked for
+```
+
+50% is a number belonging to nobody. `patterns.group_key` already puts the user in
+the identity, for exactly this reason and in exactly these words -- "two people's
+unrelated `run.sh` on one partition became a single fabricated workload" -- so the
+codebase had already diagnosed the hazard and fixed it in one of the two places it
+occurs.
+
+`nodes.Workload` is that identity now: a name, an owner, and `matches()`.
+`dominant_workload` counts by `(name, user)` and returns one; `node_table` filters
+through it. Under the single-user query that is the default the user is constant
+and nothing changes -- verified against a real 30-day history, byte for byte.
+
+**It is a `str` subclass, and that was the second attempt.** A `NamedTuple` is a
+tuple, so `"only %s counted" % workload` unpacks it and `workload in text` raises:
+71 tests failed in one run. A value whose whole job is to be displayed should be
+the thing displayed, so the class *is* its label and carries `.name` / `.user`
+alongside. Every existing caller -- and the 47 test call sites that pass a bare
+name -- keep working untouched, and a bare name still means "any user", which is
+what it has always meant and is correct for a single-user history.
+
+**The screen names the owner only where that is load-bearing.** `qualified` is set
+when the history the workload was chosen from spans more than one user:
+
+```
+--all-users   controlled for workload: only dsafarian's oligomers counted
+own history   controlled for workload: only rd-s#-run counted
+```
+
+**`--nodes --json` keeps a machine-readable field.** `workload` stays the bare
+name, with the owner beside it in a new `workload_user`, rather than the display
+label -- a consumer filtering on `workload` was reading a name and must keep
+reading one.
+
+### The negative results
+
+* **`--all-users --nodes` at cluster scale**: 3 hours, ~80,000 jobs, 20.0s and
+  514 MB. It runs, and its answer ("no node reached the 10 placements a comparison
+  needs") is honest rather than wrong -- three hours of one workload is genuinely
+  too thin. The defect was never that it failed; it was that the stratum it chose
+  was not a workload.
+* **453 distinct nodes** touched cluster-wide in two days, against the 3 the demo
+  has and the 34 in a personal history. No layout or statistical problem at that
+  scale.
 
 ---
 
@@ -3005,6 +3094,14 @@ entry was refusing, replaced by the smallest change that keeps the idiom intact.
 ---
 
 ## Consequence for the numbers
+
+**Round twenty-five.** This one moves a measurement, but only on a query that spans
+users. `--all-users --nodes` and `-u alice,bob --nodes` now compare one person's
+workload rather than everyone's jobs that share its name, so a rate can change --
+50.0% to 100.0% on the constructed pair above. A single-user query, which is the
+default, is byte-identical. `--nodes --json` gains `workload_user`; `workload`
+itself still carries the bare name. The screens name the owner only when the
+history spans users.
 
 **Round twenty-four.** `slurmpast <unexpanded array id>` starts working where it
 exited 2; nothing that worked before changes, since every other id form is passed

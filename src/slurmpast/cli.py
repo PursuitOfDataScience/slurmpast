@@ -20,7 +20,7 @@ from .duration import humanize_window
 from .index import History, filter_jobs, sort_groups
 from .logs import assign_logs, read_tail
 from .model import severity_rank
-from .nodes import note_for_allocation
+from .nodes import Workload, note_for_allocation
 from .sacct import Sacct, SacctError, live_job_ids
 
 EPILOG = """\
@@ -358,7 +358,11 @@ def _node_note(job, history):
     if history is None or len(history) <= 20:
         return ""
     # The whole allocation, not just its first node -- see note_for_allocation.
-    return note_for_allocation(history.usable_jobs, job.node_list, workload=job.name)
+    # The job's OWN workload, user included: `history` may span users under
+    # `-u alice,bob` or `--all-users`, and a bare name pools whoever shares it.
+    return note_for_allocation(
+        history.usable_jobs, job.node_list, workload=Workload(job.name, job.user)
+    )
 
 
 def _job_json(job, log_path, verdict):

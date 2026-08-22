@@ -1626,11 +1626,14 @@ class JobScreen(ScreenChrome, Screen[Any]):
         history: History | None = self.sp.history
         note = ""
         if history is not None and len(history) > 20:
-            from .nodes import note_for_allocation
+            from .nodes import Workload, note_for_allocation
 
             # The whole allocation, not just its first node -- a multi-node job's
             # bad node is rarely the one Slurm happened to list first.
-            note = note_for_allocation(history.usable_jobs, job.node_list, workload=job.name)
+            # The job's own workload, user included -- see nodes.Workload.
+            note = note_for_allocation(
+                history.usable_jobs, job.node_list, workload=Workload(job.name, job.user)
+            )
 
         verdict = diagnose(job, log_text=log_text, node_note=note)
 
