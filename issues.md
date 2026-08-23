@@ -19,7 +19,10 @@
 >
 > A `sacct` field containing a newline shattered the record, so 41 real rows parsed
 > as 56 "jobs" and the overview reported 47 unterminated records where there were
-> 2. `slurmpast > report.txt` launched the dashboard anyway and hung until killed,
+> 2 -- and, worse than its own report first said, `slurmpast <jobid>` on any job
+> submitted with a multi-line `--wrap` rendered a *phantom* instead of the job,
+> reporting "the record was never closed" about a job that had OOMed four minutes
+> earlier. `slurmpast > report.txt` launched the dashboard anyway and hung until killed,
 > having written 26 KB of escape sequences into the file. And the internal grouping
 > signature was being printed as a workload's name, so a date-stamped job appeared
 > in the top 25 as `#`.
@@ -514,6 +517,24 @@ nothing else about the spelling is guaranteed across releases, and on a package
 whose point is running on a cluster nobody here has seen, discarding a real row is
 a worse failure than admitting a malformed one.
 
+That is not a hypothetical. Run against Midway3's real 30-day history -- 43,913
+accounting lines, 13,387 records -- the anchored spelling rejects exactly two
+rows, and both are real:
+
+```
+'53421602_[10-15%5]' | cloze_S | CANCELLED by 940740146
+'53488568_[1-6%1]'   | n93big  | CANCELLED by 940740146
+```
+
+A pending array range is written `<id>_[lo-hi%throttle]`, which the anchored form
+has no branch for. Taking the report's regex literally would have fixed a parser
+that invented jobs by shipping one that deletes them.
+
+The same run is the reason this bug could not have been found here: every one of
+those 43,913 physical lines carries the delimiter, so nothing on this cluster's
+history is multi-line at all. The fix is a no-op on Midway3 and load-bearing on
+Midway2, which is the whole argument for the second cluster.
+
 **Narrowed from the report.** It also asked that rejected records be *counted*
 rather than silently dropped. They are not. There is no channel from `parse` to
 the screens for such a count, and adding one touches `sacct` → `cli`/`tui` →
@@ -610,8 +631,101 @@ count is now suppressed when `hits` is zero, and kept otherwise -- with events o
 record those nodes *are* why the table is empty, and every other truncated view
 here names its tail.
 
+### 1c. SP-1 is worse than its own report first said, and the escalation is right
+
+A fourth round of the midway2 pass built three jobs with genuine failure modes on
+that cluster and asked the tool why they died. It then retracted round 1's own
+conclusion, which had been:
+
+> "Not corrupted: the 11 real job records survive … This is a count/garbage bug,
+> **not a data-loss bug**."
+
+That held only for the aggregate views, which filter phantoms through `usable()`.
+`cli.main` sets `matches = jobs` on the explicit-id branch and filters nothing, so
+the headline command rendered a *phantom* instead of the job asked for:
+
+```
+$ slurmpast 48819165 --plain
+  [INFO] Accounting record is not closed
+        State=? with End=Unknown. Elapsed (n/a) is measured from start to *now* …
+        → squeue has never heard of it, so the job is long gone and the record
+          was never closed.
+
+job "  ?
+  ● TIME   ░░░░░░░░░░░░░░░░░░          n/a   · n/a of the n/a limit
+  job
+    name             n/a
+```
+
+named `"` for a quote character out of the wrap script, every field `n/a`, and the
+whole post-mortem printed twice. The truth was `OUT_OF_MEMORY` four minutes
+earlier, with `slurmstepd: Detected 1 oom_kill event` sitting in the log. The
+report's contrast isolates the trigger exactly: of its three jobs, the only one
+that misdiagnosed was the only one whose `SubmitLine` spanned more than one line.
+
+So this was never a reporting nit. A user asking the one question the tool exists
+to answer got a confident wrong answer, not a degraded one.
+
+**No further code change.** The fix above already covers it -- phantoms cannot be
+produced, so the id branch has only the real record to render. Verified through
+the real runner rather than by handing `parse` some text, because the damage lived
+between the parser and the id branch:
+
+```
+job 48819165  OUT_OF_MEMORY
+  ● TIME   █░░░░░░░░░░░░░░░░░         6.0%   · 36.0s of the 00:10:00 limit
+  ● MEM    ██████████████████       100.0%   · 100.0 MiB of the 100.0 MiB limit
+  job
+    name             oomjob                          partition        build
+    submitted as     python - <<'PY'
+                     buf = 'x' * (600 << 20)
+                     …
+  [FAIL] Host memory exhausted
+```
+
+One block, the real name, the real state, the real cause, and the wrap script
+rendered whole. `TestTheSingleJobPostMortemOnAMultiLineWrap` pins all four; three
+of its four fail against the reverted tree with precisely the output above, and
+the fourth is marked in its own docstring as supporting rather than
+discriminating, because the phantoms it would otherwise catch print those same
+lines by being them.
+
+Recorded because the *severity* changed and nothing else did: had the report
+stopped at round 1, this fix would have looked optional.
+
+### 1d. The report bounded SP-1's reach itself, and the bound holds
+
+Round 1 named `index.py`'s search as somewhere the phantoms might also have got
+to -- "anything iterating raw `jobs` is not [safe]: check `index.py`'s search
+index". A fifth round tested it, on a one-day history where the garbage
+outnumbered the real records 3:1, and found nothing: searching the TUI for a
+string that existed *only* inside a phantom matched no workload.
+
+Confirmed here by reading the path rather than taking the result. Every consumer
+of the model in `index.py` goes through `usable()` -- `group_jobs` at
+`index.py:189`, `History.usable_jobs` at `453`, the `--failed`/`--problem` list
+at `cli.py:846`, and the TUI's job list at `tui.py:1098` -- and `usable` drops an
+open-ended record, which every phantom was.
+
+So SP-1's confirmed reach was exactly the two surfaces fixed above: the
+`"N unterminated, excluded"` count, and the single-job post-mortem. Not the
+workload rollup, the TUI job list, the search index, `--nodes`, `--patterns` or
+`--sizing`.
+
+**No code change, and the scope was deliberately not widened to match the
+worry.** Recorded because an unwritten negative result gets re-investigated -- and
+because the two surfaces that *were* affected were both reached by a path that
+does not call `usable()`, which is the property to check if a third one is ever
+added.
+
 ### Consequence for the numbers
 
+* **`slurmpast <jobid>` stops answering with a different job.** Any job submitted
+  with a multi-line `sbatch --wrap` was rendered as a phantom -- unknown state,
+  every gauge `n/a`, an "Accounting record is not closed" finding -- and now
+  renders itself. This is the largest user-visible change in the round, and the
+  exit code moves with it: the OOM above exited 0 as an unreadable record and
+  exits 1 as a diagnosed failure.
 * **The parser fix moves a count that was wrong, and no measurement.** Any history
   containing a multi-line `sbatch --wrap` loses its phantom records, so
   `excluded_open_records` -- the `"N unterminated, excluded"` line, and the same
@@ -637,9 +751,13 @@ here names its tail.
   locale neutrality, the `-S '-7days'` rewrite, the nonexistent-user error, the
   `--all-users` scaling, and the exclusion of still-running array tasks.
 * The report's own two retractions were not re-litigated.
-* 1560 tests before, **1581 after** -- 21 new, one per fix and its control. Each
-  new test was run against the reverted tree: 15 fail there and 6 pass, and the 6
-  are exactly the controls.
+* 1560 tests before, **1586 after** -- 26 new, one per fix and its control. Each
+  new test was run against the reverted tree: 18 fail there and 8 pass, and the 8
+  are the controls plus one supporting assertion that says so in its docstring.
+  The last of them, `test_a_pending_array_range_is_not_mistaken_for_a_continuation`,
+  is a control on the *fix* rather than the bug: it fails against the stricter
+  JobID guard the report asked for, which is the only way a reader can tell that
+  narrowing was a decision and not an omission.
 * `ruff`, `ruff format`, `mypy` and `pytest` all clean.
 
 ## Round thirty-two — nothing found, and what was looked at

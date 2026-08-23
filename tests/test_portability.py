@@ -2316,6 +2316,172 @@ class TestAFieldMayContainANewline:
         )
         assert goodput(parse(text, fields=_FIELDS))["excluded_open_records"] == 1
 
+    def test_a_pending_array_range_is_not_mistaken_for_a_continuation(self):
+        """The control for how loose the boundary guard is allowed to be.
+
+        The report asked that a record be rejected unless its first field matches
+        `^\\d+(_\\d+)?(\\.\\S+)?$`. Taken literally that deletes real rows: a
+        *pending* array is written `<id>_[lo-hi%throttle]`, which the anchored
+        spelling has no branch for. Two such rows sit in Midway3's own 30-day
+        history --
+
+            53421602_[10-15%5] | cloze_S | CANCELLED by 940574...
+            53488568_[1-6%1]   | n93big  | CANCELLED by 940574...
+
+        -- so the strict guard would have replaced a parser that invents jobs
+        with one that loses them. Hence: first character a digit, no whitespace.
+        """
+        text = make_text(
+            row(
+                JobID="53421602_[10-15%5]",
+                JobName="cloze_S",
+                User="youzhi",
+                State="CANCELLED by 940740146",
+                Submit="2026-08-20T09:00:00",
+                SubmitLine="sbatch --array=1-15%5 run.sh",
+            ),
+            row(
+                JobID="53421603+0",
+                JobName="het",
+                User="youzhi",
+                State="COMPLETED",
+                Start="2026-08-20T10:00:00",
+                End="2026-08-20T10:05:00",
+                ElapsedRaw="300",
+                SubmitLine="sbatch het.sh",
+            ),
+        )
+        assert [j.job_id for j in parse(text, fields=_FIELDS)] == [
+            "53421602_[10-15%5]",
+            "53421603+0",
+        ]
+
+
+class TestTheSingleJobPostMortemOnAMultiLineWrap:
+    """The surface that made the newline bug a wrong answer rather than a wrong
+    count -- and the one the first report got wrong about itself.
+
+    Round 1 of the midway2 report concluded "not corrupted ... this is a
+    count/garbage bug, **not a data-loss bug**", true only of the aggregate views,
+    which filter phantoms through `usable()`. `cli.main` sets `matches = jobs` on
+    the explicit-id branch and filters nothing, so a real OOM job submitted with a
+    multi-line `sbatch --wrap` rendered a *phantom* instead:
+
+        job "  ?
+          ● TIME   ░░░░░░░░░░░░          n/a   · n/a of the n/a limit
+          job
+            name             n/a
+          [INFO] Accounting record is not closed
+                → squeue has never heard of it, so the job is long gone
+
+    named `"` for a quote character out of the wrap script, and printed twice.
+    The truth was `OUT_OF_MEMORY`, four minutes earlier. A user asking this tool's
+    headline question got a confident wrong answer, not a degraded one.
+
+    Driven through the real runner rather than by handing `parse` some text: the
+    defect lived between the parser and the id branch, so a test that stops at
+    `parse` would not have seen it.
+    """
+
+    WRAP = "python - <<'PY'\nbuf = 'x' * (600 << 20)\nprint('allocated')\nPY\necho done"
+
+    def _runner(self):
+        text = make_text(
+            row(
+                JobID="48819165",
+                JobName="oomjob",
+                User="youzhi",
+                Partition="build",
+                State="OUT_OF_MEMORY",
+                ExitCode="0:125",
+                Submit="2026-08-22T15:00:00",
+                Start="2026-08-22T15:00:05",
+                End="2026-08-22T15:00:41",
+                ElapsedRaw="36",
+                Timelimit="00:10:00",
+                TimelimitRaw="10",
+                ReqMem="100M",
+                ReqCPUS="1",
+                NCPUS="1",
+                AllocCPUS="1",
+                NNodes="1",
+                NodeList="midway2-0300",
+                AllocTRES="billing=1,cpu=1,mem=100M,node=1",
+                SubmitLine=self.WRAP,
+            ),
+            row(
+                JobID="48819165.batch",
+                JobName="batch",
+                State="OUT_OF_MEMORY",
+                ExitCode="0:125",
+                ElapsedRaw="36",
+                TotalCPU="00:00.900",
+                MaxRSS="102400K",
+                NCPUS="1",
+                NNodes="1",
+                NodeList="midway2-0300",
+            ),
+            row(
+                JobID="48819165.extern",
+                JobName="extern",
+                State="COMPLETED",
+                ExitCode="0:0",
+                ElapsedRaw="36",
+                NCPUS="1",
+                NNodes="1",
+                NodeList="midway2-0300",
+            ),
+        ).replace("|", SAFE_DELIMITER)
+
+        def run(args):
+            # The field probe has to answer from the same fake Slurm, or the query
+            # negotiates against whatever sacct is on the runner's PATH.
+            if "--helpformat" in args:
+                return " ".join(_FIELDS)
+            if args and args[0] in ("squeue", "scontrol"):
+                return ""
+            return text
+
+        return run
+
+    def _report(self, monkeypatch, capsys):
+        from slurmpast import cli
+
+        monkeypatch.setattr("slurmpast.sacct._run", self._runner())
+        code = cli.main(["48819165", "--plain", "--no-color", "--no-logs"])
+        return code, capsys.readouterr().out
+
+    def test_the_post_mortem_is_printed_once(self, monkeypatch, capsys):
+        _code, out = self._report(monkeypatch, capsys)
+        assert out.count("● TIME") == 1, out
+
+    def test_it_is_the_real_job_and_not_a_phantom(self, monkeypatch, capsys):
+        _code, out = self._report(monkeypatch, capsys)
+        assert "job 48819165  OUT_OF_MEMORY" in out, out
+        assert "oomjob" in out
+        assert "n/a of the n/a limit" not in out
+
+    def test_the_real_cause_is_diagnosed(self, monkeypatch, capsys):
+        """Not merely "a record was found" -- the finding that made this worth
+        reporting was the tool confidently naming the wrong cause."""
+        code, out = self._report(monkeypatch, capsys)
+        assert "Host memory exhausted" in out, out
+        assert "Accounting record is not closed" not in out
+        assert code == 1, "an OOM is a finding the exit code has to carry"
+
+    def test_the_wrap_script_is_shown_whole(self, monkeypatch, capsys):
+        """The job screen prints `submitted as`, so every line of the script has
+        to have survived the parse to reach it.
+
+        Supporting, not discriminating: against the reverted tree the same lines
+        appear anyway, as the *phantom records they were turned into*.
+        `test_the_multi_line_submit_line_survives_whole` is the one that tells the
+        two apart, because it asks a single Job for the whole field.
+        """
+        _code, out = self._report(monkeypatch, capsys)
+        for line in self.WRAP.split("\n"):
+            assert line in out, line
+
 
 class TestARedirectMustNotLaunchTheDashboard:
     """`slurmpast > report.txt` hung forever, which is the most ordinary thing
