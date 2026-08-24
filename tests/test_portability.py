@@ -4248,3 +4248,214 @@ class TestNoLogsTouchesNoFilesystem:
         cli.main(["900002", "--json", "--no-color"])
         capsys.readouterr()
         assert [s for s in seen if "sentinel-dir" in s], "the probe should have run here"
+
+
+class TestARecycledJobIdIsNotARequeue:
+    """`sacct -D -j <id>` carries no window, so it answers with every job that
+    has *ever* held the id.
+
+    Measured on Mercury (UChicago Booth), Slurm 25.11.3, RHEL 9.8: all 40 ids
+    sampled from three recent days came back with a second row, seven years
+    older and belonging to somebody else. The counter had wrapped and slurmdbd
+    still held the 2019 records::
+
+        509531|mercury|aranda   |standard|dsa-3-20                          |2019-03-03
+        509531|mercury|cmbrennan|highmem |did_bigquery_priority_general_2026|2026-08-19
+
+    `_fold_incarnations` keyed on the id alone, so every per-job view on that
+    cluster printed `requeued 1x` -- and the incarnation it attributed to the
+    reader was a stranger's job. Windowed queries were never affected: `-S/-E`
+    filters the old rows out at sacct, so only the per-job path, which has no
+    window to pass, ever saw them.
+    """
+
+    def _jobs(self, *incarnations):
+        return parse(
+            make_text(
+                *[
+                    row(
+                        JobID="509531",
+                        Cluster=cluster,
+                        User=user,
+                        UID=uid,
+                        JobName=name,
+                        State="COMPLETED",
+                        ExitCode="0:0",
+                        Submit=stamp,
+                        Start=stamp,
+                        End=stamp,
+                        ElapsedRaw="60",
+                    )
+                    for cluster, user, uid, name, stamp in incarnations
+                ]
+            ),
+            fields=_FIELDS,
+        )
+
+    MERCURY_2019 = ("mercury", "aranda", "5101", "dsa-3-20", "2019-03-03T18:35:08")
+    MERCURY_2026 = ("mercury", "cmbrennan", "7742", "did_bigquery", "2026-08-19T22:21:07")
+
+    def test_the_stranger_is_not_folded_in_as_a_requeue(self):
+        (job,) = self._jobs(self.MERCURY_2019, self.MERCURY_2026)
+        assert job.earlier == (), "a recycled id is not this job's history"
+        assert job.user == "cmbrennan", "the newest incarnation is still the job"
+
+    def test_a_genuine_requeue_still_folds(self):
+        """The control. Without it the fix above passes by never folding at all,
+        which would delete the requeue reporting this file exists to protect."""
+        first = ("mercury", "cmbrennan", "7742", "did_bigquery", "2026-08-19T22:21:07")
+        second = ("mercury", "cmbrennan", "7742", "did_bigquery", "2026-08-19T23:40:00")
+        (job,) = self._jobs(first, second)
+        assert len(job.earlier) == 1, "a real requeue keeps its earlier attempt"
+        assert job.submit == "2026-08-19T23:40:00"
+
+    def test_a_different_cluster_sharing_the_id_is_not_folded(self):
+        """One slurmdbd can serve several clusters, and ids are per-cluster.
+
+        The two rows need distinct `Submit` values to reach the fold at all:
+        `parse` keys allocations on `(JobID, Submit)`, so same-id same-instant
+        rows collapse a step earlier and this would assert nothing.
+        """
+        other = ("midway3", "cmbrennan", "7742", "did_bigquery", "2026-08-18T04:00:00")
+        (job,) = self._jobs(other, self.MERCURY_2026)
+        assert job.earlier == ()
+        assert job.cluster == "mercury"
+
+    def test_only_the_stranger_and_what_is_behind_it_is_dropped(self):
+        """The trailing run is the job's own history. An attempt between the
+        stranger and the newest row is a real requeue and has to survive."""
+        middle = ("mercury", "cmbrennan", "7742", "did_bigquery", "2026-08-19T20:00:00")
+        (job,) = self._jobs(self.MERCURY_2019, middle, self.MERCURY_2026)
+        assert len(job.earlier) == 1
+        assert job.earlier[0].submit == "2026-08-19T20:00:00"
+
+    def test_a_blank_identity_folds_as_before(self):
+        """Conservative on missing data: sacct leaves these blank often enough
+        that a blank must not split a requeue that really happened."""
+        blank_a = ("", "", "", "work", "2026-08-19T22:21:07")
+        blank_b = ("", "", "", "work", "2026-08-19T23:40:00")
+        (job,) = self._jobs(blank_a, blank_b)
+        assert len(job.earlier) == 1
+
+    def test_the_id_still_yields_exactly_one_job(self):
+        """`logs.resolve` and `cli` both key dicts on `job_id`, so the
+        one-Job-per-id contract in `_fold_incarnations` is load-bearing: two Jobs
+        sharing an id would hand one of them the other's log."""
+        jobs = self._jobs(self.MERCURY_2019, self.MERCURY_2026)
+        assert len(jobs) == 1
+
+
+class TestTheMemorySlackCaveatIsWordedFromTheCluster:
+    """The `memory-slack` finding hardcoded a sentence about MaxRSS that is only
+    true under `jobacct_gather/linux`.
+
+    `site.maxrss_caveat()` exists so this is asked of the cluster rather than
+    assumed, and `diagnose` already used it for the two findings immediately
+    above this one -- `host-oom` and `rss-above-limit`. This one was missed, so
+    on Mercury (`jobacct_gather/cgroup`) a single run of the tool printed both
+    "MaxRSS comes from the cgroup peak here" under `--sizing` and "MaxRSS
+    over-reports multi-process jobs" in the per-job view, about the same figure.
+    """
+
+    def _finding(self, monkeypatch, gather):
+        from slurmpast.diagnose import diagnose
+
+        monkeypatch.setattr("slurmpast.site._CACHE", [Site(jobacct_gather_type=gather)])
+        job = parse(
+            make_text(
+                row(
+                    JobID="700100",
+                    JobName="slack",
+                    User="youzhi",
+                    State="COMPLETED",
+                    ExitCode="0:0",
+                    Submit="2026-08-01T09:00:00",
+                    Start="2026-08-01T09:00:00",
+                    End="2026-08-01T11:00:00",
+                    ElapsedRaw="7200",
+                    Timelimit="04:00:00",
+                    TimelimitRaw="240",
+                    NCPUS="4",
+                    AllocCPUS="4",
+                    NNodes="1",
+                    ReqMem="128G",
+                    AllocTRES="billing=4,cpu=4,mem=128G,node=1",
+                    TotalCPU="02:00:00",
+                ),
+                row(
+                    JobID="700100.batch",
+                    JobName="batch",
+                    State="COMPLETED",
+                    ElapsedRaw="7200",
+                    MaxRSS="19660800K",
+                    TotalCPU="02:00:00",
+                ),
+            ),
+            fields=_FIELDS,
+        )[0]
+        for f in diagnose(job).findings:
+            if f.code == "memory-slack":
+                return f
+        raise AssertionError("the finding under test did not fire")
+
+    def test_a_cgroup_cluster_is_not_told_the_figure_over_reports(self, monkeypatch):
+        finding = self._finding(monkeypatch, "jobacct_gather/cgroup")
+        assert "cgroup peak" in finding.action, finding.action
+        assert "over-report" not in finding.action, finding.action
+
+    def test_a_linux_gathering_cluster_still_gets_the_warning(self, monkeypatch):
+        """The control. The caveat is a *cluster* property, not a sentence that
+        was simply deleted -- under the process-tree gatherer it still holds."""
+        finding = self._finding(monkeypatch, "jobacct_gather/linux")
+        assert "sums RSS" in finding.action, finding.action
+        assert "upper bound" in finding.action, finding.action
+
+    def test_the_advice_flag_survives_the_rewording(self, monkeypatch):
+        """`format_mem_flag`, not `format_bytes`: the pasteable spelling is the
+        reason this action reads the way it does, and a reworded sentence must
+        not quietly take it back to `--mem=25.0 GiB`."""
+        finding = self._finding(monkeypatch, "jobacct_gather/cgroup")
+        assert "--mem=25G" in finding.action, finding.action
+
+    def test_it_agrees_with_what_sizing_says_on_the_same_cluster(self, monkeypatch):
+        """The defect was not the wording on its own but that two surfaces
+        contradicted each other about one number in one run."""
+        monkeypatch.setattr(
+            "slurmpast.site._CACHE", [Site(jobacct_gather_type="jobacct_gather/cgroup")]
+        )
+        finding = self._finding(monkeypatch, "jobacct_gather/cgroup")
+        assert maxrss_caveat() in finding.action
+
+
+class TestSubMegabyteFiguresCarryAUnit:
+    """`format_bytes` fell from MiB straight to raw bytes, so the two figures a
+    reader most wants to compare arrived in units that cannot be compared by eye.
+
+    Both seen on Mercury in one job detail: `read 9.5 GiB` beside
+    `rate 488928 B/s`, and a step table with `612794 B` in the same column as
+    `79.0 MiB`.
+    """
+
+    def test_a_sub_megabyte_figure_reads_in_kib(self):
+        from slurmpast.duration import format_bytes
+
+        assert format_bytes(488928) == "477.5 KiB"
+        assert format_bytes(612794) == "598.4 KiB"
+
+    def test_the_byte_floor_survives(self):
+        """The control. Below 1 KiB bytes are the honest unit, and `0` must not
+        start rendering as `0.0 KiB` -- `format_bytes` promises `n/a` for None
+        and a real `0 B` for zero, and a test already pins that."""
+        from slurmpast.duration import format_bytes
+
+        assert format_bytes(0) == "0 B"
+        assert format_bytes(1023) == "1023 B"
+        assert format_bytes(1024) == "1.0 KiB"
+
+    def test_the_larger_tiers_are_untouched(self):
+        from slurmpast.duration import format_bytes
+
+        assert format_bytes(1024**2) == "1.0 MiB"
+        assert format_bytes(1024**3) == "1.0 GiB"
+        assert format_bytes(1024**4) == "1.0 TiB"
+        assert format_bytes(None) == "n/a"

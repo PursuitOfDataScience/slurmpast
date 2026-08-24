@@ -38,6 +38,65 @@
 > 100% baseline is only called a workload failure once there are enough placements
 > to support the claim.
 
+> **Release 0.8.1, 2026-08-24.** Three defects, all found by running the published
+> 0.8.0 against a **third** cluster: Mercury, at the University of Chicago Booth
+> School of Business -- RHEL 9.8, Slurm 25.11.3, cgroup v2,
+> `jobacct_gather/cgroup`, 120 sacct fields, system Python 3.9. 1753 tests at
+> 0.8.0, **1766** here; all four gates clean.
+>
+> Two properties of that cluster did the work. It is the first slurmpast has run
+> on where MaxRSS comes from the cgroup rather than the process tree, and the
+> first whose slurmdbd has outlived a job-id counter reset.
+>
+> What a user gets that they did not have at 0.8.0: `slurmpast <jobid>` no longer
+> invents a requeue out of a stranger's seven-year-old job on a cluster that has
+> recycled its ids -- it did that on all 40 ids sampled there, and no window
+> suppressed it -- while a genuine requeue, array elements included, still
+> reports. The per-job memory advice now says what MaxRSS means *on the cluster it
+> is running on*, instead of contradicting `--sizing` about the same figure in the
+> same run. And any figure between 1 KiB and 1 MiB renders as KiB rather than as a
+> raw byte count beside a GiB in the same column.
+>
+> Nothing was withdrawn this round.
+
+
+> **Round thirty-four, 2026-08-24.** Three defects, found on a **third** cluster:
+> Mercury (UChicago Booth) -- RHEL 9.8, **Slurm 25.11.3**, cgroup v2,
+> `jobacct_gather/cgroup`, 120 sacct fields, system Python 3.9. 1753 tests before,
+> **1766 after**; all four gates clean.
+>
+> The cluster mattered twice over. It is the first one this package has run on
+> where MaxRSS is gathered from the cgroup rather than the process tree -- the arm
+> §1k of this file records as never having been exercised -- and it is the first
+> whose slurmdbd has outlived a job-id counter reset.
+>
+> That reset produced the round's worst finding: `sacct -D -j <id>` carries no
+> window, so it answered with every job that had ever held the id, and
+> `_fold_incarnations` keyed on the id alone. All 40 ids sampled from three recent
+> days came back with a second row from 2019 belonging to a **different user**, and
+> every per-job view on that cluster reported `requeued 1x` -- attributing a
+> stranger's job to the reader as their own job's history. Windowed queries were
+> never affected; `-S/-E` filters those rows out at sacct, and only the per-job
+> path, which has no window to pass, ever saw them. Passing `-S` explicitly did not
+> help.
+>
+> The cgroup arm found the second: the `memory-slack` finding hardcoded "MaxRSS
+> over-reports multi-process jobs", which is true under `jobacct_gather/linux` and
+> false here. `site.maxrss_caveat()` exists precisely so this is asked of the
+> cluster, and `diagnose` already used it for the two findings immediately above --
+> this one was missed, so a single run printed both readings of the same figure.
+>
+> What a user gets: no invented requeue history on a cluster that recycles job ids,
+> one answer rather than two about what MaxRSS means, and sub-megabyte figures in
+> KiB instead of raw bytes beside GiB in the same column.
+>
+> Nothing was withdrawn. One of the three tests written for the id fix passed
+> against the deliberately broken tree on the first attempt -- `parse` keys
+> allocations on `(JobID, Submit)`, so two same-instant rows collapse before the
+> fold ever sees them -- and it was rewritten with distinct timestamps until the
+> mutation caught it.
+
+
 > **Round thirty-three, 2026-08-22.** Four defects, none of them found here: the
 > published 0.7.0 was installed on **midway2** -- CentOS 7.9, Python 3.14.6, Slurm
 > 23.02, cgroup v1, no GPU -- and run against that cluster's real history. 1560
@@ -471,6 +530,137 @@
 > and its control. `ruff`, `ruff format` and `mypy` clean.
 
 ---
+
+## Round thirty-four — a stranger's job, folded in as your own requeue
+
+Three defects, on the third cluster this package has been run against and the
+first that is neither Midway. Mercury, at the University of Chicago Booth School
+of Business: RHEL 9.8 (Plow), kernel 5.14, **Slurm 25.11.3**, cgroup v2,
+`JobAcctGatherType = jobacct_gather/cgroup`, `sacct --helpformat` advertising 120
+fields, system `python3` at 3.9.25. Run against 84,932 real jobs in 2,258
+workloads over fourteen days, `--all-users`, not fixtures.
+
+Two things about the environment are worth recording before the defects, because
+both were checked and neither is one:
+
+* **Field negotiation held at the newest Slurm yet.** The tool asked for 83 of the
+  120 fields and every one of them exists here; stderr was empty on every
+  invocation. Midway3 is 20.11.8 and midway2 is 23.02, so 25.11.3 is a five-year
+  span across three clusters with no field drift.
+* **The `--state` + relative `-S` quirk this file documents at `sacct.py:22`
+  reproduces exactly.** `sacct -S now-2days --state=COMPLETED` returns 0 rows here
+  while 23,212 such jobs exist; adding `-E now` returns 23,213. The workaround
+  already in place handles it.
+
+The Python floor also behaves: `pip install slurmpast` under the system 3.9
+refuses cleanly and installs nothing.
+
+### 1. `sacct -D -j <id>` has no window, so it answers with jobs that are not yours
+
+`slurmpast <jobid>` reported a requeue that never happened on **40 of the 40** ids
+sampled from three recent days:
+
+```
+$ slurmpast 509531
+job 509531  COMPLETED
+    requeued         1x · COMPLETED after 00:01:09
+```
+
+The two rows sacct returns under `-D` are not two incarnations of one job:
+
+```
+$ sacct -D -j 509531 -X -P -o JobID,Cluster,User,Account,Partition,JobName,Submit,End,State,NodeList
+509531|mercury|aranda   |pi-vgupta4|standard|dsa-3-20                          |2019-03-03T18:35:08|...|mcn36
+509531|mercury|cmbrennan|phd       |highmem |did_bigquery_priority_general_2026|2026-08-19T22:21:07|...|mcn58
+```
+
+Same cluster, but a different user, account, partition, job name and node, seven
+years apart. Slurm's job-id counter wrapped and this slurmdbd still holds the 2019
+records. `_fold_incarnations` grouped on `job_id` alone, so it filed a stranger's
+job as the reader's own earlier attempt and printed it as requeue history — on
+every per-job view on the cluster.
+
+**Scope, measured rather than assumed.** Windowed queries are clean: a `-S
+now-7days -E now` sweep returns 59,860 rows under `-D` against 59,849 without, and
+**zero** rows with a pre-window `Submit`. So `--overview`, `--patterns`, `--nodes`
+and `--sizing` were never affected. The per-job path is hit because it queries by
+id with no window, and **passing `-S` does not suppress it** — there is no window
+on that query to pass, so there was no user-side workaround.
+
+**The fix is identity, not time.** `_same_job` compares cluster, then uid, then
+user, and the fold keeps only the trailing run that still matches the newest row.
+A requeue cannot change whose job it is — Slurm re-queues the same submission, so
+those fields survive it — whereas a recycled id is a different submission by
+whoever drew the number next.
+
+A gap threshold was the obvious alternative and is worse. The normal requeue shape
+*is* "the previous attempt ended before this one was submitted", so the sign of
+the gap carries no signal at all, and any cutoff would eventually reject a job
+that sat requeued and held. Missing data defers rather than splits: sacct leaves
+these fields blank often enough that a blank must not break a requeue that really
+happened.
+
+The one-Job-per-id contract is kept deliberately. `logs.py:727` and `cli.py:439`
+both key log resolution on `job_id`, so emitting two Jobs for a recycled id would
+hand one of them the other's log. The foreign rows are dropped from `earlier`
+instead. The consequence worth stating: a window wide enough to contain both jobs
+still reports one of them, which is what the fold did before this round and is not
+made worse by it.
+
+Verified on the cluster, with the control that matters — job 504187, a genuine
+same-user requeue on the same cluster, still reports `requeued 1x · REQUEUED
+after 20.0s`.
+
+### 2. The `memory-slack` caveat was written for the other gatherer
+
+One run of the tool printed both of these about the same number:
+
+```
+--sizing:  MaxRSS comes from the cgroup peak here (jobacct_gather/cgroup), so it is
+           the step's real high-water mark rather than a sum over processes.
+per-job:   Try --mem=25G (peak plus ~30%). MaxRSS over-reports multi-process jobs,
+           so treat it as an upper bound.
+```
+
+The second is false here. `site.maxrss_caveat()` exists so this sentence is asked
+of the cluster rather than assumed, and returns `rss_from_cgroup: True` on this
+one. `diagnose.py` already called it for `host-oom` and `rss-above-limit`, the two
+findings immediately above — `memory-slack` was the single site that was missed,
+which is why this reads as an oversight rather than a decision.
+
+Fixed by routing it through `maxrss_caveat()` like its neighbours. The pasteable
+`--mem=25G` spelling from `format_mem_flag` is pinned by a test so the rewording
+cannot quietly take it back to `--mem=25.0 GiB`.
+
+### 3. `format_bytes` fell from MiB straight to raw bytes
+
+Both of these were on one screen:
+
+```
+    read             9.5 GiB          rate  488928 B/s sustained
+    509531.batch     ...  79.0 MiB    612794 B
+```
+
+The two figures a reader most wants to compare, in a column, in units that cannot
+be compared by eye. A `KiB` tier was added between MiB and the byte floor. Bytes
+remain below 1 KiB, where they are the honest unit and where `format_bytes(0)`
+must keep rendering `0 B` — a test already pinned that and still does.
+
+Documented as "GiB/MiB string", so this was semi-deliberate rather than an
+accident; nothing but the zero case was pinned by a test, and the docstring now
+says why the tier is there.
+
+### What changes for a user
+
+`slurmpast <jobid>` stops reporting a requeue on any cluster that has recycled job
+ids, and keeps reporting one where the incarnations are genuinely the same job.
+The `memory-slack` action now says what MaxRSS means *on the cluster it is running
+on*, so on a `jobacct_gather/cgroup` site it no longer contradicts `--sizing`; on
+a `jobacct_gather/linux` site the wording is unchanged. Any figure between 1 KiB
+and 1 MiB — `io_rate` most often, and small step writes — renders as KiB where it
+rendered as a raw byte count, so anything grepping plain output for a bare `B`
+should match the `--json` field instead, which is untouched.
+
 
 ## Round thirty-three — four defects a second cluster found in a day, and twenty-one more the rounds after it
 
