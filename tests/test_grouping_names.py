@@ -132,6 +132,65 @@ class TestTheFoldIsOnlyShownWhenItStandsForSomething:
         assert "exp-a35-newckpt" in text
         assert "exp-a#-newckpt" not in text
 
+    def test_a_fold_that_kept_no_name_falls_back_too(self, healthy_job):
+        """Reported from a real cluster-wide window, row 23 of the top 25:
+
+            #   JOB NAME     PARTITION  RUNS COMPLETED FLAGGED  CPU-HOURS
+            23  #            broadwl      20        14       6  559 / -
+
+        20 runs and 559 CPU-hours under the name `#`. An all-digit job name --
+        a date stamp -- folds to a single placeholder, so unlike `exp-a#-gate`
+        this signature stands for a family and still says nothing. Several
+        distinct names, so the one-name branch above does not catch it.
+        """
+        group = self._groups(healthy_job, ["20260821", "20260822", "20260823"])[0]
+        assert group.name == "#", "the key still folds, so the three runs stay one workload"
+        assert group.distinct_names == 3
+        # `+2`, not a bare `20260823`. This assertion used to read `== "20260823"`
+        # and the report's author was right that it should not: `#` was
+        # uninformative but visibly a fold, while one real date on a row holding
+        # three runs of three different dates is specific and wrong, and the RUNS
+        # column then reads as three runs of one workload. The substitution is
+        # still the fix -- the marker is what stops it overclaiming.
+        assert group.label == "20260823 +2", group.label
+        assert "#" not in group.label
+
+    def test_a_date_with_separators_falls_back_as_well(self, healthy_job):
+        """`2026-01` folds to `#-#`: separators are not information either."""
+        group = self._groups(healthy_job, ["2026-01", "2026-02"])[0]
+        assert group.name == "#-#"
+        assert group.label == "2026-02 +1", group.label
+
+    def test_a_fold_covering_one_name_carries_no_marker(self, healthy_job):
+        """The control on the marker's scope. `distinct_names == 1` means the
+        substituted name is the *only* name in the group, so it claims nothing the
+        row cannot support and must stay clean -- an earlier round kept the count
+        off the table as clutter, and that judgement still holds everywhere except
+        the row where the label would otherwise imply singularity it lacks."""
+        group = self._groups(healthy_job, ["20260822"])[0]
+        assert group.distinct_names == 1
+        assert group.label == "20260822", group.label
+
+    def test_one_surviving_letter_is_enough_to_keep_the_fold(self, healthy_job):
+        """The control on where the line is drawn. `a#` still names something and
+        must keep folding -- substituting one arm's name would invent a workload
+        narrower than the row's own RUNS column."""
+        group = self._groups(healthy_job, ["a2026", "a2027"])[0]
+        assert group.label == "a#" == group.name
+
+    def test_the_plain_overview_prints_the_fallback(self, healthy_job):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_overview
+
+        jobs = [
+            healthy_job._replace(job_id=str(3000 + i), name=n)
+            for i, n in enumerate(["20260821", "20260822"])
+        ]
+        text = render_overview(History(jobs), style=Style(enabled=False))
+        assert "20260822" in text
+        table = text.split("JOB NAME", 1)[1]
+        assert " # " not in table, table
+
     def test_the_hash_footnote_goes_with_it(self, healthy_job):
         """The "#" stands for a name's digits note explained notation that is no
         longer on screen."""
@@ -142,6 +201,66 @@ class TestTheFoldIsOnlyShownWhenItStandsForSomething:
             History([healthy_job._replace(name="exp-a35-newckpt")]), style=Style(enabled=False)
         )
         assert '"#" stands for' not in text
+
+
+class TestTheHashLegendFollowsWhatIsOnScreen:
+    r"""Reported as a defect and withdrawn here: that the legend is appended "based
+    on the data" while only the top 25 of 560 workloads are displayed, so a folded
+    workload below the cutoff explains a symbol the reader cannot see.
+
+    It is not. `render_overview` computes `shown = groups[:limit]` and the legend
+    tests `shown`, so it is already conditioned on rendered rows.
+
+    What produced the observation is the detection, not the tool. The check was
+    `grep -cE '^\s+[0-9]+\s+#'`, which matches only a label *beginning* with `#` —
+    and a fold that keeps letters does not. `fy#_s#_#_e#.#`, a real workload from
+    that same cluster's window, contains `#` in five places and starts with `f`, so
+    the grep returned 0 while a `#` was plainly on screen.
+
+    Both halves are pinned below because the property was doubted, and because the
+    fold-with-letters case is the one a naive check misses.
+    """
+
+    def _history(self, healthy_job, names):
+        from slurmpast.index import History
+
+        return History(
+            [
+                healthy_job._replace(job_id=str(7000 + i), name=n, user="u")
+                for i, n in enumerate(names)
+            ]
+        )
+
+    def test_a_hash_anywhere_in_a_shown_label_earns_the_legend(self, healthy_job):
+        """Not just at the start. `fy#_s#_#_e#.#` is the shape that was missed."""
+        from slurmpast.report import Style, render_overview
+
+        history = self._history(healthy_job, ["fy1_s2_3_e4.5", "fy9_s8_7_e6.5"])
+        assert any("#" in g.label for g in history.groups)
+        text = render_overview(history, style=Style(enabled=False))
+        assert '"#" stands for' in text, text
+
+    def test_a_folded_workload_below_the_cutoff_does_not_earn_it(self, healthy_job):
+        """The alleged defect, asserted as the behaviour it actually has. The
+        folded group is last by compute, so `--limit 1` renders only the unfolded
+        one and the legend must go with it."""
+        from slurmpast.report import Style, render_overview
+
+        jobs = [
+            healthy_job._replace(job_id=str(7100 + i), name="steady", user="u", elapsed=9000.0)
+            for i in range(4)
+        ]
+        jobs += [
+            healthy_job._replace(job_id="7200", name="fy1_s2", user="u", elapsed=1.0),
+            healthy_job._replace(job_id="7201", name="fy9_s8", user="u", elapsed=1.0),
+        ]
+        from slurmpast.index import History
+
+        history = History(jobs)
+        assert any("#" in g.label for g in history.groups), "the folded group must exist"
+        text = render_overview(history, style=Style(enabled=False), limit=1)
+        assert "fy#" not in text, text
+        assert '"#" stands for' not in text, text
 
 
 class TestTheColumnsReconcile:

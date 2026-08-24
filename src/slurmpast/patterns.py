@@ -25,6 +25,33 @@ from .model import CRITICAL, INFO, WARNING, Finding
 REPEAT_MIN = 5
 REPEAT_FAIL_FRACTION = 0.5
 BISECTION_MIN_OOM = 3
+# A workload keeps being requeued. Two floors, because either alone misfires on
+# real data: a *count* alone fires on a 159,602-run workload with 99 requeues,
+# which is background, and a *rate* alone fires on one job of three. Both were
+# chosen from Midway3's own seven-day history -- 938,576 job ids, 680 of them
+# requeued and 372 of those with an earlier attempt that actually ended, spread
+# over 12,130 workloads -- by looking at where the distribution separates:
+#
+#     100.0%    10 of 10       reference_#k_aldp_implicit_s
+#      83.3%     5 of 6        train_blending_model
+#      28.6%     6 of 21       _interactive
+#      12.2%   284 of 2332     Filtering
+#      12.0%    31 of 259      orca_spe
+#     ------------------------------------------- the gap
+#       6.3%     7 of 111      qmmm_ro
+#       0.1%    99 of 159602   fy#_s#_#_e#.#
+#       0.0%     5 of 204607   aa#_s#_#.#m_#_e#.#
+#
+# There is a clean break between 12.0% and 6.3%, and everything below it is a
+# long tail of enormous workloads whose absolute counts are large and whose rates
+# are noise. 3 runs and 10% together fire on 7 workloads out of 12,130.
+#
+# Not REPEAT_FAIL_FRACTION's 0.5: that rule asks "does this workload mostly fail",
+# which is the right question about a failure and the wrong one about a requeue.
+# 284 requeues out of 2,332 runs is unmistakably a node or preemption problem and
+# is nowhere near half.
+REQUEUE_MIN = 3
+REQUEUE_FRACTION = 0.10
 # Collapsed steps of a --mem walk to print before eliding the middle. Seven is what
 # the longest genuine bisection in a real 90-day history needs, so nothing that is
 # actually a search gets elided; see _mem_walk.
@@ -61,6 +88,46 @@ def normalize_name(name):
     if not name:
         return "?"
     return _DIGIT_RUN.sub("#", name)
+
+
+def fold_erased_the_name(signature) -> bool:
+    """Whether :func:`normalize_name` left a signature with no name left in it.
+
+    A job name that is *entirely* digits and separators folds to placeholders and
+    punctuation -- ``20260821`` to ``#``, ``2026-01`` to ``#-#`` -- and that
+    identifies nothing. Date-stamping a run is one of the most common naming
+    conventions there is, so this is not a rare shape: on a real cluster-wide
+    window, row 23 of the top 25 workloads was 20 runs and 559 CPU-hours printed
+    under the name ``#``.
+
+    Only a *display* rule. The fold stays the grouping key either way -- it is
+    what puts today's and yesterday's run in one workload -- and callers use this
+    to decide whether the key is fit to be read aloud, substituting a real job
+    name where it is not. Letters are the test because the fold has already taken
+    the digits: anything with one left, like ``a#_anneal_#``, still names
+    something.
+    """
+    return not any(ch.isalpha() for ch in signature or "")
+
+
+def newest_name(jobs) -> str:
+    """The most recent run's ``JobName`` in a group, or ``""`` if none recorded.
+
+    The representative to show when the folded signature cannot be
+    (:func:`fold_erased_the_name`). Ordered the way :func:`index.build_groups`
+    orders a group's members -- start, falling back to submit -- with
+    :func:`numeric_job_id` breaking the tie, so records carrying no usable
+    timestamp still resolve to the last one submitted rather than to whichever
+    happened to arrive first from sacct.
+    """
+    best = None
+    for job in jobs:
+        if not job.name:
+            continue
+        key = (job.start or job.submit or "", numeric_job_id(job))
+        if best is None or key > best[0]:
+            best = (key, job.name)
+    return best[1] if best else ""
 
 
 def group_key(job):
@@ -294,6 +361,121 @@ def _mem_walk(values):
     head, tail = 4, 3
     dropped = len(rendered) - head - tail
     return " -> ".join(rendered[:head] + ["... %d more ..." % dropped] + rendered[-tail:])
+
+
+def find_requeues(jobs, min_runs=REQUEUE_MIN, fraction=REQUEUE_FRACTION, limit=REPEAT_REPORT_LIMIT):
+    """Workloads Slurm keeps requeueing.
+
+    A requeue is not the user's mistake -- Slurm does it on ``NODE_FAIL``, on
+    preemption, and on ``scontrol requeue`` -- which is exactly why it belongs
+    here rather than in the per-job findings: one requeue is weather, and the same
+    workload being requeued over and over is a node or a preemption policy, which
+    is a thing the reader can act on and a thing ``--nodes`` can attribute.
+
+    Reads ``Job.earlier``, so it depends on ``sacct -D``: before that was passed,
+    Slurm returned only each job's last incarnation and this rule could not have
+    seen anything at all.
+
+    Ranked by the time the abandoned attempts burned, not by count. That is the
+    number that makes the case -- a requeued allocation really ran, and its hours
+    appear in no other total the tool prints.
+    """
+    groups = {}
+    for job in usable(jobs):
+        groups.setdefault(group_key(job), []).append(job)
+
+    findings = []
+    for key, members in groups.items():
+        # Only attempts that *ended*. An earlier incarnation with no End is an
+        # unterminated record, and this tool already refuses to measure those --
+        # `usable` drops them, and the "N unterminated, excluded" line exists to
+        # say so. Counting them here reproduced exactly the failure that line
+        # warns about: one array of 284 tasks whose original rows were never
+        # closed reported "284 were RUNNING. The abandoned attempts ran
+        # 4030-18:48:58 between them", four thousand days that nobody spent,
+        # because Elapsed on an open record is measured to *now*.
+        #
+        # Filtering on End is not merely defensive, it is what makes the finding
+        # mean anything: across 680 requeued ids on Midway3, the 372 with a closed
+        # earlier row carry the states you would expect a requeue to have --
+        # NODE_FAIL 348, REQUEUED 27, and nothing else -- while the open ones
+        # carry only the stale RUNNING they were left in.
+        requeued = [[earlier for earlier in job.earlier if earlier.end] for job in members]
+        requeued = [ended for ended in requeued if ended]
+        if len(requeued) < min_runs:
+            continue
+        if len(requeued) / float(len(members)) < fraction:
+            continue
+
+        attempts = [earlier for ended in requeued for earlier in ended]
+        burned = sum(earlier.elapsed or 0.0 for earlier in attempts)
+        states = {}
+        for earlier in attempts:
+            state = earlier.base_state or "?"
+            states[state] = states.get(state, 0) + 1
+        dominant, count = max(states.items(), key=lambda kv: (kv[1], kv[0]))
+
+        evidence = "%d of %d runs of %s in %s were requeued, %d %s in total; %d %s %s." % (
+            len(requeued),
+            len(members),
+            key[0],
+            key[1],
+            len(attempts),
+            plural(len(attempts), "attempt"),
+            count,
+            "was" if count == 1 else "were",
+            dominant,
+        )
+        if burned > 0:
+            evidence += " The abandoned attempts ran %s between them." % format_duration(burned)
+
+        if dominant == "NODE_FAIL":
+            action = (
+                "NODE_FAIL is the node, not the job. `slurmpast --nodes` attributes it, "
+                "and a workload this exposed is worth pinning away from the nodes it keeps "
+                "landing on."
+            )
+        elif dominant in ("PREEMPTED", "CANCELLED"):
+            action = (
+                "Preemption is a queue policy, not a fault: check whether this account has a "
+                "higher-priority QOS, and make the work checkpoint so a requeue resumes "
+                "rather than restarts."
+            )
+        else:
+            action = (
+                "Requeue restarts the job from the beginning unless it checkpoints, so this "
+                "time is spent twice. `slurmpast --nodes` says whether particular nodes are "
+                "behind it."
+            )
+
+        findings.append(
+            (
+                burned,
+                Finding(
+                    WARNING,
+                    "requeue-repeat",
+                    "This workload keeps being requeued",
+                    evidence,
+                    action,
+                ),
+            )
+        )
+
+    findings.sort(key=lambda row: -row[0])
+    kept = [row[1] for row in findings[:limit]]
+    hidden = findings[limit:]
+    if hidden:
+        kept.append(
+            Finding(
+                INFO,
+                "requeue-repeat-more",
+                "%d further %s requeued as often"
+                % (len(hidden), "workload is" if len(hidden) == 1 else "workloads are"),
+                "Shown in full with a narrower --since window.",
+                "",
+            )
+        )
+    return kept
 
 
 def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):

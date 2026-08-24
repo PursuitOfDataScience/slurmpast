@@ -31,6 +31,18 @@ AccountingStorageType   = accounting_storage/slurmdbd
 AccountingStorageTRES   = cpu,mem,energy,node,billing,fs/disk,vmem,pages,gres/gpu
 """
 
+# The synthetic cluster's node sizes, pinned for the same reason DEMO_SITE is.
+# `sizing.cpu_advice` clamps an upward recommendation to the partition's ceiling,
+# which it learns by running `sinfo` -- so without this, `--demo --sizing` on a
+# login node asks the *real* cluster how big its `test` nodes are and the demo
+# changes by machine. Measured to be doing exactly that before this was added.
+#
+# Chosen well above anything the synthetic history requests (its largest ask is
+# 16 cores), so the clamp never binds here and the demo's advice is unchanged.
+# A demo that exercised the clamp would be worth having, but not at the cost of
+# making this output a moving target for the CI check that reads it.
+DEMO_PARTITIONS = {"test": (48, 196608)}
+
 _FIELDS_ORDER = None  # resolved lazily from sacct._FIELDS
 
 

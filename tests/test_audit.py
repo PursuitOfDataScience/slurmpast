@@ -8,6 +8,8 @@ output.
 import ast
 import pathlib
 import re
+import shutil
+import tarfile
 
 import pytest
 
@@ -1073,6 +1075,48 @@ class TestTheJsonPayloadKeepsItsPromise:
             seen[state] = doc["outcome"]["live"]
         assert len(set(map(repr, seen.values()))) == 3, seen
 
+    def test_the_count_does_not_depend_on_which_job_it_is(self):
+        """The documented figure is "N values per job", so it has to be a property
+        of the payload rather than of one job.
+
+        A conditional per-job key breaks that quietly: `log_expected` first shipped
+        only when a recorded path had been tried and missed, which made the count
+        97 or 99 depending on the job while this class's own sample -- which has no
+        recorded path -- never saw the second. The audit passed and the README was
+        wrong for anyone whose job had one.
+
+        Three shapes here: no recorded path, a recorded path that missed, and a
+        job whose log was found. Conditional root keys are a different matter and
+        stay conditional -- `dropped_rows` is emitted only when non-zero, and
+        nothing documents a root-key count.
+        """
+        from slurmpast.cli import _job_json
+        from slurmpast.diagnose import diagnose
+
+        def leaves(value):
+            if isinstance(value, dict):
+                return sum(leaves(v) for v in value.values())
+            return 1
+
+        def per_job(job, log_path):
+            doc = _job_json(job, log_path, diagnose(job))
+            return leaves({k: v for k, v in doc.items() if k not in ("steps", "findings")})
+
+        job = self._sample()
+        with_path = job._replace(std_out="/nonexistent-audit-path/j.out")
+        # A requeued job too: `timing.earlier` is the other per-job field added
+        # recently, and it is a *list*, which `leaves` counts as one however many
+        # incarnations it holds. Stable by construction rather than by care --
+        # asserted so that stays true if it is ever expanded into an object.
+        requeued = job._replace(earlier=(job._replace(job_id=job.job_id + "_prev"),))
+        counts = {
+            per_job(job, None),
+            per_job(with_path, None),
+            per_job(job, "/tmp/found.out"),
+            per_job(requeued, None),
+        }
+        assert len(counts) == 1, "the per-job count varies by job: %s" % sorted(counts)
+
     def test_the_documented_value_count_is_the_real_one(self):
         """`README.md` and `docs/details.md` both print a count of what `--json`
         emits, and nothing checked either. The README's test badge sat stale for
@@ -1195,3 +1239,139 @@ class TestTheResolvedClockIsMachineReadable:
             assert not (raw.endswith("M") and hz == float(raw[:-1] or 0) * 1e6), (
                 "%s resolved to the ambiguous reading" % raw
             )
+
+
+class TestTheSdistShipsASuiteThatCanRun:
+    """The released 0.7.0 sdist carried 18 of the 20 files in `tests/`.
+
+    setuptools' default sdist file list includes `tests/test*.py` -- a distutils
+    legacy rule -- and nothing else under that directory, and this project had no
+    `MANIFEST.in`. `conftest.py` and `__init__.py` do not match `test*.py`, so
+    every shipped module importing a fixture from `tests.conftest` failed at
+    collection:
+
+        $ pip download slurmpast==0.7.0 --no-deps --no-binary :all:
+        $ tar xzf slurmpast-0.7.0.tar.gz && cd slurmpast-0.7.0 && pytest -q
+        ERROR tests/test_extraction.py
+        ERROR tests/test_patterns.py
+        ERROR tests/test_portability.py
+        ERROR tests/test_sacct.py
+        ERROR tests/test_sizing.py
+        E   ModuleNotFoundError: No module named 'tests.conftest'
+        Interrupted: 5 errors during collection
+
+    Not cosmetic for this package specifically: the way its portability claims
+    get checked is somebody on another cluster downloading the *released*
+    artefact and running it there, which is precisely what the midway2 report
+    did. Shipping a suite that cannot be collected is worse than shipping none,
+    because the failure reads as a broken package rather than a broken sdist.
+
+    Checked against the manifest rather than by building an sdist: a build needs
+    `build`/`wheel` in the test environment and several seconds, and the rule
+    that was missing is a manifest rule.
+    """
+
+    def _rules(self):
+        root = SRC.parent.parent
+        manifest = root / "MANIFEST.in"
+        assert manifest.exists(), "MANIFEST.in is gone; the sdist reverts to test*.py only"
+        return root, [
+            line.strip()
+            for line in manifest.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+
+    @staticmethod
+    def _built_sdist(tmp_path):
+        """The real tarball, built the way PyPI's is.
+
+        This used to read `MANIFEST.in` and reason about what a build *would*
+        include, on the stated grounds that a build needs `build` in the test
+        environment. That was wrong twice over: `build>=1.0` is in this project's
+        `[dev]` extra and CI installs it, and a manifest is a description of the
+        artifact rather than the artifact. The report this class came from makes
+        exactly that point about the whole suite -- that a green run is evidence
+        about internal consistency, and the only two tests across four packages
+        that caught real portability defects were the ones that touched the real
+        environment or the real artifact. This is the artifact one.
+        """
+        try:
+            from build import ProjectBuilder
+        except ImportError:  # pragma: no cover - `build` is in [dev] and CI has it
+            pytest.skip("`build` is not installed; cannot inspect the real sdist")
+
+        # From a pristine copy, because setuptools reuses `src/*.egg-info/
+        # SOURCES.txt` when it is present and a developer tree always has one.
+        # Building in place made this test read a *cached description* of the
+        # artifact instead of the artifact: with `MANIFEST.in` deleted outright,
+        # both assertions below still passed. That is the same mistake the
+        # manifest-reading version made, one layer down and harder to see.
+        source = tmp_path / "src-copy"
+        shutil.copytree(
+            SRC.parent.parent,
+            source,
+            ignore=shutil.ignore_patterns(
+                ".git",
+                "*.egg-info",
+                "__pycache__",
+                ".pytest_cache",
+                ".mypy_cache",
+                ".ruff_cache",
+                "dist",
+                "build",
+                ".claude",
+            ),
+        )
+        path = ProjectBuilder(str(source)).build("sdist", str(tmp_path / "dist"))
+        with tarfile.open(path) as tar:
+            return {name.split("/", 1)[1] for name in tar.getnames() if "/" in name}
+
+    def test_the_built_sdist_carries_every_file_under_tests(self, tmp_path):
+        """Not just the two that were missing: a helper added later must not be
+        left behind the same way, which is why the manifest grafts the directory
+        rather than naming `conftest.py`. Compared against what is on disk, so the
+        test cannot go stale as files are added."""
+        root = SRC.parent.parent
+        on_disk = {
+            path.relative_to(root).as_posix()
+            for path in (root / "tests").rglob("*")
+            if path.is_file() and "__pycache__" not in path.parts
+        }
+        missing = sorted(on_disk - self._built_sdist(tmp_path))
+        assert missing == [], "in tests/ but not in the built sdist: %s" % ", ".join(missing)
+
+    def test_the_built_sdist_carries_what_the_repo_audits_read(self, tmp_path):
+        """Shipping a runnable suite is not enough on its own.
+
+        Once `conftest.py` was added, eight tests still failed on a correct build,
+        because this suite audits the *repository*: the dependency pin in
+        `.github/workflows/ci.yml`, the prose in `docs/details.md`, the imports in
+        `tools/`, and the images `README.md` points at. A suite that ships and
+        then fails eight tests reads as a broken package rather than a broken
+        sdist, which is the same confusion in a quieter form.
+        """
+        shipped = self._built_sdist(tmp_path)
+        for needed in (
+            ".github/workflows/ci.yml",
+            "docs/details.md",
+            "tools/demo_gif.py",
+            "assets/demo.gif",
+        ):
+            assert needed in shipped, needed
+
+    def test_the_two_files_that_were_actually_missing_are_named_in_the_repro(self):
+        """The control on the claim, not on the fix: if `conftest.py` ever stops
+        being importable as `tests.conftest`, the docstring above is describing a
+        failure that can no longer happen and this class should be re-read rather
+        than trusted."""
+        root, _ = self._rules()
+        assert (root / "tests" / "conftest.py").exists()
+        assert (root / "tests" / "__init__.py").exists(), (
+            "without this, `tests.conftest` is not an importable module path"
+        )
+        importers = [
+            p.name
+            for p in sorted((root / "tests").glob("test_*.py"))
+            if "tests.conftest" in p.read_text()
+        ]
+        assert len(importers) >= 5, importers

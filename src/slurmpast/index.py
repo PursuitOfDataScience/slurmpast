@@ -25,7 +25,16 @@ from typing import NamedTuple
 from .diagnose import looks_like_noop
 from .duration import plural
 from .model import Job
-from .patterns import find_memory_search, find_repeat_failures, goodput, group_key, usable
+from .patterns import (
+    find_memory_search,
+    find_repeat_failures,
+    find_requeues,
+    fold_erased_the_name,
+    goodput,
+    group_key,
+    newest_name,
+    usable,
+)
 
 # Core-hours one GPU-hour is worth when ranking mixed workloads. See
 # GroupStats.cost for why this number and not a site billing weight.
@@ -87,9 +96,35 @@ class GroupStats(NamedTuple):
 
         Grouping still keys on the pattern, so a second differently-numbered run
         joins this same group and the label folds the moment it means something.
+
+        The second fallback is for a pattern that never says anything, however
+        many names it covers: an all-digit job name folds to ``#``, and a
+        date-stamped one to ``#-#``. Reported from a real cluster-wide window,
+        where a 20-run workload holding 559 CPU-hours sat at row 23 of the top 25
+        labelled ``#``. Falling back to the same representative name is what stops
+        the main table and ``--nodes`` disagreeing about what the workload is
+        called -- they take the rule from one place, `patterns`, for the reason
+        `render` exists.
         """
         if self.distinct_names == 1 and self.jobs:
             return self.jobs[0].name or self.name
+        if fold_erased_the_name(self.name):
+            real = newest_name(self.jobs)
+            if not real:
+                return self.name
+            # `+N` when the fold covers more than one raw name, because this
+            # substitution is the one case where showing a real name is a claim
+            # the row cannot support. `#` was uninformative but honest: it was
+            # visibly a fold. `20260822` on a row that also holds `20260821`'s run
+            # is specific, real and wrong, and `RUNS 2` then reads as two runs of
+            # one workload rather than one run each of two.
+            #
+            # `distinct_names` was kept off the table in an earlier round as
+            # clutter beside the name, and that judgement stands for the ordinary
+            # row -- which is why this is not the count, and appears only where
+            # the fold erased the name *and* the group holds more than one. On
+            # every other row nothing changes.
+            return "%s +%d" % (real, self.distinct_names - 1) if self.distinct_names > 1 else real
         return self.name
 
     @property
@@ -455,6 +490,7 @@ class History:
         if self._patterns is None:
             found = list(find_repeat_failures(self.jobs))
             found.extend(find_memory_search(self.jobs))
+            found.extend(find_requeues(self.jobs))
             self._patterns = found
         return self._patterns
 
@@ -462,6 +498,7 @@ class History:
         """Findings scoped to one workload."""
         found = list(find_repeat_failures(group.jobs, limit=3))
         found.extend(find_memory_search(group.jobs))
+        found.extend(find_requeues(group.jobs, limit=3))
         return found
 
     @property
@@ -517,7 +554,7 @@ class History:
             return (idle, total)
         return None
 
-    def tail_summary(self, shown: int, ordered: Sequence[GroupStats] | None = None) -> str:
+    def tail_summary(self, shown: int | None, ordered=None) -> str:
         """What sits below the fold, so truncation is never silent.
 
         The top 20 workloads carry 93.4% of all weighted resource on a real
@@ -532,6 +569,13 @@ class History:
         worse than silent truncation: it is a reassurance, and it is wrong.
         """
         groups = list(ordered) if ordered is not None else self.groups
+        # `None` is `-n 0`, i.e. no limit, and nothing is below a fold that does
+        # not exist. Not a guard for its own sake: `groups[None:]` is the whole
+        # list, so without this the unlimited view rendered every row and then
+        # announced that every row had been hidden -- a contradiction on one
+        # screen, which is the class of defect this line exists to prevent.
+        if shown is None:
+            return ""
         hidden = groups[shown:]
         if not hidden:
             return ""

@@ -914,3 +914,202 @@ class TestACancellationIsNotASuccess:
             jobs + cancelled, workload="node-evaluation", metric="hang", min_samples=5
         )
         assert table["rows"][0]["trials"] == 20
+
+
+class TestADateStampedWorkloadIsNamedNotFolded:
+    """`--nodes` printed the internal grouping signature as the workload's name,
+    so a date-stamped job read as `#-#`:
+
+        node reliability — hang rate
+          controlled for workload: only #-# counted (placement is not random)
+          No hangs recorded for #-# in this window, so there is nothing to
+          attribute to a node.
+
+    and `--json` carried the same value, confirming it was not a rendering
+    artifact. `normalize_name` folds digit runs so reruns group -- correct, and
+    the grouping must not change -- but a name that is *entirely* digits and
+    separators folds to placeholders and identifies nothing. Date-stamping a run
+    is one of the most common naming conventions in HPC.
+    """
+
+    def _dated(self):
+        from slurmpast.demo import history
+
+        base = next(j for j in history() if j.completed and j.steps)
+        return [
+            base._replace(
+                job_id="d%03d" % index,
+                name="2026-%02d" % (index + 1),
+                user="youzhi",
+                node_list="n1",
+                start="2026-07-%02dT00:00:00" % (index + 1),
+                end="2026-07-%02dT00:30:00" % (index + 1),
+            )
+            for index in range(6)
+        ]
+
+    def test_the_workload_is_named_with_a_real_job_name(self):
+        from slurmpast.nodes import dominant_workload
+
+        workload = dominant_workload(self._dated(), metric="hang")
+        assert "#" not in str(workload), workload
+        # The most recent run's name, which is what the overview already shows.
+        assert workload.name == "2026-06", workload.name
+
+    def test_the_stratum_it_selects_is_unchanged(self):
+        """The point of the fix: only the *label* moves. `Workload.matches`
+        normalises before comparing, so all six dated runs are still one
+        workload and the table is built from exactly the same placements."""
+        from slurmpast.nodes import dominant_workload, node_table
+
+        jobs = self._dated()
+        workload = dominant_workload(jobs, metric="hang")
+        assert sum(1 for j in jobs if workload.matches(j)) == 6
+        table = node_table(jobs, workload=workload, metric="hang", min_samples=3)
+        assert table["rows"][0]["trials"] == 6, table["rows"]
+
+    def test_a_folded_name_that_still_says_something_keeps_its_fold(self):
+        """The control. `att-speed-#` stands for a family of real names and is
+        the more informative label; substituting one arm's name there would
+        claim the screen controlled on less than it did."""
+        from slurmpast.demo import history
+        from slurmpast.nodes import dominant_workload
+
+        base = next(j for j in history() if j.completed and j.steps)
+        jobs = [
+            base._replace(
+                job_id="s%03d" % index,
+                name="att-speed-%d" % (index * 7),
+                user="youzhi",
+                node_list="n1",
+                start="2026-07-%02dT00:00:00" % (index + 1),
+                end="2026-07-%02dT00:30:00" % (index + 1),
+            )
+            for index in range(6)
+        ]
+        assert dominant_workload(jobs, metric="hang").name == "att-speed-#"
+
+
+class TestTheBaselineDoesNotContradictTheEmptyReason:
+    """On a sparse history `--nodes` printed two lines that disagree:
+
+        baseline 0.0% over 2 placements; 2 nodes below threshold omitted
+        No hangs recorded for #-# in this window, so there is nothing to
+        attribute to a node.
+
+    The first says nodes were evaluated and withheld for want of samples; the
+    second says there was nothing to evaluate at all. Only the second can be
+    right -- with no events the sample threshold is not what stands between the
+    reader and a verdict, so naming it points at a fix that would not produce one.
+    """
+
+    def _table(self, hits):
+        return {
+            "rows": [],
+            "baseline": 0.0 if not hits else 0.5,
+            "trials": 2,
+            "hits": hits,
+            "metric": "hang",
+            "workload": "w",
+            "workload_user": None,
+            "tested_nodes": 0,
+            "held_back": 0,
+            "skipped_nodes": 2,
+        }
+
+    def test_no_events_means_no_omission_count(self):
+        from slurmpast.render import nodes_baseline
+
+        line = nodes_baseline(self._table(0))
+        assert "omitted" not in line, line
+        assert line == "baseline 0.0% over 2 placements"
+
+    def test_events_recorded_still_name_what_was_withheld(self):
+        """The control, and the reason this is a condition rather than a
+        deletion: with events on record the omitted nodes are the reason the
+        table is empty, and every other truncated view here names its tail."""
+        from slurmpast.render import nodes_baseline
+
+        assert "2 nodes below threshold omitted" in nodes_baseline(self._table(1))
+
+    def test_the_two_lines_are_never_both_on_screen(self):
+        """End to end through the sentence pair, which is what the reader saw."""
+        from slurmpast.render import nodes_baseline, nodes_empty_reason
+
+        table = self._table(0)
+        assert "nothing to attribute" in nodes_empty_reason(table, "hang", "w")
+        assert "omitted" not in nodes_baseline(table)
+
+
+class TestADegenerateBaselineIsNamedRatherThanBlamedOnSampleSize:
+    """At a 100% baseline no node can be worse than the baseline, so the
+    comparison is unavailable for a reason no window can fix — and the screen
+    blamed sample size and prescribed `--since`.
+
+    Reported from a real run: a workload whose every decided run had failed, 53
+    placements across 44 nodes, told to widen the window. Following that advice
+    costs a bigger query and returns the same non-answer, while the useful
+    statement is already in the data — the workload completed on no node, so no
+    node is the problem.
+
+    The 0% mirror image does not need a branch: `baseline` is `hits/trials`, so
+    `hits > 0` implies `baseline > 0`, and `hits == 0` is caught by the sentence
+    above it ("no failures recorded ... nothing to attribute to a node"), which is
+    already the right answer. Checked rather than assumed.
+    """
+
+    @staticmethod
+    def _table(baseline, trials, skipped=32, rows=()):
+        return {
+            "hits": int(baseline * trials),
+            "trials": trials,
+            "rows": list(rows),
+            "baseline": baseline,
+            "skipped_nodes": skipped,
+            "tested_nodes": 0,
+        }
+
+    def test_a_degenerate_baseline_is_named_rather_than_blamed_on_sample_size(self):
+        """The test the report asks for by name."""
+        from slurmpast.render import nodes_empty_reason
+
+        said = nodes_empty_reason(self._table(1.0, 53), "failure", "abraude's test#")
+        assert "--since" not in said, said
+        assert "abraude's test#" in said
+        assert "workload failure, not a node failure" in said
+
+    def test_it_counts_the_nodes_the_workload_touched(self):
+        """The number that makes it a conclusion rather than an assertion."""
+        from slurmpast.render import nodes_empty_reason
+
+        said = nodes_empty_reason(self._table(1.0, 53, skipped=44), "failure", "test#")
+        assert "all 44 nodes it touched" in said, said
+
+    def test_a_thin_all_failing_sample_still_blames_the_sample(self):
+        """The gate the report's own sketch left out, and the suite's fixtures
+        showed is needed: four all-hung runs give a 100% baseline too, and
+        concluding "this is a workload failure" from four is the same over-reading
+        in the other direction. Below the placement threshold the sample size is a
+        real obstacle as well, so the original sentence stays."""
+        from slurmpast.nodes import MIN_SAMPLES
+        from slurmpast.render import nodes_empty_reason
+
+        said = nodes_empty_reason(self._table(1.0, MIN_SAMPLES - 1, skipped=1), "hang", "t#")
+        assert "placements a comparison needs" in said, said
+        assert "workload failure" not in said
+
+    def test_an_ordinary_thin_sample_is_unchanged(self):
+        """The control. A non-degenerate baseline must keep the sentence it had."""
+        from slurmpast.render import nodes_empty_reason
+
+        said = nodes_empty_reason(self._table(0.25, 12), "hang", "t#")
+        assert "placements a comparison needs" in said
+        assert "--since" in said
+
+    def test_a_never_failing_workload_already_had_its_answer(self):
+        """The 0% end, asserted rather than branched on, so a later reader can see
+        it was considered."""
+        from slurmpast.render import nodes_empty_reason
+
+        said = nodes_empty_reason(self._table(0.0, 40), "failure", "t#")
+        assert "nothing to attribute to a node" in said, said

@@ -2,6 +2,7 @@ from slurmpast.patterns import (
     find_memory_search,
     find_noop_allocations,
     find_repeat_failures,
+    find_requeues,
     goodput,
     group_key,
     summarize,
@@ -667,3 +668,99 @@ class TestTheMemoryWalkIsBounded:
 
         assert _ASCII_FOLD["×"] == "x"
         assert ascii_fold("32.0 GiB ×2").isascii()
+
+
+class TestAWorkloadThatKeepsBeingRequeued:
+    """The cross-run half of SP-5, which the report asked for alongside the
+    per-job `requeued Nx` row: *"a --patterns rule for a workload that keeps being
+    requeued (that pattern is a node or preemption problem, which is precisely
+    what --nodes exists to attribute)"*.
+
+    Deferred one round for want of a threshold and then set from Midway3's own
+    seven days: 938,576 job ids, 680 requeued, 372 of those with an earlier
+    attempt that ended, across 12,130 workloads. Both floors are needed. A count
+    alone fires on a 159,602-run workload with 99 requeues, which is background; a
+    rate alone fires on one job out of three. Together, `>= 3` and `>= 10%` fire
+    on five workloads out of 12,130, and the distribution has a clean break
+    between 12.0% and 6.3% for the rate to sit in.
+    """
+
+    @staticmethod
+    def _job(index, *, requeued, earlier_state="NODE_FAIL", earlier_end="2026-08-17T10:48:35"):
+        rows = []
+        if requeued:
+            rows.append(
+                row(
+                    JobID="5400%04d" % index,
+                    JobName="orca_spe",
+                    User="me",
+                    Partition="amd",
+                    State=earlier_state,
+                    Submit="2026-08-17T10:08:59",
+                    Start="2026-08-17T10:20:46",
+                    End=earlier_end,
+                    ElapsedRaw="900" if earlier_end else "",
+                )
+            )
+        rows.append(
+            row(
+                JobID="5400%04d" % index,
+                JobName="orca_spe",
+                User="me",
+                Partition="amd",
+                State="COMPLETED",
+                Submit="2026-08-17T10:48:35",
+                Start="2026-08-17T10:50:37",
+                End="2026-08-17T11:00:00",
+                ElapsedRaw="563",
+            )
+        )
+        return rows
+
+    def _jobs(self, requeued, total, **kwargs):
+        rows = []
+        for index in range(total):
+            rows += self._job(index, requeued=index < requeued, **kwargs)
+        return parse(make_text(*rows))
+
+    def test_a_workload_over_both_floors_is_reported(self):
+        finding = find(find_requeues(self._jobs(4, 10)), "requeue-repeat")
+        assert finding is not None
+        assert "4 of 10 runs of orca_spe in amd were requeued" in finding.evidence
+        assert "4 were NODE_FAIL" in finding.evidence
+
+    def test_the_abandoned_time_is_named(self):
+        """The number that makes the case: a requeued allocation really ran, and
+        its hours appear in no other total this tool prints."""
+        finding = find(find_requeues(self._jobs(4, 10)), "requeue-repeat")
+        # Four abandoned attempts of 900s each: the sum, not one of them.
+        assert "01:00:00" in finding.evidence, finding.evidence
+
+    def test_node_fail_is_sent_to_the_screen_that_attributes_it(self):
+        finding = find(find_requeues(self._jobs(4, 10)), "requeue-repeat")
+        assert "--nodes" in finding.action
+        assert "not the job" in finding.action
+
+    def test_too_few_requeues_is_not_a_pattern(self):
+        """First control. Two requeues is weather, whatever the rate -- here it is
+        100% of the workload and still silent."""
+        assert find_requeues(self._jobs(2, 2)) == []
+
+    def test_a_low_rate_is_not_a_pattern_however_many(self):
+        """Second control, and the one a count-only rule would fail: 20 requeues
+        is a lot in absolute terms and nothing at all out of 1,000 runs."""
+        assert find_requeues(self._jobs(20, 1000)) == []
+
+    def test_an_attempt_that_never_ended_is_not_counted(self):
+        """The control that matters most, and the bug this rule shipped with for
+        an hour.
+
+        An earlier incarnation with no End is an unterminated record, and Elapsed
+        on one is measured to *now*. Counting them turned a single array of 284
+        tasks whose original rows were never closed into "284 were RUNNING. The
+        abandoned attempts ran 4030-18:48:58 between them" -- four thousand days
+        nobody spent. `usable` already drops open records everywhere else in this
+        module; so does this.
+        """
+        stale = self._jobs(4, 10, earlier_state="RUNNING", earlier_end="")
+        assert find_requeues(stale) == []

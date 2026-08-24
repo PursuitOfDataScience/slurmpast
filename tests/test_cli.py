@@ -607,3 +607,474 @@ class TestAsciiIsHonouredByEveryTextView:
         # The options section, not the usage line, where every flag also appears.
         entry = text.split("--ascii", 2)[-1]
         assert "text output" in entry[:140], entry[:140]
+
+
+class TestTwoSectionsAreBothPrinted:
+    """Asking for two report sections used to yield one, silently.
+
+    Each section branch in `cli.main` ended in `return 0`, so the first one whose
+    flag was set won and the rest evaporated with no message and rc=0. Which one
+    survived was the order the branches happened to be written in, which no reader
+    can see:
+
+        --overview --patterns  -> patterns only
+        --overview --nodes     -> nodes only
+        --patterns --nodes     -> nodes only
+        --overview --sizing    -> sizing only
+
+    Both sibling packages reject this class of mistake loudly and name both flags
+    (`slurmwatch: ERROR: --once and --log are mutually exclusive`), which is the
+    standard the report holds this one to. Composing is the better answer where
+    the reports can coexist, and these can: the default plain output already
+    prints several sections in sequence, so asking for two by name has an obvious
+    meaning.
+    """
+
+    def test_both_sections_appear(self, capsys):
+        run("--demo", "--overview", "--patterns", "--plain", "--no-color")
+        out = capsys.readouterr().out
+        assert "cross-run patterns" in out
+        assert "JOB NAME" in out, "the overview table is the part that used to vanish"
+
+    def test_the_order_is_the_reading_order_not_the_branch_order(self, capsys):
+        """`--patterns --nodes` used to give nodes, because nodes is written
+        first. The composed order is fixed and independent of that."""
+        run("--demo", "--patterns", "--nodes", "--plain", "--no-color")
+        out = capsys.readouterr().out
+        assert out.index("cross-run patterns") < out.index("node reliability")
+
+    def test_the_same_order_however_the_flags_are_typed(self, capsys):
+        run("--demo", "--nodes", "--patterns", "--plain", "--no-color")
+        first = capsys.readouterr().out
+        run("--demo", "--patterns", "--nodes", "--plain", "--no-color")
+        assert first == capsys.readouterr().out
+
+    def test_one_section_alone_is_unchanged(self, capsys):
+        """The control. Composing must not add a separator, a heading or a blank
+        line to the single-section case, which is every existing caller."""
+        run("--demo", "--patterns", "--plain", "--no-color")
+        out = capsys.readouterr().out
+        assert out.startswith("cross-run patterns")
+        assert "JOB NAME" not in out
+
+
+class TestJsonTakesOneSectionAtATime:
+    """`--json` emits one document per section and there is no defined way to
+    concatenate two, so the composing above is text-only and the pair is refused.
+
+    Refused rather than silently reduced to one, which is the behaviour being
+    fixed: picking a winner is exactly what made the text case wrong.
+    """
+
+    def test_two_sections_with_json_is_an_error(self, capsys):
+        with pytest.raises(SystemExit) as caught:
+            run("--demo", "--overview", "--patterns", "--json")
+        assert caught.value.code == 2
+        err = capsys.readouterr().err
+        assert "--overview" in err and "--patterns" in err, err
+        assert "one section at a time" in err
+
+    def test_one_section_with_json_emits_exactly_one_document(self, capsys):
+        """The control, and the regression this fix nearly shipped.
+
+        Removing the `return 0` that made the sections exclusive also removed the
+        one the *json* path relied on, so `--overview --json` printed its document
+        and then fell through and printed the per-job payload after it. Valid JSON
+        followed by more valid JSON is not valid JSON, and `json.loads` is the
+        only thing that says so -- eyeballing the output does not.
+        """
+        run("--demo", "--overview", "--json", "--no-color")
+        json.loads(capsys.readouterr().out)
+
+    def test_json_with_no_section_is_still_one_document(self, capsys):
+        run("--demo", "--json", "--no-color")
+        json.loads(capsys.readouterr().out)
+
+
+class TestStepsNeedsAJobToStep:
+    """`--steps` is per-job accounting -- `--help` says "on a named job" -- and
+    without one it used to evaporate: rc=0, the ordinary overview, and no hint
+    that the flag did nothing.
+    """
+
+    def test_it_is_refused_and_says_what_to_do(self, capsys):
+        with pytest.raises(SystemExit) as caught:
+            run("--demo", "--steps", "--plain")
+        assert caught.value.code == 2
+        err = capsys.readouterr().err
+        assert "--steps" in err and "job id" in err, err
+
+    def test_with_a_job_id_it_still_breaks_the_job_down(self, capsys):
+        """The control: refusing the bare flag must not cost the flag itself."""
+        assert run("--demo", "5100057", "--steps", "--plain", "--no-color") in (0, 1)
+        assert "step" in capsys.readouterr().out.lower()
+
+
+class TestTheDemoAsksTheRealClusterNothing:
+    """`--demo` is meant to render identically on a login node and a laptop.
+
+    It already pins the synthetic cluster's `scontrol show config`, because
+    several messages are worded from `JobAcctGatherType` and without that the demo
+    changed by machine. The partition-ceiling clamp added for the unschedulable
+    `--cpus-per-task` finding introduced a second such leak and no test caught it:
+    `sizing.cpu_advice` learns a partition's node size by running `sinfo`, so
+    `--demo --sizing` on a login node asked the *real* cluster how big its `test`
+    nodes are.
+
+    Latent rather than visible, which is why it needed looking for: every CPU
+    recommendation in the synthetic history is downward or unchanged, and the
+    clamp only applies upward, so the output happened to be identical either way.
+    A demo that grew one upward recommendation would have started differing by
+    machine with nothing to say so.
+    """
+
+    def _subprocesses(self, *argv):
+        from slurmpast import site
+
+        seen = []
+        real = site._run
+        site._run = lambda args: seen.append(list(args)) or real(args)
+        try:
+            run(*argv)
+        finally:
+            site._run = real
+        return seen
+
+    # Every mode, not the two that happened to break. Twice in three rounds a new
+    # field reached the scheduler or the filesystem from a path that promises not
+    # to -- `--sizing` running `sinfo` under `--demo`, and `--json` stat-ing a log
+    # under `--no-logs` -- and both were invisible in the output. Enumerating the
+    # modes is what turns that from a thing caught twice by luck into a thing that
+    # cannot be added a third time.
+    MODES = (
+        ("--overview",),
+        ("--patterns",),
+        ("--nodes",),
+        ("--sizing",),
+        ("--plain",),
+        ("--failed",),
+        ("--json",),
+        ("--overview", "--json"),
+        ("--sizing", "--json"),
+        ("5100057",),
+        ("5100057", "--json"),
+    )
+
+    @pytest.mark.parametrize("mode", MODES, ids=[" ".join(m) for m in MODES])
+    def test_no_mode_asks_the_scheduler_anything(self, mode):
+        assert self._subprocesses("--demo", *mode, "--no-color") == []
+
+    def test_the_list_of_modes_is_not_stale(self):
+        """The guard on the guard. A mode added to the parser and not to `MODES`
+        above would be untested and look tested, which is how the two leaks got
+        in -- so the parser is asked what it offers rather than a human
+        remembering."""
+        parser = cli.build_parser()
+        offered = {
+            option
+            for action in parser._actions
+            for option in action.option_strings
+            if option.startswith("--")
+        }
+        # The view-selecting flags. Everything else is a modifier (--no-color,
+        # -S) or an escape hatch (--demo, --help) and does not select an output.
+        views = {"--overview", "--patterns", "--nodes", "--sizing", "--json", "--failed"}
+        assert views <= offered, views - offered
+        covered = {flag for mode in self.MODES for flag in mode if flag.startswith("--")}
+        assert views <= covered, "views with no isolation test: %s" % (views - covered)
+
+    def test_the_ceiling_used_is_the_synthetic_one(self, capsys):
+        """Pinned to a real value rather than to "no ceiling", so the demo
+        exercises the same code path a cluster does."""
+        from slurmpast.demo import DEMO_PARTITIONS
+
+        run("--demo", "--sizing", "--plain", "--no-color")
+        capsys.readouterr()
+        from slurmpast.site import partition_ceiling
+
+        assert partition_ceiling("test") == DEMO_PARTITIONS["test"]
+
+
+class TestTheJsonSaysHowMuchItClipped:
+    """`-n/--limit` clips the `--json` findings array and nothing in the payload
+    said so.
+
+    No wrong number and no crash: the clip is newest-first, the default output is
+    a strict prefix of the full list, and the aggregates in `summary` are computed
+    over every job rather than the clipped set. The defect is that it is
+    *undetectable*. `summary.jobs` counts everything in the window, so
+    `len(jobs) < summary.jobs` is the normal state whether anything was dropped or
+    not, and there was no `findings_jobs`, `shown` or `truncated` key to compare
+    against.
+
+    The consequence is a monitoring consumer polling this payload: as an account
+    accumulates more than `-n` findings-bearing jobs in the window, the oldest
+    drop off silently and the JSON looks exactly as complete as before.
+
+    Mirror image of the `--sizing` defect fixed one round earlier -- there the
+    text view collapsed what the JSON carried in full, here the JSON is the lossy
+    one -- and the same cause: a truncation decided at render time with no field
+    recording that it happened.
+    """
+
+    def _payload(self, capsys, *extra):
+        run("--demo", "--json", "--no-color", *extra)
+        return json.loads(capsys.readouterr().out)
+
+    def test_json_reports_how_many_findings_jobs_were_clipped(self, capsys):
+        """The test the report asks for by name."""
+        clipped = self._payload(capsys, "-n", "5")
+        assert len(clipped["jobs"]) == 5
+        assert clipped["summary"]["findings_jobs_shown"] == 5
+        assert clipped["summary"]["findings_jobs"] > 5, clipped["summary"]
+
+    def test_the_two_counts_agree_when_nothing_was_clipped(self, capsys):
+        """The control, and the invariant a consumer actually checks: equal means
+        complete."""
+        whole = self._payload(capsys, "-n", "0")
+        summary = whole["summary"]
+        assert summary["findings_jobs"] == summary["findings_jobs_shown"]
+        assert summary["findings_jobs"] == len(whole["jobs"])
+
+    def test_the_new_counts_are_not_the_window_total(self, capsys):
+        """`summary.jobs` is every job in the window and cannot reveal the clip --
+        which is exactly why comparing against it told a consumer nothing."""
+        whole = self._payload(capsys, "-n", "0")
+        assert whole["summary"]["jobs"] > whole["summary"]["findings_jobs"]
+
+
+class TestZeroMeansUnlimited:
+    """`-n 0` exited 2 with an argparse usage dump.
+
+    A sibling tool in this suite already spells "no limit" as `-n 0`, so the same
+    flag meant "unlimited" in one and "usage error" in another. It is also the
+    escape hatch the JSON clip above needs.
+
+    The old rejection had a recorded reason -- `-n 0` "renders a table with a
+    header, no rows, and a footer saying everything was omitted" -- and that
+    reason is about `[:0]`, which is a good argument against 0 as a literal count
+    and none at all against this meaning. Under it the table renders everything,
+    so the objection cannot arise.
+    """
+
+    def test_zero_is_accepted_and_means_everything(self, capsys):
+        assert run("--demo", "--overview", "--plain", "--no-color", "-n", "0") == 0
+        wide = capsys.readouterr().out
+        run("--demo", "--overview", "--plain", "--no-color", "-n", "2")
+        narrow = capsys.readouterr().out
+        assert len(wide) > len(narrow)
+
+    def test_it_does_not_render_an_empty_table(self, capsys):
+        """The recorded objection, asserted as the behaviour that answers it."""
+        run("--demo", "--overview", "--plain", "--no-color", "-n", "0")
+        out = capsys.readouterr().out
+        assert "JOB NAME" in out
+        assert "more workload" not in out, "nothing should be reported as omitted"
+
+    @pytest.mark.parametrize("mode", ["--overview", "--plain", "--sizing", "--failed"])
+    def test_no_view_claims_a_tail_it_did_not_truncate(self, capsys, mode):
+        """The general form of the contradiction, swept across every view `-n`
+        governs.
+
+        Fixing `tail_summary` closed it on the overview; nothing said the other
+        views were clean, and each keeps its own tail line (`render_list`'s
+        "… N more (raise --limit)", `render_sizing`'s "below the N shown"). With
+        no limit in force none of them may claim anything is below a fold.
+
+        `--nodes` is deliberately absent: its "N nodes below threshold omitted" is
+        a *sample* threshold, not a row limit — it is invariant under `-n`, and
+        including it here would assert something false.
+        """
+        run("--demo", mode, "--plain", "--no-color", "-n", "0")
+        out = capsys.readouterr().out
+        for claim in ("more workload", "more (raise --limit)", "below the"):
+            assert claim not in out, "%s claimed a tail under -n 0: %r" % (mode, claim)
+
+    def test_the_nodes_threshold_note_is_not_a_limit_claim(self, capsys):
+        """The control for the exclusion above, so it is a measured fact rather
+        than an assumption: that line does not move with `-n`."""
+        seen = set()
+        for limit in ("0", "1", "25"):
+            run("--demo", "--nodes", "--plain", "--no-color", "-n", limit)
+            out = capsys.readouterr().out
+            seen.add("below threshold omitted" in out)
+        assert len(seen) == 1, "the nodes note changed with --limit, so it is one"
+
+    def test_a_negative_limit_is_still_refused(self, capsys):
+        """The control. `-n -5` is a plausible typo for `-n 5` -- one this tool
+        invites by accepting `-S -7days` -- and must not become a silent slice."""
+        with pytest.raises(SystemExit) as caught:
+            run("--demo", "--overview", "-n", "-5")
+        assert caught.value.code == 2
+        assert "0 (unlimited) or more" in capsys.readouterr().err
+
+
+class TestTheExitCodeContractIsStatedAndOptional:
+    """The scan mode exits 0 while reporting critical findings, and until now
+    nothing said so.
+
+    Deliberate, and the code says why: without job ids the cross-run patterns
+    decide the code, so a scan across a cluster does not exit 1 almost always and
+    stay useless as a signal. The JSON path computes the per-job verdict anyway --
+    the payload needs it -- and then discards it, which is the asymmetry that
+    makes `slurmpast --json || alert` silent on exactly the mode anyone would
+    automate.
+
+    So: state the contract, and offer the other reading rather than changing the
+    default. Reproduced with one OOM job -- a critical per-job finding, too few
+    runs for any pattern -- where the same payload gives rc=0 scanning and rc=1
+    by job id.
+    """
+
+    def _runner(self):
+        from tests.conftest import make_text, row
+        from tests.test_portability import _FIELDS
+
+        text = make_text(
+            row(
+                JobID="900001",
+                JobName="solo",
+                User="u",
+                Partition="p",
+                State="OUT_OF_MEMORY",
+                ExitCode="0:125",
+                Submit="2026-08-23T09:00:00",
+                Start="2026-08-23T09:00:00",
+                End="2026-08-23T09:10:00",
+                ElapsedRaw="600",
+                ReqMem="1G",
+                NCPUS="1",
+                AllocCPUS="1",
+                NNodes="1",
+                AllocTRES="billing=1,cpu=1,mem=1G,node=1",
+            ),
+            row(
+                JobID="900001.batch",
+                JobName="batch",
+                State="OUT_OF_MEMORY",
+                ExitCode="0:125",
+                ElapsedRaw="600",
+                TotalCPU="00:09:00",
+                NCPUS="1",
+                AllocCPUS="1",
+                MaxRSS="1048576K",
+            ),
+        ).replace("|", "\x1f")
+
+        def run_sacct(args):
+            if "--helpformat" in args:
+                return " ".join(_FIELDS)
+            if args and args[0] in ("squeue", "scontrol", "sinfo"):
+                return ""
+            return text
+
+        return run_sacct
+
+    def _rc(self, monkeypatch, capsys, *argv):
+        monkeypatch.setattr("slurmpast.sacct._run", self._runner())
+        code = run(*argv)
+        capsys.readouterr()
+        return code
+
+    def test_exit_code_ignores_per_job_criticals_without_job_ids(self, monkeypatch, capsys):
+        """Pinning the current contract, which the report asks for by name and
+        agrees is defensible."""
+        assert self._rc(monkeypatch, capsys, "--json", "--no-color", "-S", "now-1days") == 0
+
+    def test_the_same_job_asked_for_by_id_still_exits_one(self, monkeypatch, capsys):
+        """The asymmetry itself: identical payload, different code."""
+        assert self._rc(monkeypatch, capsys, "900001", "--json", "--no-color") == 1
+
+    def test_strict_flag_ors_in_per_job_criticals(self, monkeypatch, capsys):
+        """The opt-in, also named in the report."""
+        assert (
+            self._rc(monkeypatch, capsys, "--json", "--strict", "--no-color", "-S", "now-1days")
+            == 1
+        )
+
+    def test_strict_reaches_the_text_path_too(self, monkeypatch, capsys):
+        """The two paths agree without the flag and must agree under it. They
+        reach the answer differently -- the text branch never runs the per-job
+        loop -- so this is not the same code being exercised twice."""
+        assert (
+            self._rc(monkeypatch, capsys, "--plain", "--strict", "--no-color", "-S", "now-1days")
+            == 1
+        )
+        assert self._rc(monkeypatch, capsys, "--plain", "--no-color", "-S", "now-1days") == 0
+
+    def test_the_help_states_all_three_codes(self):
+        """Undiscoverable is the actual complaint: `2` is in use as well, so the
+        real contract is 0/1/2 with a mode-dependent 1, and `--help` said none of
+        it."""
+        epilog = cli.EPILOG
+        assert "exit status:" in epilog
+        for code in ("0 ", "1 ", "2 "):
+            assert code in epilog
+        assert "--strict" in epilog
+        assert "report rather than judge" in epilog
+
+
+class TestTheSyntheticMarkerReachesEverySurface:
+    """`--demo` marks its output as synthetic, and the cross-package review named
+    that the pattern the other tools should copy: *"the marker sits in a field the
+    output always renders, so it cannot scroll away or be dropped by a consumer."*
+
+    It did not. Checking the compliment rather than accepting it found `--json`
+    carrying no marker at all — `summary` had no window and the string "synthetic"
+    appeared nowhere in the payload — so a machine consumer of `--demo --json`
+    could not tell simulated data from real. That is the same defect filed against
+    the sibling tool in the same table (*"no in `--once --json`, 3438 bytes of
+    telemetry, zero markers"*), and only the overview had been looked at here.
+
+    Fixed by carrying `history.window` into every payload root, which is worth
+    having on its own account: a consumer could not previously tell what window a
+    payload covered either.
+    """
+
+    JSON_VIEWS = ((), ("--overview",), ("--patterns",), ("--nodes",), ("--sizing",), ("5100057",))
+
+    @pytest.mark.parametrize("view", JSON_VIEWS, ids=[" ".join(v) or "jobs" for v in JSON_VIEWS])
+    def test_every_json_surface_says_the_data_is_synthetic(self, capsys, view):
+        run("--demo", *view, "--json", "--no-color")
+        payload = json.loads(capsys.readouterr().out)
+        assert payload.get("window") == "synthetic demo data", sorted(payload)
+
+    def test_a_real_window_is_named_rather_than_blank(self, capsys, monkeypatch):
+        """The control, and the reason this is not a demo-only field: the same key
+        tells a consumer what period the numbers cover, which nothing did before."""
+        from slurmpast.sacct import SAFE_DELIMITER
+        from tests.conftest import make_text, row
+        from tests.test_portability import _FIELDS
+
+        # `_FIELDS`, not `Sacct().fields`: the latter negotiates against whatever
+        # sacct is on the runner's PATH, so on a real cluster the probe answers 80
+        # fields while `row()` builds 85 and every row is dropped as shifted.
+        fields = _FIELDS
+        text = make_text(
+            row(
+                JobID="700100",
+                JobName="w",
+                User="u",
+                State="COMPLETED",
+                Submit="2026-08-23T09:00:00",
+                Start="2026-08-23T09:00:00",
+                End="2026-08-23T09:10:00",
+                ElapsedRaw="600",
+                NCPUS="1",
+                AllocCPUS="1",
+                NNodes="1",
+            )
+        ).replace("|", SAFE_DELIMITER)
+
+        def fake(args):
+            if "--helpformat" in args:
+                return " ".join(fields)
+            if args and args[0] in ("squeue", "scontrol", "sinfo"):
+                return ""
+            return text
+
+        monkeypatch.setattr("slurmpast.sacct._run", fake)
+        run("-u", "u", "--overview", "--json", "--no-color", "-S", "now-2days")
+        payload = json.loads(capsys.readouterr().out)
+        assert payload.get("window") == "last 2 days", payload.get("window")
+        assert "synthetic" not in json.dumps(payload)

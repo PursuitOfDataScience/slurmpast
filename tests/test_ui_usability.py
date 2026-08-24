@@ -293,6 +293,29 @@ class TestClipboard:
         monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
         assert tui._clip_path().startswith(str(tmp_path))
 
+    def test_an_unwritable_cache_home_costs_nothing(self, tmp_path, monkeypatch):
+        """The failing side of the same question, which the three tests above do
+        not reach -- they all point at a writable directory.
+
+        This is the only path in the package that writes state anywhere, and a
+        clipboard fallback file is not worth failing a report over. Exercised on a
+        second cluster with the directory unwritable and reported as degrading
+        silently at rc=0; confirmed here, since "we never write anything" and "we
+        write and handle the failure" look identical from outside and only one of
+        them keeps working when the feature is used.
+        """
+        import os
+
+        blocked = tmp_path / "blocked"
+        blocked.mkdir()
+        blocked.chmod(0o500)
+        monkeypatch.setenv("XDG_CACHE_HOME", str(blocked / "slurmpast-cache"))
+        try:
+            assert tui._clip_path() == ""
+        finally:
+            blocked.chmod(0o700)
+            os.rmdir(blocked)
+
     @pytest.mark.asyncio
     async def test_copy_is_offered_in_the_footer(self):
         app = make_app(history(), no_logs=True)

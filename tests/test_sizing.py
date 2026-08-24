@@ -1031,3 +1031,217 @@ class TestNoSuggestionFallsBelowWhatTheWorkloadNeeded:
                     assert then < now, (advice.flag, advice.requested, advice.suggestion)
                 else:
                     assert then > now, (advice.flag, advice.requested, advice.suggestion)
+
+
+class TestAnUpwardAdviceCannotExceedTheNode:
+    """`--sizing` advised `--cpus-per-task=34` on a partition whose nodes have 28.
+
+    Found on 7 days of all-users data: `twistedBD`, 401 runs, "the busiest run
+    used 27.9 of 28 cores per task" -- a correct reading -- and then a
+    ready-to-paste line that `sbatch` refuses outright:
+
+        $ sbatch --test-only --partition=broadwl --cpus-per-task=34 …
+        allocation failure: Requested node configuration is not available
+
+    The value it recommended raising *from* was already the ceiling. One missing
+    guard, not a misjudged feature.
+
+    Only upward advice is clamped. A downward recommendation was verified on that
+    same cluster to round-trip through `sbatch --test-only` and complete inside
+    the tightened limits, and a ceiling cannot make a smaller number
+    unschedulable.
+    """
+
+    @staticmethod
+    def _saturated(monkeypatch, ceiling, cores=28, busy="27:54:00"):
+        from slurmpast import sizing
+
+        monkeypatch.setattr(sizing, "partition_ceiling", lambda name: (ceiling, None))
+        rows = []
+        for index in range(6):
+            rows.append(
+                row(
+                    JobID=str(9000 + index),
+                    JobName="twistedBD",
+                    User="u",
+                    Partition="broadwl",
+                    State="COMPLETED",
+                    Submit="2026-08-23T09:00:00",
+                    Start="2026-08-23T09:00:00",
+                    End="2026-08-23T10:00:00",
+                    ElapsedRaw="3600",
+                    NCPUS=str(cores),
+                    AllocCPUS=str(cores),
+                    ReqCPUS=str(cores),
+                    NNodes="1",
+                    AllocTRES="billing=%d,cpu=%d,mem=100G,node=1" % (cores, cores),
+                )
+            )
+            rows.append(
+                row(
+                    JobID=str(9000 + index) + ".batch",
+                    JobName="batch",
+                    State="COMPLETED",
+                    ElapsedRaw="3600",
+                    TotalCPU=busy,
+                    NCPUS=str(cores),
+                    AllocCPUS=str(cores),
+                )
+            )
+        return parse(make_text(*rows))
+
+    def test_no_unschedulable_line_is_emitted(self, monkeypatch):
+        """The defect as filed: the paste-ready line is what gets submitted."""
+        advice = cpu_advice(self._saturated(monkeypatch, 28))
+        assert "--cpus-per-task" not in " ".join(sbatch_lines([advice]))
+
+    def test_it_does_not_claim_the_request_is_already_right(self, monkeypatch):
+        """Clamping alone turns "raise to 34" into "already about right", which is
+        a different wrong answer -- the workload is using 27.9 of 28 and would take
+        more. Saturation gets its own verdict so it can say so."""
+        advice = cpu_advice(self._saturated(monkeypatch, 28))
+        assert advice.verdict == "capped", advice.verdict
+        assert advice.actionable is False
+
+    def test_the_caution_names_the_actual_remedy(self, monkeypatch):
+        advice = cpu_advice(self._saturated(monkeypatch, 28))
+        assert "ceiling of 28 cores per node" in advice.caution, advice.caution
+        assert "partition with more cores per node" in advice.caution
+
+    def test_the_measurement_survives(self, monkeypatch):
+        """The reading was right and is the evidence for moving partition."""
+        advice = cpu_advice(self._saturated(monkeypatch, 28))
+        assert "of 28 cores per task" in advice.basis, advice.basis
+
+    def test_a_raise_below_the_ceiling_is_untouched(self, monkeypatch):
+        """The control. A partition with room still gets its number."""
+        advice = cpu_advice(self._saturated(monkeypatch, 64))
+        assert advice.verdict == "raise", advice.verdict
+        assert int(advice.suggestion) > 28
+        assert int(advice.suggestion) <= 64
+
+    def test_an_unknown_ceiling_changes_nothing(self, monkeypatch):
+        """No `sinfo`, or a partition it cannot see, must leave today's behaviour
+        alone -- an unclamped number is what shipped, while a wrong clamp would
+        suppress advice a user needs."""
+        advice = cpu_advice(self._saturated(monkeypatch, None))
+        assert advice.verdict == "raise", advice.verdict
+        assert advice.suggestion
+
+    def test_a_downward_recommendation_is_never_clamped(self, monkeypatch):
+        """Verified end to end on a second cluster, and a ceiling cannot make a
+        smaller request unschedulable."""
+        idle = self._saturated(monkeypatch, 28, busy="00:30:00")
+        advice = cpu_advice(idle)
+        assert advice.verdict == "lower", advice.verdict
+        assert int(advice.suggestion) < 28
+
+
+class TestNoDataIsNotAnAllClear:
+    """`--sizing`'s only output on a thin history was an affirmative green pass.
+
+    "every workload is already about right, or lacks the runs to say" merges two
+    states that mean opposite things, in the screen's most reassuring colour, for
+    the state that is actually "I have no idea". Measured on the reporting
+    cluster: 61 of 69 workloads dropped, **every one for lack of runs and none
+    because it was correctly sized** — so the sentence was 0% its first half and
+    100% its second. This is the first thing a new user sees on a new cluster,
+    which is the open-box case the whole exercise is about.
+
+    A second omission sat beside it. `hidden_groups` counts only workloads *with*
+    advice pushed past the limit, so with 8 shown and 61 dropped it never fires
+    and the 61 leave with no tally. Naming a tail is this file's own stated
+    standard, met by the branch two lines below the filter that broke it.
+
+    `--json` needed no change: it carries every workload with a per-flag `unknown`
+    verdict and a basis saying which state it is in. Purely a render defect.
+    """
+
+    def _runs(self, count, name="xtool"):
+        rows = []
+        for index in range(count):
+            rows.append(
+                row(
+                    JobID=str(48819683 + index),
+                    JobName=name,
+                    User="u",
+                    Partition="build",
+                    State="COMPLETED",
+                    Submit="2026-08-23T09:00:00",
+                    Start="2026-08-23T09:00:00",
+                    End="2026-08-23T09:10:00",
+                    ElapsedRaw="600",
+                    Timelimit="00:15:00",
+                    TimelimitRaw="15",
+                    ReqMem="6G",
+                    NCPUS="1",
+                    AllocCPUS="1",
+                    NNodes="1",
+                    AllocTRES="billing=1,cpu=1,mem=6G,node=1",
+                )
+            )
+            rows.append(
+                row(
+                    JobID=str(48819683 + index) + ".batch",
+                    JobName="batch",
+                    State="COMPLETED",
+                    ElapsedRaw="600",
+                    TotalCPU="00:09:30",
+                    NCPUS="1",
+                    AllocCPUS="1",
+                    MaxRSS="1580836K",
+                )
+            )
+        return parse(make_text(*rows))
+
+    def _screen(self, jobs):
+        """Rendered, with whitespace collapsed -- the sentences under test are
+        wrapped prose, and where the wrap falls depends on the terminal width and
+        on how long the interpolated names happen to be."""
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_sizing
+
+        return " ".join(render_sizing(History(jobs), style=Style(enabled=False)).split())
+
+    def test_no_runs_and_all_correctly_sized_do_not_print_the_same_line(self):
+        """The test the report asks for by name. Both states leave the screen
+        empty; they must not leave the same sentence on it."""
+        no_data = self._screen(self._runs(1))
+        # Three runs of a request that is already right: judged, and left alone.
+        sized = self._screen(
+            [
+                job._replace(req_mem_bytes=2 * 1024**3, alloc_tres="billing=1,cpu=1,mem=2G,node=1")
+                for job in self._runs(3)
+            ]
+        )
+        assert no_data.strip() != sized.strip()
+
+    def test_the_no_data_screen_says_it_has_no_data(self):
+        screen = self._screen(self._runs(1))
+        assert "no workload has the 3 completed runs" in screen, screen
+        assert "already about right" not in screen
+
+    def test_it_counts_what_it_could_not_judge(self):
+        """A number, because "some workloads" is the omission being fixed."""
+        screen = self._screen(self._runs(1))
+        assert "1 workload, 1 run" in screen, screen
+
+    def test_a_shown_workload_does_not_hide_the_unjudged_ones(self):
+        """The second omission: with something actionable on screen, the dropped
+        workloads had no tally at all."""
+        jobs = self._runs(3) + self._runs(1, name="swtwo")
+        screen = self._screen(jobs)
+        assert "--mem" in screen, "the judged workload should still be shown"
+        assert "too few runs to judge" in screen, screen
+
+    def test_a_genuine_all_clear_keeps_its_plain_sentence(self):
+        """The control. When every workload really was judged and left alone, the
+        reassuring sentence is the true one and must survive."""
+        sized = self._screen(
+            [
+                job._replace(req_mem_bytes=2 * 1024**3, alloc_tres="billing=1,cpu=1,mem=2G,node=1")
+                for job in self._runs(3)
+            ]
+        )
+        assert "already about right" in sized, sized
+        assert "too few runs" not in sized

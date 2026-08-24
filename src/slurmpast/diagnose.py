@@ -411,18 +411,46 @@ def _cpu_rules(job, add):
                 )
             )
             return
+        # Same validity problem as `cpu-overrequest` below, one rule over and a
+        # severity higher. "Nothing was computed" is an absolute claim read off
+        # `TotalCPU`, which under `jobacct_gather/linux` cannot see a reparented
+        # worker pool -- so a `multisession` job whose master idles while eight
+        # detached workers burn hundreds of core-seconds lands here and is sent to
+        # "find the blocking call" that does not exist. The reported job cleared
+        # the floor by 13x and escaped; the reporter's arm C, 3.08 CPU-seconds
+        # over 31s, is the shape that does not.
+        #
+        # The threshold is *not* re-keyed: separating "idle" from "counted
+        # elsewhere" needs evidence `sacct` does not carry, and moving the floor
+        # without it trades a wrong CRITICAL for a missed one. What is fixed is
+        # the honesty -- the sentence now states what was recorded rather than
+        # what happened, and the caveat says which of those two this cluster can
+        # tell apart.
+        from .site import cpu_caveat, cpu_total_is_complete
+
+        # "Nothing was computed" is a claim about the *job*; the record only
+        # supports a claim about what was *attributed*. Where the cluster gathers
+        # from the cgroup the two are the same thing and the original sentence
+        # stands. Where it does not, they are not, and the softer sentence plus
+        # the caveat is the most the record will carry.
+        if cpu_total_is_complete():
+            outcome = "Nothing was computed."
+        else:
+            outcome = "No CPU time was attributed to it. %s." % cpu_caveat()
         add(
             Finding(
                 CRITICAL,
                 "noop-allocation",
                 "Allocation did essentially nothing",
-                "%s of wall clock, %s of CPU%s. Nothing was computed."
+                "%s of wall clock, %s of CPU%s. %s"
                 % (
                     format_duration(job.elapsed),
                     format_duration(job.total_cpu),
                     held,
+                    outcome,
                 ),
-                "Find the blocking call. If this allocation is a deliberate reservation, "
+                "Find the blocking call — or the work, if it ran in a detached pool this "
+                "cluster cannot attribute. If this allocation is a deliberate reservation, "
                 "mark it so and this rule will stay quiet.",
             )
         )
@@ -443,14 +471,32 @@ def _cpu_rules(job, add):
         shape = ""
         if job.task_count > 1:
             shape = " across %d tasks" % job.task_count
+        # Imported here rather than at module scope, matching the two
+        # `maxrss_caveat` call sites above: `site` shells out to `scontrol` on
+        # first use, and `diagnose` is imported by paths that never need it.
+        from .site import cpu_caveat
+
+        # The evidence carries the cluster's own caveat, exactly as the memory
+        # finding carries `maxrss_caveat()`. `TotalCPU` cannot see work in
+        # processes reparented out of the step's tree, so on a
+        # `jobacct_gather/linux` site this utilisation is a lower bound. Reported
+        # from a second cluster on an eight-worker R `multisession` job that ran
+        # in 24 minutes what would take four hours serially, and was told to ask
+        # for one core.
+        #
+        # Caveated, not suppressed. The reporter is right that
+        # `_CPU_TIME_ALREADY_EXPLAINED` is the wrong instrument here: that set is
+        # for states where the number is garbage, and this number is real work
+        # really done — it is just not all of it.
         add(
             Finding(
                 WARNING,
                 "cpu-overrequest",
                 "Most allocated cores were idle",
-                "Utilization %s of %d cores%s, i.e. about %.1f cores of real work."
-                % (format_percent(util), cores, shape, effective),
-                "Try --cpus-per-task=%d, unless those cores feed dataloader workers."
+                "Utilization %s of %d cores%s, i.e. about %.1f cores of real work. %s."
+                % (format_percent(util), cores, shape, effective, cpu_caveat()),
+                "Try --cpus-per-task=%d, unless those cores feed dataloader workers, "
+                "or the work runs in a detached worker pool this cluster cannot attribute."
                 % max(1, int(busy_per_task + 0.999)),
             )
         )
@@ -632,7 +678,28 @@ def _exit_rules(job, log_text, add):
             )
         return
 
-    if any(marker in lowered for marker in _CUDA_OOM_MARKERS):
+    # A GPU cause cannot belong to a job that was never given a GPU. The job
+    # record already says so -- `AllocTRES` carries no `gres` entry -- and not
+    # checking it let a mis-attached log produce a *critical* "GPU ran out of
+    # memory" for a job on a GPU-less partition: reported from a second cluster,
+    # where a decoy file with the same mtime was matched by timing and the real
+    # cause (`disk quota exceeded`) never appeared. The log-matching hedge was
+    # printed, but one dim line of caveat does not balance the loudest severity
+    # the tool emits, stated as fact and followed by four remediations.
+    #
+    # This does not make the wrong log right -- it is still the wrong log. It
+    # stops the tool from asserting, on evidence it holds, a cause it can rule
+    # out. Only the GPU rules are gated: a traceback or an import error in a
+    # mis-attached log is still a possible cause for any job.
+    # `job.gpu_count`, the *identical* test `_gpu_rules` uses at its own top --
+    # not a similar one. A looser spelling here (say, "gres" appearing anywhere in
+    # AllocTRES) would let `cuda-oom` fire on a job where the GPU-utilisation
+    # findings stay silent, which is two findings on one screen disagreeing about
+    # whether the job had a GPU at all. `_io_explains_idle_cpu` sets that standard
+    # explicitly a few hundred lines up: share the condition rather than pick a
+    # second threshold, "so the guard has to fire on the same jobs the other rule
+    # does, not on a similar-looking set."
+    if job.gpu_count and any(marker in lowered for marker in _CUDA_OOM_MARKERS):
         add(
             Finding(
                 CRITICAL,
@@ -644,7 +711,23 @@ def _exit_rules(job, log_text, add):
                 "Consider a card with more HBM.",
             )
         )
-    if any(marker in lowered for marker in _NCCL_MARKERS):
+    # Two preconditions, because a collective fault needs both a device and a peer.
+    # NCCL is NVIDIA-only, so no GPU means nothing was running it; and with a
+    # single rank there is nobody to block on, which is what this finding's own
+    # explanation describes -- "one rank diverged, died, or is slow, and the
+    # others block on it". Reported for a job whose entire allocation read
+    # `billing=1,cpu=1,mem=200M,node=1` and which drew this at CRITICAL.
+    #
+    # A rank is not a task. The report proposed `nodes > 1 or ntasks > 1`, and
+    # that is wrong here: the suite's own `healthy_job` is `gres/gpu=3` on
+    # `node=1` with no NTasks recorded, and three GPUs on one node do collectives
+    # across each other all day. Testing tasks and nodes alone would have
+    # suppressed five real fault shapes this suite already pins -- it caught it
+    # immediately. Whichever of the three is largest is the rank count.
+    collective_possible = job.gpu_count and (
+        job.gpu_count > 1 or job.task_count > 1 or job.node_count > 1
+    )
+    if collective_possible and any(marker in lowered for marker in _NCCL_MARKERS):
         add(
             Finding(
                 CRITICAL,
@@ -670,6 +753,45 @@ def _exit_rules(job, log_text, add):
     tail = _traceback_tail(log_text)
     if tail:
         add(Finding(INFO, "traceback", "Traceback tail from the log", tail, ""))
+        return
+
+    # A failed job whose log matched no rule used to produce no finding at all,
+    # so the screen read "nothing to flag" -- about a job that failed, with its
+    # log sitting on the line above. That was masked while the log-matching
+    # heuristic preferred an empty `--output`: the empty file took the "no log
+    # was found" branch, which at least said something. Routing the real stderr
+    # in exposed it.
+    #
+    # The tool cannot name a cause it has no rule for, and should not invent one.
+    # It can show the reader the last lines of the file it found, which is what
+    # they would do next anyway. Held to INFO and phrased as an excerpt rather
+    # than a diagnosis, because that is exactly what it is.
+    if job.failed:
+        excerpt = _last_lines(log_text)
+        if excerpt:
+            add(
+                Finding(
+                    INFO,
+                    "log-tail",
+                    "End of the log, which names no cause this tool recognises",
+                    excerpt,
+                    "",
+                )
+            )
+
+
+def _last_lines(log_text, max_lines=6):
+    """The final non-blank lines of a log, for a failure nothing else explains.
+
+    Deliberately not `_traceback_tail`: that one finds a Python traceback and
+    returns nothing when there is not one, which is the case this exists for.
+    Whatever wrote the last line is usually what stopped the job -- a quota
+    message, an MPI abort, a shell error -- and none of those is a shape this
+    tool has a rule for.
+    """
+    lines = [line.rstrip() for line in (log_text or "").splitlines()]
+    kept = [line for line in lines if line.strip()][-max_lines:]
+    return "\n".join(kept)
 
 
 def _strip_rank(line):
