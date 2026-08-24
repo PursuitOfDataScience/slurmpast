@@ -202,11 +202,21 @@ def format_duration(seconds):
 
 
 def format_bytes(value):
-    """Bytes -> GiB/MiB string. ``None`` renders as ``n/a``, never ``0``."""
+    """Bytes -> TiB/GiB/MiB/KiB string. ``None`` renders as ``n/a``, never ``0``.
+
+    The KiB tier is not decoration. Without it the ladder fell from MiB straight
+    to raw bytes, so a job detail printed ``read 9.5 GiB`` and ``rate 488928 B/s``
+    in the same block, and a step table put ``612794 B`` beside ``79.0 MiB`` in
+    one column -- the two figures a reader most wants to compare, in units that
+    cannot be compared by eye.
+
+    Bytes remain the floor below 1 KiB, where they are the honest unit and where
+    ``0`` must keep rendering as ``0 B`` rather than ``0.0 KiB``.
+    """
     if value is None or not math.isfinite(float(value)):
         return "n/a"
     value = float(value)
-    for unit, scale in (("TiB", 1024**4), ("GiB", 1024**3), ("MiB", 1024**2)):
+    for unit, scale in (("TiB", 1024**4), ("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024)):
         if value >= scale:
             return "%.1f %s" % (value / scale, unit)
     return "%d B" % int(value)

@@ -283,6 +283,10 @@ def _memory_rules(job, add):
         # Two gates, both required: a large *fraction* left unused AND a large
         # absolute amount. A 90%-unused 2 GiB request is not worth a word.
         if used < MEM_SLACK and unused >= MEM_SLACK_FLOOR:
+            # Deferred like the two `maxrss_caveat` calls above, and for the same
+            # reason: `site` shells out to `scontrol`.
+            from .site import maxrss_caveat
+
             add(
                 Finding(
                     INFO,
@@ -297,9 +301,16 @@ def _memory_rules(job, add):
                     ),
                     # `format_mem_flag`, not `format_bytes`: the display formatter
                     # spelled this "--mem=52.0 GiB", which sbatch rejects.
-                    "Try --mem=%s (peak plus ~30%%). MaxRSS over-reports "
-                    "multi-process jobs, so treat it as an upper bound."
-                    % format_mem_flag(int(rss * 1.3)),
+                    #
+                    # The caveat is asked of `site` rather than written out here.
+                    # Hardcoded, it said MaxRSS "over-reports multi-process jobs"
+                    # unconditionally -- true under `jobacct_gather/linux`, false
+                    # under `jobacct_gather/cgroup`, where the number is the
+                    # cgroup's own peak. On Mercury that put this sentence in
+                    # direct contradiction with the one `--sizing` prints about
+                    # the same figure in the same run.
+                    "Try --mem=%s (peak plus ~30%%). %s."
+                    % (format_mem_flag(int(rss * 1.3)), maxrss_caveat()),
                 )
             )
 

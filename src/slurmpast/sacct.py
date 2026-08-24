@@ -841,6 +841,43 @@ def parse(text, fields=None, delimiter="|", stats=None):
     )
 
 
+def _same_job(candidate, newest):
+    """Whether two rows sharing a job id are one job requeued, or two jobs.
+
+    ``sacct -D -j <id>`` carries no window, so on a cluster whose slurmdbd has
+    outlived a job-id counter reset it answers with every job that has *ever*
+    held the id. Measured on Mercury (Slurm 25.11.3), where all 40 ids sampled
+    from three recent days came back with a second row::
+
+        509531|mercury|aranda   |standard|dsa-3-20                          |2019-03-03
+        509531|mercury|cmbrennan|highmem |did_bigquery_priority_general_2026|2026-08-19
+
+    Folding those together reported "requeued 1x" on every per-job view on that
+    cluster, and the incarnation it attributed to the reader was a stranger's
+    job from seven years earlier. Passing ``-S`` does not help: the per-job path
+    has no window to pass.
+
+    The discriminator is identity, not time. A requeue cannot change whose job
+    it is -- Slurm re-queues the same submission, so uid, user and cluster all
+    survive it -- whereas a recycled id is a different submission by whoever
+    happened to draw the number next. A gap threshold was the obvious
+    alternative and is worse: the normal requeue shape *is* "previous attempt
+    ended before this one was submitted", so the sign carries no signal, and any
+    cutoff would eventually reject a job that sat requeued and held.
+
+    Conservative on missing data: sacct leaves these blank often enough that a
+    blank must not split a genuine requeue, so an absent field defers to the
+    next one and a group with nothing to compare on folds as it did before.
+    """
+    if candidate.cluster and newest.cluster and candidate.cluster != newest.cluster:
+        return False
+    for field in ("uid", "user"):
+        mine, theirs = getattr(candidate, field), getattr(newest, field)
+        if mine and theirs:
+            return mine == theirs
+    return True
+
+
 def _fold_incarnations(jobs):
     """Collapse a requeued job's incarnations onto the latest one.
 
@@ -884,7 +921,18 @@ def _fold_incarnations(jobs):
         # `or ""` so a missing Submit sorts first rather than raising against a
         # string, and the index keeps the sort stable on ties.
         ordered = [j for _, _, j in sorted((j.submit or "", i, j) for i, j in enumerate(group))]
-        folded[job_id] = ordered[-1]._replace(earlier=tuple(ordered[:-1]))
+        newest = ordered[-1]
+        # Only the trailing run that is still the *same job* is this job's
+        # history. Walking back and stopping at the first stranger, rather than
+        # filtering the whole group, is what makes "the newest incarnation is
+        # the job" hold: anything behind a stranger belongs to the stranger.
+        kept = []
+        for earlier_run in reversed(ordered[:-1]):
+            if not _same_job(earlier_run, newest):
+                break
+            kept.append(earlier_run)
+        kept.reverse()
+        folded[job_id] = newest._replace(earlier=tuple(kept))
 
     out, emitted = [], set()
     for job in jobs:
