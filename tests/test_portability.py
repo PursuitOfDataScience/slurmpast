@@ -6,16 +6,19 @@ release notes that changed the behaviour, or `scontrol show hostnames` itself.
 None of them fail on Midway3, which is exactly why they need pinning.
 """
 
+import io
+import json
 import os
 import pathlib
 import subprocess
+import sys
 from datetime import datetime
 
 import pytest
 
 from slurmpast import logs, model
 from slurmpast import sacct as sacct_mod
-from slurmpast.duration import parse_bytes
+from slurmpast.duration import parse_bytes, parse_mem_limit
 from slurmpast.nodes import expand_nodelist
 from slurmpast.sacct import (
     _ALIASES,
@@ -2562,3 +2565,1676 @@ class TestARedirectMustNotLaunchTheDashboard:
         monkeypatch.setattr("slurmpast.cli._has_terminal", lambda *a, **kw: True)
         cli.main(["--demo", "--overview", "--no-color"])
         assert capsys.readouterr().out.strip()
+
+
+class TestAUnitLessMemoryLimitIsMegabytes:
+    """A bare integer in a memory *option* is megabytes in Slurm, not bytes.
+
+    `sbatch(1)`, `--mem=<size>[units]`: *"Default units are megabytes"*. Reported
+    as a divergence across the three tools rather than against this one -- on the
+    same inputs slurmate read `16` as 16 MB while slurmpast and slurmwatch both
+    read it as **16 bytes**, off by 1,048,576x and silent. slurmate was right.
+
+    Latent on both clusters checked: Slurm 23.02 and 20.11.8 alike write an
+    explicit unit into `ReqMem`, and 30 days of Midway3 accounting (609,511 rows
+    at `4Gn` alone) held no unit-less spelling. Pinned rather than hunted for,
+    because the thing that decides it is a site's Slurm version.
+
+    The narrowing matters as much as the fix: `parse_bytes` was left alone. It
+    also decodes `MaxPages`, which is a *page count* this cluster emits bare
+    (`0`), and `MaxDiskRead`/`MaxDiskWrite`, which are byte counters. Applying the
+    limit convention to those would read a bare `312` as 312 MiB.
+    """
+
+    def test_a_bare_integer_limit_is_mebibytes(self):
+        assert parse_mem_limit("16") == 16 * 1024**2
+
+    def test_the_scope_suffix_does_not_change_that(self):
+        """`16n` is 16 MiB per node on Slurm <= 20.11, not 16 bytes."""
+        assert parse_mem_limit("16n") == 16 * 1024**2
+        assert parse_mem_limit("16c") == 16 * 1024**2
+
+    def test_every_suffixed_spelling_is_unchanged(self):
+        """The control. The forms real clusters actually emit must read exactly
+        as they did before, or the fix has moved every memory figure in the tool."""
+        for text in ("4Gn", "500Mc", "3810Mc", "1.50T", "53741792K", "80G"):
+            assert parse_mem_limit(text) == parse_bytes(text), text
+
+    def test_parse_bytes_still_reads_a_bare_counter_as_bytes(self):
+        """The control that stops the fix spreading. `MaxPages` is a page count
+        and `MaxDiskRead` a byte counter; this cluster emits `MaxPages` bare."""
+        assert parse_bytes("16") == 16
+        assert parse_bytes("0") == 0
+
+    def test_the_unreadable_and_the_missing_are_still_told_apart(self):
+        """`64GB` is not Slurm syntax and stays unparseable rather than being
+        guessed at -- the divergence the report noted across the three tools, left
+        as it was on purpose."""
+        assert parse_mem_limit("64GB") is None
+        assert parse_mem_limit("") is None
+        assert parse_mem_limit(None) is None
+
+    def test_the_job_record_carries_the_corrected_limit(self):
+        """Through the parser, not just the helper: `ReqMem` is the one field
+        wired to the limit convention."""
+        text = make_text(
+            row(
+                JobID="900001",
+                JobName="bare",
+                User="youzhi",
+                State="COMPLETED",
+                Start="2026-08-22T10:00:00",
+                End="2026-08-22T10:01:00",
+                ElapsedRaw="60",
+                ReqMem="16",
+            )
+        )
+        job = parse(text, fields=_FIELDS)[0]
+        assert job.req_mem_bytes == 16 * 1024**2
+
+
+class TestAHostileLogDoesNotTakeTheReaderDown:
+    """The log reader is the likeliest place a post-mortem tool dies on a real
+    cluster, and until now nothing in this suite exercised it.
+
+    A portability round on a second cluster built a `.err` hostile in the two
+    ways HPC logs actually are -- invalid UTF-8 (what MPI/CUDA/Fortran tooling
+    emits) and 40 MB on a single line -- with the real error buried after the
+    noise, and reported a clean pass: no crash, 17 MB peak RSS against the 40 MB
+    file, a 1,572-byte report, and the right diagnosis found past the padding.
+
+    That was a *negative* result, which is exactly the kind that quietly stops
+    being true. `read_tail` appears in this suite three times and is monkeypatched
+    on all three (`test_tui.py:773,833,849`), so none of those properties was
+    pinned by anything. They are now.
+
+    Reproduced here before being written down: a 40 MB build of the same file
+    reads in 262,144 characters and finds the error, while `Path.read_text()` on
+    it raises `UnicodeDecodeError: ... can't decode byte 0xff in position 30`. The
+    fixtures below use a smaller multiple of the cap so the suite stays fast --
+    the property is "bounded by max_bytes whatever the size", and four times the
+    cap tests it as well as a hundred and sixty times does.
+    """
+
+    NOISE = b"\xff\xfe\x80\x81 \xc3\x28 \xed\xa0\x80 "
+    REAL = "RuntimeError: real failure after the noise"
+
+    def _hostile(self, tmp_path):
+        from slurmpast.logs import MAX_TAIL_BYTES
+
+        path = tmp_path / "badlog-48819300.err"
+        with path.open("wb") as fh:
+            fh.write(b"start of one very long line: ")
+            while fh.tell() < MAX_TAIL_BYTES * 4:
+                fh.write(self.NOISE + b"x" * 4096)
+            fh.write(("\n%s\n" % self.REAL).encode())
+        return path
+
+    def test_invalid_utf8_does_not_raise(self, tmp_path):
+        """`Path.read_text()` on this file raises. The reader must not."""
+        from slurmpast.logs import read_tail
+
+        path = self._hostile(tmp_path)
+        with pytest.raises(UnicodeDecodeError):
+            path.read_text()
+        assert read_tail(str(path)) is not None
+
+    def test_the_read_is_bounded_by_the_cap_not_the_file(self, tmp_path):
+        """17 MB peak against a 40 MB log was the reported figure; the mechanism
+        behind it is that the file is never slurped."""
+        from slurmpast.logs import MAX_TAIL_BYTES, read_tail
+
+        path = self._hostile(tmp_path)
+        assert path.stat().st_size > MAX_TAIL_BYTES * 4
+        text = read_tail(str(path))
+        assert len(text) <= MAX_TAIL_BYTES, len(text)
+
+    def test_the_real_error_after_the_noise_still_arrives(self, tmp_path):
+        """Bounding is only correct because it keeps the *tail*. A reader that
+        capped the head would pass the test above and lose the diagnosis."""
+        from slurmpast.logs import read_tail
+
+        assert self.REAL in read_tail(str(self._hostile(tmp_path)))
+
+    def test_a_small_clean_log_is_returned_whole(self, tmp_path):
+        """The control. Bounding must not start truncating ordinary logs."""
+        from slurmpast.logs import read_tail
+
+        path = tmp_path / "fine.err"
+        path.write_text("line one\nline two\n")
+        assert read_tail(str(path)) == "line one\nline two\n"
+
+    def test_carriage_returns_are_still_normalised(self, tmp_path):
+        """The other control: the reader's documented job. tqdm spam collapsing a
+        traceback onto one row is why this function exists, and a fix aimed at
+        hostile bytes must not cost that."""
+        from slurmpast.logs import read_tail
+
+        path = tmp_path / "tqdm.err"
+        path.write_bytes(b"50%\r99%\r100%\r\nTraceback\n")
+        assert read_tail(str(path)) == "50%\n99%\n100%\nTraceback\n"
+
+    def test_an_unreadable_path_is_none_not_an_exception(self, tmp_path):
+        """A missing log is an ordinary state for a post-mortem, not an error."""
+        from slurmpast.logs import read_tail
+
+        assert read_tail(str(tmp_path / "nope.err")) is None
+
+
+class TestARequeuedJobIsNotInvisible:
+    """`sacct` reports only a job's *latest* incarnation unless `-D` is asked for,
+    and `sacct.py` contained no `-D`. A job requeued on NODE_FAIL, on preemption,
+    or by `scontrol requeue` therefore rendered as its final attempt with no sign
+    there had been others -- which is the one case where the missing part *is* the
+    answer: "why is my job still pending when I watched it start" is a requeue.
+
+    Reproduced on Midway3's real accounting, job 53432121::
+
+        53432121|NODE_FAIL|2026-08-17T10:08:59|...|00:27:49
+        53432121|COMPLETED|2026-08-17T10:48:35|...|03:41:52
+
+    The tool showed `COMPLETED` after 03:41:52 and said nothing about the 27m49s
+    burned on a node that failed under it. 773 of 922,534 rows in seven
+    cluster-days here are requeues, so it is uncommon and not rare.
+
+    One `Job` per id still comes out -- the newest incarnation, with the earlier
+    ones in `earlier` -- so no count, ranking or post-mortem starts doubling.
+    """
+
+    def _jobs(self):
+        text = make_text(
+            row(
+                JobID="53432121",
+                JobName="latent_sweep",
+                User="youzhi",
+                State="NODE_FAIL",
+                Submit="2026-08-17T10:08:59",
+                Start="2026-08-17T10:20:46",
+                End="2026-08-17T10:48:35",
+                ElapsedRaw="1669",
+                Timelimit="10:00:00",
+            ),
+            row(
+                JobID="53432121.batch",
+                JobName="batch",
+                State="CANCELLED",
+                Submit="2026-08-17T10:20:46",
+                ElapsedRaw="1669",
+            ),
+            row(
+                JobID="53432121",
+                JobName="latent_sweep",
+                User="youzhi",
+                State="COMPLETED",
+                Submit="2026-08-17T10:48:35",
+                Start="2026-08-17T10:50:37",
+                End="2026-08-17T14:32:29",
+                ElapsedRaw="13312",
+                Timelimit="10:00:00",
+            ),
+            row(
+                JobID="53432121.batch",
+                JobName="batch",
+                State="COMPLETED",
+                Submit="2026-08-17T10:50:37",
+                ElapsedRaw="13312",
+                MaxRSS="10822892K",
+            ),
+        )
+        return parse(text, fields=_FIELDS)
+
+    def test_the_query_asks_for_duplicates(self):
+        """Without `-D` none of the rest of this can happen: Slurm simply does not
+        send the earlier incarnation."""
+        seen = []
+
+        def runner(args):
+            seen.append(args)
+            return ""
+
+        Sacct(runner=runner, probe=" ".join(_FIELDS)).history(user="u")
+        assert "-D" in seen[0], seen[0]
+
+    def test_the_id_still_yields_exactly_one_job(self):
+        """The requeue must not become a second job in the rollup, or every count
+        in the tool moves for a job that ran once."""
+        jobs = self._jobs()
+        assert [j.job_id for j in jobs] == ["53432121"]
+
+    def test_it_is_the_latest_incarnation_that_is_the_job(self):
+        job = self._jobs()[0]
+        assert job.base_state == "COMPLETED"
+        assert job.elapsed == 13312.0
+        assert job.submit == "2026-08-17T10:48:35"
+
+    def test_the_earlier_attempt_and_the_time_it_burned_survive(self):
+        """The count alone would not say 27m49s went into a failed node, and the
+        time is the part that was missing from accounting."""
+        (earlier,) = self._jobs()[0].earlier
+        assert earlier.base_state == "NODE_FAIL"
+        assert earlier.elapsed == 1669.0
+
+    def test_the_steps_attach_to_the_incarnation_that_ran_them(self):
+        """The control that matters most, and the one this fix first got wrong.
+
+        A step's `Submit` is its own start, not the job's -- `53432121.batch`
+        reads `10:50:37` where its allocation reads `10:48:35` -- so grouping
+        steps by Submit matches nothing and silently empties every job's step
+        list. That surfaces as `MEM  n/a` on a job whose memory was recorded, an
+        erasure that looks like missing data rather than a bug. Steps attach
+        positionally instead, which is the order sacct emits them in.
+        """
+        job = self._jobs()[0]
+        assert [s.step_id for s in job.steps] == ["53432121.batch"]
+        assert job.max_rss == 10822892 * 1024
+        assert job.earlier[0].steps and job.earlier[0].steps[0].state == "CANCELLED"
+
+    def test_the_report_says_how_many_times_and_what_happened(self, capsys):
+        from slurmpast import report
+
+        out, _verdict = report.render_job(
+            self._jobs()[0], no_logs=True, style=report.Style(enabled=False)
+        )
+        assert "requeued" in out
+        assert "1x" in out and "NODE_FAIL" in out and "00:27:49" in out, out
+
+    def test_an_ordinary_job_is_untouched(self):
+        """The control. Nothing about a job that was never requeued may change --
+        no `earlier`, and its steps still attach."""
+        text = make_text(
+            row(
+                JobID="700001",
+                JobName="plain",
+                User="youzhi",
+                State="COMPLETED",
+                Submit="2026-08-17T10:00:00",
+                Start="2026-08-17T10:00:05",
+                End="2026-08-17T10:01:05",
+                ElapsedRaw="60",
+            ),
+            row(
+                JobID="700001.batch",
+                JobName="batch",
+                State="COMPLETED",
+                Submit="2026-08-17T10:00:05",
+                ElapsedRaw="60",
+                MaxRSS="2048K",
+            ),
+        )
+        (job,) = parse(text, fields=_FIELDS)
+        assert job.earlier == ()
+        assert [s.step_id for s in job.steps] == ["700001.batch"]
+        assert job.max_rss == 2048 * 1024
+        from slurmpast import report
+
+        text, _verdict = report.render_job(job, no_logs=True, style=report.Style(enabled=False))
+        assert "requeued" not in text
+
+
+class TestAStepRowsMultiLineFieldMakesNoPhantoms:
+    """SP-1's second trigger, and the far more common one.
+
+    Round 4 pinned the newline bug to a multi-line `sbatch --wrap`. A later round
+    found it reaches any multi-line field in *any* row, including **step** rows:
+    job 48819348 was submitted the tidy way, from a script file, so its own
+    `SubmitLine` is the single line `sbatch steps.sh` -- and asking for that one
+    job id still printed four post-mortems, because step `.1` was an ordinary
+    `srun ... bash -c` with a heredoc in it.
+
+    That matters more than the `--wrap` case: the user did nothing unusual, and
+    `srun python -c "..."` / heredocs are everyday HPC usage. The two failure
+    modes also differ -- a multi-line *job* row replaces the real record with a
+    phantom, while a multi-line *step* row leaves the record correct and appends
+    fabricated post-mortems to it.
+
+    The fix needed no change: the boundary test asks whether a line's first field
+    looks like a JobID, and `48819348.1` does while `from slurmwatch import slurm`
+    does not. Pinned because the report named it as a distinct trigger, and a
+    reassembly rule that happened to cover it should be shown to.
+    """
+
+    HEREDOC = (
+        "srun --jobid=48819348 --overlap bash -c "
+        "'python - <<EOF\nfrom slurmwatch import slurm\nEOF'"
+    )
+
+    def _jobs(self):
+        text = make_text(
+            row(
+                JobID="48819348",
+                JobName="steps",
+                User="youzhi",
+                State="COMPLETED",
+                Submit="2026-08-23T00:00:00",
+                Start="2026-08-23T00:00:01",
+                End="2026-08-23T00:01:00",
+                ElapsedRaw="60",
+                SubmitLine="sbatch steps.sh",
+            ),
+            row(
+                JobID="48819348.1",
+                JobName="bash",
+                State="COMPLETED",
+                Submit="2026-08-23T00:00:05",
+                ElapsedRaw="45",
+                SubmitLine=self.HEREDOC,
+            ),
+        )
+        return parse(text, fields=_FIELDS)
+
+    def test_the_heredoc_lines_do_not_become_jobs(self):
+        assert [j.job_id for j in self._jobs()] == ["48819348"]
+
+    def test_the_step_still_attaches_to_its_job(self):
+        """The control: rejecting the fragments must not cost the step itself."""
+        assert [s.step_id for s in self._jobs()[0].steps] == ["48819348.1"]
+
+    def test_only_one_post_mortem_is_printed_for_the_requested_id(self, monkeypatch, capsys):
+        """The reported symptom: three extra post-mortems below the real one.
+
+        Driven through `cli.main`, not `report.render_job`. Handing the renderer a
+        single Job cannot see this defect at all -- one job in, one block out,
+        whatever the parser did -- so that version of this test passed against the
+        broken parser and was asserting nothing. The phantoms only become visible
+        where `matches = jobs` on the explicit-id branch decides how many jobs
+        there are to render.
+        """
+        from slurmpast import cli
+
+        text = make_text(
+            row(
+                JobID="48819348",
+                JobName="steps",
+                User="youzhi",
+                State="COMPLETED",
+                Submit="2026-08-23T00:00:00",
+                Start="2026-08-23T00:00:01",
+                End="2026-08-23T00:01:00",
+                ElapsedRaw="60",
+                SubmitLine="sbatch steps.sh",
+            ),
+            row(
+                JobID="48819348.1",
+                JobName="bash",
+                State="COMPLETED",
+                Submit="2026-08-23T00:00:05",
+                ElapsedRaw="45",
+                SubmitLine=self.HEREDOC,
+            ),
+        ).replace("|", SAFE_DELIMITER)
+
+        def run(args):
+            if "--helpformat" in args:
+                return " ".join(_FIELDS)
+            if args and args[0] in ("squeue", "scontrol"):
+                return ""
+            return text
+
+        monkeypatch.setattr("slurmpast.sacct._run", run)
+        cli.main(["48819348", "--plain", "--no-color", "--no-logs"])
+        out = capsys.readouterr().out
+        assert out.count("\u25cf TIME") == 1, out
+        assert "job from slurmwatch import slurm" not in out
+
+
+class TestAMixedOutcomeArrayAggregates:
+    """A 4-task array with two tasks OOM-killed and two completed.
+
+    Verified on a second cluster and reported as correct -- one workload, each
+    task a run, the completed/flagged split right:
+
+        4 jobs in 1 workload · 50.0% completed
+        1  mixedarr  build  RUNS 4  COMPLETED 2  FLAGGED 2
+
+    It is correct. Nothing in this suite said so: the rollup's tests build
+    separate submissions, and no test anywhere folded array *tasks* of one array
+    into a workload and checked the split. An array whose tasks disagree is the
+    ordinary shape of a parameter sweep, and it is where a rollup that keyed on
+    the array id rather than the task, or that took the first task's state for the
+    group, would go wrong without anything failing.
+    """
+
+    def _history(self, outcomes):
+        from slurmpast.index import History
+
+        rows = [
+            row(
+                JobID="48819369_%d" % index,
+                JobName="mixedarr",
+                User="youzhi",
+                Partition="build",
+                State=state,
+                ExitCode=code,
+                Submit="2026-08-23T01:00:00",
+                Start="2026-08-23T01:00:05",
+                End="2026-08-23T01:01:05",
+                ElapsedRaw="60",
+                ReqMem="120M",
+                ReqCPUS="1",
+                NCPUS="1",
+                AllocCPUS="1",
+                NNodes="1",
+                NodeList="midway2-0300",
+            )
+            for index, (state, code) in enumerate(outcomes, 1)
+        ]
+        return History(parse(make_text(*rows), fields=_FIELDS))
+
+    MIXED = [
+        ("OUT_OF_MEMORY", "0:125"),
+        ("OUT_OF_MEMORY", "0:125"),
+        ("COMPLETED", "0:0"),
+        ("COMPLETED", "0:0"),
+    ]
+
+    def test_the_tasks_are_one_workload_and_four_runs(self):
+        history = self._history(self.MIXED)
+        (group,) = history.groups
+        assert group.name == "mixedarr"
+        assert group.total == 4, "each task is a run, not the array one run"
+
+    def test_the_split_follows_the_tasks_not_the_array(self):
+        (group,) = self._history(self.MIXED).groups
+        assert (group.completed, group.problems) == (2, 2)
+
+    def test_the_headline_counts_the_failed_tasks(self):
+        assert "2 of 4 jobs failed" in self._history(self.MIXED).headline()
+
+    def test_an_array_that_all_succeeded_flags_nothing(self):
+        """The control. A split of 2/2 must come from the tasks, not from the
+        shape -- an all-COMPLETED array has to read as clean."""
+        (group,) = self._history([("COMPLETED", "0:0")] * 4).groups
+        assert (group.total, group.completed, group.problems) == (4, 4, 0)
+
+
+class TestArraySiblingsAlreadyCountAsEvidence:
+    """A portability round observed that two OOM tasks inside one array did not
+    trip the memory rule while three separate submissions did, and wondered
+    whether the rule should "ever count array siblings", weighting them
+    differently if it did.
+
+    The premise is off, and worth pinning rather than arguing: siblings are
+    already counted. Two does not clear the bar because the bar is three, not
+    because they are siblings -- the grouping key is `(folded name, partition,
+    kind, user)`, which an array's tasks all share.
+
+    Left at three deliberately. The suggestion that two *simultaneous* identical
+    tasks are stronger evidence than three sequential ones is reasonable and is
+    not a defect: the report filed it as an observation, and acting on it would
+    mean a second, lower threshold whose only justification is an intuition
+    nobody has data for. Recorded in `issues.md` rather than implemented.
+    """
+
+    def _siblings(self, count):
+        from slurmpast.patterns import find_memory_search
+
+        text = make_text(
+            *(
+                row(
+                    JobID="48819369_%d" % index,
+                    JobName="mixedarr",
+                    User="youzhi",
+                    Partition="build",
+                    State="OUT_OF_MEMORY",
+                    ExitCode="0:125",
+                    Submit="2026-08-23T01:00:00",
+                    Start="2026-08-23T01:00:05",
+                    End="2026-08-23T01:01:05",
+                    ElapsedRaw="60",
+                    ReqMem="120M",
+                    ReqCPUS="1",
+                    NCPUS="1",
+                    AllocCPUS="1",
+                    NNodes="1",
+                    NodeList="midway2-0300",
+                )
+                for index in range(1, count + 1)
+            )
+        )
+        return [f.code for f in find_memory_search(parse(text, fields=_FIELDS))]
+
+    def test_three_siblings_at_one_request_is_a_pattern(self):
+        assert self._siblings(3) == ["memory-unchanged"]
+
+    def test_two_is_below_the_bar_which_is_the_only_reason_it_is_silent(self):
+        """The control that identifies *why* the reported case was quiet. If a
+        future change exempted arrays, this would still pass while the test above
+        started failing -- so both are needed to say "the threshold, not the
+        shape"."""
+        assert self._siblings(2) == []
+
+
+class TestTheOnlyEnvironmentVariableIsValidated:
+    """`SLURMPAST_TIMEOUT` accepted anything and silently used the default.
+
+    One variable is a small surface, but it is the whole of this package's
+    environment surface, and nothing in this suite touched it. Measured on a
+    second cluster:
+
+        SLURMPAST_TIMEOUT=garbage  -> rc=0, query runs normally
+        SLURMPAST_TIMEOUT=-5       -> rc=0, query runs normally
+        SLURMPAST_TIMEOUT=0        -> rc=0, query runs normally
+
+    `0` is the one that stings: a reader writes it meaning *no timeout* and gets
+    300 seconds, with nothing said either way. `garbage` was indistinguishable
+    from leaving the variable unset. The sibling package rejects the same class of
+    input by name, which is the standard being matched here.
+    """
+
+    def test_a_non_number_is_refused_by_name(self, monkeypatch):
+        from slurmpast.sacct import SacctError, _timeout
+
+        monkeypatch.setenv("SLURMPAST_TIMEOUT", "garbage")
+        with pytest.raises(SacctError) as caught:
+            _timeout()
+        assert "SLURMPAST_TIMEOUT" in str(caught.value)
+        assert "garbage" in str(caught.value), "the value has to be quoted back"
+
+    @pytest.mark.parametrize("value", ["0", "-5", "0.0", "1e999"])
+    def test_a_non_positive_or_infinite_budget_is_refused(self, monkeypatch, value):
+        """`0` and `-5` from the report, plus infinity, which `float` accepts and
+        `communicate` would take as "wait forever" -- the unbounded wait this tool
+        has already had to be fixed for once."""
+        from slurmpast.sacct import SacctError, _timeout
+
+        monkeypatch.setenv("SLURMPAST_TIMEOUT", value)
+        with pytest.raises(SacctError) as caught:
+            _timeout()
+        assert "positive" in str(caught.value)
+
+    def test_a_usable_value_is_honoured(self, monkeypatch):
+        """The control. A large budget is honoured rather than capped: the
+        variable exists so a site whose accounting takes an hour can say so, and
+        silently overriding that is the same fault in the other direction."""
+        from slurmpast.sacct import _timeout
+
+        monkeypatch.setenv("SLURMPAST_TIMEOUT", "999999")
+        assert _timeout() == 999999.0
+
+    def test_a_bad_value_is_refused_before_anything_is_spawned(self, monkeypatch):
+        """Where the check happens, not just that it happens.
+
+        `_timeout` is read inside `_run`, and reading it *after* `Popen` left a
+        real `sacct` running with nothing to reap it: the only cleanup in that
+        function is the TimeoutExpired branch, which a SacctError skips straight
+        past. Refusing a setting is also no reason to have started a query.
+        """
+        import subprocess as sp
+
+        from slurmpast.sacct import SacctError, _run
+
+        spawned = []
+        monkeypatch.setattr(sp, "Popen", lambda *a, **k: spawned.append(a) or None)
+        monkeypatch.setenv("SLURMPAST_TIMEOUT", "0")
+        with pytest.raises(SacctError):
+            _run(["sacct", "--noheader"])
+        assert spawned == [], "the child was started before the setting was checked"
+
+    def test_unset_is_the_default_and_says_nothing(self, monkeypatch):
+        """The other control: validation must not turn the ordinary case into an
+        error, and the empty string is what an exported-but-blank variable is."""
+        from slurmpast.sacct import DEFAULT_TIMEOUT, _timeout
+
+        monkeypatch.delenv("SLURMPAST_TIMEOUT", raising=False)
+        assert _timeout() == DEFAULT_TIMEOUT
+        monkeypatch.setenv("SLURMPAST_TIMEOUT", "  ")
+        assert _timeout() == DEFAULT_TIMEOUT
+
+
+class TestASubSecondTimeoutSaysWhatItWas:
+    """The timeout message formatted the budget with `%.0f`, so every sub-second
+    value printed as `0s`:
+
+        $ SLURMPAST_TIMEOUT=0.05 slurmpast --overview
+        slurmpast: sacct did not answer within 0s — ...  Narrow the window with
+        -S, or raise SLURMPAST_TIMEOUT.
+
+    That reads as *the tool used a zero timeout* -- its own defect -- rather than
+    *your 50 ms budget was too small*. The advice is to raise the variable, and
+    the reader cannot act on it without seeing what it currently is.
+
+    Driven through the real subprocess path with a command that genuinely
+    outlasts its budget, because the formatting sits in the except branch and a
+    test that builds the string by hand would pin the wrong thing.
+    """
+
+    def _timed_out(self, monkeypatch, budget):
+        from slurmpast.sacct import SacctError, _run
+
+        monkeypatch.setenv("SLURMPAST_TIMEOUT", budget)
+        with pytest.raises(SacctError) as caught:
+            _run(["sleep", "5"])
+        return str(caught.value)
+
+    def test_a_fractional_budget_is_shown_as_itself(self, monkeypatch):
+        message = self._timed_out(monkeypatch, "0.05")
+        assert "within 0.05s" in message, message
+        assert "within 0s" not in message
+
+    def test_a_whole_budget_keeps_its_plain_spelling(self, monkeypatch):
+        """The control: `%g` must not turn 2 seconds into `2.0s`."""
+        assert "within 2s" in self._timed_out(monkeypatch, "2")
+
+    def test_the_advice_still_names_the_way_out(self, monkeypatch):
+        message = self._timed_out(monkeypatch, "0.05")
+        assert "SLURMPAST_TIMEOUT" in message and "-S" in message
+
+
+@pytest.mark.skipif(
+    subprocess.run(["which", "sacct"], capture_output=True).returncode != 0,
+    reason="no Slurm on this machine",
+)
+class TestTheFieldProbeAgreesWithTheLocalSacct:
+    """Differential test of the field negotiation against a real `sacct`.
+
+    The same shape as `test_agrees_with_the_local_scheduler` above, which checks
+    the nodelist expander against `scontrol show hostnames` and skips where there
+    is no scheduler. This is the other half: the negotiation that decides *which*
+    of the 80-odd fields to ask for, which is the thing that breaks first on a
+    Slurm nobody here has seen.
+
+    Worth adding because a portability pass across four packages concluded that a
+    green suite says nothing about portability -- *"every finding here lives at a
+    boundary the tests mock"* -- and the sacct boundary is the one this package's
+    worst defect came through. Every other test of the parser hands it a fixture.
+    None of them can notice that `SubmitLine` does not exist before Slurm 21.08,
+    or that `Reserved` became `Planned` in 23.02; only asking the local scheduler
+    can.
+
+    Skips rather than fails wherever the scheduler is present but cannot answer:
+    on a login node with an unreachable accounting database, an unanswerable query
+    is the environment's state, not this package's defect.
+    """
+
+    def _sacct(self):
+        from slurmpast.sacct import Sacct
+
+        return Sacct()
+
+    def _skip_if_unreachable(self, exc):
+        from slurmpast.sacct import SacctError
+
+        assert isinstance(exc, SacctError)
+        text = str(exc).lower()
+        if "did not answer" in text or "unreachable" in text or "cannot execute" in text:
+            pytest.skip("Slurm is present but not answering: %s" % exc)
+        raise exc
+
+    def test_every_negotiated_field_is_one_this_sacct_knows(self):
+        """The probe must not ask for a spelling the local release dropped or has
+        not added yet."""
+        fields = self._sacct().fields
+        known = {
+            word.strip().lower()
+            for word in subprocess.run(
+                ["sacct", "--helpformat"], capture_output=True, text=True
+            ).stdout.split()
+        }
+        if not known:
+            pytest.skip("this sacct does not implement --helpformat")
+        unknown = [f for f in fields if f.lower() not in known]
+        assert unknown == [], "asked for fields this sacct does not list: %s" % unknown
+
+    def test_the_negotiated_query_is_actually_accepted(self):
+        """The assertion that matters, and the one a fixture cannot make: issue the
+        real query and let the real sacct judge it. `Invalid field requested` is
+        how this fails on a release the negotiation guessed wrong about."""
+        from slurmpast.sacct import SacctError
+
+        try:
+            self._sacct().history(since="now-5minutes")
+        except SacctError as exc:
+            self._skip_if_unreachable(exc)
+
+    def test_the_safe_delimiter_is_accepted(self):
+        """`--delimiter` has been in sacct since 17.11 and the code falls back
+        without it. Which branch this cluster takes is a fact about the cluster, so
+        assert only that one of them was reached and that the choice is recorded."""
+        from slurmpast.sacct import SAFE_DELIMITER, SacctError
+
+        sacct = self._sacct()
+        try:
+            sacct.history(since="now-5minutes")
+        except SacctError as exc:
+            self._skip_if_unreachable(exc)
+        assert sacct._delimiter in (SAFE_DELIMITER, "|")
+
+
+class TestAMisMatchedLogCannotInventAGpuCause:
+    """The log-matching heuristic guesses, and a guess can be wrong loudly.
+
+    Reported from a second cluster: a job on a GPU-less partition failed with
+    `disk quota exceeded`, and a decoy file in the search directory -- unrelated
+    name, `touch -r`'d to the same mtime -- was matched by timing. The tool then
+    printed, at its highest severity and as a statement of fact:
+
+        [FAIL] GPU ran out of memory
+              Device-side allocation failure in the log. This is NOT host memory
+
+    for a job that allocated no GPU. The `matched by timing, not by name` hedge
+    was there, but one dim line does not balance a `[FAIL]` followed by four
+    specific remediations, and the real cause never appeared.
+
+    The guard is free: `AllocTRES` carries no `gres` entry, so the whole class of
+    finding is ruled out by evidence the tool already holds. This does not make a
+    mis-attached log right -- it is still the wrong file -- it stops the tool
+    asserting a cause it can disprove.
+    """
+
+    CUDA = "DECOY CAUSE: CUDA error: out of memory\n"
+
+    def _job(self, alloc_tres):
+        text = make_text(
+            row(
+                JobID="48819449",
+                JobName="quotajob",
+                User="youzhi",
+                Partition="build",
+                State="FAILED",
+                ExitCode="3:0",
+                Submit="2026-08-23T08:00:00",
+                Start="2026-08-23T08:00:05",
+                End="2026-08-23T08:00:41",
+                ElapsedRaw="36",
+                ReqMem="4G",
+                ReqCPUS="1",
+                NCPUS="1",
+                AllocCPUS="1",
+                NNodes="1",
+                NodeList="midway2-0300",
+                AllocTRES=alloc_tres,
+            )
+        )
+        return parse(text, fields=_FIELDS)[0]
+
+    def test_a_gpuless_job_gets_no_gpu_finding(self):
+        from slurmpast.diagnose import diagnose
+
+        job = self._job("billing=1,cpu=1,mem=4G,node=1")
+        assert job.gpu_count == 0
+        codes = {f.code for f in diagnose(job, log_text=self.CUDA).findings}
+        assert "cuda-oom" not in codes, codes
+
+    def test_a_job_that_did_hold_a_gpu_still_gets_it(self):
+        """The control, and the one that matters: this must not silence the
+        finding for the jobs it was written for."""
+        from slurmpast.diagnose import diagnose
+
+        job = self._job("billing=1,cpu=1,gres/gpu=1,mem=4G,node=1")
+        assert job.gpu_count == 1
+        codes = {f.code for f in diagnose(job, log_text=self.CUDA).findings}
+        assert "cuda-oom" in codes, codes
+
+    def test_a_failure_with_an_unrecognised_log_is_still_flagged(self):
+        """The other control. Suppressing the wrong cause must not leave a failed
+        job reading "nothing to flag" -- which is what it did, because no rule
+        matched the text and nothing showed the reader the file it had found."""
+        from slurmpast.diagnose import diagnose
+
+        job = self._job("billing=1,cpu=1,mem=4G,node=1")
+        verdict = diagnose(job, log_text="REAL CAUSE: disk quota exceeded on /scratch\n")
+        assert verdict.findings, "a failed job with a log must say something"
+        assert "disk quota exceeded" in verdict.findings[0].evidence
+
+
+class TestTheFailurePostMortemPrefersStderr:
+    """With both real logs present it chose the empty `--output` and then said no
+    log explained the failure.
+
+    Slurm touches an unused stdout at job end, so on a failed job the 0-byte
+    `.out` is routinely *closer* to End than the `.err` written moments earlier
+    when the error happened. Ranking on distance alone therefore picks the empty
+    one, and the advice that follows -- "Pass --log-dir" -- is advice the user had
+    already taken.
+    """
+
+    def _pick(self, tmp_path, err_mtime, out_mtime, err_text="REAL CAUSE: quota\n"):
+        import os
+
+        from slurmpast.logs import find_log_by_time
+
+        (tmp_path / "realname-A.err").write_text(err_text)
+        (tmp_path / "realname-A.out").write_text("")
+        os.utime(tmp_path / "realname-A.err", (err_mtime, err_mtime))
+        os.utime(tmp_path / "realname-A.out", (out_mtime, out_mtime))
+        job = parse(
+            make_text(
+                row(
+                    JobID="48819449",
+                    JobName="quotajob",
+                    User="youzhi",
+                    State="FAILED",
+                    ExitCode="3:0",
+                    Submit="2026-08-23T08:00:00",
+                    Start="2026-08-23T08:00:05",
+                    End="2026-08-23T08:00:41",
+                    ElapsedRaw="36",
+                )
+            ),
+            fields=_FIELDS,
+        )[0]
+        picked = find_log_by_time(job, extra_dirs=[str(tmp_path)])
+        return os.path.basename(picked) if picked else None
+
+    @staticmethod
+    def _stamp(text):
+        from datetime import datetime
+
+        return datetime.fromisoformat(text).timestamp()
+
+    def test_an_empty_candidate_loses_to_a_written_one(self):
+        """Even when the empty file is nearer the end. This is the reported case:
+        stderr at 08:00:38, the touched-at-exit stdout at 08:00:41 = End."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            picked = self._pick(
+                pathlib.Path(tmp),
+                self._stamp("2026-08-23T08:00:38"),
+                self._stamp("2026-08-23T08:00:41"),
+            )
+        assert picked == "realname-A.err", picked
+
+    def test_stderr_wins_an_exact_tie(self):
+        """`touch -r` gives both files one mtime, which is how the report built
+        it. Nothing but the suffix can decide, and a post-mortem wants stderr."""
+        import tempfile
+
+        stamp = self._stamp("2026-08-23T08:00:41")
+        with tempfile.TemporaryDirectory() as tmp:
+            picked = self._pick(pathlib.Path(tmp), stamp, stamp, err_text="cause\n")
+        assert picked == "realname-A.err", picked
+
+    def test_timing_still_decides_between_two_written_files(self):
+        """The control. Emptiness and the suffix are tie-breaks; the signal this
+        function exists for is the mtime, and it must still be the signal -- the
+        docstring's 135-of-148 result came from it."""
+        import os
+        import tempfile
+
+        from slurmpast.logs import find_log_by_time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            (tmp_path / "far.out").write_text("something\n")
+            (tmp_path / "near.out").write_text("something\n")
+            os.utime(tmp_path / "far.out", (self._stamp("2026-08-23T08:00:10"),) * 2)
+            os.utime(tmp_path / "near.out", (self._stamp("2026-08-23T08:00:41"),) * 2)
+            job = parse(
+                make_text(
+                    row(
+                        JobID="48819449",
+                        JobName="q",
+                        User="youzhi",
+                        State="FAILED",
+                        ExitCode="3:0",
+                        Submit="2026-08-23T08:00:00",
+                        Start="2026-08-23T08:00:05",
+                        End="2026-08-23T08:00:41",
+                        ElapsedRaw="36",
+                    )
+                ),
+                fields=_FIELDS,
+            )[0]
+            picked = find_log_by_time(job, extra_dirs=[str(tmp_path)])
+            assert os.path.basename(picked) == "near.out", picked
+
+
+class TestACollectiveFaultNeedsADeviceAndAPeer:
+    """`nccl` was a pure text match, so a mis-attached log drew a *critical*
+    "Collective communication fault" for a job whose entire allocation read
+    `billing=1,cpu=1,mem=200M,node=1`. No GPU for NCCL to run on, and no peer rank
+    to block on -- the finding's own explanation ("one rank diverged, died, or is
+    slow, and the others block on it") describes a topology the job did not have.
+
+    An audit of all eight rule families found this and `cuda-oom` are the only two
+    that can contradict the allocation; every metric-derived family already guards
+    its preconditions. So the fix is two guards in one function, sharing the tests
+    the neighbouring families use.
+
+    **A rank is not a task**, and this is where the report's own suggestion --
+    `nodes > 1 or ntasks > 1` -- would have been wrong. The suite's `healthy_job`
+    is `gres/gpu=3` on `node=1` with no NTasks recorded, and three GPUs on one node
+    do collectives across each other. Taking that suggestion literally suppressed
+    five real fault shapes this suite already pins; the existing tests caught it on
+    the first run. Whichever of GPUs, tasks and nodes is largest is the rank count.
+    """
+
+    LOG = (
+        "CUDA error: out of memory\n"
+        "[E ProcessGroupNCCL.cpp:828] [Rank 3] Watchdog caught collective operation timeout\n"
+    )
+
+    def _codes(self, alloc_tres, nodes="1"):
+        from slurmpast.diagnose import diagnose
+
+        job = parse(
+            make_text(
+                row(
+                    JobID="48819454",
+                    JobName="j",
+                    User="youzhi",
+                    State="FAILED",
+                    ExitCode="1:0",
+                    Submit="2026-08-23T08:00:00",
+                    Start="2026-08-23T08:00:00",
+                    End="2026-08-23T08:01:00",
+                    ElapsedRaw="60",
+                    NNodes=nodes,
+                    NCPUS="1",
+                    AllocCPUS="1",
+                    AllocTRES=alloc_tres,
+                )
+            ),
+            fields=_FIELDS,
+        )[0]
+        return {f.code for f in diagnose(job, log_text=self.LOG).findings}
+
+    def test_the_reported_job_gets_neither_finding(self):
+        codes = self._codes("billing=1,cpu=1,mem=200M,node=1")
+        assert "nccl" not in codes and "cuda-oom" not in codes, codes
+
+    def test_one_gpu_alone_can_oom_but_cannot_collective(self):
+        """The discriminating middle case. A single GPU is a device, so the OOM
+        stands; it is not a peer, so the collective does not."""
+        codes = self._codes("billing=1,cpu=1,gres/gpu=1,mem=8G,node=1")
+        assert "cuda-oom" in codes
+        assert "nccl" not in codes, codes
+
+    def test_several_gpus_on_one_node_are_peers(self):
+        """The control the report's suggestion would have broken."""
+        assert "nccl" in self._codes("billing=4,cpu=4,gres/gpu=3,mem=200G,node=1")
+
+    def test_gpus_across_nodes_are_peers_too(self):
+        assert "nccl" in self._codes("billing=2,cpu=2,gres/gpu=2,mem=16G,node=2", nodes="2")
+
+
+class TestANameMatchBeatsATimingDecoy:
+    """The narrowing the report made to its own finding, kept honest.
+
+    A decoy with a matching mtime only wins when nothing matches by *name*. Given
+    a log named with `%j` in the job's WorkDir, that path is found first and the
+    decoy is never considered -- so the fabrication needs a fixed log name
+    (`train.err`, `logs/run.err`) rather than the Slurm default.
+
+    Pinned because it is load-bearing for how far the finding reaches, and because
+    the candidate ranking was changed in the same round for a different reason:
+    an assertion that name beats timing is what stops that change quietly widening
+    the blast radius later.
+    """
+
+    def test_the_job_named_log_wins_and_is_not_marked_a_guess(self, tmp_path):
+        from slurmpast.logs import assign_logs
+
+        work = tmp_path / "work"
+        decoy = tmp_path / "decoy"
+        work.mkdir()
+        decoy.mkdir()
+        (work / "gpuless-48819454.err").write_text("real: quota exceeded\n")
+        (decoy / "x.err").write_text("DECOY: CUDA error: out of memory\n")
+        stamp = 1787000441
+        for path in (work / "gpuless-48819454.err", decoy / "x.err"):
+            os.utime(path, (stamp, stamp))
+
+        job = parse(
+            make_text(
+                row(
+                    JobID="48819454",
+                    JobName="gpuless",
+                    User="youzhi",
+                    State="FAILED",
+                    ExitCode="3:0",
+                    Submit="2026-08-23T08:00:00",
+                    Start="2026-08-23T08:00:05",
+                    End="2026-08-23T08:00:41",
+                    ElapsedRaw="36",
+                    NCPUS="1",
+                    AllocCPUS="1",
+                    NNodes="1",
+                    WorkDir=str(work),
+                    AllocTRES="billing=1,cpu=1,mem=200M,node=1",
+                )
+            ),
+            fields=_FIELDS,
+        )[0]
+        path, inferred = assign_logs([job], extra_dirs=[str(decoy)])[job.job_id]
+        assert os.path.basename(path) == "gpuless-48819454.err", path
+        assert inferred is False, "a name match is certain and must not carry the timing hedge"
+
+
+class TestARefusedRowIsCounted:
+    """The one part of SP-1 this round first declined, reopened by the reporter.
+
+    The original ask was "count what you rejected instead of silently binning it
+    into `open_ended`". The binning half was fixed by the parser; the counting
+    half was recorded as not-done, on the stated grounds that there was no channel
+    from `parse` to a front end. The reporter's feedback answered that -- `--json`
+    is a channel that already exists, and it needs no change to `parse`'s
+    signature. It was right, so the count now ships.
+
+    `parse` fills an optional dict; `Sacct` holds the last query's; `--json` emits
+    it **only when non-zero**, so a well-formed cluster's payload is byte-identical
+    to before and no existing consumer moves.
+
+    One counter, not the two first written. A "first field is not a JobID" counter
+    cannot fire: `_records` only opens a record on a line whose head is already
+    JobID-shaped, and JobID is field 0, so the in-`parse` test re-asks a settled
+    question. It was removed rather than shipped reading a permanent 0, which
+    would read as evidence of soundness.
+    """
+
+    def _clean(self):
+        return make_text(
+            row(
+                JobID="1",
+                JobName="j",
+                User="u",
+                State="COMPLETED",
+                Start="2026-08-23T09:00:00",
+                End="2026-08-23T09:01:00",
+                ElapsedRaw="60",
+            )
+        )
+
+    def test_a_clean_history_counts_nothing(self):
+        stats = {}
+        parse(self._clean(), fields=_FIELDS, stats=stats)
+        assert stats["dropped_rows"] == {"shifted": 0}
+
+    def test_a_shifted_row_is_counted(self):
+        """A value holding the delimiter gives the row more fields than were
+        asked for, so every column after it is misaligned. Refusing it is what
+        this module has always done; saying so is the new part."""
+        stats = {}
+        text = self._clean().rstrip("\n") + "\nnot-a-job|x\n"
+        parse(text, fields=_FIELDS, stats=stats)
+        assert stats["dropped_rows"]["shifted"] == 1
+
+    def test_noise_without_a_delimiter_costs_nothing(self):
+        """The control. A line that is merely not a record is a continuation of
+        the one above it, not a loss, and must not inflate the count -- the whole
+        point of the reassembly is that such lines belong to the record above."""
+        stats = {}
+        text = self._clean().rstrip("\n") + "\nplain noise line\n"
+        jobs = parse(text, fields=_FIELDS, stats=stats)
+        assert stats["dropped_rows"]["shifted"] == 0
+        assert [j.job_id for j in jobs] == ["1"]
+
+    def test_the_payload_is_unchanged_when_nothing_was_dropped(self, capsys):
+        """The other control, and the one that protects every existing consumer:
+        the key appears only when it has something to say."""
+        from slurmpast import cli
+
+        cli.main(["--demo", "--overview", "--json", "--no-color"])
+        assert "dropped_rows" not in json.loads(capsys.readouterr().out)
+
+
+class TestTheCpuFigureCarriesItsOwnLimits:
+    """`TotalCPU` is summed over the *step's process tree*, and a whole class of
+    parallel runtime leaves that tree on purpose.
+
+    `parallelly::makeClusterPSOCK`, which backs R's `plan(multisession)` and is
+    that ecosystem's default recommendation, reparents every worker to PID 1.
+    Reported from a second cluster on a real job: eight workers genuinely running,
+    24 minutes of wall time against ~4 hours of serial work, and slurmpast saying
+    `0.1 of 8 cores busy` with `→ Try --cpus-per-task=1`. Taking that advice
+    serialises the fan-out.
+
+    The shape of the fix is the one this codebase already uses twice. `sizing.py`
+    documents four rules that keep advice honest, two of which are about a
+    measurement that lies in a known direction — `Elapsed` on a TIMEOUT bounds
+    runtime from below, `MaxRSS` under `jobacct_gather/linux` bounds memory from
+    above, and the second is *worded from the cluster* via `site.maxrss_caveat()`.
+    `TotalCPU` is the third such measurement and had no equivalent. It is also the
+    only one whose absence points at **shrinking** an allocation that was in use.
+
+    **Caveated, not suppressed.** `_CPU_TIME_ALREADY_EXPLAINED` is the wrong
+    instrument: that set is for states where the number is garbage, and here the
+    number is real work really done — it is just not all of it.
+    """
+
+    def _job(self):
+        return parse(
+            make_text(
+                row(
+                    JobID="48728837",
+                    JobName="rcchelp",
+                    User="youzhi",
+                    Partition="broadwl",
+                    State="COMPLETED",
+                    ExitCode="0:0",
+                    Submit="2026-08-01T09:00:00",
+                    Start="2026-08-01T09:00:00",
+                    End="2026-08-01T09:24:22",
+                    ElapsedRaw="1462",
+                    Timelimit="04:00:00",
+                    TimelimitRaw="240",
+                    NCPUS="8",
+                    AllocCPUS="8",
+                    NNodes="1",
+                    ReqMem="57G",
+                    AllocTRES="billing=8,cpu=8,mem=57G,node=1",
+                ),
+                row(
+                    JobID="48728837.batch",
+                    JobName="batch",
+                    State="COMPLETED",
+                    ElapsedRaw="1462",
+                    TotalCPU="02:13.700",
+                    NCPUS="8",
+                    AllocCPUS="8",
+                    MaxRSS="206028K",
+                ),
+            ),
+            fields=_FIELDS,
+        )[0]
+
+    def _finding(self, monkeypatch, gather):
+        from slurmpast import site
+        from slurmpast.diagnose import diagnose
+
+        monkeypatch.setattr(site, "site", lambda: site.Site(jobacct_gather_type=gather))
+        for f in diagnose(self._job()).findings:
+            if f.code == "cpu-overrequest":
+                return f
+        raise AssertionError("the finding under test did not fire")
+
+    def test_the_finding_says_the_figure_is_a_lower_bound(self, monkeypatch):
+        finding = self._finding(monkeypatch, "jobacct_gather/linux")
+        assert "lower bound" in finding.evidence, finding.evidence
+        assert "reparented" in finding.evidence
+
+    def test_the_action_names_the_second_reading(self, monkeypatch):
+        """The bare `Try --cpus-per-task=1` is what gets acted on, so the hedge has
+        to reach it and not only the evidence above it."""
+        finding = self._finding(monkeypatch, "jobacct_gather/linux")
+        assert "detached worker pool" in finding.action, finding.action
+
+    def test_a_cgroup_cluster_is_told_its_figure_is_sound(self, monkeypatch):
+        """The control that makes this a *cluster* property rather than a
+        universal disclaimer. Reparenting moves a process in the tree but not out
+        of its cgroup, so a cgroup-gathering site counts those workers and has
+        nothing to apologise for."""
+        finding = self._finding(monkeypatch, "jobacct_gather/cgroup")
+        assert "lower bound" not in finding.evidence, finding.evidence
+        assert "are counted" in finding.evidence
+
+    def test_an_unknown_cluster_hedges_rather_than_asserting(self, monkeypatch):
+        """`site`'s own rule: None is not False, so the pessimistic wording is
+        only justified when `jobacct_gather/linux` is confirmed."""
+        finding = self._finding(monkeypatch, "")
+        assert "may miss" in finding.evidence, finding.evidence
+
+    def test_the_finding_is_not_suppressed(self, monkeypatch):
+        """The other control. The reported figure is a lower bound, not garbage:
+        0.1 of 8 cores really was accounted, and a reader with a genuinely idle
+        allocation still needs to be told."""
+        assert self._finding(monkeypatch, "jobacct_gather/linux") is not None
+
+    def test_the_paste_ready_advice_carries_it_too(self, monkeypatch):
+        """The highest-value half: these `#SBATCH` lines were verified on a second
+        cluster to be pasted into a script verbatim and accepted by `sbatch`
+        unmodified, so an un-caveated undercount here is executed, not just read."""
+        from slurmpast import site
+        from slurmpast.sizing import recommend
+
+        monkeypatch.setattr(
+            site, "site", lambda: site.Site(jobacct_gather_type="jobacct_gather/linux")
+        )
+        jobs = [self._job()._replace(job_id=str(60000 + i)) for i in range(5)]
+        cpu = [a for a in recommend(jobs) if a.flag == "--cpus-per-task"]
+        assert cpu, "the workload should draw CPU advice"
+        assert cpu[0].verdict == "lower", cpu[0].verdict
+        assert "lower bound" in cpu[0].caution, cpu[0].caution
+
+    def test_advice_that_does_not_shrink_is_not_caveated(self, monkeypatch):
+        """The control on scope. The caveat is about under-counting, so it belongs
+        only on the verdict that would cut an allocation; a `keep` or `raise` is
+        not put at risk by a figure that is too low."""
+        from slurmpast import site
+        from slurmpast.sizing import recommend
+
+        monkeypatch.setattr(
+            site, "site", lambda: site.Site(jobacct_gather_type="jobacct_gather/linux")
+        )
+        busy = self._job()
+        jobs = [busy._replace(job_id=str(61000 + i), ncpus=1, alloc_cpus=1) for i in range(5)]
+        for advice in recommend(jobs):
+            if advice.flag == "--cpus-per-task" and advice.verdict != "lower":
+                assert "lower bound" not in advice.caution, advice.caution
+
+
+class TestANonUtf8StdoutStillProducesOutput:
+    """Under a valid non-UTF-8 locale every text mode emitted **zero bytes**.
+
+    Not degraded output — none. `rc=1` and a `UnicodeEncodeError` traceback, on
+    three of the six locales installed on the reporting host. `LC_ALL=C` is *not*
+    the case that bites: PEP 538/540 coerce `C`/`POSIX` to UTF-8, so the setting
+    people type in job scripts is rescued. A real 8-bit locale — `en_US`,
+    `en_US.iso88591`, and `LANG=en_US` is ordinary in a site profile — gets no
+    coercion because it is legitimate and Python honours it.
+
+    Two layers, and `--ascii` only ever fixed the first:
+
+    * the package's own glyphs (box, block, arrow, em dash), which `--ascii`
+      switches — but only if the user knows to pass it;
+    * **the data**, which it cannot touch. A job name is arbitrary user-controlled
+      text arriving from Slurm, and one job named `\u30d5\u30a1\u30a4\u30eb` in the queried
+      window took down every text mode for every user querying that window,
+      including users who did not submit it once `--all-users` is in play.
+
+    So `reconfigure(errors="backslashreplace")` is the fix that closes both, and
+    auto-selecting `--ascii` from the encoding is what stops the reader needing to
+    know about the first.
+    """
+
+    MODES = ("--plain", "--overview", "--patterns", "--sizing", "--nodes")
+
+    def _run(self, *argv):
+        # Bytes. The child writes latin-1 by construction, so `text=True` decodes
+        # its stdout as UTF-8 and raises in the *harness* -- which looks exactly
+        # like a tool failure and is not one. That mistake made this test appear
+        # to prove something it does not; see the ascii test below.
+        return subprocess.run(
+            [sys.executable, "-m", "slurmpast", "--demo", "--no-color", *argv],
+            capture_output=True,
+            env={
+                **os.environ,
+                "PYTHONIOENCODING": "iso8859-1",
+                "PYTHONPATH": str(pathlib.Path(__file__).resolve().parent.parent / "src"),
+            },
+            timeout=120,
+        )
+
+    @pytest.mark.parametrize("mode", MODES)
+    def test_every_text_mode_still_emits_something(self, mode):
+        done = self._run(mode)
+        stderr = done.stderr.decode("utf-8", "replace")
+        # 0 or 1: the post-mortem paths exit 1 when they have a critical finding,
+        # which the demo history does. The defect was rc=1 *with no output at all*.
+        assert done.returncode in (0, 1), stderr[-400:]
+        assert done.stdout, "zero bytes is the defect"
+        assert "UnicodeEncodeError" not in stderr
+
+    # A job name from the reporting cluster's real accounting, not a synthetic
+    # string: `48819177|\u00fcn\u00ef \u30d5\u30a1\u30a4\u30eb job`.
+    _DATA_CASE = r"""
+import sys
+from slurmpast import cli, sacct
+FIELDS = sacct.Sacct().fields
+row = {"JobID": "48819177", "User": "youzhi",
+       "JobName": "\u00fcn\u00ef \u30d5\u30a1\u30a4\u30eb job",
+       "State": "COMPLETED", "Submit": "2026-08-23T09:00:00",
+       "Start": "2026-08-23T09:00:00", "End": "2026-08-23T09:10:00",
+       "ElapsedRaw": "600", "NCPUS": "1", "AllocCPUS": "1", "NNodes": "1"}
+def fake(args):
+    if "--helpformat" in args:
+        return " ".join(FIELDS)
+    if args and args[0] in ("squeue", "scontrol", "sinfo"):
+        return ""
+    return "\x1f".join(row.get(f, "") for f in FIELDS) + "\n"
+sacct._run = fake
+sys.exit(cli.main(["--overview", "--plain", "--no-color", "-S", "now-1days"]))
+"""
+
+    def test_a_job_name_outside_the_encoding_does_not_abort_the_report(self):
+        """The layer `--ascii` cannot reach, and the one the cases above miss.
+
+        Those run `--demo`, whose job names are all ASCII, so auto-`--ascii` alone
+        carries them and they pass with the encode-safety removed -- the same
+        blind spot the tool had. A job name is arbitrary user-controlled text
+        arriving from Slurm, and it is the answer rather than the chrome: no flag
+        can substitute it away.
+        """
+        # Bytes, not text: the child writes latin-1 by construction, so decoding
+        # its stdout as UTF-8 raises in the *test*. That failure is itself a
+        # demonstration that the child produced output at all.
+        done = subprocess.run(
+            [sys.executable, "-c", self._DATA_CASE],
+            capture_output=True,
+            env={
+                **os.environ,
+                "PYTHONIOENCODING": "iso8859-1",
+                "PYTHONPATH": str(pathlib.Path(__file__).resolve().parent.parent / "src"),
+            },
+            timeout=120,
+        )
+        stderr = done.stderr.decode("utf-8", "replace")
+        assert "UnicodeEncodeError" not in stderr, stderr[-400:]
+        assert done.stdout, "zero bytes is the defect"
+        # The overview lists job *names*. `ünï` is representable in latin-1 and
+        # survives as itself; the Katakana is not and comes through escaped, which
+        # is the whole point of `backslashreplace` -- ugly, reversible, and never
+        # the difference between a report and nothing.
+        assert "\u00fcn\u00ef".encode("iso8859-1") in done.stdout, done.stdout[:200]
+        assert b"\\u30d5" in done.stdout, "the unencodable name should be escaped, not fatal"
+
+    def test_ascii_is_selected_from_the_encoding_without_the_flag(self):
+        """The reader should not have to know `--ascii` exists to get output from
+        a terminal that cannot draw. The flag stays as an override."""
+        from slurmpast.cli import _encoding_cannot_draw
+
+        assert _encoding_cannot_draw(io.TextIOWrapper(io.BytesIO(), encoding="iso8859-1"))
+        assert not _encoding_cannot_draw(io.TextIOWrapper(io.BytesIO(), encoding="utf-8"))
+
+    def test_what_the_auto_ascii_half_actually_buys_is_legibility(self):
+        """Stated precisely, because it is easy to overclaim.
+
+        The report says the encode-safety "alone closes every case", and it is
+        right: with `backslashreplace` in place, removing the auto-`--ascii`
+        selection leaves every mode exiting 0 with output. What it leaves is
+        output whose box drawing has become `\\u2502` escapes -- present, honest
+        and unreadable.
+
+        So this half is not a correctness fix and should not be tested as one. It
+        is tested for what it does: no escaped box glyphs on a terminal that
+        cannot encode them.
+        """
+        # The single-job screen, because that is where the gauges are -- the list
+        # views' non-ASCII is all latin-1-representable, so they look identical
+        # either way and would make this test pass for no reason.
+        rendered = self._run("5100057").stdout
+        assert rendered
+        assert rb"\\u2588" not in rendered, "the gauge bar came through as escapes"
+        assert rb"\\u25cf" not in rendered, "the bullet came through as escapes"
+        assert b"#" in rendered, "the ASCII gauge should have been substituted"
+
+
+class TestTheUserIsResolvableWithoutAnEnvironment:
+    """`sbatch --export=NONE` leaves no identity, and three of the four modes
+    aborted with an unhandled `OSError` traceback — the three a script would use.
+
+    `getpass.getuser()` reads the environment and then `pwd`, and raises when both
+    fail. That is reachable with a documented, unmodified Slurm flag, and some
+    sites set `SBATCH_EXPORT=NONE` cluster-wide. It degrades that far because the
+    reporting cluster's compute nodes carry no passwd entry for the user — `id -un`
+    answers "cannot find name for user ID 940740146" — so the whole class of
+    failure is invisible on the login node where the tool was written.
+
+    The uid is not a consolation prize: `sacct -u 940740146` returns that user's
+    rows, verified on a live cluster. It is the identity the accounting database
+    keyed on.
+    """
+
+    def _blank_environment(self, monkeypatch):
+        import pwd
+
+        for var in ("USER", "LOGNAME", "LNAME", "USERNAME", "HOME", "SLURM_JOB_USER"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr(
+            pwd, "getpwuid", lambda uid: (_ for _ in ()).throw(KeyError("uid not found"))
+        )
+
+    def test_the_uid_is_used_when_nothing_else_answers(self, monkeypatch):
+        from slurmpast.sacct import current_user
+
+        self._blank_environment(monkeypatch)
+        assert current_user() == str(os.getuid())
+
+    def test_slurms_own_variable_is_preferred_to_the_bare_uid(self, monkeypatch):
+        """`SLURM_JOB_USER` survives `--export=NONE`, because Slurm re-exports its
+        own variables, and a name reads better than a number."""
+        from slurmpast.sacct import current_user
+
+        self._blank_environment(monkeypatch)
+        monkeypatch.setenv("SLURM_JOB_USER", "youzhi")
+        assert current_user() == "youzhi"
+
+    def test_the_ordinary_environment_is_unchanged(self, monkeypatch):
+        """The control: none of this may alter who the tool asks about normally.
+
+        `LOGNAME` as well as `USER`, because `getpass.getuser()` reads LOGNAME
+        first and leaving it set was enough to make this test pass for the wrong
+        reason on a developer machine.
+        """
+        from slurmpast.sacct import current_user
+
+        monkeypatch.setenv("LOGNAME", "alice")
+        monkeypatch.setenv("USER", "alice")
+        assert current_user() == "alice"
+
+    def test_no_traceback_reaches_the_scriptable_modes(self, monkeypatch, capsys):
+        """The defect as filed was a traceback on `--plain`/`--json`/`--overview`
+        while the TUI printed one clean line."""
+        from slurmpast import cli
+
+        self._blank_environment(monkeypatch)
+        monkeypatch.setattr("slurmpast.sacct._run", lambda args: "")
+        code = cli.main(["--overview", "--plain", "--no-color", "-S", "now-1hours"])
+        assert code in (0, 2), code
+        assert "Traceback" not in capsys.readouterr().err
+
+
+class TestAnUnreadableLogIsNotReportedAsDeleted:
+    """`os.path.isfile` answers False for ENOENT and EACCES alike, so a log behind
+    a mode-700 home was reported as "moved or deleted".
+
+    Not a corner case on a shared cluster and impossible to see on a single-user
+    machine, which is where the message was written: over 12 hours of other users'
+    jobs, 104 of the 106 records naming a log path were unreadable rather than
+    absent, so the claim was wrong 98% of the time it appeared about a foreign job.
+    The file may well be exactly where the record says.
+
+    Same shape as two findings elsewhere in this family -- a failed call's own
+    explanation discarded and the gap filled with a guess -- and the errno was
+    available the whole time.
+    """
+
+    def _job(self, tmp_path, path):
+        return parse(
+            make_text(
+                row(
+                    JobID="48781550",
+                    JobName="arr",
+                    User="trabbani",
+                    State="FAILED",
+                    ExitCode="1:0",
+                    Submit="2026-08-23T09:00:00",
+                    Start="2026-08-23T09:00:00",
+                    End="2026-08-23T09:10:00",
+                    ElapsedRaw="600",
+                    NCPUS="1",
+                    AllocCPUS="1",
+                    NNodes="1",
+                    StdOut=str(path),
+                )
+            ),
+            fields=_FIELDS,
+        )[0]
+
+    @staticmethod
+    def _blocked(tmp_path):
+        private = tmp_path / "private"
+        (private / "logs").mkdir(parents=True)
+        target = private / "logs" / "job.out"
+        target.write_text("real content\n")
+        private.chmod(0o000)
+        return target, private
+
+    def _render(self, job):
+        from slurmpast import report
+
+        text, _verdict = report.render_job(job, style=report.Style(enabled=False))
+        return text
+
+    def test_an_unreadable_log_is_not_reported_as_deleted(self, tmp_path):
+        """The test the report asks for by name."""
+        target, private = self._blocked(tmp_path)
+        try:
+            rendered = self._render(self._job(tmp_path, target))
+        finally:
+            private.chmod(0o700)
+        assert "moved" not in rendered and "deleted" not in rendered, rendered
+        assert "not readable by you" in rendered
+        assert "trabbani" in rendered, "the owner is on the record and should be named"
+
+    def test_a_genuinely_absent_log_keeps_the_old_wording(self, tmp_path):
+        """The control. ENOENT really does mean moved or deleted, and that
+        sentence is right -- the fix must not cost it."""
+        rendered = self._render(self._job(tmp_path, tmp_path / "gone.out"))
+        assert "moved or deleted" in rendered, rendered
+
+    def test_the_probe_tells_the_three_apart(self, tmp_path):
+        from slurmpast.logs import probe_path
+
+        target, private = self._blocked(tmp_path)
+        try:
+            assert probe_path(str(target)) == "unreadable"
+        finally:
+            private.chmod(0o700)
+        assert probe_path(str(tmp_path / "nope")) == "absent"
+        assert probe_path(str(target)) == "found"
+
+    def test_an_errno_that_is_neither_is_not_guessed_at(self, tmp_path):
+        """The third state, which shipped without a test of its own.
+
+        `absent` and `unreadable` cover the two errnos anyone thinks of; the
+        `unknown` branch exists so a stat that fails for some other reason is
+        reported rather than folded into one of them, and an untested branch that
+        only fires on an exotic errno is exactly the kind that rots.
+
+        Two real triggers rather than a patched `os.stat`, so this tests the errno
+        handling rather than the mock: a path component over `NAME_MAX`
+        (ENAMETOOLONG, errno 36) and a symlink pointing at itself (ELOOP).
+        """
+        import os
+
+        from slurmpast.logs import probe_path
+
+        assert probe_path(str(tmp_path / ("x" * 300) / "j.out")) == "unknown"
+
+        loop = tmp_path / "loop"
+        os.symlink(loop, loop)
+        assert probe_path(str(loop)) == "unknown"
+
+    def test_the_unknown_state_names_the_refusal_rather_than_a_cause(self, tmp_path):
+        """And the sentence it produces, which had no test at all. It must not
+        borrow either of the other two claims -- the whole point is that the tool
+        does not know which is true."""
+        job = self._job(tmp_path, tmp_path / ("x" * 300) / "j.out")
+        rendered = self._render(job)
+        assert "could not be checked" in rendered, rendered
+        for borrowed in ("moved", "deleted", "not readable by you"):
+            assert borrowed not in rendered, borrowed
+
+    def test_the_payload_carries_the_path_and_the_reason(self, tmp_path):
+        """Secondary half: `--json` collapsed every miss to `null`, so a consumer
+        could not see which path was tried, let alone why it failed."""
+        from slurmpast.cli import _job_json
+        from slurmpast.diagnose import diagnose
+
+        target, private = self._blocked(tmp_path)
+        job = self._job(tmp_path, target)
+        try:
+            payload = _job_json(job, None, diagnose(job))
+        finally:
+            private.chmod(0o700)
+        assert payload["log"] is None
+        assert payload["log_expected"] == {"path": str(target), "status": "unreadable"}
+
+    def test_no_logs_still_stats_nothing(self, tmp_path):
+        """The guard the report singles out as already correct, and which the
+        first version of this fix broke: computing a status means stat-ing the
+        path, and under `--no-logs` the filesystem is not to be touched at all."""
+        import os
+
+        from slurmpast.cli import _job_json
+        from slurmpast.diagnose import diagnose
+
+        target, private = self._blocked(tmp_path)
+        job = self._job(tmp_path, target)
+        seen = []
+        real = os.stat
+        os.stat = lambda path, *a, **k: seen.append(str(path)) or real(path, *a, **k)
+        try:
+            payload = _job_json(job, None, diagnose(job), no_logs=True)
+        finally:
+            os.stat = real
+            private.chmod(0o700)
+        # Present but empty, not absent: the key is unconditional so the per-job
+        # value count stays fixed, and `null` is the honest answer for a question
+        # that was deliberately not asked.
+        assert payload["log_expected"] == {"path": None, "status": None}
+        assert not [s for s in seen if "private" in s], seen
+
+
+class TestNoLogsTouchesNoFilesystem:
+    """`--no-logs` promises the filesystem is not consulted, and one new field
+    broke it while looking strictly more informative.
+
+    The sibling guard to `TestTheDemoAsksTheRealClusterNothing`. Both leaks that
+    have happened here were additions to a payload that quietly reached outside
+    the process -- `--sizing` running `sinfo` under `--demo`, and `--json`
+    stat-ing a recorded log path under `--no-logs` -- and neither showed in the
+    output. Counting the calls is the only way to see it, so every mode is counted
+    rather than the one that broke.
+    """
+
+    MODES = (
+        ("--plain",),
+        ("--json",),
+        ("--failed",),
+        ("--overview",),
+        ("900002",),
+        ("900002", "--json"),
+    )
+
+    def _runner(self, recorded):
+        text = make_text(
+            row(
+                JobID="900002",
+                JobName="j",
+                User="u",
+                State="FAILED",
+                ExitCode="1:0",
+                Submit="2026-08-23T09:00:00",
+                Start="2026-08-23T09:00:00",
+                End="2026-08-23T09:10:00",
+                ElapsedRaw="600",
+                NCPUS="1",
+                AllocCPUS="1",
+                NNodes="1",
+                StdOut=str(recorded),
+            )
+        ).replace("|", SAFE_DELIMITER)
+
+        def run_sacct(args):
+            if "--helpformat" in args:
+                return " ".join(_FIELDS)
+            if args and args[0] in ("squeue", "scontrol", "sinfo"):
+                return ""
+            return text
+
+        return run_sacct
+
+    @pytest.mark.parametrize("mode", MODES, ids=[" ".join(m) for m in MODES])
+    def test_the_recorded_path_is_never_stat_ed(self, monkeypatch, capsys, tmp_path, mode):
+        from slurmpast import cli
+
+        recorded = tmp_path / "sentinel-dir" / "job.out"
+        monkeypatch.setattr("slurmpast.sacct._run", self._runner(recorded))
+        seen = []
+        real = os.stat
+        monkeypatch.setattr(
+            os, "stat", lambda path, *a, **k: seen.append(str(path)) or real(path, *a, **k)
+        )
+        cli.main([*mode, "--no-logs", "--no-color", "-S", "now-1days"])
+        capsys.readouterr()
+        assert not [s for s in seen if "sentinel-dir" in s], seen
+
+    def test_without_the_flag_it_does_look(self, monkeypatch, capsys, tmp_path):
+        """The control, and the one that stops this passing for the wrong reason:
+        if nothing ever stat'd the recorded path, the tests above would be
+        vacuous."""
+        from slurmpast import cli
+
+        recorded = tmp_path / "sentinel-dir" / "job.out"
+        monkeypatch.setattr("slurmpast.sacct._run", self._runner(recorded))
+        seen = []
+        real = os.stat
+        monkeypatch.setattr(
+            os, "stat", lambda path, *a, **k: seen.append(str(path)) or real(path, *a, **k)
+        )
+        cli.main(["900002", "--json", "--no-color"])
+        capsys.readouterr()
+        assert [s for s in seen if "sentinel-dir" in s], "the probe should have run here"

@@ -1,0 +1,35 @@
+# A source distribution has to carry enough to rebuild and re-verify the
+# project, and this one did not. setuptools' default sdist file list includes
+# `tests/test*.py` -- a distutils legacy rule -- and nothing else, and there was
+# no MANIFEST.in, so the released 0.7.0 sdist shipped 18 of the 20 files in
+# tests/: `conftest.py` and `__init__.py` do not match `test*.py`. Every module
+# importing a fixture from `tests.conftest` then failed at collection --
+#
+#   $ tar xzf slurmpast-0.7.0.tar.gz && cd slurmpast-0.7.0 && pytest -q
+#   ERROR tests/test_extraction.py ... ERROR tests/test_sizing.py
+#   E   ModuleNotFoundError: No module named 'tests.conftest'
+#   Interrupted: 5 errors during collection
+#
+# -- and once that was fixed, eight more failed for the same underlying reason
+# one level out: this suite audits the repository, not only the package. It
+# checks the README against the dependency pin in `.github/workflows/ci.yml`,
+# the prose in `docs/details.md` against the code it documents, the import
+# declarations in `tools/`, and every image `README.md` points at under
+# `assets/`. None of those shipped either.
+#
+# That matters for this package specifically: the way its portability claims get
+# checked is somebody on a cluster nobody here has seen downloading the
+# *released* artefact and running it there. A suite that cannot be collected --
+# or that fails eight tests on a correct build -- reads as a broken package
+# rather than a broken sdist.
+#
+# Grafting whole directories rather than naming files, so a helper added later
+# is not silently left behind the same way.
+graft tests
+graft docs
+graft tools
+graft assets
+graft .github
+include LICENSE
+include README.md
+include issues.md

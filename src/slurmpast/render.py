@@ -703,6 +703,39 @@ def nodes_empty_reason(table, metric: str, workload: str | None, widen: str = "-
             " for %s" % workload if workload else "",
         )
     if not table["rows"]:
+        # A degenerate baseline first, because the sample-size sentence is a true
+        # statement that prescribes a useless action. At 100% no node can be worse
+        # than the baseline, so the comparison is unavailable for a reason no
+        # window can fix: the reader widens `--since`, waits for a bigger query,
+        # and gets the same non-answer. Reported from a real screen where a
+        # workload's every decided run had failed across 44 nodes.
+        #
+        # The conclusion is already in the data, and it is the answer to what the
+        # reader actually asked -- "is a node hurting me?" -- so it is said
+        # instead of the threshold.
+        #
+        # Only here, in the branch that has no table to show. A 100% baseline with
+        # rows is a real table of rows all at the baseline, and this sentence
+        # would replace it: `render_nodes` returns early on any non-empty reason.
+        # Gated on having enough placements to support the claim, which the
+        # reported fix sketch did not ask for and which the suite's own fixtures
+        # showed is needed: four all-hung runs give a 100% baseline too, and
+        # asserting "this is a workload failure" from four is the same
+        # over-reading in the other direction. The reported screen had 53
+        # placements across 44 nodes. Below the threshold the sample size really
+        # is an obstacle as well, so the existing sentence stays.
+        baseline = table.get("baseline")
+        trials = table.get("trials") or 0
+        if baseline is not None and baseline >= 1.0 and trials >= MIN_SAMPLES:
+            # Read inside the branch, and with `.get`: this function takes a plain
+            # mapping rather than the `node_table` return type, so a caller that
+            # builds one by hand need only carry the keys its case reaches.
+            touched = table.get("tested_nodes", 0) + table.get("skipped_nodes", 0)
+            return (
+                "Every decided run of %s failed, on all %d node%s it touched — no node is "
+                "an outlier because none succeeded. This is a workload failure, not a node "
+                "failure." % (workload or "this workload", touched, "" if touched == 1 else "s")
+            )
         # "%d seen, all below it" reads as a plural claim, and one node below the
         # threshold is the ordinary way to reach this branch on a short window.
         skipped = table["skipped_nodes"]
@@ -1113,6 +1146,30 @@ def pair_value_lines(label: str, value: str, budget: int) -> list[str]:
     return wrap_or_clip(value, budget)
 
 
+def requeue_summary(job) -> str:
+    """How many times a job was requeued and what each earlier attempt did.
+
+    Slurm reports only a job's latest incarnation unless `sacct -D` is asked for,
+    so a job requeued on NODE_FAIL, on preemption, or by `scontrol requeue` used
+    to render as its final attempt with no sign there had been others. That is the
+    one case where the answer to *"what happened to my job?"* is precisely the
+    thing not shown: "why is it still pending when I watched it start" is a
+    requeue, every time.
+
+    The elapsed time is the point, not just the count. On Midway3, job 53432121
+    reads `COMPLETED` after 03:41:52 -- and burned another 27m49s on a node that
+    failed under it first. A count alone would not say that.
+    """
+    if not job.earlier:
+        return ""
+    attempts = ", ".join(
+        "%s after %s" % (job_earlier.base_state or "?", format_duration(job_earlier.elapsed))
+        for job_earlier in job.earlier
+    )
+    n = len(job.earlier)
+    return "%dx · %s" % (n, attempts)
+
+
 def job_sections(job, summarized: bool = False):
     """Everything known about a finished job, as ``(title, [(label, value, bar)])``.
 
@@ -1168,6 +1225,11 @@ def job_sections(job, summarized: bool = False):
         timing.append(("ended", job.end, None))
     if job.queue_wait is not None:
         timing.append(("queued for", format_duration(job.queue_wait), None))
+    if job.earlier:
+        # Above the walltime row on purpose: the walltime below is this
+        # incarnation's, and a reader who has not been told the job ran before
+        # will take it for the whole story.
+        timing.append(("requeued", requeue_summary(job), None))
     timing.append(
         (
             "walltime",

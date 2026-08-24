@@ -870,15 +870,43 @@ class TestNothingWasComputedIsNotSaidOverTerabytes:
         assert noop.severity == CRITICAL
         assert "4 GPU(s)" in noop.evidence, noop.evidence
 
-    def test_a_genuinely_idle_allocation_still_gets_the_old_wording(self, healthy_job):
+    def test_a_genuinely_idle_allocation_still_gets_the_old_wording(self, healthy_job, monkeypatch):
         """The control that matters most. A hang with no I/O is what the original
         wording is *for*, and it has to survive intact -- otherwise this fix has
-        traded one wrong message for another."""
+        traded one wrong message for another.
+
+        Pinned to a cgroup-gathering cluster, which is where the absolute sentence
+        is *earned*: `TotalCPU` there covers processes reparented out of the
+        step's tree, so "nothing was computed" is a claim about the job and not
+        merely about what was attributed. This suite's default site is
+        `jobacct_gather/linux` (see `conftest`), where it is not -- and asserting
+        the absolute wording under that config, which this test used to do, is
+        asserting the over-claim.
+        """
+        from slurmpast import site
+
+        monkeypatch.setattr(
+            site, "site", lambda: site.Site(jobacct_gather_type="jobacct_gather/cgroup")
+        )
         job = self._stalled(healthy_job, 67925.0)
         noop = find(diagnose(job), "noop-allocation")
         assert noop is not None
         assert "Nothing was computed" in noop.evidence
         assert "Find the blocking call" in noop.action
+
+    def test_on_a_cluster_that_cannot_see_all_cpu_the_claim_is_softened(self, healthy_job):
+        """The other half, under this suite's default `jobacct_gather/linux`.
+
+        The same record cannot support "nothing was computed" there: `TotalCPU` is
+        summed over the step's process tree, and a detached worker pool is outside
+        it. The finding still fires -- suppressing it would lose the genuinely
+        idle allocation -- but it states what was attributed and says why that may
+        not be everything."""
+        job = self._stalled(healthy_job, 67925.0)
+        noop = find(diagnose(job), "noop-allocation")
+        assert "Nothing was computed" not in noop.evidence, noop.evidence
+        assert "attributed" in noop.evidence and "lower bound" in noop.evidence
+        assert "detached pool" in noop.action
 
     def test_traffic_below_the_rules_own_floor_is_not_an_explanation(self, healthy_job):
         """2.8 GB over two hours does not explain a missing CPU-hour, and the
@@ -887,7 +915,9 @@ class TestNothingWasComputedIsNotSaidOverTerabytes:
         job = self._stalled(healthy_job, 8172.0, read=2984952396, write=1174232073)
         verdict = diagnose(job)
         assert find(verdict, "io-heavy") is None
-        assert "Nothing was computed" in find(verdict, "noop-allocation").evidence
+        # The finding still fires; only the sentence about what it means is
+        # conditioned on the cluster, and this suite's default cannot see all CPU.
+        assert find(verdict, "noop-allocation") is not None
 
     def test_high_volume_at_a_trickle_is_not_an_explanation_either(self, healthy_job):
         """Both halves of the threshold are load-bearing: 30 GiB dribbled out over
@@ -895,7 +925,7 @@ class TestNothingWasComputedIsNotSaidOverTerabytes:
         job = self._stalled(healthy_job, 604800.0, read=32 * 1024**3)
         verdict = diagnose(job)
         assert find(verdict, "io-heavy") is None
-        assert "Nothing was computed" in find(verdict, "noop-allocation").evidence
+        assert find(verdict, "noop-allocation") is not None
 
     def test_end_to_end_the_plain_output_does_not_argue_with_itself(self, healthy_job):
         """The defect as a reader met it: both findings in one rendered report,

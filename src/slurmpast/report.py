@@ -70,7 +70,7 @@ from .render import (
     wrap,
     wrap_or_clip,
 )
-from .sizing import recommend, sbatch_lines
+from .sizing import MIN_RUNS, recommend, sbatch_lines
 
 _CODES = {
     "reset": "\033[0m",
@@ -399,13 +399,34 @@ def render_job(
         # post-mortem can reach (slurmctld forgets a job after MinJobAge), so the
         # path is genuinely unknowable and saying more would explain a limitation
         # the reader cannot act on.
-        from .logs import recorded_paths
+        #
+        # Three spellings where there used to be one, because a stat that failed
+        # is not the same as a stat that found nothing. "moved or deleted" is a
+        # sound inference from ENOENT and an unsound one from EACCES, and on a
+        # shared cluster the second is the common case: 104 of the 106 foreign
+        # jobs naming a log path on the reporting cluster were unreadable rather
+        # than absent. The owner is on the record, so the message can say who to
+        # ask instead of asserting something about a file nobody could see.
+        from .logs import probe_path, recorded_paths
 
         expected = recorded_paths(job)
-        if expected:
-            detail = "none at %s — moved or deleted; --log-dir points at it" % expected[0]
-        else:
+        if not expected:
             detail = "none found — --log-dir points at one"
+        else:
+            state = probe_path(expected[0])
+            if state == "unreadable":
+                whose = ("%s's" % job.user) if job.user else "its owner's"
+                detail = (
+                    "none readable at %s — it may well be there, but %s directory is not "
+                    "readable by you; ask them, or point --log-dir at a copy" % (expected[0], whose)
+                )
+            elif state == "unknown":
+                detail = (
+                    "could not be checked at %s — the filesystem refused the question; "
+                    "--log-dir points somewhere reachable" % expected[0]
+                )
+            else:
+                detail = "none at %s — moved or deleted; --log-dir points at it" % expected[0]
         # Wrapped: this one is a sentence built around a path, not a bare path, so
         # unlike the found case above there is nothing here that has to survive a
         # copy. It reached 122 cells at every terminal width.
@@ -443,6 +464,12 @@ def render_job(
                 )
     out.append("")
     return _fold("\n".join(out), ascii_mode), verdict
+
+
+# A label `GroupStats.label` marked as covering more than one raw job name, e.g.
+# `20260822 +1`. Anchored at the end so a job genuinely named `run+1` is not
+# mistaken for one.
+_MERGED_LABEL = re.compile(r" \+\d+$")
 
 
 def render_overview(history: History, style=None, limit=25, sort="cost", ascii_mode=False):
@@ -534,6 +561,11 @@ def render_overview(history: History, style=None, limit=25, sort="cost", ascii_m
         notes.append("ordered by %s" % sort_label(sort))
     if any("#" in g.label for g in shown):
         notes.append('"#" stands for a name\'s digits')
+    # Only when such a row is on screen. The name shown is one real name out of
+    # several the fold merged, and without this the row claims a singularity it
+    # does not have.
+    if any(_MERGED_LABEL.search(g.label) for g in shown):
+        notes.append('"+N" means the name shown covers N more')
     # RUNS, COMPLETED and FLAGGED read as a partition of the same runs and are not:
     # argonne35-pretrain showed 15 / 10 / 2 and was asked whether the math was
     # wrong. It was not -- the other 5 were cancelled, and 2 of those held GPUs
@@ -638,7 +670,7 @@ def render_list(jobs, style=None, limit=40, ascii_mode=False):
             }
         )
     out = text_table(layout, rows, style=style)
-    if len(jobs) > limit:
+    if limit is not None and len(jobs) > limit:
         out.append(style("  … %d more (raise --limit)" % (len(jobs) - limit), "grey"))
     return _fold("\n".join(out), ascii_mode)
 
@@ -824,15 +856,34 @@ def render_sizing(history, style=None, limit=12, sort="cost", ascii_mode=False):
     # *with actionable advice*, which is not a prefix of history.groups.
     hidden_groups = 0
     hidden_runs = 0
+    # Why a workload left, not just that it did. The filter below drops two states
+    # that mean opposite things -- "correctly sized" and "I have no idea" -- and
+    # the one sentence at the bottom offered them as equal possibilities. On the
+    # cluster this was reported from, 61 of 69 workloads were dropped and *every
+    # one* was for lack of runs; none was correctly sized. A screen whose only
+    # output is an affirmative green pass, for a state that is actually no data,
+    # is the first thing a new user sees on a new cluster.
+    no_data_groups = 0
+    no_data_runs = 0
+    # Judged and left alone, as distinct from never judged. Kept so the empty
+    # screen can tell the reader which of the two it is looking at.
+    shown_judged = 0
     for group in sort_groups(history.groups, sort):
         advice = recommend(group.jobs)
         if not advice:
             continue
         actionable = [a for a in advice if a.actionable]
         if not actionable:
+            # `unknown` means the runs were too few to infer anything;
+            # `keep`/`capped` mean the request was judged and left alone.
+            if all(a.verdict == "unknown" for a in advice):
+                no_data_groups += 1
+                no_data_runs += group.total
+            else:
+                shown_judged += 1
             continue
         shown += 1
-        if shown > limit:
+        if limit is not None and shown > limit:
             hidden_groups += 1
             hidden_runs += group.total
             continue
@@ -857,6 +908,20 @@ def render_sizing(history, style=None, limit=12, sort="cost", ascii_mode=False):
         for a in advice:
             if a.verdict == "keep":
                 out.append("    %-17s %s" % (a.flag, style("already about right", "green")))
+                continue
+            if a.verdict == "capped":
+                # Not "already about right": the workload wants more and cannot
+                # have it here. The basis line carries the measurement and the
+                # caution names the way out, so both are printed rather than the
+                # flag line alone.
+                out.append(
+                    "    %-17s %s" % (a.flag, style("at this partition's ceiling", "yellow"))
+                )
+                for line in wrap(a.basis, _prose_width(8)):
+                    out.append("        " + style(line, "grey"))
+                for index, line in enumerate(wrap(a.caution, _prose_width(8 + len(CAUTION_MARK)))):
+                    prefix = CAUTION_MARK if index == 0 else " " * len(CAUTION_MARK)
+                    out.append("        " + style(prefix + line, "yellow"))
                 continue
             if a.verdict == "unknown":
                 out.append("    %-17s %s" % (a.flag, style("no advice", "grey")))
@@ -902,13 +967,41 @@ def render_sizing(history, style=None, limit=12, sort="cost", ascii_mode=False):
         # Wrapped for the same reason the nodes screen's two are: at 66 cells this
         # is the only line on the view, so a narrow terminal broke the one sentence
         # standing in for the whole screen.
-        out.extend(
-            style("  " + line, "green")
-            for line in wrap(
-                "every workload is already about right, or lacks the runs to say.",
-                _prose_width(2),
+        #
+        # Green is reserved for the genuine all-clear. A no-data screen is grey,
+        # like the `no advice` rows it is standing in for -- the least-informed
+        # state should not be rendered in the most reassuring colour.
+        if no_data_groups and not shown_judged:
+            sentence = (
+                "no workload has the %d completed runs --sizing needs "
+                "(%d workload%s, %d run%s)."
+                % (
+                    MIN_RUNS,
+                    no_data_groups,
+                    "" if no_data_groups == 1 else "s",
+                    no_data_runs,
+                    "" if no_data_runs == 1 else "s",
+                )
             )
-        )
+            colour = "grey"
+        elif no_data_groups:
+            sentence = (
+                "every workload with enough runs is already about right; %d other%s "
+                "(%d run%s) lack%s the %d runs --sizing needs."
+                % (
+                    no_data_groups,
+                    "" if no_data_groups == 1 else "s",
+                    no_data_runs,
+                    "" if no_data_runs == 1 else "s",
+                    "s" if no_data_groups == 1 else "",
+                    MIN_RUNS,
+                )
+            )
+            colour = "grey"
+        else:
+            sentence = "every workload is already about right."
+            colour = "green"
+        out.extend(style("  " + line, colour) for line in wrap(sentence, _prose_width(2)))
         out.append("")
     elif hidden_groups:
         tail = "… %d more workload%s (%d run%s) also ha%s advice, below the %d shown. " % (
@@ -921,6 +1014,24 @@ def render_sizing(history, style=None, limit=12, sort="cost", ascii_mode=False):
         )
         tail += "Narrow --since, or ask about one with `slurmpast --sizing -p <partition>`."
         for line in wrap(tail, _prose_width(2)):
+            out.append("  " + style(line, "grey"))
+        out.append("")
+    if shown and no_data_groups:
+        # The other tail, and the one that was missing. `hidden_groups` counts only
+        # workloads *with* advice pushed past the limit, so on a history where 8
+        # workloads are shown and 61 were dropped for lack of runs, it never fires
+        # and 61 leave with no tally at all. Naming a tail is this file's own
+        # standard, stated two branches up; the filter above it did not meet it.
+        note = "%d other workload%s (%d run%s) %s too few runs to judge — %s needs %d." % (
+            no_data_groups,
+            "" if no_data_groups == 1 else "s",
+            no_data_runs,
+            "" if no_data_runs == 1 else "s",
+            "has" if no_data_groups == 1 else "have",
+            "--sizing",
+            MIN_RUNS,
+        )
+        for line in wrap(note, _prose_width(2)):
             out.append("  " + style(line, "grey"))
         out.append("")
     return _fold("\n".join(_titled("what to request next time", out, style)), ascii_mode)

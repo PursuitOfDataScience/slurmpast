@@ -7,8 +7,8 @@ targets one thing, and every view is also reachable as plain text for pipes.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
-import getpass
 import json
 import re
 import sys
@@ -21,7 +21,7 @@ from .index import History, filter_jobs, sort_groups
 from .logs import assign_logs, read_tail
 from .model import severity_rank
 from .nodes import Workload, note_for_allocation
-from .sacct import Sacct, SacctError, live_job_ids
+from .sacct import Sacct, SacctError, controller_log_paths, current_user, live_job_ids
 
 EPILOG = """\
 examples:
@@ -35,6 +35,22 @@ examples:
   slurmpast --all-users --nodes    every account on the cluster
   slurmpast 51170455 --json        machine readable
 
+exit status:
+  0  ran, and nothing it judges is critical
+  1  a critical finding
+  2  slurmpast or sacct could not answer (bad argument, no Slurm, query failed)
+
+  What `1` means depends on how it was invoked, which is worth knowing before
+  wrapping it: with job ids it is "one of these jobs has a critical finding";
+  without them it is "a cross-run pattern is critical", and per-job findings in
+  the same payload do not raise it. That default is deliberate — a scan over a
+  whole cluster would exit 1 almost always, which makes the code useless as a
+  signal — but it is not what `slurmpast --json || alert` assumes. Pass
+  --strict to fold per-job findings back in.
+
+  The reporting views always exit 0 — they report rather than judge:
+  --overview --patterns --nodes --sizing
+
 `sp` is a short alias for the same entry point.
 """
 
@@ -44,16 +60,36 @@ def _row_limit(value):
 
     Every consumer slices ``[:limit]``, so ``-n -5`` -- a plausible typo for ``-n 5``,
     and one this tool invites by accepting ``-S -7days`` -- quietly drops the last
-    five rows and prints "5 more" instead of failing. ``-n 0`` renders a table with a
-    header, no rows, and a footer saying everything was omitted.
+    five rows and prints "5 more" instead of failing.
+
+    ``0`` means **unlimited**, returned as ``None`` so every ``[:limit]`` site gets
+    it for free. It used to be refused on the grounds that it "renders a table with
+    a header, no rows, and a footer saying everything was omitted" -- which is what
+    ``[:0]`` does and is a good reason to reject 0 as a literal count. It is not a
+    reason to reject this meaning: under it the table renders *everything*, so the
+    objection no longer applies.
+
+    The meaning is borrowed rather than invented. A sibling tool in this suite
+    already spells "no limit" as ``-n 0``, and one flag meaning "unlimited" in one
+    tool and "usage error" in another is a worse surface than either alone. It also
+    gives `--json` consumers the explicit escape hatch they need, since the
+    findings array is clipped by this same flag.
     """
     try:
         number = int(value)
     except (TypeError, ValueError):
         raise argparse.ArgumentTypeError("not a number: %s" % value) from None
+    if number == 0:
+        return None
     if number < 1:
-        raise argparse.ArgumentTypeError("must be 1 or more, got %s" % number)
+        raise argparse.ArgumentTypeError("must be 0 (unlimited) or more, got %s" % number)
     return number
+
+
+# The order composed text sections print in, which is deliberately not the order
+# the branches are written in: a reader wants the rollup before the findings, and
+# the findings before the screens that attribute them to a node or a request.
+SECTION_ORDER = ("overview", "patterns", "nodes", "sizing")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,12 +121,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-E", "--until", default=None, help="end of the window")
     parser.add_argument("-p", "--partition", default=None, help="restrict to a partition")
     parser.add_argument("--failed", action="store_true", help="only jobs that failed")
-    parser.add_argument("-n", "--limit", type=_row_limit, default=25, help="rows in plain output")
+    parser.add_argument(
+        "-n",
+        "--limit",
+        type=_row_limit,
+        default=25,
+        help="rows in plain output and entries in --json's findings array; 0 for no limit",
+    )
 
     parser.add_argument(
         "--plain",
         action="store_true",
         help="text output, no dashboard (automatic when stdout is not a terminal)",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="exit 1 if any job has a critical finding, not just a cross-run pattern",
     )
     parser.add_argument("--overview", action="store_true", help="workload rollup as text")
     parser.add_argument("--patterns", action="store_true", help="cross-run patterns as text")
@@ -251,8 +298,8 @@ def _mark_open_records(jobs, runner=None, user=None, all_users=False):
 def _load(args, sacct):
     if getattr(args, "demo", False):
         # Clearly synthetic; see demo.py. Never mixed with real records.
-        from .demo import DEMO_SITE, history
-        from .site import reset_cache, site
+        from .demo import DEMO_PARTITIONS, DEMO_SITE, history
+        from .site import pin_partition_ceilings, reset_cache, site
 
         # Pin the synthetic cluster's configuration too. Otherwise `--demo` on a
         # real cluster words its memory and GPU notes from *that* cluster's
@@ -260,6 +307,10 @@ def _load(args, sacct):
         # depends on the runner having no Slurm.
         reset_cache()
         site(runner=lambda _args: DEMO_SITE)
+        # Node sizes too, for the same reason: `--sizing` clamps upward advice to
+        # the partition ceiling and would otherwise run `sinfo` against whatever
+        # cluster the demo happens to be launched from.
+        pin_partition_ceilings(DEMO_PARTITIONS)
 
         jobs = history()
         if args.job_ids:
@@ -308,7 +359,7 @@ def _load(args, sacct):
         # latent inconsistency round four fixed one level down in `live_job_ids`.
         return _mark_open_records(jobs, runner=runner, user=args.user, all_users=all_users)
 
-    user = None if all_users else (args.user or getpass.getuser())
+    user = None if all_users else (args.user or current_user())
     # DEADLINE alongside the rest: `Job.failed` counts it, so leaving it out here
     # meant `--failed` quietly excluded a state the tool calls a failure everywhere
     # else.
@@ -340,6 +391,36 @@ def _load(args, sacct):
     return _mark_open_records(jobs, runner=runner, user=user, all_users=all_users)
 
 
+def _with_controller_paths(targets, args):
+    """Fill in ``StdOut``/``StdErr`` from the controller where sacct could not.
+
+    `sacct` only learned those fields in 24.05, so on an older cluster the log
+    ladder falls through to guessing by mtime -- and a guess can be wrong with
+    confidence: a decoy file with a matching timestamp was attached to a job on a
+    GPU-less partition and drew a *critical* "GPU ran out of memory". `scontrol`
+    knows the real answer for as long as the controller remembers the job, which
+    is the window a post-mortem run right after a failure sits in.
+
+    **Only for ids the caller typed.** The list branches (`--failed`, `--problem`)
+    can hold hundreds of jobs, mostly old enough that the controller has forgotten
+    them, and one subprocess each to be told so is a cost with no return. The
+    explicit-id branch is both small and the case that is usually recent.
+
+    Jobs that already carry a recorded path are left alone -- 24.05 answered, and
+    asking twice cannot improve on it.
+    """
+    if not args.job_ids:
+        return targets
+    out = []
+    for job in targets:
+        if job.std_out or job.std_err:
+            out.append(job)
+            continue
+        std_out, std_err = controller_log_paths(job.job_id)
+        out.append(job._replace(std_out=std_out, std_err=std_err) if (std_out or std_err) else job)
+    return out
+
+
 def _logs_for_all(targets, args):
     """``{job_id: (path, text, inferred)}`` for a whole list, resolved together.
 
@@ -350,6 +431,7 @@ def _logs_for_all(targets, args):
     """
     if args.no_logs:
         return {job.job_id: (None, None, False) for job in targets}
+    targets = _with_controller_paths(targets, args)
     assigned = assign_logs(targets, extra_dirs=args.log_dir)
     out = {}
     for job in targets:
@@ -369,7 +451,61 @@ def _node_note(job, history):
     )
 
 
-def _job_json(job, log_path, verdict):
+def _parse_warnings(sacct):
+    """``{"dropped_rows": …}`` when the parser refused any row, else ``{}``.
+
+    Emitted only when non-zero, so a well-formed cluster sees no schema change at
+    all and every existing consumer is unaffected. The report that asked for this
+    count also pointed out that `--json` is a channel that already exists, which
+    is right and is why nothing else had to move: `parse` fills an optional dict,
+    `Sacct` holds it, this reads it.
+
+    What it counts is the pipe-shifted row: a value containing the delimiter, so
+    every column after it is misaligned and the row is refused. That is deliberate
+    and documented; being silent about it was not. It is reachable on a cluster
+    whose sacct predates `--delimiter` (17.11) and therefore uses `|`, which is
+    precisely the kind of site nobody here can test on.
+    """
+    dropped = sacct.stats.get("dropped_rows") or {}
+    return {"dropped_rows": dropped} if any(dropped.values()) else {}
+
+
+def _log_miss(job, log_path, no_logs=False):
+    """``{"log_expected": …}`` when a recorded path was tried and missed, else {}.
+
+    Kept out of `log` rather than turned into an object there: `log` is a path or
+    null in every existing consumer, and widening its type to carry a diagnosis
+    would break readers to describe a case most of them never hit.
+
+    Always present, both sub-keys, `null` where there is nothing to say. It first
+    shipped conditionally -- absent when a log was found or none was recorded --
+    which is the right instinct for a *root* key (`dropped_rows` above is emitted
+    only when non-zero, so a well-formed cluster's payload is unchanged) and the
+    wrong one here. Per-job keys are counted: `--json`'s value count is documented
+    in the README and pinned by `TestTheJsonPayloadKeepsItsPromise`, and a key
+    that comes and goes made that number 97 or 99 depending on the job, with the
+    audit's sample never carrying it. A machine payload is easier to consume with
+    one shape than with two.
+
+    Silent under `--no-logs`, and that is not a nicety. The whole point of the
+    flag is that the filesystem is not touched, and the text view already guards
+    the equivalent sentence on exactly that basis -- "both spellings are claims
+    about the filesystem and under `--no-logs` nothing was stat'd". Reporting a
+    status here would stat the path to compute it, so the first version of this
+    broke the guard while adding the field it was meant to complement.
+    """
+    empty = {"log_expected": {"path": None, "status": None}}
+    if no_logs or log_path:
+        return empty
+    from .logs import probe_path, recorded_paths
+
+    expected = recorded_paths(job)
+    if not expected:
+        return empty
+    return {"log_expected": {"path": expected[0], "status": probe_path(expected[0])}}
+
+
+def _job_json(job, log_path, verdict, no_logs=False):
     """Every extracted measurement, machine-readable.
 
     Deliberately exhaustive: if the tool read it, this emits it, so downstream
@@ -445,6 +581,27 @@ def _job_json(job, log_path, verdict):
             "scheduled_by": job.scheduled_by,
             "flags": job.flags,
             "priority": job.priority,
+            # Earlier incarnations of this id, oldest first, when Slurm requeued
+            # it. Empty for the ordinary job. Each carries its own state and the
+            # time it really consumed -- the whole point of surfacing them is
+            # that a requeued allocation is allocated time that used to appear
+            # nowhere, so a consumer summing `elapsed_seconds` alone still
+            # understates the job. Not nested Job payloads: a requeued
+            # incarnation has no steps of its own worth re-emitting here, and a
+            # recursive structure would break every existing reader of this key.
+            "earlier": [
+                {
+                    "state": earlier.state,
+                    "base_state": earlier.base_state,
+                    "exit_code": earlier.exit_code,
+                    "submit": earlier.submit,
+                    "start": earlier.start,
+                    "end": earlier.end,
+                    "elapsed_seconds": earlier.elapsed,
+                    "node_list": earlier.node_list,
+                }
+                for earlier in job.earlier
+            ],
         },
         "shape": {
             "nodes": job.node_count,
@@ -538,6 +695,13 @@ def _job_json(job, log_path, verdict):
         },
         "energy_joules": job.energy_joules,
         "log": log_path,
+        # What was tried and why it did not work, when nothing was found. The text
+        # view has always printed the recorded path; the payload collapsed every
+        # miss to `null`, so a consumer could not see which path was attempted let
+        # alone whether it was absent or merely unreadable. Absent entirely when a
+        # log *was* found -- `log` already answers that -- and when the cluster
+        # recorded no path at all, since there is then nothing to report.
+        **_log_miss(job, log_path, no_logs),
         "steps": [
             {
                 "step_id": s.step_id,
@@ -617,6 +781,58 @@ def _has_terminal(stdin=None, stdout=None) -> bool:
     return True
 
 
+def _encoding_cannot_draw(stream=None) -> bool:
+    """Whether this stdout can carry the glyphs the reports are drawn with.
+
+    Not a question about the terminal's *font* -- that is what `--ascii` is for --
+    but about its **encoding**, which is a different failure and a much louder one.
+    Under a valid non-UTF-8 locale every box, block, arrow and em dash is
+    unencodable, and Python raises rather than degrading: four of the five text
+    modes exited 1 with **zero bytes** on stdout.
+
+    Worth being exact about why `LC_ALL=C` is not the case that bites. PEP 538/540
+    coerce `C`/`POSIX` to UTF-8, so the setting people type in job scripts is
+    rescued automatically. A real 8-bit locale -- `en_US`, `en_US.iso88591`, three
+    of the six on the reporting host, and `LANG=en_US` is an ordinary thing to
+    find in a site profile -- gets no coercion, because it is a legitimate locale
+    and Python honours it.
+    """
+    encoding = getattr(stream or sys.stdout, "encoding", None)
+    if not encoding:
+        return False
+    try:
+        # One glyph from each family the reports use: box drawing, block shading,
+        # the arrow every action line starts with, and the em dash in the prose.
+        "\u2502\u2588\u2192\u2014".encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return True
+    return False
+
+
+def _make_output_encode_safe():
+    """Never let an unencodable character cost the whole report.
+
+    `--ascii` fixes the *decoration*; it cannot fix the *data*. A job name is
+    arbitrary user-controlled text arriving from Slurm, and one job named
+    `\u30d5\u30a1\u30a4\u30eb` anywhere in the queried window took down every text mode
+    for every user who queried that window -- including users who did not submit
+    it, once `--all-users` is in play. There is no flag that can help, because the
+    character is the answer rather than the chrome.
+
+    `backslashreplace` over `replace`: a job name rendered `\\u30d5...` is ugly and
+    reversible, where `????` is ugly and lossy, and the reader of a post-mortem is
+    someone who may need to match the name against a submission script.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # pragma: no cover - a replaced stream in a test
+            continue
+        # A detached or closed stream cannot be reconfigured, and failing to make
+        # output safer is not a reason to fail the run.
+        with contextlib.suppress(OSError, ValueError):
+            reconfigure(errors="backslashreplace")
+
+
 def main(argv=None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -656,6 +872,38 @@ def main(argv=None) -> int:
     # be noise in every CI log for a fallback that did what was wanted.
     if not _has_terminal():
         args.plain = True
+
+    # Before anything is rendered. Two separate problems with one cause: the
+    # package's own glyphs, which `--ascii` already has a switch for, and the
+    # job names Slurm hands back, which it does not.
+    _make_output_encode_safe()
+    if not args.ascii and _encoding_cannot_draw():
+        args.ascii = True
+
+    # Reading order for composed sections, not the order the branches happen to
+    # sit in below: the rollup first, then what recurs across runs, then the two
+    # screens that attribute it.
+    sections: dict[str, str] = {}
+    requested = [name for name in SECTION_ORDER if getattr(args, name)]
+
+    # `--json` emits one document per section and there is no defined way to
+    # concatenate two of them, so composing is a text-only affordance. Rejecting
+    # is right here rather than picking one, which is the behaviour being fixed.
+    if args.json and len(requested) > 1:
+        parser.error(
+            "--json takes one section at a time; %s ask for %d documents. "
+            "Run them separately, or drop --json to get all of them as text."
+            % (", ".join("--" + name for name in requested), len(requested))
+        )
+    # `--steps` is per-job accounting: `--help` says "on a named job", and without
+    # one there is nothing to break down. It used to evaporate, so a caller who
+    # forgot the id got the ordinary overview and no hint that the flag they typed
+    # did nothing.
+    if args.steps and not args.job_ids:
+        parser.error(
+            "--steps breaks a named job into its steps, so it needs a job id: "
+            "try `slurmpast <jobid> --steps`."
+        )
 
     wants_text = (
         args.plain
@@ -722,6 +970,8 @@ def main(argv=None) -> int:
                 json.dumps(
                     {
                         "slurmpast": __version__,
+                        **_parse_warnings(sacct),
+                        "window": history.window,
                         "nodes": node_table(
                             history.usable_jobs, workload=workload, metric=args.metric
                         ),
@@ -729,17 +979,15 @@ def main(argv=None) -> int:
                     indent=2,
                 )
             )
+            return 0
         else:
-            print(
-                report.render_nodes(
-                    history,
-                    metric=args.metric,
-                    controlled=not args.all_workloads,
-                    style=style,
-                    ascii_mode=args.ascii,
-                )
+            sections["nodes"] = report.render_nodes(
+                history,
+                metric=args.metric,
+                controlled=not args.all_workloads,
+                style=style,
+                ascii_mode=args.ascii,
             )
-        return 0
 
     if args.sizing:
         from .sizing import recommend
@@ -749,6 +997,8 @@ def main(argv=None) -> int:
                 json.dumps(
                     {
                         "slurmpast": __version__,
+                        **_parse_warnings(sacct),
+                        "window": history.window,
                         "workloads": [
                             {
                                 "name": g.name,
@@ -766,13 +1016,11 @@ def main(argv=None) -> int:
                     indent=2,
                 )
             )
+            return 0
         else:
-            print(
-                report.render_sizing(
-                    history, style=style, limit=args.limit, sort=args.sort, ascii_mode=args.ascii
-                )
+            sections["sizing"] = report.render_sizing(
+                history, style=style, limit=args.limit, sort=args.sort, ascii_mode=args.ascii
             )
-        return 0
 
     if args.patterns:
         if args.json:
@@ -780,15 +1028,19 @@ def main(argv=None) -> int:
                 json.dumps(
                     {
                         "slurmpast": __version__,
+                        **_parse_warnings(sacct),
+                        "window": history.window,
                         "summary": history.stats,
                         "findings": [f._asdict() for f in history.patterns],
                     },
                     indent=2,
                 )
             )
+            return 0
         else:
-            print(report.render_patterns(history, style=style, ascii_mode=args.ascii))
-        return 0
+            sections["patterns"] = report.render_patterns(
+                history, style=style, ascii_mode=args.ascii
+            )
 
     if args.overview:
         if args.json:
@@ -796,6 +1048,8 @@ def main(argv=None) -> int:
                 json.dumps(
                     {
                         "slurmpast": __version__,
+                        **_parse_warnings(sacct),
+                        "window": history.window,
                         "summary": history.stats,
                         "workloads": [
                             {
@@ -830,12 +1084,22 @@ def main(argv=None) -> int:
                     indent=2,
                 )
             )
+            return 0
         else:
-            print(
-                report.render_overview(
-                    history, style=style, limit=args.limit, sort=args.sort, ascii_mode=args.ascii
-                )
+            sections["overview"] = report.render_overview(
+                history, style=style, limit=args.limit, sort=args.sort, ascii_mode=args.ascii
             )
+
+    if sections:
+        # Every section the caller asked for, in one fixed reading order --
+        # summary, then the cross-run findings, then the two that attribute them.
+        # Each `if` above used to `return 0`, so `--overview --patterns` printed
+        # patterns alone and dropped the overview without a word, and which one
+        # survived was an internal branch order nobody could see: `--patterns
+        # --nodes` gave nodes, `--overview --sizing` gave sizing. Composing is
+        # what the default plain report already does with its own sections, so
+        # asking for two of them by name has an obvious meaning.
+        print("\n\n".join(sections[name] for name in SECTION_ORDER if name in sections))
         return 0
 
     # Per-job. Explicit ids get full detail; a bare --plain/--failed gets a list
@@ -866,16 +1130,45 @@ def main(argv=None) -> int:
         for job in targets:
             log_path, log_text, _inferred = resolved[job.job_id]
             verdict = diagnose(job, log_text=log_text, node_note=_node_note(job, history))
-            payload.append(_job_json(job, log_path, verdict))
+            payload.append(_job_json(job, log_path, verdict, no_logs=args.no_logs))
             json_critical |= any(f.severity == "critical" for f in verdict.findings)
-        body = {"slurmpast": __version__, "summary": history.stats, "jobs": payload}
+        body = {
+            "slurmpast": __version__,
+            **_parse_warnings(sacct),
+            "window": history.window,
+            # `findings_jobs` beside the clipped array, because without it the clip
+            # is undetectable: `summary.jobs` counts *every* job in the window, so
+            # `len(jobs) < summary.jobs` is the normal state whether anything was
+            # dropped or not. A monitoring consumer polling this payload would lose
+            # older findings silently as an account accumulates more than `-n` of
+            # them, and the JSON would look exactly as complete as before.
+            #
+            # The mirror image of the `--sizing` defect fixed above: there the text
+            # view collapsed what the JSON carried in full, here the JSON is the
+            # lossy one. Same cause -- a truncation decided at render time with no
+            # field recording that it happened.
+            "summary": {
+                **history.stats,
+                "findings_jobs": len(matches),
+                "findings_jobs_shown": len(payload),
+            },
+            "jobs": payload,
+        }
         if not args.job_ids:
             # The cross-run findings decide the exit code on this path, exactly as
             # they do for the text rendering below, so they have to be in the
             # payload: an exit code pointing at data the caller cannot see is worse
             # than no exit code. The --overview JSON has always carried them.
             body["patterns"] = [f._asdict() for f in history.patterns]
-            json_critical = any(f.severity == "critical" for f in history.patterns)
+            # Overwrite, not `|=`, and that is the contract rather than a slip:
+            # a scan across a whole cluster's jobs would exit 1 almost always,
+            # which makes the code useless as a signal. The per-job accumulation
+            # above is real work whose result is deliberately dropped here, so
+            # `--strict` folds it back in for the caller who wants the other
+            # reading -- `... --json || alert` is the obvious wrapper and it is
+            # silent on exactly the mode anyone would automate.
+            patterns_critical = any(f.severity == "critical" for f in history.patterns)
+            json_critical = (json_critical and args.strict) or patterns_critical
         print(json.dumps(body, indent=2, default=str))
         # `--json` used to `return 0` unconditionally, so the one mode a script
         # actually checks `$?` from was the one that never reported severity, while
@@ -916,7 +1209,17 @@ def main(argv=None) -> int:
             print(report.render_list(matches, style=style, limit=args.limit, ascii_mode=args.ascii))
             print("")
         print(report.render_patterns(history, style=style, ascii_mode=args.ascii))
-        worst_critical = any(f.severity == "critical" for f in history.patterns)
+        # `worst_critical` is False here: the per-job loop above runs only on the
+        # `args.job_ids` branch, so unlike the JSON path there is nothing to fold
+        # in. `--strict` therefore reads the findings this branch actually
+        # rendered -- the problem list it just printed -- so the two paths agree
+        # under the flag exactly as they do without it.
+        strict_jobs = args.strict and any(
+            f.severity == "critical"
+            for job in targets
+            for f in diagnose(job, node_note=_node_note(job, history)).findings
+        )
+        worst_critical = strict_jobs or any(f.severity == "critical" for f in history.patterns)
 
     return 1 if worst_critical else 0
 

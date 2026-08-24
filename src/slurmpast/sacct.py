@@ -60,7 +60,7 @@ import os
 import re
 import subprocess
 
-from .duration import mem_scope, parse_bytes, parse_duration
+from .duration import mem_scope, parse_bytes, parse_duration, parse_mem_limit
 from .model import Job, Step
 
 # Every field carrying a distinct measurement -- 85 of the 107 Slurm 20.11 offers.
@@ -281,19 +281,51 @@ def child_env(environ=None):
 
 
 def _timeout():
-    """Query timeout, overridable for a site whose accounting is genuinely slow."""
+    """Query timeout, overridable for a site whose accounting is genuinely slow.
+
+    Raises on a value it cannot use rather than falling back to the default.
+    This is the package's only environment variable, so it is the whole of that
+    surface, and it used to accept anything: ``garbage`` was indistinguishable
+    from leaving it unset, and ``0`` -- which a reader naturally writes meaning
+    *no timeout* -- silently became 300 seconds with nothing said. A setting that
+    does not do what it says and does not complain is worse than one that is not
+    offered. The sibling package rejects the same class of input by name
+    (``Invalid value for SLURMWATCH_HEADLESS_INTERVAL: 'garbage'``).
+
+    A large value is honoured, not capped: the variable exists precisely so a site
+    whose accounting takes an hour can say so, and silently overriding that would
+    be the same fault in the other direction. Zero and negative are refused rather
+    than read as "wait forever" because unbounded is what this tool already had to
+    be fixed for once -- a redirect that hung until killed -- and a query with no
+    ceiling under cron is the same failure again.
+    """
     raw = os.environ.get("SLURMPAST_TIMEOUT", "").strip()
-    if raw:
-        try:
-            value = float(raw)
-        except ValueError:
-            return DEFAULT_TIMEOUT
-        if value > 0:
-            return value
-    return DEFAULT_TIMEOUT
+    if not raw:
+        return DEFAULT_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SacctError(
+            "SLURMPAST_TIMEOUT is not a number: %r. Give it a count of seconds, "
+            "for example SLURMPAST_TIMEOUT=600, or unset it for the default of %gs."
+            % (raw, DEFAULT_TIMEOUT)
+        ) from None
+    if not math.isfinite(value) or value <= 0:
+        raise SacctError(
+            "SLURMPAST_TIMEOUT must be a positive number of seconds, not %r. "
+            "There is no way to wait forever: a query with no ceiling never "
+            "returns under cron. Unset it for the default of %gs." % (raw, DEFAULT_TIMEOUT)
+        )
+    return value
 
 
 def _run(args):
+    # Before the spawn, not after. `_timeout` raises on a value it cannot use,
+    # and reading it once the child is already running left `sacct` orphaned --
+    # nothing kills it on that path, because the only cleanup is in the
+    # TimeoutExpired branch below. It also costs nothing to refuse a bad setting
+    # without starting a query first.
+    budget = _timeout()
     try:
         proc = subprocess.Popen(
             args,
@@ -313,14 +345,20 @@ def _run(args):
             % (args[0], exc)
         ) from exc
     try:
-        out, err = proc.communicate(timeout=_timeout())
+        out, err = proc.communicate(timeout=budget)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.communicate()
+        # `%g`, not `%.0f`: a sub-second budget printed as "within 0s", which
+        # reads as this tool having used a zero timeout -- its own bug -- rather
+        # than as the 50 ms the caller asked for. The advice below is to raise the
+        # variable, and the reader cannot act on it without seeing what it is.
+        # Read once, before the spawn, so the message quotes the budget actually
+        # used rather than re-deriving it from an environment that may have moved.
         raise SacctError(
-            "%s did not answer within %.0fs — the accounting database may be "
+            "%s did not answer within %gs — the accounting database may be "
             "unreachable. Narrow the window with -S, or raise SLURMPAST_TIMEOUT."
-            % (args[0], _timeout())
+            % (args[0], budget)
         ) from None
     if proc.returncode != 0:
         message = (err or "").strip() or "%s exited %d" % (args[0], proc.returncode)
@@ -566,7 +604,7 @@ def _looks_like_job_id(value):
     return value[:1].isdigit() and not any(ch.isspace() for ch in value)
 
 
-def parse(text, fields=None, delimiter="|"):
+def parse(text, fields=None, delimiter="|", stats=None):
     """Parse ``sacct --parsable2`` output into Jobs with their steps attached.
 
     ``delimiter`` must match what the query asked for. When it is the default
@@ -593,24 +631,73 @@ def parse(text, fields=None, delimiter="|"):
             return ""
         return _clean(row[pos], field=name)
 
+    # Optional and mutated in place, so no existing caller's signature or return
+    # type changes -- the report's own suggestion for how to carry this without
+    # touching `parse`'s contract.
+    #
+    # One counter, not two. A second for "first field is not a JobID" was written
+    # and removed: it cannot fire. `_records` only opens a record on a line whose
+    # head is already JobID-shaped, and JobID is field 0 of the query, so the test
+    # below re-asks a question that was answered upstream. A counter that always
+    # reads 0 is worse than no counter -- it reads as evidence of soundness.
+    dropped = {"shifted": 0}
+    if stats is not None:
+        stats["dropped_rows"] = dropped
+
     allocations = {}
     order = []
+    seen = set()
     pending_steps = {}
+    # Which incarnation a step row belongs to, positionally: sacct emits an
+    # allocation row and then its steps, so the open allocation for a base id is
+    # the one a step attaches to. NOT by matching Submit -- a step's Submit is its
+    # own start, not the job's, which the requeued 53432121 shows plainly:
+    #
+    #   53432121        |2026-08-17T10:08:59|NODE_FAIL
+    #   53432121.batch  |2026-08-17T10:20:46|CANCELLED   <- the *step's* start
+    #   53432121        |2026-08-17T10:48:35|COMPLETED
+    #   53432121.batch  |2026-08-17T10:50:37|COMPLETED
+    #
+    # Keying steps on Submit therefore matched nothing and silently emptied every
+    # job's step list, which reads as `MaxRSS n/a` rather than as an error.
+    open_key = {}
+    orphan_steps = {}
 
     for line in _records(text, delimiter, len(fields)):
         row = line.split(delimiter)
+        # A row with more fields than were asked for has a delimiter inside a
+        # value, so every column after it is shifted and reading it would report
+        # another job's memory as this one's. Dropping is right and is what this
+        # module has always documented -- what was missing is saying so. Reachable
+        # in practice only on the `|` fallback, which is a cluster whose sacct
+        # predates `--delimiter` (17.11): exactly the kind of site nobody here can
+        # see, and exactly where a user should be told rows went missing rather
+        # than left to wonder why a job is absent.
         if len(row) > len(fields):
+            dropped["shifted"] += 1
             continue
         raw_id = (row[job_id_at] if job_id_at < len(row) else "").strip()
         if not raw_id or raw_id.lower() == "jobid":
+            # A header line or a blank id: not a row, and not a loss.
             continue
         if not _looks_like_job_id(raw_id):
+            # Unreachable through `_records`, which already made this test; kept
+            # as the guard for a caller passing `parse` hand-built text, and
+            # deliberately not counted -- see the note above.
             continue
 
         exit_code, signal = _parse_exit(get(row, "ExitCode"))
 
         if "." in raw_id:
-            pending_steps.setdefault(_base_job_id(raw_id), []).append(
+            base = _base_job_id(raw_id)
+            # A step ahead of its allocation row keeps the old behaviour: held
+            # aside and given to that id's first incarnation below.
+            bucket = (
+                pending_steps.setdefault(open_key[base], [])
+                if base in open_key
+                else (orphan_steps.setdefault(base, []))
+            )
+            bucket.append(
                 Step(
                     step_id=raw_id,
                     name=get(row, "JobName"),
@@ -698,7 +785,12 @@ def parse(text, fields=None, delimiter="|"):
             suspended=parse_duration(get(row, "Suspended")),
             req_mem_raw=req_mem,
             # "0n" means not recorded, not zero bytes. See Job.mem_limit_bytes.
-            req_mem_bytes=(parse_bytes(req_mem) or None),
+            #
+            # `parse_mem_limit`, not `parse_bytes`: this is the one field where a
+            # unit-less number means MiB rather than bytes, and the two cannot be
+            # merged because the byte counters above (MaxPages especially, which
+            # this cluster emits bare) would then be read a million times too big.
+            req_mem_bytes=(parse_mem_limit(req_mem) or None),
             req_mem_scope=mem_scope(req_mem),
             req_cpus=_int(get(row, "ReqCPUS")),
             req_nodes=_int(get(row, "ReqNodes")),
@@ -732,18 +824,159 @@ def parse(text, fields=None, delimiter="|"):
             open_ended=(not end_raw)
             and (state.split()[0] if state else "") not in _TERMINAL_STATES,
         )
-        allocations[raw_id] = job
-        order.append(raw_id)
+        key = (raw_id, get(row, "Submit"))
+        allocations[key] = job
+        open_key[raw_id] = key
+        if key not in seen:
+            seen.add(key)
+            order.append(key)
+            # The first incarnation of an id inherits any steps that arrived
+            # before it.
+            early = orphan_steps.pop(raw_id, None)
+            if early:
+                pending_steps.setdefault(key, [])[:0] = early
 
-    return [
-        allocations[job_id]._replace(steps=tuple(pending_steps.get(job_id, ()))) for job_id in order
-    ]
+    return _fold_incarnations(
+        [allocations[key]._replace(steps=tuple(pending_steps.get(key, ()))) for key in order]
+    )
+
+
+def _fold_incarnations(jobs):
+    """Collapse a requeued job's incarnations onto the latest one.
+
+    ``sacct -D`` reports every incarnation of a job id: a job requeued on
+    ``NODE_FAIL``, on preemption, or by ``scontrol requeue`` comes back as two or
+    more rows sharing the id and differing in ``Submit``. Without ``-D`` Slurm
+    shows only the last of them, which is why this tool used to answer *"what
+    happened to my job?"* with the final attempt and no sign there had been
+    others. Measured on Midway3, job 53432121::
+
+        53432121|NODE_FAIL|2026-08-17T10:08:59|...|00:27:49
+        53432121|COMPLETED|2026-08-17T10:48:35|...|03:41:52
+
+    -- 27m49s of real allocation on a failed node, invisible.
+
+    One ``Job`` per id still comes out, so nothing downstream starts counting a
+    requeued job twice: the newest incarnation is the job, and the ones before it
+    hang off it in ``earlier``, oldest first. That keeps job counts, rankings and
+    the single-job view exactly as they were for the overwhelming majority of jobs
+    -- 773 rows in 7 cluster-days here are requeues, out of 922,534 -- while
+    making the ones that were requeued able to say so.
+
+    Ordering is by ``Submit``, because that is the field Slurm actually advances
+    on requeue and the only one guaranteed present: a requeued incarnation may
+    never have started, so ``Start`` can be empty on either side. Rows with no
+    ``Submit`` at all keep the order sacct emitted them in, which is chronological.
+    """
+    by_id = {}
+    for job in jobs:
+        by_id.setdefault(job.job_id, []).append(job)
+    if len(by_id) == len(jobs):
+        # The ordinary case, and worth not rebuilding the list for: no id occurs
+        # twice, so nothing was requeued and every Job is already its own latest.
+        return jobs
+
+    folded = {}
+    for job_id, group in by_id.items():
+        if len(group) == 1:
+            folded[job_id] = group[0]
+            continue
+        # `or ""` so a missing Submit sorts first rather than raising against a
+        # string, and the index keeps the sort stable on ties.
+        ordered = [j for _, _, j in sorted((j.submit or "", i, j) for i, j in enumerate(group))]
+        folded[job_id] = ordered[-1]._replace(earlier=tuple(ordered[:-1]))
+
+    out, emitted = [], set()
+    for job in jobs:
+        if job.job_id in emitted:
+            continue
+        emitted.add(job.job_id)
+        out.append(folded[job.job_id])
+    return out
 
 
 # An array that has not been expanded yet: `49046820_[1-20%10]`, or `_[0-4]` without
 # a throttle. Anchored, and the brackets are required -- `49046820_4` is a real
 # element and sacct takes it.
 _UNEXPANDED_ARRAY = re.compile(r"^(\d+)_\[")
+
+
+def current_user() -> str:
+    """Who to ask sacct about, or raise :class:`SacctError` saying why not.
+
+    `getpass.getuser()` reads ``$LOGNAME``/``$USER``/``$LNAME``/``$USERNAME`` and
+    then `pwd`, and raises ``OSError`` when all of them fail. That is reachable
+    with a documented, unmodified Slurm flag: ``sbatch --export=NONE`` clears the
+    environment, and some sites set ``SBATCH_EXPORT=NONE`` cluster-wide. On a
+    cluster whose compute nodes carry no passwd entry for the user -- reported
+    from one where ``id -un`` answers *"cannot find name for user ID 940740146"*
+    -- the `pwd` fallback fails too, and the whole class of failure is invisible
+    on the login node where these tools are written.
+
+    Two fallbacks past that, in order of how much they are worth trusting:
+
+    * ``SLURM_JOB_USER``, which Slurm sets and which survives ``--export=NONE``
+      because it re-exports its own ``SLURM_*`` variables.
+    * the bare numeric uid, which ``sacct -u`` accepts. Less readable, and it is
+      the right answer rather than a guess -- it is the identity the accounting
+      database keyed the rows on.
+
+    `SacctError` rather than `OSError` at the end, so the existing handler in
+    `cli.main` prints one line. Broadening that `except` instead would stop the
+    traceback and still leave the tool unable to say whose history to read, when
+    the uid is sitting there and is a usable argument.
+    """
+    try:
+        return getpass.getuser()
+    except (OSError, KeyError):
+        pass
+    from_slurm = os.environ.get("SLURM_JOB_USER", "").strip()
+    if from_slurm:
+        return from_slurm
+    try:
+        return str(os.getuid())
+    except AttributeError:  # pragma: no cover - not POSIX
+        raise SacctError(
+            "cannot tell which user to query: no USER or LOGNAME in the "
+            "environment, no passwd entry, and no SLURM_JOB_USER. Pass -u <name> "
+            "explicitly, or --all-users."
+        ) from None
+
+
+def controller_log_paths(job_id, runner=None):
+    """``(StdOut, StdErr)`` from ``scontrol show job``, or ``("", "")``.
+
+    The authoritative answer to "where did this job's output go", and available on
+    every Slurm -- unlike ``sacct``'s ``StdOut``/``StdErr``, which arrived in 24.05
+    and are simply refused before it::
+
+        $ sacct -o StdErr        sacct: error: Invalid field requested: "StdErr"
+        $ scontrol show job N    StdErr=/scratch/.../realname-A.err
+
+    Only for as long as the controller remembers the job -- ``MinJobAge``, often
+    a couple of minutes -- which is exactly the window a post-mortem run right
+    after a job dies falls into. Past it this returns nothing and the existing
+    ladder (SubmitLine, --comment, conventional names, timing) takes over
+    unchanged.
+
+    Worth asking because the alternative is a guess that can be wrong with
+    confidence: a decoy file with a matching mtime was attached to a job on a
+    GPU-less partition and produced a *critical* "GPU ran out of memory". The
+    heuristic is a reasonable answer to a real constraint; it is not the best
+    answer available when the controller is still holding the real one.
+
+    Never raises. No scontrol, no such job, a controller that will not answer --
+    all of them mean "nothing recorded", which is the state this already handles.
+    """
+    run = runner or _run
+    try:
+        text = run(["scontrol", "show", "job", str(job_id)])
+    except (SacctError, OSError):
+        return "", ""
+    found = {}
+    for match in re.finditer(r"\b(StdOut|StdErr)=(\S+)", text or ""):
+        found.setdefault(match.group(1), match.group(2))
+    return found.get("StdOut", ""), found.get("StdErr", "")
 
 
 def queryable_job_id(value: str) -> str:
@@ -779,6 +1012,10 @@ class Sacct:
         self._probe = probe
         self._supported = None
         self._delimiter = delimiter
+        # Filled by the last query. Read by `--json` so a cluster whose sacct
+        # emits rows this parser refuses says so, instead of the rows simply not
+        # being there.
+        self.stats: dict = {}
 
     @property
     def fields(self):
@@ -792,7 +1029,14 @@ class Sacct:
 
     def _query(self, extra):
         fields = self.fields
-        base = ["sacct", "--parsable2", "--noheader", "--format=" + ",".join(fields)]
+        # `-D` because without it sacct reports only a job's *latest* incarnation,
+        # so a job requeued on NODE_FAIL, on preemption, or by `scontrol requeue`
+        # loses every attempt but the last -- including the time those attempts
+        # really consumed. `_fold_incarnations` puts the id back to one Job, so
+        # this widens what is known without changing what is counted. Present in
+        # sacct far longer than `--delimiter`, which this negotiates against
+        # anyway, so it needs no probe of its own.
+        base = ["sacct", "-D", "--parsable2", "--noheader", "--format=" + ",".join(fields)]
         if self._delimiter is None:
             # Negotiated once per instance, on the first real query rather than
             # by a second probe. ``--delimiter`` has been in sacct since at least
@@ -807,11 +1051,11 @@ class Sacct:
                 self._delimiter = "|"
             else:
                 self._delimiter = SAFE_DELIMITER
-                return parse(text, fields=fields, delimiter=SAFE_DELIMITER)
+                return parse(text, fields=fields, delimiter=SAFE_DELIMITER, stats=self.stats)
         args = base + list(extra)
         if self._delimiter != "|":
             args = base + ["--delimiter=" + self._delimiter] + list(extra)
-        return parse(self._run(args), fields=fields, delimiter=self._delimiter)
+        return parse(self._run(args), fields=fields, delimiter=self._delimiter, stats=self.stats)
 
     def jobs(self, job_ids):
         ids = [str(j) for j in job_ids if str(j).strip()]
@@ -873,7 +1117,7 @@ def live_job_ids(runner=None, user=None, all_users=False):
     covered by a test, which is why it read as working.
     """
     run = runner or _run
-    me = getpass.getuser()
+    me = current_user()
     who = user or me
     attempts = []
     if all_users or user == "":

@@ -289,6 +289,37 @@ def candidate_paths(job, extra_dirs=None):
     return out
 
 
+def probe_path(path):
+    """``"found"``, ``"absent"``, ``"unreadable"`` or ``"unknown"`` for one path.
+
+    `os.path.isfile` answers False for ENOENT and EACCES alike -- it swallows the
+    `OSError` -- so a caller holding only that boolean can say a file is missing
+    when the truth is that it is behind a directory mode 700. On a shared cluster
+    that is not a corner case: measured over 12 hours of other users' jobs, 104 of
+    the 106 records naming a log path were unreadable rather than absent, so the
+    "moved or deleted" wording was wrong 98% of the time it appeared about a
+    foreign job. It is also impossible to see on a single-user machine, which is
+    where the message was written.
+
+    The errno is the answer and it is already being thrown away. Same shape as two
+    findings elsewhere in this family -- a failed call's own explanation discarded
+    and the gap filled with a guess -- so this returns the distinction rather than
+    a boolean and lets the caller word it.
+    """
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return "absent"
+    except NotADirectoryError:
+        # A component of the path is a file, so the target cannot exist either.
+        return "absent"
+    except PermissionError:
+        return "unreadable"
+    except OSError:
+        return "unknown"
+    return "found" if os.path.isfile(path) else "absent"
+
+
 def find_log(job, extra_dirs=None, exists=os.path.isfile):
     """First existing candidate path, or None. Matched by name, so it is certain."""
     for path in candidate_paths(job, extra_dirs=extra_dirs):
@@ -354,6 +385,7 @@ class Scan:
         self._names = {}
         self._by_digits = {}
         self._stat = {}
+        self._size = {}
 
     def entries(self, directory):
         """Names in ``directory`` that could be a job log at all."""
@@ -429,6 +461,22 @@ class Scan:
             except OSError:
                 self._stat[path] = None
         return self._stat[path]
+
+    def size(self, path):
+        """Byte size of a regular file, or 0 when it cannot be read.
+
+        Cached beside ``mtime`` for the same reason: ``time_candidates`` asks
+        about every entry in every candidate directory, and a scan that stats
+        each one twice doubles the syscalls on a directory holding thousands of
+        logs. Unreadable counts as 0 -- a file this process cannot open cannot
+        explain a failure either.
+        """
+        if path not in self._size:
+            try:
+                self._size[path] = os.path.getsize(path) if os.path.isfile(path) else 0
+            except OSError:
+                self._size[path] = 0
+        return self._size[path]
 
     def is_file(self, path):
         return self.exists(path)
@@ -561,7 +609,34 @@ def time_candidates(job, extra_dirs=None, scan=None):
                 continue
             if not (start - _MTIME_SLACK_BEFORE <= mtime <= end + _MTIME_SLACK_AFTER):
                 continue
-            found.append(((0 if trusted else 1, abs(mtime - end)), path))
+            # (tier, empty, distance, suffix, path)
+            #
+            # `empty` before the distance, because a zero-byte file explains
+            # nothing whatever its mtime, and Slurm touches an unused `--output`
+            # at job end -- so on a failed job the empty stdout is routinely
+            # *closer* to End than the stderr holding the error, which was
+            # written moments earlier. Reported from a second cluster: with both
+            # real logs present the tool picked the 0-byte `.out` and then said
+            # "no log was found to explain it", while the `.err` beside it read
+            # `REAL CAUSE: disk quota exceeded`. The advice it gave was to pass
+            # `--log-dir`, which the user had done.
+            #
+            # `suffix` *after* the distance, deliberately: only a tie-break. A
+            # post-mortem wants stderr, but timing is the signal this function
+            # exists for and the one measured to recover 135 of 148 runs on a
+            # real history. Letting the suffix outrank it would re-pick a
+            # different file for every job in a directory holding both streams.
+            found.append(
+                (
+                    (
+                        0 if trusted else 1,
+                        1 if scan.size(path) == 0 else 0,
+                        abs(mtime - end),
+                        _SUFFIX_RANK.get(os.path.splitext(path)[1], 3),
+                    ),
+                    path,
+                )
+            )
     found.sort()
     return found
 

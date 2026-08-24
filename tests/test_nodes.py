@@ -1039,3 +1039,77 @@ class TestTheBaselineDoesNotContradictTheEmptyReason:
         table = self._table(0)
         assert "nothing to attribute" in nodes_empty_reason(table, "hang", "w")
         assert "omitted" not in nodes_baseline(table)
+
+
+class TestADegenerateBaselineIsNamedRatherThanBlamedOnSampleSize:
+    """At a 100% baseline no node can be worse than the baseline, so the
+    comparison is unavailable for a reason no window can fix — and the screen
+    blamed sample size and prescribed `--since`.
+
+    Reported from a real run: a workload whose every decided run had failed, 53
+    placements across 44 nodes, told to widen the window. Following that advice
+    costs a bigger query and returns the same non-answer, while the useful
+    statement is already in the data — the workload completed on no node, so no
+    node is the problem.
+
+    The 0% mirror image does not need a branch: `baseline` is `hits/trials`, so
+    `hits > 0` implies `baseline > 0`, and `hits == 0` is caught by the sentence
+    above it ("no failures recorded ... nothing to attribute to a node"), which is
+    already the right answer. Checked rather than assumed.
+    """
+
+    @staticmethod
+    def _table(baseline, trials, skipped=32, rows=()):
+        return {
+            "hits": int(baseline * trials),
+            "trials": trials,
+            "rows": list(rows),
+            "baseline": baseline,
+            "skipped_nodes": skipped,
+            "tested_nodes": 0,
+        }
+
+    def test_a_degenerate_baseline_is_named_rather_than_blamed_on_sample_size(self):
+        """The test the report asks for by name."""
+        from slurmpast.render import nodes_empty_reason
+
+        said = nodes_empty_reason(self._table(1.0, 53), "failure", "abraude's test#")
+        assert "--since" not in said, said
+        assert "abraude's test#" in said
+        assert "workload failure, not a node failure" in said
+
+    def test_it_counts_the_nodes_the_workload_touched(self):
+        """The number that makes it a conclusion rather than an assertion."""
+        from slurmpast.render import nodes_empty_reason
+
+        said = nodes_empty_reason(self._table(1.0, 53, skipped=44), "failure", "test#")
+        assert "all 44 nodes it touched" in said, said
+
+    def test_a_thin_all_failing_sample_still_blames_the_sample(self):
+        """The gate the report's own sketch left out, and the suite's fixtures
+        showed is needed: four all-hung runs give a 100% baseline too, and
+        concluding "this is a workload failure" from four is the same over-reading
+        in the other direction. Below the placement threshold the sample size is a
+        real obstacle as well, so the original sentence stays."""
+        from slurmpast.nodes import MIN_SAMPLES
+        from slurmpast.render import nodes_empty_reason
+
+        said = nodes_empty_reason(self._table(1.0, MIN_SAMPLES - 1, skipped=1), "hang", "t#")
+        assert "placements a comparison needs" in said, said
+        assert "workload failure" not in said
+
+    def test_an_ordinary_thin_sample_is_unchanged(self):
+        """The control. A non-degenerate baseline must keep the sentence it had."""
+        from slurmpast.render import nodes_empty_reason
+
+        said = nodes_empty_reason(self._table(0.25, 12), "hang", "t#")
+        assert "placements a comparison needs" in said
+        assert "--since" in said
+
+    def test_a_never_failing_workload_already_had_its_answer(self):
+        """The 0% end, asserted rather than branched on, so a later reader can see
+        it was considered."""
+        from slurmpast.render import nodes_empty_reason
+
+        said = nodes_empty_reason(self._table(0.0, 40), "failure", "t#")
+        assert "nothing to attribute to a node" in said, said

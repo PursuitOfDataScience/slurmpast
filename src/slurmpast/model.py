@@ -236,6 +236,14 @@ class Job(NamedTuple):
     # of them is a measurement. See cli._mark_open_records.
     live: bool | None = None
 
+    # Earlier incarnations of this same job id, oldest first, when Slurm requeued
+    # it -- on NODE_FAIL, on preemption, or on `scontrol requeue`. Only the latest
+    # incarnation is this Job; the ones before it are real allocations that ran,
+    # consumed time and ended, and without them a post-mortem answers "what
+    # happened to my job?" with the last attempt only. Empty for the ordinary job,
+    # which is every job that was never requeued. See sacct.parse.
+    earlier: tuple = ()
+
     # ------------------------------------------------------------------- state
 
     @property

@@ -126,6 +126,7 @@ def site(runner=None, refresh=False):
 def reset_cache():
     """Forget the cached configuration. For tests, and for ``--demo``."""
     _CACHE.clear()
+    _PARTITION_CEILING.clear()
 
 
 def maxrss_caveat(known_site=None):
@@ -149,6 +150,132 @@ def maxrss_caveat(known_site=None):
     return (
         "MaxRSS sums RSS across the process tree under %s, double-counting shared "
         "pages, so treat it as an upper bound" % current.jobacct_gather_type
+    )
+
+
+_PARTITION_CEILING: dict = {}
+
+
+def pin_partition_ceilings(mapping):
+    """Seed the ceiling cache so no ``sinfo`` runs for those partitions.
+
+    The counterpart to passing ``site(runner=...)``: `--demo` pins the synthetic
+    cluster's configuration that way, and this pins its node sizes, so the demo
+    renders identically on a login node and a laptop. Without it `--demo --sizing`
+    asked the real cluster how big its partitions are.
+    """
+    _PARTITION_CEILING.update(mapping)
+
+
+def partition_ceiling(partition, runner=None):
+    """``(max cores, max MB)`` on any single node of a partition, or ``(None, None)``.
+
+    The ceiling an upward recommendation has to respect. `--sizing` read a
+    saturated workload correctly -- "the busiest run used 27.9 of 28 cores per
+    task" -- and advised `--cpus-per-task=34` on a partition whose nodes have 28,
+    which `sbatch` refuses outright with *"Requested node configuration is not
+    available"*. The reading was right; nothing checked it against the hardware.
+
+    Per **node**, not per partition group: `sinfo -o "%c"` collapses a
+    heterogeneous partition to one row and marks it `32+`, where the number is the
+    minimum and the maximum is exactly what is wanted here. `-N` lists every node,
+    so the maximum is real. Measured at ~40 ms for a 605-node partition.
+
+    Never raises and never guesses. No `sinfo`, an unknown partition, or output
+    that will not parse all give ``(None, None)``, and the caller then leaves the
+    recommendation alone -- an unclamped number is the current behaviour, while a
+    wrong clamp would suppress advice a user needs.
+    """
+    if not partition:
+        return None, None
+    if partition in _PARTITION_CEILING:
+        return _PARTITION_CEILING[partition]
+    run = runner or _run
+    cores, mb = None, None
+    try:
+        text = run(["sinfo", "-h", "-p", partition, "-N", "-o", "%c %m"])
+    except (SacctError, OSError):
+        text = ""
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        # `%c`/`%m` can carry a trailing `+` even per node on some releases; the
+        # digits are the value either way.
+        got = []
+        for token in parts:
+            digits = token.rstrip("+")
+            got.append(int(digits) if digits.isdigit() else None)
+        if got[0] is not None:
+            cores = got[0] if cores is None else max(cores, got[0])
+        if got[1] is not None:
+            mb = got[1] if mb is None else max(mb, got[1])
+    _PARTITION_CEILING[partition] = (cores, mb)
+    return cores, mb
+
+
+def cpu_total_is_complete(known_site=None) -> bool | None:
+    """Whether ``TotalCPU`` covers the whole job, or None when it cannot be said.
+
+    The single question behind :func:`cpu_caveat`, exposed separately so a caller
+    that must choose between two *sentences* asks the same thing the caveat does
+    rather than re-deriving it. `_io_explains_idle_cpu` sets that discipline in
+    `diagnose`: share the condition, do not pick a similar-looking one.
+
+    True only for ``jobacct_gather/cgroup``, where a reparented process stays in
+    the cgroup and is still counted. None is not False, per this module's rule --
+    an unknown gather type does not license the pessimistic claim.
+    """
+    current = known_site if known_site is not None else site()
+    return current.rss_from_cgroup
+
+
+def cpu_caveat(known_site=None):
+    """One clause on how far ``TotalCPU`` can be trusted, or "" when it cannot say.
+
+    The missing third arm beside :func:`maxrss_caveat`. ``TotalCPU`` is summed over
+    the *step's process tree*, and a whole class of parallel runtime leaves that
+    tree deliberately: `parallelly::makeClusterPSOCK`, which backs R's
+    `plan(multisession)` and is that ecosystem's default recommendation, reparents
+    every worker to PID 1. Their CPU is then charged to nobody.
+
+    Reported from a second cluster on a real job: eight workers genuinely running,
+    a 24-minute wall time against ~4 hours of serial work, and slurmpast reporting
+    `0.1 of 8 cores busy` with `→ Try --cpus-per-task=1`. Taking that advice
+    serialises the fan-out. The number is not garbage — the master's CPU is real —
+    it is a **lower bound presented as a measurement**, which is the same shape as
+    the two lies this module already words for and the only one that points at
+    *shrinking* an allocation being used.
+
+    Why this is a cluster property and not a universal disclaimer: reparenting
+    moves a process in the tree but not out of its cgroup, so a site gathering
+    with ``jobacct_gather/cgroup`` charges those workers to the job correctly and
+    has nothing to apologise for. Confirmed on the reporting cluster, which has no
+    per-job ``cpuacct`` at all, so no user-side change could improve the figure —
+    which is what makes saying how good it is the whole remedy.
+
+    ``JobAcctGatherFrequency`` is deliberately not read: the poll interval is
+    irrelevant here, and the reporter's own three-arm control disproved it as an
+    explanation. Encoding it would put a wrong reason in the code.
+    """
+    current = known_site if known_site is not None else site()
+    from_cgroup = cpu_total_is_complete(current)
+    if from_cgroup is None:
+        return (
+            "TotalCPU may miss work done in processes reparented out of the step's "
+            "tree, depending on this cluster's JobAcctGatherType, so treat it as a "
+            "lower bound"
+        )
+    if from_cgroup:
+        return (
+            "TotalCPU is gathered from the cgroup here (%s), which a reparented "
+            "process stays in, so detached worker pools are counted" % current.jobacct_gather_type
+        )
+    return (
+        "TotalCPU is summed over the step's process tree under %s, so work in "
+        "processes reparented away from it — PSOCK/multisession worker pools, "
+        "nohup/setsid children, detached daemons — is not counted; treat it as a "
+        "lower bound" % current.jobacct_gather_type
     )
 
 

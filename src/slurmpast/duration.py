@@ -116,6 +116,48 @@ def parse_bytes(text):
     return int(value) if math.isfinite(value) else None
 
 
+def parse_mem_limit(text):
+    """A Slurm memory *limit* -> bytes, or None. A unit-less number is MiB.
+
+    Same spellings as :func:`parse_bytes`, one difference: what a bare integer
+    means. Slurm's memory options are documented in megabytes -- ``sbatch(1)``,
+    ``--mem=<size>[units]``: *"Default units are megabytes"* -- so ``ReqMem=16``
+    is 16 MiB, and reading it as 16 bytes is wrong by 1,048,576x and silent. A
+    memory ceiling a millionth of its real size makes every job look catastrophically
+    over its limit.
+
+    Kept separate from :func:`parse_bytes` rather than changing it, because that
+    function also decodes fields where a bare integer is *not* a memory size and
+    the MiB rule would be actively wrong. ``MaxPages`` is a page count and this
+    cluster emits it bare (``0``); ``MaxDiskRead``/``MaxDiskWrite`` are byte
+    counters. Only a limit gets the limit convention.
+
+    Reported as a cross-package divergence rather than against this tool: on the
+    same inputs slurmate read ``16`` as 16 MB while slurmpast and slurmwatch both
+    read it as 16 bytes. slurmate was right.
+
+    Latent on both clusters checked -- Slurm 23.02 and 20.11.8 alike write an
+    explicit unit into ``ReqMem`` (``4Gn``, ``3810Mc``), and a sweep of 30 days of
+    Midway3 accounting found no unit-less row. Fixed anyway: the spelling that
+    reaches this is a site's Slurm version and submit style, which is exactly the
+    axis this tool cannot see from here.
+    """
+    if text is None:
+        return None
+    s = str(text).strip().rstrip("nc")
+    if not s or s.lower() in ("unknown", "none", "n/a"):
+        return None
+    if s[-1:].lower() not in _UNITS:
+        # Unit-less. Anchor it to MiB by appending the unit rather than
+        # multiplying afterwards, so there is one conversion table, not two.
+        try:
+            float(s)
+        except ValueError:
+            return None
+        s += "m"
+    return parse_bytes(s)
+
+
 def mem_scope(text):
     """Return ``'node'``, ``'cpu'`` or None for a ReqMem string's scope suffix."""
     if text is None:

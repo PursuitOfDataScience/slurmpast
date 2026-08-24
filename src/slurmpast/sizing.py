@@ -36,7 +36,7 @@ from typing import NamedTuple
 from .diagnose import looks_like_noop
 from .duration import format_bytes, format_duration
 from .patterns import hung_split_note, numeric_job_id
-from .site import maxrss_caveat
+from .site import cpu_caveat, maxrss_caveat, partition_ceiling
 
 # Below this many usable observations there is no distribution to reason about.
 MIN_RUNS = 3
@@ -492,8 +492,30 @@ def cpu_advice(jobs) -> Advice:
     peak = busiest.cpu_utilization * busiest.cpus_per_task
     target = max(1, int(math.ceil(peak * CPU_MARGIN)))
 
+    # Nothing on a node can be asked for more cores than the node has. `--sizing`
+    # read a saturated workload correctly -- "the busiest run used 27.9 of 28
+    # cores per task" -- and then advised `--cpus-per-task=34` on a partition
+    # whose nodes have 28, across a workload with 401 runs. Every job submitted
+    # with that line is refused: "Requested node configuration is not available".
+    # The inference was right and unchecked against the hardware.
+    #
+    # Only upward. A downward recommendation was verified on a second cluster to
+    # round-trip through `sbatch --test-only` and complete inside the tightened
+    # limits, and a ceiling cannot make a smaller number unschedulable.
+    ceiling, _mb = partition_ceiling(next((j.partition for j in usable if j.partition), ""))
+    saturated = False
+    if ceiling and target > ceiling:
+        saturated = current is not None and current >= ceiling
+        target = ceiling
+
     if current is None:
         verdict = "unknown"
+    elif saturated:
+        # Its own verdict, not `keep`. Clamping alone turned "raise to 34" into
+        # "already about right", which is a different wrong answer: the workload
+        # is using 27.9 of its 28 cores and would take more. There is no number
+        # `--cpus-per-task` can carry that says so, so the verdict says it instead.
+        verdict = "capped"
     elif target < current * (1 - MIN_RELATIVE_CHANGE):
         verdict = "lower"
     elif target > current * (1 + MIN_RELATIVE_CHANGE):
@@ -501,20 +523,46 @@ def cpu_advice(jobs) -> Advice:
     else:
         verdict = "keep"
 
+    # The cluster-derived clause, first, the way `mem_advice` carries
+    # `maxrss_caveat`. `TotalCPU` misses work in processes reparented out of the
+    # step's tree, so on a `jobacct_gather/linux` site the figure this advice is
+    # computed from is a lower bound -- and only on the `lower` verdict does that
+    # matter, because it is the direction that shrinks an allocation which may be
+    # in full use.
+    #
+    # This is the highest-value of the three places the caveat belongs: these
+    # `#SBATCH` lines were verified on a second cluster to be pasted into a script
+    # verbatim and accepted by `sbatch` unmodified, so an un-caveated undercount
+    # here is *executed*, not merely read.
     gpu = any(j.gpu_count for j in usable)
-    caution = ""
+    clauses = []
+    if verdict == "lower":
+        clauses.append(cpu_caveat() + ".")
     if gpu and verdict == "lower":
-        caution = (
+        clauses.append(
             "This is a GPU workload: cores may be there to feed dataloader "
             "workers, and cutting them can starve the GPU even though they look idle."
         )
     tasks = max((j.task_count for j in usable), default=1)
     if tasks > 1:
-        caution = (
-            (caution + "  " if caution else "")
-            + "Per task: this workload runs %d, so the allocation total is that many times larger."
+        clauses.append(
+            "Per task: this workload runs %d, so the allocation total is that many times larger."
             % (tasks)
         )
+    # Joined rather than assigned. The GPU clause used to *replace* whatever was
+    # in `caution`, which was harmless while it was the first thing written and
+    # silently dropped the cluster-derived clause added above it.
+    # Where the clamp bound and the workload was *already* at the ceiling, a
+    # number is not the answer at all: the honest advice is that more cores per
+    # node is what it needs, which no `--cpus-per-task` can express.
+    if saturated:
+        clauses.insert(
+            0,
+            "Saturated at this partition's ceiling of %d cores per node, so a larger "
+            "request here cannot be scheduled — this workload needs a partition with "
+            "more cores per node." % ceiling,
+        )
+    caution = "  ".join(c for c in clauses if c)
 
     # Singular only for exactly one, because the figure is printed to one decimal:
     # `peak < 2` made every value from 1.0 to 1.9 read "1.5 core busy per task".

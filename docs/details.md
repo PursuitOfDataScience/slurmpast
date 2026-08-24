@@ -37,6 +37,7 @@ these is a regression test in `tests/test_portability.py`:
 | **`JobAcctGatherType`** decides what MaxRSS *is* | `jobacct_gather/cgroup` gives a genuine high-water mark, so the "double-counts shared pages" warning is withheld there rather than repeated |
 | **`StdOut`/`StdErr`** exist from Slurm 24.05 | used, with `%j`/`%A`/`%a`/`%x`/`%N` expanded, before falling back to guessing a filename |
 | **`--me`** needs Slurm 20.02 | falls back to `-u <you>`, not to an unfiltered `squeue` over the whole cluster — and is only asked when the account being reconciled *is* yours, so `-u alice` does not check alice's records against your queue |
+| **Accounting can be slow.** A big site's `sacct` over a wide window can take minutes | one query budget, 300s by default and settable with **`SLURMPAST_TIMEOUT`** (seconds, must be positive). A value that is not a positive number is refused by name rather than quietly replaced by the default, because a setting that does not do what it says and does not say so is worse than one that is not offered |
 | **`PrivateData=jobs`** hides other accounts | `-u alice` and `--all-users` are one flag either way; at such a site sacct returns an empty set with no error, so the "no jobs for alice" line names the scope it asked about rather than reading as your own quiet window |
 | **Accounting may be off**, or `sacct` absent | a one-line explanation and exit 2, never a traceback; the query has a timeout so an unreachable `slurmdbd` cannot hang the dashboard |
 
@@ -70,7 +71,7 @@ Two were entirely invisible with a narrow `--format`: **disk writes** (one run
 read 112 GB and wrote 139 GB) and the **user/kernel CPU split** (791 of 6,582
 jobs exceed 30% kernel time — syscall overhead no other tool surfaces).
 
-`--json` emits all of it — 96 values per job, plus 40 for every step. Nothing is
+`--json` emits all of it — 99 values per job, plus 40 for every step. Nothing is
 captured and then hidden: a test reads `cli._job_json` itself and holds every
 `Job` and `Step` value to it, so a measurement that does not reach the payload
 has to be argued for by name in that test's exemption list rather than dropped.
