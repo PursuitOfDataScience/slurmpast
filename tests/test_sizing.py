@@ -1195,10 +1195,13 @@ class TestNoDataIsNotAnAllClear:
         return parse(make_text(*rows))
 
     def _screen(self, jobs):
+        """Rendered, with whitespace collapsed -- the sentences under test are
+        wrapped prose, and where the wrap falls depends on the terminal width and
+        on how long the interpolated names happen to be."""
         from slurmpast.index import History
         from slurmpast.report import Style, render_sizing
 
-        return render_sizing(History(jobs), style=Style(enabled=False))
+        return " ".join(render_sizing(History(jobs), style=Style(enabled=False)).split())
 
     def test_no_runs_and_all_correctly_sized_do_not_print_the_same_line(self):
         """The test the report asks for by name. Both states leave the screen

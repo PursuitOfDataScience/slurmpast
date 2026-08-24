@@ -2974,7 +2974,9 @@ class TestAStepRowsMultiLineFieldMakesNoPhantoms:
         cli.main(["48819348", "--plain", "--no-color", "--no-logs"])
         out = capsys.readouterr().out
         assert out.count("\u25cf TIME") == 1, out
-        assert "job from slurmwatch import slurm" not in out
+        # Collapsed: this is a *negative* assertion, so a wrap splitting the
+        # phrase would make it pass while the phantom sat on screen.
+        assert "job from slurmwatch import slurm" not in " ".join(out.split())
 
 
 class TestAMixedOutcomeArrayAggregates:
@@ -4052,10 +4054,18 @@ class TestAnUnreadableLogIsNotReportedAsDeleted:
         return target, private
 
     def _render(self, job):
+        """Rendered, with whitespace collapsed.
+
+        The report wraps prose around a path, so "moved or deleted" splits across
+        two lines the moment the path is long enough -- which a local `tmp_path`
+        is not and CI's `/tmp/pytest-of-runner/pytest-0/...` is. Asserting on the
+        raw text passed locally and failed on every CI job. `" ".join(split())`
+        is the idiom the rest of this suite already uses for wrapped output.
+        """
         from slurmpast import report
 
         text, _verdict = report.render_job(job, style=report.Style(enabled=False))
-        return text
+        return " ".join(text.split())
 
     def test_an_unreadable_log_is_not_reported_as_deleted(self, tmp_path):
         """The test the report asks for by name."""
