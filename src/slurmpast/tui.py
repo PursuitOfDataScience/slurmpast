@@ -18,6 +18,7 @@ and blocking the first paint on it would feel broken.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Any, ClassVar, cast
 
 from rich.text import Text
@@ -120,15 +121,70 @@ def _loader_accepts_since(loader) -> bool:
 
 
 def _clip_path() -> str:
+    """Where the clipboard fallback is written, created private to the user.
+
+    The contents are whatever row or view was on screen -- job names, partitions,
+    workdirs, run counts -- so this file is not public even though nothing in it
+    is a secret in the credential sense.
+
+    ``mode=0o700`` on :func:`os.makedirs` applies only when the directory is
+    *created*, and the ``chmod`` is what closes an existing one. Every install
+    predating this had it at whatever the umask gave -- ``drwxrwxr-x`` under the
+    common ``umask 002`` -- and a fix that only sets the mode on first creation
+    leaves exactly the users who already have the problem still having it.
+    """
     import os
 
     base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
     directory = os.path.join(base, "slurmpast")
     try:
-        os.makedirs(directory, exist_ok=True)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
     except OSError:
         return ""
+    # Best effort: a directory we cannot chmod is still usable, and the file
+    # below carries its own mode regardless.
+    with contextlib.suppress(OSError):
+        os.chmod(directory, 0o700)
     return os.path.join(directory, "clip.txt")
+
+
+def _write_clip(path: str, text: str) -> None:
+    """Write the fallback file 0600, whatever the umask says.
+
+    ``os.open`` with an explicit mode is umask-independent for the bits it clears,
+    but the mode argument is honoured *only on creation* -- reopening a file that
+    already exists leaves its permissions alone. The ``fchmod`` is therefore the
+    part that matters for anyone upgrading: without it a ``clip.txt`` already on
+    disk at ``0644`` or ``0664`` keeps those bits forever.
+
+    ``fchmod`` on the descriptor rather than ``chmod`` on the path, so there is no
+    window between opening and tightening in which the name could point somewhere
+    else.
+    """
+    import os
+
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text if text.endswith("\n") else text + "\n")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _discard_clip() -> None:
+    """Remove the fallback file. A copy buffer has no reason to outlive the app.
+
+    Called from :func:`run`'s ``finally`` rather than a Textual unmount hook, so
+    it also runs when the app exits by exception -- which is when a stale file is
+    least likely to be noticed.
+    """
+    import os
+
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    with contextlib.suppress(OSError):
+        os.unlink(os.path.join(base, "slurmpast", "clip.txt"))
 
 
 class ScreenChrome:
@@ -191,8 +247,7 @@ class ScreenChrome:
                 # preferred encoding resolves to ASCII this raised UnicodeEncodeError
                 # -- which is a ValueError, so the OSError handler below would not
                 # have caught it and `y` would have thrown out of a UI action.
-                with open(path, "w", encoding="utf-8") as handle:
-                    handle.write(text if text.endswith("\n") else text + "\n")
+                _write_clip(path, text)
                 written = True
             except (OSError, UnicodeError):
                 written = False
@@ -1774,12 +1829,18 @@ class JobScreen(ScreenChrome, Screen[Any]):
                     style=theme.HEALTH_COLOR["warn"],
                 )
         elif not self.sp.no_logs:
-            # One line. Slurm keeps StdOut/StdErr only in slurmctld and MinJobAge
-            # is 120s here, so `scontrol show job` answers "Invalid job id" for
-            # anything a post-mortem looks at and sacct has no such field at all.
-            # The path is unknowable, and saying so over three lines was explaining
-            # a limitation the reader cannot act on.
-            body.append("  log  none found — --log-dir points at one\n", style=theme.FAINT)
+            # One line, and the same one `--plain` prints -- `render.log_miss_detail`
+            # holds the rule for both. This screen used to hardcode "none found" on
+            # the grounds that "the path is unknowable", which stopped being true
+            # when Slurm 24.05 began recording StdOut: on a 24.11 cluster the plain
+            # renderer named the path and said whether it was absent, unreadable or
+            # deliberately discarded, while this one said nothing was found at all.
+            #
+            # Guarded on `no_logs` for the reason `report` guards it: every spelling
+            # is a claim about the filesystem, and under `--no-logs` nothing was
+            # stat'd. `--demo` forces that flag, so the synthetic post-mortem still
+            # shows no line here.
+            body.append("  log  %s\n" % render.log_miss_detail(job), style=theme.FAINT)
 
         body.append("\n")
         findings = render.sort_findings(verdict.findings)
@@ -2413,5 +2474,8 @@ def run(
     # mouse-tracking escape sequences, so the terminal handles the mouse itself
     # and drag-select behaves normally. Textual 0.89 has no in-app selection
     # API, so this is the only way to get selection at all.
-    app.run(mouse=mouse)
+    try:
+        app.run(mouse=mouse)
+    finally:
+        _discard_clip()
     return 2 if app.load_error else 0

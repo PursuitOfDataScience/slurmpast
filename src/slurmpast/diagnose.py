@@ -106,6 +106,29 @@ _NCCL_MARKERS = (
 _IMPORT_MARKERS = ("modulenotfounderror", "importerror", "no module named")
 
 
+def _slack_sampling_warning(job):
+    """The floor caveat for advice that says to ask for *less* memory.
+
+    SP-22 was fixed on the OUT_OF_MEMORY path, where the kill proves the peak. The
+    reporter's next round supplied the other half without meaning to: a 20-second
+    chain job that allocated 40 MiB recorded ``MaxRSS 2484K``, and called it
+    "another instance of SP-22, not a new finding" -- correctly, because it is the
+    same sparse sampler. But that job is COMPLETED, so nothing on the OOM path
+    covers it, and this is the finding that fires there.
+
+    It is the more dangerous direction of the two. Over-reporting inflates a
+    number a reader might leave alone; a missed spike here becomes "Try --mem=3G"
+    against a 64 GiB request, and taking that advice under-provisions a job that
+    then gets killed for it.
+    """
+    from .site import maxrss_sampling_note
+
+    note = maxrss_sampling_note(job.elapsed)
+    if not note:
+        return ""
+    return "  Thinly sampled, so the peak may be a floor: %s." % note
+
+
 def diagnose(job, log_text=None, node_note=None):
     """Return a Verdict for one job.
 
@@ -251,6 +274,22 @@ def _memory_rules(job, add):
                 "which is impossible for a working set: %s. Do not size --mem from it."
                 % (format_bytes(rss), format_bytes(limit), maxrss_caveat())
             )
+        elif rss is not None and limit is not None:
+            # The understating direction, and the one the reader cannot spot from
+            # the number. Every other sentence this tool has about MaxRSS explains
+            # how it *over*-reports; here the kill proves the peak reached the
+            # limit while the sample sat 21x below it, so repeating the
+            # over-report caveat would be the one reading the evidence rules out.
+            from .site import maxrss_sampling_note
+
+            detail += (
+                " MaxRSS sampled only %s of that %s limit, but the kill is proof the peak "
+                "reached it: treat the sample as a floor, not the footprint, and do not "
+                "size --mem from it." % (format_bytes(rss), format_bytes(limit))
+            )
+            note = maxrss_sampling_note(job.elapsed)
+            if note:
+                detail += " Sampling is why — %s." % note
         add(
             Finding(
                 CRITICAL,
@@ -309,8 +348,12 @@ def _memory_rules(job, add):
                     # cgroup's own peak. On Mercury that put this sentence in
                     # direct contradiction with the one `--sizing` prints about
                     # the same figure in the same run.
-                    "Try --mem=%s (peak plus ~30%%). %s."
-                    % (format_mem_flag(int(rss * 1.3)), maxrss_caveat()),
+                    "Try --mem=%s (peak plus ~30%%). %s.%s"
+                    % (
+                        format_mem_flag(int(rss * 1.3)),
+                        maxrss_caveat(),
+                        _slack_sampling_warning(job),
+                    ),
                 )
             )
 

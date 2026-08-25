@@ -130,6 +130,56 @@ def newest_name(jobs) -> str:
     return best[1] if best else ""
 
 
+def workload_label(signature, jobs) -> str:
+    """What to call a workload on screen, from its folded key and its members.
+
+    The rule this holds used to live only in :attr:`index.GroupStats.label`, so
+    only the surfaces built from ``GroupStats`` -- the overview table and
+    ``--nodes`` -- obeyed it. The cross-run findings in this module named their
+    groups ``key[0]`` instead, which is the raw fold, and that reintroduced on the
+    patterns surface the exact defect ``label`` exists to prevent:
+
+        overview   m110_robustness_current_source_20260823_c9ea44e_v1
+        patterns   20 of 20 runs of m#_robustness_current_source_#_c#ea#e_v# ...
+
+    One workload, 20 runs, one job name, named two ways in one report -- and the
+    second invents a family of runs that does not exist. Measured on pythia
+    (Slurm 24.11.5) over a two-day cluster-wide window.
+
+    Both callers now take the rule from here, which is the "one place" the
+    ``label`` docstring already claimed for it and the reason ``render`` exists.
+    """
+    members = list(jobs)
+    # Counted the way `build_groups` counts it, so the two cannot disagree about
+    # whether a fold covers one name: an unnamed record is a distinct value there
+    # and must be one here.
+    distinct = len({job.name for job in members})
+    if distinct == 1 and members:
+        # `newest_name` rather than `members[0].name`: `GroupStats.jobs` is sorted
+        # newest-first and can be indexed, but the group lists in this module are
+        # not sorted at all. With one distinct name the two agree by definition;
+        # ordering independence is what stops that being a latent assumption.
+        return newest_name(members) or signature
+    if fold_erased_the_name(signature):
+        real = newest_name(members)
+        if not real:
+            return signature
+        # `+N` when the fold covers more than one raw name, because this
+        # substitution is the one case where showing a real name is a claim the row
+        # cannot support. `#` was uninformative but honest: it was visibly a fold.
+        # `20260822` on a row that also holds `20260821`'s run is specific, real
+        # and wrong, and `RUNS 2` then reads as two runs of one workload rather
+        # than one run each of two.
+        #
+        # `distinct_names` was kept off the table in an earlier round as clutter
+        # beside the name, and that judgement stands for the ordinary row -- which
+        # is why this is not the count, and appears only where the fold erased the
+        # name *and* the group holds more than one. On every other row nothing
+        # changes.
+        return "%s +%d" % (real, distinct - 1) if distinct > 1 else real
+    return signature
+
+
 def group_key(job):
     """Identity for "the same piece of work".
 
@@ -250,7 +300,7 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
         evidence = "%d of %d runs of %s in %s failed; %d %s %s." % (
             len(failures),
             len(members),
-            key[0],
+            workload_label(key[0], members),
             key[1],
             count,
             # Reachable at one: `failures` is at least REPEAT_MIN, and five runs
@@ -418,7 +468,7 @@ def find_requeues(jobs, min_runs=REQUEUE_MIN, fraction=REQUEUE_FRACTION, limit=R
         evidence = "%d of %d runs of %s in %s were requeued, %d %s in total; %d %s %s." % (
             len(requeued),
             len(members),
-            key[0],
+            workload_label(key[0], members),
             key[1],
             len(attempts),
             plural(len(attempts), "attempt"),
@@ -532,11 +582,15 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
                 break
 
         if searching:
-            evidence = "%d OOM kills for %s with --mem walking %s." % (len(ooms), key[0], walk)
+            evidence = "%d OOM kills for %s with --mem walking %s." % (
+                len(ooms),
+                workload_label(key[0], members),
+                walk,
+            )
         else:
             evidence = (
                 "%d OOM kills for %s, every one of them at --mem %s: the request has not moved."
-                % (len(ooms), key[0], format_bytes(requests[0]))
+                % (len(ooms), workload_label(key[0], members), format_bytes(requests[0]))
             )
         if contradiction is not None:
             evidence += " Job %s then COMPLETED at %s — a value that had already OOM'd." % (
@@ -608,6 +662,12 @@ def goodput(jobs):
     # accounted. Counting both as "unterminated" made the report state something
     # false about the second kind.
     open_ended = sum(1 for job in jobs if job.open_ended)
+    # The third kind the two buckets above did not cover: a row with no state at
+    # all. It is not an unterminated job and it is not a closed job missing an
+    # elapsed -- it is not a job. Kept separate so `excluded_no_elapsed` stops
+    # absorbing it and reading 0 while rows go unaccounted. Disjoint from
+    # `open_ended` by construction, since that now requires a state.
+    unparsed = sum(1 for job in jobs if not job.base_state)
     stats = {
         "jobs": len(records),
         "completed": 0,
@@ -618,8 +678,10 @@ def goodput(jobs):
         "gpu_hours_noop": 0.0,
         "core_hours_total": 0.0,
         "noop_jobs": 0,
+        "unclassified": 0,
         "excluded_open_records": open_ended,
-        "excluded_no_elapsed": len(jobs) - len(records) - open_ended,
+        "excluded_unparsed": unparsed,
+        "excluded_no_elapsed": len(jobs) - len(records) - open_ended - unparsed,
     }
     for job in records:
         gpu_h = job.gpu_hours or 0.0
@@ -633,6 +695,22 @@ def goodput(jobs):
             stats["cancelled"] += 1
         elif job.failed:
             stats["failed"] += 1
+        else:
+            # The buckets above are not exhaustive over Slurm's state list, and
+            # a record that matched none of them used to be counted in `jobs`
+            # and classified nowhere -- silently deflating `completion_rate`,
+            # with no counter a reader could use to notice. Measured: user
+            # mariaace over 30 days, 1434 + 100 + 283 = 1817 against jobs=1820,
+            # the three REQUEUED.
+            #
+            # An `else` rather than the reported `_NOT_YET_DECIDED` tuple, so a
+            # state this codebase has never seen is caught the first time it
+            # appears instead of the next time someone extends a list. Two of
+            # the states in that tuple also do not belong in it: REVOKED is in
+            # `_TERMINAL_STATES` -- a revoked federation sibling is decided, not
+            # pending -- and PENDING/RUNNING never reach here at all, being
+            # open_ended and therefore filtered by `usable`.
+            stats["unclassified"] += 1
         if looks_like_noop(job):
             stats["noop_jobs"] += 1
             stats["gpu_hours_noop"] += gpu_h
@@ -640,7 +718,18 @@ def goodput(jobs):
     total = stats["gpu_hours_total"]
     stats["gpu_goodput"] = (stats["gpu_hours_completed"] / total) if total else None
     stats["gpu_noop_fraction"] = (stats["gpu_hours_noop"] / total) if total else None
-    stats["completion_rate"] = stats["completed"] / float(stats["jobs"]) if stats["jobs"] else None
+    # Over the *classified* population, not over `jobs`. A REQUEUED job has not
+    # finished, so counting it in the denominator understates the rate in exactly
+    # the way a RUNNING job would -- and RUNNING is already excluded, by never
+    # reaching `records` at all. Counting these as non-completions instead would
+    # assert they failed, which for REQUEUED is simply false.
+    #
+    # `jobs` itself is left alone: a requeued run consumed real core-hours, and
+    # dropping it from the resource totals would trade one wrong number for
+    # another. So the invariant is completed + failed + cancelled + unclassified
+    # == jobs, and the rate's denominator is the first three.
+    classified = stats["completed"] + stats["failed"] + stats["cancelled"]
+    stats["completion_rate"] = stats["completed"] / float(classified) if classified else None
     return stats
 
 

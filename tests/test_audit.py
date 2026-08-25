@@ -1296,7 +1296,7 @@ class TestTheSdistShipsASuiteThatCanRun:
         environment or the real artifact. This is the artifact one.
         """
         try:
-            from build import ProjectBuilder
+            from build import BuildBackendException, ProjectBuilder
         except ImportError:  # pragma: no cover - `build` is in [dev] and CI has it
             pytest.skip("`build` is not installed; cannot inspect the real sdist")
 
@@ -1322,7 +1322,24 @@ class TestTheSdistShipsASuiteThatCanRun:
                 ".claude",
             ),
         )
-        path = ProjectBuilder(str(source)).build("sdist", str(tmp_path / "dist"))
+        # `ProjectBuilder.build` runs the backend *in this interpreter* -- it does
+        # not fetch one -- so a missing `setuptools` is a missing prerequisite for
+        # the test, not a fact about the artifact. `setuptools` is in `[dev]` for
+        # exactly this reason, and the skip is for someone who installed bare
+        # pytest instead: without it they get `BuildBackendException` out of a
+        # 40-line build traceback, which reads as the sdist being broken when what
+        # is broken is the environment inspecting it.
+        #
+        # Caught rather than pre-checked with `find_spec("setuptools.build_meta")`
+        # so this cannot drift from whatever `[build-system] backend` says.
+        try:
+            path = ProjectBuilder(str(source)).build("sdist", str(tmp_path / "dist"))
+        except BuildBackendException as exc:  # pragma: no cover - [dev] installs the backend
+            pytest.skip(
+                "no PEP 517 backend in this environment, so the sdist cannot be built to "
+                'inspect it: %s. Install the test extra -- `pip install -e ".[dev]"` -- '
+                "which carries setuptools for this." % exc
+            )
         with tarfile.open(path) as tar:
             return {name.split("/", 1)[1] for name in tar.getnames() if "/" in name}
 

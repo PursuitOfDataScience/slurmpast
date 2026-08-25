@@ -59,6 +59,70 @@
 >
 > Nothing was withdrawn this round.
 
+> **Release 0.8.2, 2026-08-25.** Five defects, found by running the working tree
+> against **two** clusters at once and re-checking a third after every fix: Mercury
+> (RHEL 9.7, Slurm 25.11.3, Python 3.13.15), **Pythia** (RHEL 8.10, Slurm 24.11.5,
+> Python 3.12.14) and midway3 (Slurm 20.11.8, Python 3.11.14). A five-year Slurm
+> span, three interpreters, both `jobacct_gather` plugins. 1766 tests at 0.8.1,
+> **1842** here; all four gates clean on all three.
+>
+> The round's first finding is about the suite itself: **it could not run on either
+> new cluster.** A plain `python3.12 -m venv` plus `pip install -e ".[dev]"` gave
+> 1821 passed / 2 failed on both, because two tests build an sdist in-process and
+> Python 3.12 stopped seeding `setuptools` into new venvs. Neither midway3 nor CI
+> could see it -- conda seeds `setuptools`, and `ci.yml` installs it by hand before
+> the test extra -- so the first environment to install the package the way the
+> README describes was the first to fail.
+>
+> What a user gets that they did not have at 0.8.1: one workload called one thing,
+> where the overview table named a 20-run group
+> `m110_robustness_current_source_20260823_c9ea44e_v1` and the cross-run finding
+> directly beneath it called the same group `m#_robustness_current_source_#_c#ea#e_v#`;
+> a job that sent its output to `/dev/null` told the output was discarded rather than
+> that its log had been *moved or deleted*, which was 5.7% of the records on Pythia;
+> the dashboard and `--plain` describing a missed log the same way, where the app said
+> only "none found" and `--plain` named the path and the reason; and a `--partition`
+> that does not exist at this site named as the filter that emptied the window,
+> instead of the window being called empty while holding 18 jobs.
+>
+> Nothing was withdrawn. Four things were checked and are not defects, each recorded
+> with its reasoning: a 101-run workload at zero completed and zero flagged (all
+> cancelled), a `--all-users --nodes` timeout on midway3, exit 2 on a cluster where
+> the caller has no jobs, and an NFS that forces mode 0700 on the clipboard file.
+
+
+> **Round thirty-five, 2026-08-25.** Five defects, found by running the working
+> tree against **two** clusters at once and holding a third fixed: Mercury
+> (RHEL 9.7, Slurm 25.11.3, Python 3.13.15) and **Pythia** (RHEL 8.10, Slurm
+> 24.11.5, Python 3.12.14), with midway3 (Slurm 20.11.8, Python 3.11.14) re-run
+> after every fix to check nothing regressed there. A five-year Slurm span, three
+> interpreters, two `jobacct_gather` plugins. 1823 tests before, **1842 after**;
+> all four gates clean on all three.
+>
+> The round's own method is the finding worth recording first: **the suite could
+> not run on either new cluster.** `python3.12 -m venv` plus
+> `pip install -e ".[dev]"` gave 1821 passed / 2 failed on both, because since
+> Python 3.12 `venv` no longer seeds `setuptools` and two tests build an sdist
+> *in-process*. midway3 passed 1823 only because conda happens to seed it. That is
+> this package's own portability claim -- somebody on another cluster runs the
+> shipped suite -- failing for a reason that is not about the package.
+>
+> What a user gets that they did not have at 0.8.1: one workload is called one
+> thing, where the overview table said
+> `m110_robustness_current_source_20260823_c9ea44e_v1` and the cross-run finding
+> below it said `m#_robustness_current_source_#_c#ea#e_v#` about the same 20 runs;
+> a job that sent its output to `/dev/null` is told the output was discarded
+> rather than that its log was *moved or deleted*, on 5.7% of the records on
+> Pythia; the dashboard and `--plain` describe a missed log the same way, where the
+> app said "none found" and `--plain` named the path and its reason; and a
+> `--partition` that does not exist at this site is named as the filter that
+> emptied the window instead of the window being called empty.
+>
+> Nothing was withdrawn. Four things were checked and are **not** defects, listed
+> in the round below: a 101-run workload at zero completed and zero flagged, a
+> `--all-users --nodes` timeout on midway3, exit 2 on a cluster where the caller
+> has no jobs, and an NFS that forces mode 0700 on the clipboard file.
+
 
 > **Round thirty-four, 2026-08-24.** Three defects, found on a **third** cluster:
 > Mercury (UChicago Booth) -- RHEL 9.8, **Slurm 25.11.3**, cgroup v2,
@@ -528,6 +592,212 @@
 > upheld by a three-reviewer panel, thirteen fixed, plus one the panel found that
 > was not on the list. 1,029 tests before, **1,083 after** — 54 new, one per fix
 > and its control. `ruff`, `ruff format` and `mypy` clean.
+
+---
+
+## Round thirty-five — one workload, two names, and a suite that could not run
+
+Five defects, found by running the working tree against **two** new clusters in
+parallel while re-checking a third after every change. The instruction that shaped
+the round was "don't fix one thing while breaking the others", so midway3 was
+re-run at each step rather than at the end.
+
+| | midway3 | Mercury | Pythia |
+|---|---|---|---|
+| OS | RHEL 8 | RHEL 9.7 (Plow) | RHEL 8.10 (Ootpa) |
+| Slurm | **20.11.8** | **25.11.3** | **24.11.5** |
+| Python | 3.11.14 (conda) | 3.13.15 (venv) | 3.12.14 (venv) |
+| `JobAcctGatherType` | `jobacct_gather/linux` | `jobacct_gather/cgroup` | `jobacct_gather/cgroup` |
+| `JobAcctGatherFrequency` | 30 | 30 | 30 |
+
+Mercury and Pythia share one NFS home (same inode for `/home/youzhi`), so one
+rsync served both, but they are different OS images with different interpreters and
+two Slurm minors apart. Data: 26 of the caller's own jobs on Mercury, and 2,044
+jobs in 280 workloads over two days `--all-users` on Pythia. Every finding below
+was reproduced by running the tool, and each has a test that fails without the fix
+-- verified by reverting the fix and watching the test fail, which caught two
+assertions that passed either way (§2 and §4).
+
+### 1. The suite could not run on either new cluster
+
+```
+$ python3.12 -m venv ~/spv && ~/spv/bin/pip install -e ".[dev]"
+$ ~/spv/bin/python -m pytest -q
+FAILED tests/test_audit.py::TestTheSdistShipsASuiteThatCanRun::test_the_built_sdist_carries_every_file_under_tests
+FAILED tests/test_audit.py::TestTheSdistShipsASuiteThatCanRun::test_the_built_sdist_carries_what_the_repo_audits_read
+E   build._exceptions.BuildBackendException: Backend 'setuptools.build_meta' is not available.
+2 failed, 1821 passed
+```
+
+Identical on Mercury (3.13.15) and Pythia (3.12.14). `_built_sdist` calls
+`ProjectBuilder(...).build("sdist", ...)`, which runs the backend **in the current
+interpreter** rather than fetching it into an isolated environment -- and since
+Python 3.12, `venv` no longer seeds `setuptools`. `build` was in `[dev]`; the
+backend it needs was not.
+
+The class this sits in exists precisely because "the way its portability claims get
+checked is somebody on another cluster downloading the *released* artefact and
+running it there". On the two clusters that describes, it failed.
+
+midway3 passed 1823 for an unrelated reason: its conda env happens to ship
+`setuptools` 81.0.0. A local gate runs on one interpreter and could not see this,
+which is the same shape as the `tomllib` finding at §*Round twelve*.
+
+Nor could CI, and that is worth stating rather than leaving implied: `ci.yml` has an
+`Install build deps` step that pip-installs `"setuptools>=77" wheel` *before*
+`pip install -e ".[dev]"`, so the gate has always had a backend by hand. The
+dependency was therefore satisfied in the two environments that run the suite
+routinely and declared in neither -- which is why the first environment to install
+the package the way its own README describes was the first to fail. The fix moves
+the guarantee from CI's shell into the manifest, where anyone installing the test
+extra gets it; the CI step is now redundant rather than load-bearing, and is left
+in place because a workflow that installs its own build deps costs nothing.
+
+**Fixed** in `pyproject.toml`: `setuptools>=77` and `wheel` -- the two names already
+in `[build-system] requires` -- added to `[dev]`, since the suite performs an
+in-process PEP 517 build. `tests/test_audit.py` additionally converts a missing
+backend into a skip that names the fix, so someone running bare `pytest` gets a
+sentence instead of a 40-line build traceback about an sdist that is fine.
+
+Two tests, and the second is the control on *which* backend: `[build-system]
+requires` must be a subset of what `[dev]` installs, so the pin cannot drift if the
+project ever moves off setuptools.
+
+### 2. One workload, named two ways in one report
+
+The overview table and the cross-run finding below it disagreed about what the same
+20 runs were called:
+
+```
+overview   m110_robustness_current_source_20260823_c9ea44  20 runs  0 completed  20 flagged
+patterns   20 of 20 runs of m#_robustness_current_source_#_c#ea#e_v# in standard_hopper failed
+```
+
+`GroupStats.label` deliberately shows a group's one real job name instead of the
+fold, on its own stated grounds: the `#` "hides the one name it is standing in for
+and invents a family that does not exist". The findings in `patterns.py` named their
+groups `key[0]` -- the raw fold -- at four sites (`patterns.py:253`, `:421`, `:535`,
+`:539`), so the rule reached the table and `--nodes` and stopped there.
+
+**Fixed** by extracting the rule into `patterns.workload_label(signature, jobs)` and
+routing both surfaces through it; `GroupStats.label` now delegates, so there is one
+copy. This is the "one place" that property's docstring already claimed for it.
+
+Why the existing tests did not catch it: the suite had tests for the table's half of
+this rule and they passed throughout, because their fixtures are named `cot-exp` and
+`rc-tok-github_code` -- **no digits, so the fold is the identity**, and a surface
+printing the fold is indistinguishable from one printing the name. Every name in the
+new tests carries digits.
+
+The first version of the cross-surface test asserted over `render_overview` alone
+and passed with the defect still in place -- `render_overview` draws only the table,
+and the cross-run section is `render_patterns`, which the CLI composes separately.
+Corrected to render both.
+
+### 3. A log sent to `/dev/null`, reported as moved or deleted
+
+```
+$ slurmpast 182712 --plain          # Pythia, a real DEADLINE job
+job 182712  DEADLINE
+  log none at /dev/null — moved or deleted; --log-dir points at it
+```
+
+`/dev/null` is a character device, so `os.path.isfile` is False for it, and
+`probe_path`'s last line folded "exists but is not a regular file" into `absent`:
+
+```python
+return "found" if os.path.isfile(path) else "absent"  # logs.py:320
+```
+
+So the single most common way to say "I do not want this output" was reported as a
+log that had gone missing, with `--log-dir points at it` offering a recovery for a
+file that was never written. **152 of 2,675 records on Pythia over three days --
+5.7%, and the fourth most common log path on the cluster.**
+
+That is the same error this function was written to stop making one branch up: a
+stat that *succeeded* is not a stat that found a file, just as a stat that failed is
+not a stat that found nothing.
+
+**Fixed**: `probe_path` gains `discarded` (the null device, decided by intent before
+the stat, so a site where `/dev/null` is unstattable is still not told its log
+moved) and `special` (present, not a regular file -- a directory, a fifo, another
+device). Both get their own sentence. `--json`'s `log_expected.status` can therefore
+now carry two values it could not before; see *Consequence for the numbers*.
+
+### 4. The dashboard and `--plain` disagreed about a missed log
+
+`--plain` had grown four spellings keyed on `probe_path` -- naming the recorded path,
+and distinguishing absent from unreadable from unknown. The dashboard printed one
+unconditional line:
+
+```python
+body.append("  log  none found — --log-dir points at one\n", ...)  # tui.py:1837
+```
+
+on a comment claiming "the path is unknowable". That stopped being true when Slurm
+24.05 began recording `StdOut`, which is exactly the version range both new clusters
+sit in -- so on a 24.11 cluster the two front ends described the same job
+differently, and nothing on either screen could show a reader that, because only one
+of the two is ever in front of them.
+
+**Fixed** by moving the wording to `render.log_miss_detail(job)` and calling it from
+both, which is what `render.py` is for. The `--no-logs` guard stays with each caller,
+because every spelling is a claim about the filesystem.
+
+Its source-inspection control also had to be fixed twice: anchored on a trailing
+quote it matched neither version, and without the quote it matched the explanatory
+comment above the fixed line. It now walks the string literals with `ast`, since only
+a literal can reach the screen.
+
+### 5. `--failed` was named as the reason a window was empty; `--partition` was not
+
+```
+$ slurmpast -p nonexistent_xyz -S now-30days --plain      # Mercury, 18 jobs in the window
+slurmpast: no jobs for youzhi since now-30days
+```
+
+A partition name is the one argument that reliably does not survive being carried
+between clusters -- midway3 has `caslake`, Mercury `standard`, Pythia
+`standard_hopper` -- so `-p` naming something this site has never heard of is the
+ordinary way to reach that message, and it stated something false about the window.
+`--failed` was already named there; `-p` and `-E` were not.
+
+**Fixed** in `cli.py`: every narrowing filter is named, and `--until` is reported
+when given, so the window is not described by half. With no filter the sentence is
+unchanged -- that is the control.
+
+### Checked, and not defects
+
+* **A 101-run workload showing zero completed and zero flagged.** Row 15 on Pythia,
+  `full-data-supervised-#-#_#-#`. All 101 are `CANCELLED by 89161`, and a
+  cancellation is deliberately neither a success nor a failure -- the behaviour
+  §*Round nine* settled and a test pins. Correct as shown.
+* **`--all-users --nodes` exiting 2 on midway3.** `sacct did not answer within 300s
+  — ... Narrow the window with -S, or raise SLURMPAST_TIMEOUT`. midway3 holds
+  ~938,576 job ids in seven days; the timeout is real and the message says what to
+  do. Both new clusters answer the same query in seconds.
+* **Exit 2 for every own-jobs view on Pythia.** The caller genuinely has no jobs
+  there (`sacct -X -u youzhi` returns nothing), and `no jobs for youzhi since
+  now-7days` is the right answer. `--all-users` worked throughout, which is how the
+  rest of the round got its data.
+* **The clipboard file at mode 0700 rather than 0600.** Booth's NFS home forces
+  0700 on every file regardless of the mode requested -- a probe creating a file at
+  `0o666` also read back `0o700`, and `fchmod` did not move it. The security intent
+  (no group or other access) holds, and it fails *more* restrictive, so this is a
+  filesystem ACL policy rather than a defect. The tests assert exact 0600 under
+  pytest's `tmp_path`, which is local, and are right to.
+
+### What was exercised
+
+Every text surface on all three clusters (overview, `--overview`, `--patterns`,
+`--nodes` with both metrics and `--all-workloads`, `--sizing`, `--failed`, `--json`,
+`--ascii`, `--no-color`, all six `--sort` modes, `--no-logs`, `-n 0`, `--strict`,
+`--demo`, empty and inverted windows, a nonexistent partition), per-job surfaces over
+a spread of states on both new clusters (post-mortem, `--steps`, `--json`, `--ascii`,
+`--strict` across 12 jobs; every JSON payload parsed), and the dashboard driven by
+keystroke on both: workload drill-down, job detail, `--nodes` with metric and control
+toggles, patterns, search, all sort and filter cycles, copy, and the clipboard file
+confirmed discarded on exit. No traceback on any surface on any cluster.
 
 ---
 
@@ -6015,6 +6285,32 @@ entry was refusing, replaced by the smallest change that keeps the idiom intact.
 ---
 
 ## Consequence for the numbers
+
+**Round thirty-five.** No measurement changes and no exit code moves; every fix is
+naming or wording. Four things a reader or a script might be matching on do change.
+
+`--json`'s `log_expected.status` gains two values it could not previously carry --
+`discarded` and `special` -- both drawn from cases that used to report `absent`. A
+consumer testing `status == "absent"` to mean "the log is gone" now sees
+`"discarded"` for a job that wrote to `/dev/null`, which is the distinction the field
+was missing rather than a renaming: no existing value changed meaning, and nothing
+was removed. The payload's key count and shape are untouched.
+
+On screen, the `log` line reads differently in three of its cases -- a `/dev/null`
+path, a path that is present but not a regular file, and every missed log in the
+**dashboard**, which previously said only "none found" and now says what `--plain`
+says. Anything grepping for `moved or deleted` on a `/dev/null` job will stop
+matching, which is the point.
+
+Cross-run findings name a workload by its real job name wherever the group covers
+exactly one, where they previously printed the folded pattern. A script matching a
+finding's evidence on a folded name (`m#_robust_#_v#`) will not match where the group
+holds a single name; the overview table has named these groups this way for several
+rounds, so the two surfaces now agree rather than either moving independently. Groups
+covering more than one name are unaffected.
+
+The `no jobs for ...` message gains ` matching --partition <name>` and ` until <t>`
+clauses when those arguments were given. The unfiltered sentence is byte-identical.
 
 **Round twenty-seven.** A job whose log merely mentions NCCL loses its
 `nccl` finding, and with it a CRITICAL -- so `slurmpast <jobid>` can exit 0 where

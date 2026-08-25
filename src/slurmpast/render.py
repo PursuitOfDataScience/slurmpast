@@ -131,6 +131,65 @@ def bar(
     return text
 
 
+def log_miss_detail(job) -> str:
+    """The one line saying why no log is on screen, for whichever surface asks.
+
+    Both front ends draw this and they had drifted badly. ``--plain`` grew four
+    spellings keyed on :func:`logs.probe_path` -- naming the recorded path, and
+    distinguishing a file that is absent from one that is merely unreadable --
+    while the dashboard still printed a single unconditional "none found", on a
+    stale comment claiming "the path is unknowable". It has been knowable since
+    Slurm 24.05 recorded ``StdOut``, and on a shared cluster the two surfaces were
+    telling the same reader different things about the same job.
+
+    So the rule lives here, which is what this module is for. Callers get the
+    sentence and keep their own wrapping and styling: the plain renderer wraps it
+    to the prose width, the app hands it to a Textual span.
+
+    The caller is responsible for not asking under ``--no-logs`` -- every branch
+    below is a claim about the filesystem, and nothing was stat'd in that mode.
+    """
+    from .logs import probe_path, recorded_paths
+
+    expected = recorded_paths(job)
+    if not expected:
+        # No StdOut/StdErr (below Slurm 24.05), no `-o` in a recorded SubmitLine
+        # (below 21.08), no path in a --comment. Nothing a post-mortem can reach
+        # knows where the output went, and slurmctld has long forgotten the job.
+        return "none found — --log-dir points at one"
+    path = expected[0]
+    state = probe_path(path)
+    if state == "discarded":
+        # Not a miss at all: the job asked for this. Naming --log-dir here offered
+        # a recovery for a file that was never written, and "moved or deleted" said
+        # something had gone wrong with a decision the submitter made on purpose.
+        # 152 of 2,675 records on pythia over three days.
+        return (
+            "discarded — this job sent its output to %s, so there is none to read. "
+            "Re-run with --output=<path> to keep it." % path
+        )
+    if state == "special":
+        return (
+            "not a regular file at %s — there is nothing to read there; --log-dir "
+            "points at a real one" % path
+        )
+    if state == "unreadable":
+        # On a shared cluster this is the common case, not the corner: 104 of the
+        # 106 foreign jobs naming a log path were unreadable rather than absent.
+        # The owner is on the record, so say who to ask.
+        whose = ("%s's" % job.user) if job.user else "its owner's"
+        return (
+            "none readable at %s — it may well be there, but %s directory is not "
+            "readable by you; ask them, or point --log-dir at a copy" % (path, whose)
+        )
+    if state == "unknown":
+        return (
+            "could not be checked at %s — the filesystem refused the question; "
+            "--log-dir points somewhere reachable" % path
+        )
+    return "none at %s — moved or deleted; --log-dir points at it" % path
+
+
 def health_dot(grade: str, ascii_mode: bool = False):
     glyphs = theme.HEALTH_GLYPH_ASCII if ascii_mode else theme.HEALTH_GLYPH
     return Text(glyphs.get(grade, glyphs["none"]), style=theme.HEALTH_COLOR.get(grade, theme.FAINT))
@@ -1601,6 +1660,28 @@ def resource_rows(
             # is that the figure is a ceiling, not that it is 2.5 GiB over one.
             "an upper bound, over the %s limit" % format_bytes(job.mem_limit_bytes),
             instead="no percentage",
+        )
+    elif job.base_state == "OUT_OF_MEMORY" and job.mem_limit_bytes:
+        # The kill is the measurement here, and it outranks the sample. An OOM job
+        # whose sampled peak sits *under* the limit is the one case where the
+        # gauge actively misleads: job 48850414 on the reporting cluster drew a
+        # 4.6% bar -- 188.6 MiB of 4.0 GiB -- on a job the kernel had just killed
+        # for exhausting that 4.0 GiB, understating by 21x with nothing on screen
+        # connecting the two. `MaxRSS` is sampled every `JobAcctGatherFrequency`
+        # seconds and a spike between polls is never recorded, so on a short job
+        # the figure is a floor; the OOM state, being event-driven, is not.
+        #
+        # No fraction is drawn for the same reason the branch above draws none:
+        # the honest value is "at least the limit", and any bar short of full
+        # would restate the number the findings are about to contradict.
+        row(
+            "MEM",
+            theme.MEM_COLOR,
+            None,
+            format_bytes(job.mem_limit_bytes),
+            "OOM kill — the peak reached this limit; MaxRSS sampled only %s"
+            % format_bytes(job.max_rss),
+            instead="limit reached",
         )
     else:
         row(

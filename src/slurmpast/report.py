@@ -51,6 +51,7 @@ from .render import (
     hours_text,
     idle_hours_note,
     job_sections,
+    log_miss_detail,
     nodes_baseline,
     nodes_correction_note,
     nodes_empty_reason,
@@ -407,26 +408,7 @@ def render_job(
         # jobs naming a log path on the reporting cluster were unreadable rather
         # than absent. The owner is on the record, so the message can say who to
         # ask instead of asserting something about a file nobody could see.
-        from .logs import probe_path, recorded_paths
-
-        expected = recorded_paths(job)
-        if not expected:
-            detail = "none found — --log-dir points at one"
-        else:
-            state = probe_path(expected[0])
-            if state == "unreadable":
-                whose = ("%s's" % job.user) if job.user else "its owner's"
-                detail = (
-                    "none readable at %s — it may well be there, but %s directory is not "
-                    "readable by you; ask them, or point --log-dir at a copy" % (expected[0], whose)
-                )
-            elif state == "unknown":
-                detail = (
-                    "could not be checked at %s — the filesystem refused the question; "
-                    "--log-dir points somewhere reachable" % expected[0]
-                )
-            else:
-                detail = "none at %s — moved or deleted; --log-dir points at it" % expected[0]
+        detail = log_miss_detail(job)
         # Wrapped: this one is a sentence built around a path, not a bare path, so
         # unlike the found case above there is nothing here that has to survive a
         # copy. It reached 122 cells at every terminal width.
@@ -527,8 +509,25 @@ def render_overview(history: History, style=None, limit=25, sort="cost", ascii_m
         kinds.append("%d unterminated" % stats["excluded_open_records"])
     if stats.get("excluded_no_elapsed"):
         kinds.append("%d with no elapsed time" % stats["excluded_no_elapsed"])
+    if stats.get("excluded_unparsed"):
+        # Worth its own words rather than folding into either count above: these
+        # are rows sacct returned that this tool could not read, which is a
+        # different thing to tell a reader than "a job we could not rate".
+        kinds.append("%d unreadable" % stats["excluded_unparsed"])
     if kinds:
         out.append(style("  %s, excluded" % " and ".join(kinds), "grey"))
+    if stats.get("unclassified"):
+        # Its own line, deliberately: these are NOT excluded. They are counted in
+        # the job total and their core-hours are in the resource sums -- the only
+        # figure they are missing from is the completion rate, and appending them
+        # to the "excluded" line above would say the opposite.
+        out.append(
+            style(
+                "  %d in no outcome state (REQUEUED and the like), so outside the "
+                "completion rate" % stats["unclassified"],
+                "grey",
+            )
+        )
 
     spec = OVERVIEW_COLUMNS
     has_gpu = any(g.gpu_hours for g in history.groups)

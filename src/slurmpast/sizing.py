@@ -36,7 +36,7 @@ from typing import NamedTuple
 from .diagnose import looks_like_noop
 from .duration import format_bytes, format_duration
 from .patterns import hung_split_note, numeric_job_id
-from .site import cpu_caveat, maxrss_caveat, partition_ceiling
+from .site import cpu_caveat, maxrss_caveat, maxrss_sampling_note, partition_ceiling
 
 # Below this many usable observations there is no distribution to reason about.
 MIN_RUNS = 3
@@ -429,6 +429,17 @@ def memory_advice(jobs) -> Advice:
     verdict = _memory_verdict(target, current)
 
     caution = maxrss_caveat() + "."
+    # The sampler's blind spot, on the surface whose whole output is "ask for
+    # less". `maxrss_caveat` words the direction MaxRSS overstates; a peak taken
+    # from one or two samples of a short run can also sit far *under* the truth,
+    # and acting on that here under-provisions a job that then OOMs. Worded from
+    # the shortest contributing run, because that is the one whose sample count
+    # is thinnest and it is the peak's provenance that is in question.
+    shortest = min((j.elapsed for j in usable if j.elapsed is not None), default=None)
+    sampling = maxrss_sampling_note(shortest)
+    if sampling:
+        caution += "  The shortest of these runs is thinly sampled, so the peak may be a "
+        caution += "floor rather than a ceiling: %s. Confirm before lowering." % sampling
     if untrustworthy:
         caution += "  %d run%s excluded: MaxRSS above the limit there, which cannot be a " % (
             len(untrustworthy),

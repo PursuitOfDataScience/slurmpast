@@ -1810,6 +1810,59 @@ class TestTheToolsDeclareWhatTheyImport:
         # And it no longer claims `dev` is enough.
         assert "what a dev install already brings in" not in source
 
+    def test_the_dev_extra_carries_the_build_backend(self):
+        """The suite builds an sdist in-process, so the backend is a test dependency.
+
+        `TestTheSdistShipsASuiteThatCanRun` calls `ProjectBuilder.build("sdist")`,
+        which imports `setuptools.build_meta` from the *current* environment rather
+        than fetching it into an isolated one. Since Python 3.12, `venv` no longer
+        seeds `setuptools`, so on a fresh venv those two tests failed with
+        `BuildBackendException` on a tree where nothing was wrong:
+
+            mercury  RHEL 9.7,  Python 3.13.15   1821 passed, 2 failed
+            pythia   RHEL 8.10, Python 3.12.14   1821 passed, 2 failed
+            midway3  conda env, Python 3.11.14   1823 passed
+
+        midway3 passed only because conda happens to seed setuptools. That is this
+        package's own portability claim -- somebody on another cluster runs the
+        shipped suite -- failing for a reason that is not about the package.
+        """
+        _, project = self._project()
+        names = set()
+        for spec in project["optional-dependencies"]["dev"]:
+            names.add(spec.split(">")[0].split("<")[0].split("=")[0].split(";")[0].strip().lower())
+        for needed in ("setuptools", "wheel", "build"):
+            assert needed in names, "%s is not in the dev extra: %s" % (needed, sorted(names))
+
+    def test_the_declared_backend_is_the_one_the_dev_extra_installs(self):
+        """The control on *which* backend, so the pin cannot drift from
+        `[build-system]`. If the project ever moves off setuptools, this fails and
+        the dev extra has to move with it rather than silently pinning a package
+        nothing uses."""
+        import pathlib
+
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # Python 3.10
+            import tomli as tomllib
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        config = tomllib.loads((root / "pyproject.toml").read_text())
+        backend = config["build-system"]["build-backend"]
+        assert backend == "setuptools.build_meta", backend
+        requires = {
+            spec.split(">")[0].split("<")[0].split("=")[0].strip().lower()
+            for spec in config["build-system"]["requires"]
+        }
+        dev = {
+            spec.split(">")[0].split("<")[0].split("=")[0].split(";")[0].strip().lower()
+            for spec in config["project"]["optional-dependencies"]["dev"]
+        }
+        assert requires <= dev, (
+            "in [build-system] requires but not installable for the suite: %s"
+            % (sorted(requires - dev),)
+        )
+
     def test_the_readme_names_the_install_step_too(self):
         """The README is where a contributor reads the regenerate command, so the
         command there has to be the one that works on a clean checkout."""
@@ -4095,6 +4148,111 @@ class TestAnUnreadableLogIsNotReportedAsDeleted:
         assert probe_path(str(tmp_path / "nope")) == "absent"
         assert probe_path(str(target)) == "found"
 
+    def test_a_discarded_log_is_not_reported_as_deleted(self, tmp_path):
+        """`/dev/null` is a character device, so `os.path.isfile` is False for it and
+        the probe folded "exists but is not a regular file" into `absent`.
+
+        The result was that the single most common way to say "I do not want this
+        output" was reported as a log that had been *moved or deleted*, with
+        `--log-dir points at it` offering a recovery that cannot exist. Measured on
+        pythia (Slurm 24.11.5) over three days: `StdOut=/dev/null` on 152 of 2,675
+        records -- 5.7%, and the fourth most common log path on the cluster.
+
+            job 182712  DEADLINE
+              log none at /dev/null - moved or deleted; --log-dir points at it
+        """
+        rendered = self._render(self._job(tmp_path, "/dev/null"))
+        assert "discarded" in rendered, rendered
+        assert "moved" not in rendered and "deleted" not in rendered, rendered
+        # And it must not offer the recovery, because there is nothing to recover.
+        assert "--log-dir points at it" not in rendered, rendered
+
+    def test_the_probe_calls_the_null_device_discarded(self, tmp_path):
+        from slurmpast.logs import probe_path
+
+        assert probe_path("/dev/null") == "discarded"
+
+    def test_the_null_device_is_named_by_intent_not_by_stat(self, tmp_path):
+        """A path is `discarded` because the submitter asked for it, so the answer
+        may not depend on the device being stattable. The control is that an
+        ordinary missing file is still `absent` -- the rule is about /dev/null, not
+        about anything unstattable."""
+        import os
+
+        from slurmpast.logs import probe_path
+
+        real = os.stat
+
+        def refuse(path, *a, **k):
+            raise OSError(5, "EIO")
+
+        os.stat = refuse
+        try:
+            assert probe_path(os.devnull) == "discarded"
+        finally:
+            os.stat = real
+        assert probe_path(str(tmp_path / "nope")) == "absent"
+
+    def test_a_path_that_exists_but_is_no_file_is_its_own_state(self, tmp_path):
+        """The other half of the same conflation, and the control on the fix's
+        scope: a directory is present, unreadable as a log, and neither `found` nor
+        `absent`. Reported without claiming it was deleted."""
+        from slurmpast.logs import probe_path
+
+        directory = tmp_path / "logs"
+        directory.mkdir()
+        assert probe_path(str(directory)) == "special"
+        rendered = self._render(self._job(tmp_path, directory))
+        assert "not a regular file" in rendered, rendered
+        assert "moved" not in rendered and "deleted" not in rendered, rendered
+
+    def test_the_dashboard_and_plain_agree_about_a_missed_log(self, tmp_path):
+        """The drift `render` exists to prevent, on the line that reports a miss.
+
+        `--plain` grew four spellings keyed on `probe_path`; the dashboard kept one
+        unconditional "none found", on a comment claiming the path was unknowable.
+        It has been knowable since Slurm 24.05 recorded `StdOut`, so on a 24.11
+        cluster the two surfaces described the same job differently.
+
+        Asserted through `render.log_miss_detail`, which is now the only copy --
+        driving the whole Textual screen here would test the app, not the rule.
+        """
+        from slurmpast import render
+
+        cases = {
+            "/dev/null": "discarded",
+            str(tmp_path / "gone.out"): "moved or deleted",
+        }
+        for path, expected in cases.items():
+            detail = render.log_miss_detail(self._job(tmp_path, path))
+            assert expected in detail, (path, detail)
+            # The sentence the plain renderer prints is this same sentence.
+            assert expected in self._render(self._job(tmp_path, path)), path
+
+    def test_the_dashboard_no_longer_hardcodes_the_sentence(self):
+        """The control on where the rule lives: `tui` must not carry a second copy,
+        which is how the two drifted in the first place."""
+        import pathlib
+
+        source = (
+            pathlib.Path(__file__).resolve().parent.parent / "src" / "slurmpast" / "tui.py"
+        ).read_text()
+        assert "render.log_miss_detail(job)" in source
+        # Over the string *literals*, via `ast`, rather than over the raw text.
+        # Anchoring the pattern on a trailing quote matched neither version, so the
+        # assertion passed against the defect it was written to catch; dropping the
+        # quote then matched the comment above the fixed line, which explains the
+        # sentence by quoting it. Only a literal can actually reach the screen.
+        import ast
+
+        literals = [
+            node.value
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        ]
+        spelled = [text for text in literals if "--log-dir points at" in text]
+        assert not spelled, "tui.py still spells the sentence itself: %s" % spelled
+
     def test_an_errno_that_is_neither_is_not_guessed_at(self, tmp_path):
         """The third state, which shipped without a test of its own.
 
@@ -4459,3 +4617,793 @@ class TestSubMegabyteFiguresCarryAUnit:
         assert format_bytes(1024**3) == "1.0 GiB"
         assert format_bytes(1024**4) == "1.0 TiB"
         assert format_bytes(None) == "n/a"
+
+
+class TestAnOomJobIsNotToldItsSampledPeakIsAnUpperBound:
+    """SP-22. `MaxRSS` is sampled every `JobAcctGatherFrequency` seconds, so on a
+    short job it is a *floor*, and an OOM kill is proof the true peak reached the
+    limit.
+
+    Reported against job 48850414 on the reporting cluster
+    (`JobAcctGatherFrequency=30`, `jobacct_gather/linux`): an 89-second job killed
+    for exhausting 4.0 GiB, and slurmpast drew
+
+        ● MEM  █░░░░░░░░░░░░░░░░░  4.6%  · 188.6 MiB of the 4.0 GiB limit
+
+    a near-empty bar understating by 21x, with nothing connecting it to the kill
+    directly beneath. Every wording this tool had about MaxRSS pointed the other
+    way -- over-report, upper bound, high-water mark -- because the sampling axis
+    was never asked about.
+
+    Note the recorded decision at `site.cpu_caveat` that
+    ``JobAcctGatherFrequency`` is "deliberately not read" is *not* reopened here:
+    that is scoped to whether the poll interval explains the **TotalCPU**
+    reparenting undercount, where the reporter's own control disproved it. This is
+    MaxRSS, a different quantity with a different mechanism.
+    """
+
+    def _job(self, state="OUT_OF_MEMORY", max_rss="193104K", elapsed="89", req="4G"):
+        return parse(
+            make_text(
+                row(
+                    JobID="48850414",
+                    JobName="boothbench2",
+                    User="youzhi",
+                    State=state,
+                    ExitCode="0:125",
+                    Submit="2026-08-24T10:00:00",
+                    Start="2026-08-24T10:00:01",
+                    End="2026-08-24T10:01:30",
+                    ElapsedRaw=elapsed,
+                    Timelimit="00:20:00",
+                    TimelimitRaw="20",
+                    NCPUS="2",
+                    AllocCPUS="2",
+                    NNodes="1",
+                    ReqMem=req,
+                    AllocTRES="billing=2,cpu=2,mem=%s,node=1" % req,
+                ),
+                row(
+                    JobID="48850414.batch",
+                    JobName="batch",
+                    State=state,
+                    ElapsedRaw=elapsed,
+                    MaxRSS=max_rss,
+                ),
+            ),
+            fields=_FIELDS,
+        )[0]
+
+    def _pin(self, monkeypatch, frequency="30", gather="jobacct_gather/linux"):
+        monkeypatch.setattr(
+            "slurmpast.site._CACHE",
+            [Site(jobacct_gather_type=gather, jobacct_gather_frequency=frequency)],
+        )
+
+    def _mem_row(self, monkeypatch, **kw):
+        """The MEM row *and* its continuation lines.
+
+        `resource_rows` moves a detail too long for the budget onto its own
+        indented line rather than clipping it, so a test reading only the row with
+        " MEM " in it would miss the sentence that carries the interpretation --
+        and would keep passing after that sentence was deleted.
+        """
+        from slurmpast.render import resource_rows
+
+        self._pin(monkeypatch)
+        rows = [r.plain for r in resource_rows(self._job(**kw), max_width=100)]
+        start = next(i for i, r in enumerate(rows) if " MEM " in r)
+        block = [rows[start]]
+        for line in rows[start + 1 :]:
+            if " TIME " in line or " CPU " in line or " MEM " in line:
+                break
+            block.append(line)
+        return "\n".join(block)
+
+    # -- the gauge ---------------------------------------------------------------
+
+    def test_the_gauge_does_not_draw_the_sampled_fraction(self, monkeypatch):
+        mem = self._mem_row(monkeypatch)
+        assert "4.6%" not in mem, mem
+        assert "limit reached" in mem, mem
+
+    def test_the_gauge_names_the_limit_as_the_figure_reached(self, monkeypatch):
+        """`"4.0 GiB" in mem` alone would pass on the unfixed row too, which prints
+        "188.6 MiB of the 4.0 GiB limit" -- so this pins the kill as the reason and
+        the sample as subordinate to it, which only the new row says."""
+        mem = self._mem_row(monkeypatch)
+        assert "OOM kill" in mem, mem
+        assert "the peak reached this limit" in mem, mem
+        assert "sampled only 188.6 MiB" in mem, mem
+
+    def test_a_completed_job_keeps_its_ordinary_gauge(self, monkeypatch):
+        """The control. The fix is about the OOM state, not about every job whose
+        MaxRSS is a small fraction of its limit -- most of those are simply
+        over-requested, which is what `memory-slack` is for."""
+        mem = self._mem_row(monkeypatch, state="COMPLETED")
+        assert "4.6%" in mem, mem
+        assert "limit reached" not in mem, mem
+
+    def test_an_oom_job_reading_above_its_limit_is_left_alone(self, monkeypatch):
+        """The other control, and the reason this fix is scoped. When the sample
+        already exceeds the limit the reader is not being told the job used little
+        memory, so the existing upper-bound row is not the misleading case."""
+        mem = self._mem_row(monkeypatch, max_rss="5G")
+        assert "an upper bound, over the" in mem, mem
+        assert "limit reached" not in mem, mem
+
+    # -- the finding -------------------------------------------------------------
+
+    def _finding(self, monkeypatch, **kw):
+        from slurmpast.diagnose import diagnose
+
+        self._pin(monkeypatch, **kw.pop("site", {}))
+        for f in diagnose(self._job(**kw)).findings:
+            if f.code == "host-oom":
+                return f
+        raise AssertionError("the finding under test did not fire")
+
+    def test_oom_job_does_not_present_maxrss_as_an_upper_bound(self, monkeypatch):
+        """The reporter's own suggested test, kept under their name."""
+        finding = self._finding(monkeypatch)
+        assert "upper bound" not in finding.evidence, finding.evidence
+        assert "floor" in finding.evidence, finding.evidence
+        assert "4.0 GiB" in finding.evidence, finding.evidence
+
+    def test_the_finding_explains_that_sampling_is_the_mechanism(self, monkeypatch):
+        finding = self._finding(monkeypatch)
+        assert "every 30s" in finding.evidence, finding.evidence
+        assert "at most 3 samples" in finding.evidence, finding.evidence
+
+    def test_a_long_oom_job_gets_the_floor_without_the_sampling_clause(self, monkeypatch):
+        """Sample count stops being the interesting fact once there are plenty of
+        them: 1,200 samples over a 10-hour job is not why the figure is low."""
+        finding = self._finding(monkeypatch, elapsed="36000")
+        assert "floor" in finding.evidence, finding.evidence
+        assert "at most" not in finding.evidence, finding.evidence
+
+    def test_an_over_limit_oom_job_keeps_the_over_report_wording(self, monkeypatch):
+        """Control for the finding, mirroring the gauge control above."""
+        finding = self._finding(monkeypatch, max_rss="5G")
+        assert "upper bound" in finding.evidence, finding.evidence
+        assert "floor" not in finding.evidence, finding.evidence
+
+
+class TestTheSamplerIntervalIsReadFromTheCluster:
+    """`JobAcctGatherFrequency` is a per-site setting and was never read."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("30", 30),
+            ("task=30,network=60", 30),
+            ("network=60,task=15", 15),
+            ("0", None),  # sampler off: not a frequency, and not a divisor
+            ("", None),
+            ("network=60", None),  # nothing gathering RSS
+            ("nonsense", None),
+        ],
+    )
+    def test_the_frequency_spelling_is_parsed(self, raw, expected):
+        assert Site(jobacct_gather_frequency=raw).sampling_seconds == expected
+
+    def test_sample_count_counts_the_first_look(self):
+        """floor(e/f) + 1: a 30s sampler over an 89s job looks at 0, 30 and 60."""
+        from slurmpast.site import sample_count
+
+        s = Site(jobacct_gather_frequency="30")
+        assert sample_count(89, s) == 3
+        assert sample_count(30, s) == 2
+        assert sample_count(0, s) == 1
+
+    def test_the_note_is_empty_when_the_cluster_cannot_say(self):
+        from slurmpast.site import maxrss_sampling_note
+
+        assert maxrss_sampling_note(89, Site()) == ""
+        assert maxrss_sampling_note(89, Site(jobacct_gather_frequency="0")) == ""
+        assert maxrss_sampling_note(None, Site(jobacct_gather_frequency="30")) == ""
+
+    def test_the_note_fires_only_while_samples_are_sparse(self):
+        from slurmpast.site import SPARSE_SAMPLE_COUNT, maxrss_sampling_note
+
+        s = Site(jobacct_gather_frequency="30")
+        assert maxrss_sampling_note(30 * (SPARSE_SAMPLE_COUNT - 1), s) != ""
+        assert maxrss_sampling_note(30 * (SPARSE_SAMPLE_COUNT + 2), s) == ""
+
+    def test_a_cgroup_cluster_samples_no_more_often(self):
+        """The cgroup plugin reads a truer number per sample, which `maxrss_caveat`
+        says. It does not read it more often, so the floor applies there too."""
+        from slurmpast.site import maxrss_sampling_note
+
+        cg = Site(jobacct_gather_type="jobacct_gather/cgroup", jobacct_gather_frequency="30")
+        assert "at most 3 samples" in maxrss_sampling_note(89, cg)
+
+    def test_the_note_folds_under_ascii(self):
+        """It carries an em dash, and `--ascii` promises one cell for one cell."""
+        from slurmpast.render import ascii_fold
+        from slurmpast.site import maxrss_sampling_note
+
+        note = maxrss_sampling_note(89, Site(jobacct_gather_frequency="30"))
+        assert "—" in note
+        folded = ascii_fold(note)
+        assert "—" not in folded and len(folded) == len(note)
+
+
+class TestShrinkAdviceAdmitsASparseSampler:
+    """SP-22's other half, on the surfaces that say "ask for less".
+
+    The OOM path is covered by
+    :class:`TestAnOomJobIsNotToldItsSampledPeakIsAnUpperBound`, where the kill
+    proves the peak. The reporter's next round supplied this case without meaning
+    to: a 20-second chain job that allocated 40 MiB recorded ``MaxRSS 2484K``, and
+    they filed it as "another instance of SP-22, not a new finding" -- right about
+    the root cause, but that job is COMPLETED, so nothing on the OOM path covers
+    it.
+
+    This is the more dangerous direction. Over-reporting inflates a number a
+    reader might leave alone; a missed spike here becomes "Try --mem=3G" against a
+    64 GiB request, and acting on it under-provisions a job that is then killed.
+    """
+
+    def _jobs(self, elapsed="20", limit="64G", rss="2097152K", runs=3):
+        rows = []
+        for i in range(runs):
+            rows.append(
+                row(
+                    JobID="90000%d" % i,
+                    JobName="bigshort",
+                    User="youzhi",
+                    Partition="build",
+                    State="COMPLETED",
+                    ExitCode="0:0",
+                    Submit="2026-08-24T22:0%d:00" % i,
+                    Start="2026-08-24T22:0%d:00" % i,
+                    End="2026-08-24T22:0%d:20" % i,
+                    ElapsedRaw=elapsed,
+                    Timelimit="01:00:00",
+                    TimelimitRaw="60",
+                    NCPUS="2",
+                    AllocCPUS="2",
+                    NNodes="1",
+                    ReqMem=limit,
+                    AllocTRES="billing=2,cpu=2,mem=%s,node=1" % limit,
+                )
+            )
+            rows.append(
+                row(
+                    JobID="90000%d.batch" % i,
+                    State="COMPLETED",
+                    ElapsedRaw=elapsed,
+                    MaxRSS=rss,
+                )
+            )
+        return parse(make_text(*rows), fields=_FIELDS)
+
+    def _pin(self, monkeypatch, frequency="30"):
+        monkeypatch.setattr(
+            "slurmpast.site._CACHE",
+            [
+                Site(
+                    jobacct_gather_type="jobacct_gather/linux",
+                    jobacct_gather_frequency=frequency,
+                )
+            ],
+        )
+
+    def _slack(self, monkeypatch, **kw):
+        from slurmpast.diagnose import diagnose
+
+        self._pin(monkeypatch, kw.pop("frequency", "30"))
+        for f in diagnose(self._jobs(**kw)[0]).findings:
+            if f.code == "memory-slack":
+                return f
+        raise AssertionError("the finding under test did not fire")
+
+    def test_the_per_job_advice_says_the_peak_may_be_a_floor(self, monkeypatch):
+        finding = self._slack(monkeypatch)
+        assert "may be a floor" in finding.action, finding.action
+        assert "at most 1 sample" in finding.action, finding.action
+
+    def test_it_still_carries_the_over_report_caveat_too(self, monkeypatch):
+        """Both directions, not one replacing the other: the process-tree sum is
+        still real, and a reader sizing --mem needs to know the figure is loose at
+        both ends."""
+        finding = self._slack(monkeypatch)
+        assert "upper bound" in finding.action, finding.action
+        assert "floor" in finding.action, finding.action
+
+    def test_a_well_sampled_run_is_not_hedged(self, monkeypatch):
+        """The control. A two-hour job has 240 samples and its peak is a
+        measurement; hedging it would make the warning worthless where it counts."""
+        finding = self._slack(monkeypatch, elapsed="7200")
+        assert "floor" not in finding.action, finding.action
+        assert "upper bound" in finding.action, finding.action
+
+    def test_a_cluster_that_cannot_say_is_not_hedged(self, monkeypatch):
+        """No JobAcctGatherFrequency, no claim about sampling."""
+        finding = self._slack(monkeypatch, frequency="")
+        assert "floor" not in finding.action, finding.action
+
+    def test_sizing_warns_before_recommending_a_lower_mem(self, monkeypatch):
+        from slurmpast.sizing import memory_advice
+
+        self._pin(monkeypatch)
+        advice = memory_advice(self._jobs())
+        assert advice.verdict == "lower", advice.verdict
+        assert "may be a floor" in advice.caution, advice.caution
+        assert "Confirm before lowering" in advice.caution, advice.caution
+
+    def test_sizing_words_it_from_the_shortest_run(self, monkeypatch):
+        """The peak's provenance is what is in question, and the thinnest sample
+        count belongs to the shortest run -- so a group holding one short run and
+        two long ones still gets the warning."""
+        from slurmpast.sizing import memory_advice
+
+        self._pin(monkeypatch)
+        jobs = list(self._jobs(elapsed="7200")) + list(self._jobs(elapsed="20", runs=1))
+        assert "may be a floor" in memory_advice(jobs).caution
+
+    def test_sizing_leaves_a_well_sampled_group_alone(self, monkeypatch):
+        from slurmpast.sizing import memory_advice
+
+        self._pin(monkeypatch)
+        advice = memory_advice(self._jobs(elapsed="7200"))
+        assert "floor" not in advice.caution, advice.caution
+
+
+class TestTheClipboardFallbackIsPrivate:
+    """SP-24. The TUI's `y`/`Y` fallback file was created with no explicit mode, so
+    its confidentiality was whatever the user's umask happened to be.
+
+    Reported from midway2, where `~/.cache/slurmpast/clip.txt` sat at `0664`
+    holding two-day-old copied rows. Reproduced identically here. The contents are
+    job names, partitions, workdirs and run counts -- not credentials, but not
+    public either -- and under `umask 002` or `umask 022`, two of the three common
+    settings, the file is world-readable. Whether that matters then depends on the
+    home directory being non-traversable, which is a site policy the tool has no
+    say in: the reporter sampled four homes on their cluster and found one at
+    `0777`.
+    """
+
+    @pytest.fixture
+    def cache(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        # The permissive umask is the point: under 077 the old code passed by
+        # accident, which is why this fixture forces the case that failed.
+        old = os.umask(0o002)
+        yield tmp_path / "slurmpast"
+        os.umask(old)
+
+    def test_clip_file_is_created_mode_600(self, cache):
+        """The reporter's own suggested test, kept under their name."""
+        from slurmpast.tui import _clip_path, _write_clip
+
+        path = _clip_path()
+        _write_clip(path, "some copied rows")
+        assert os.stat(path).st_mode & 0o777 == 0o600
+
+    def test_the_directory_is_private_too(self, cache):
+        from slurmpast.tui import _clip_path
+
+        _clip_path()
+        assert os.stat(cache).st_mode & 0o777 == 0o700
+
+    def test_an_existing_world_readable_file_is_repaired(self, cache):
+        """The upgrade case, and the one a mode-on-create fix silently misses.
+
+        `os.open`'s mode argument applies only when the file is created, so every
+        install that already has a 0664 `clip.txt` -- which is every install that
+        had the bug -- would keep it. `fchmod` is what actually closes those.
+        """
+        from slurmpast.tui import _clip_path, _write_clip
+
+        path = _clip_path()
+        with open(path, "w") as handle:
+            handle.write("stale")
+        os.chmod(path, 0o664)
+        _write_clip(path, "fresh")
+        assert os.stat(path).st_mode & 0o777 == 0o600
+
+    def test_an_existing_loose_directory_is_repaired(self, cache):
+        from slurmpast.tui import _clip_path
+
+        _clip_path()
+        os.chmod(cache, 0o775)
+        _clip_path()
+        assert os.stat(cache).st_mode & 0o777 == 0o700
+
+    def test_the_file_does_not_outlive_the_app(self, cache):
+        from slurmpast.tui import _clip_path, _discard_clip, _write_clip
+
+        path = _clip_path()
+        _write_clip(path, "rows")
+        assert os.path.exists(path)
+        _discard_clip()
+        assert not os.path.exists(path)
+
+    def test_discarding_a_file_that_is_not_there_is_not_an_error(self, cache):
+        """`run`'s `finally` fires whether or not anything was ever copied."""
+        from slurmpast.tui import _discard_clip
+
+        _discard_clip()
+        _discard_clip()
+
+    def test_the_contents_still_survive_a_non_utf8_environment(self, cache):
+        """The control for the rewrite. The old code carried an explicit UTF-8
+        encoding with a comment explaining why -- what gets copied always contains
+        `●` and box drawing, and on a Python whose preferred encoding resolves to
+        ASCII this raised `UnicodeEncodeError`, a `ValueError` the caller's
+        `OSError` handler would not have caught. Switching to `os.open` must not
+        quietly drop that.
+        """
+        from slurmpast.tui import _clip_path, _write_clip
+
+        path = _clip_path()
+        _write_clip(path, "● MEM  ░░░  · 4.0 GiB — copied")
+        with open(path, encoding="utf-8") as handle:
+            assert "●" in handle.read()
+
+    def test_a_trailing_newline_is_added_once(self, cache):
+        from slurmpast.tui import _clip_path, _write_clip
+
+        path = _clip_path()
+        _write_clip(path, "no newline")
+        with open(path, encoding="utf-8") as handle:
+            assert handle.read() == "no newline\n"
+        _write_clip(path, "has newline\n")
+        with open(path, encoding="utf-8") as handle:
+            assert handle.read() == "has newline\n"
+
+    def test_a_shorter_copy_does_not_leave_the_old_tail_behind(self, cache):
+        """O_TRUNC. Without it a long copy followed by a short one leaves the
+        remainder of the first on disk, which is both wrong and a longer-lived
+        disclosure than the copy the user actually made."""
+        from slurmpast.tui import _clip_path, _write_clip
+
+        path = _clip_path()
+        _write_clip(path, "x" * 500)
+        _write_clip(path, "short")
+        with open(path, encoding="utf-8") as handle:
+            assert handle.read() == "short\n"
+
+    # -- wiring, not just the helper ------------------------------------------
+    #
+    # The three tests above exercised `_discard_clip` directly and all passed with
+    # the call removed from `run`, which is this suite's recurring failure: a unit
+    # test for a function that never proves the function is reached.
+
+    def _fake_app(self, monkeypatch, on_run):
+        from slurmpast import tui
+
+        class FakeApp:
+            load_error = None
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def run(self, **kwargs):
+                on_run()
+
+        monkeypatch.setattr(tui, "SlurmpastApp", FakeApp)
+        return tui
+
+    def test_run_discards_the_file_when_the_app_exits(self, cache, monkeypatch):
+        seen = {}
+
+        def on_run():
+            from slurmpast.tui import _clip_path, _write_clip
+
+            path = _clip_path()
+            _write_clip(path, "copied during the session")
+            seen["path"] = path
+
+        tui = self._fake_app(monkeypatch, on_run)
+        tui.run(lambda since=None: None, window="last 7 days")
+        assert not os.path.exists(seen["path"]), "the copy buffer outlived the app"
+
+    def test_run_discards_the_file_even_when_the_app_raises(self, cache, monkeypatch):
+        """`finally`, not a line after `app.run()`. An exception out of the UI is
+        exactly when a leftover file is least likely to be noticed."""
+        seen = {}
+
+        def on_run():
+            from slurmpast.tui import _clip_path, _write_clip
+
+            path = _clip_path()
+            _write_clip(path, "copied before the crash")
+            seen["path"] = path
+            raise RuntimeError("boom")
+
+        tui = self._fake_app(monkeypatch, on_run)
+        with pytest.raises(RuntimeError):
+            tui.run(lambda since=None: None, window="last 7 days")
+        assert not os.path.exists(seen["path"])
+
+    # -- the keypress path, not just the writer ---------------------------------
+
+    def _chrome(self):
+        """A `ScreenChrome` with its app stubbed.
+
+        `_deliver` is what `y` and `Y` call, and it is the only link between the
+        keypress and `_write_clip`. Driving it through a Textual pilot does not
+        reach here -- the copy actions return early on an unfocused table -- so
+        the integration is pinned directly rather than left to a smoke test that
+        silently exercises nothing.
+        """
+        from slurmpast.tui import ScreenChrome
+
+        class StubApp:
+            def __init__(self):
+                self.messages = []
+
+            def copy_to_clipboard(self, text):
+                self.copied = text
+
+            def notify(self, message, **kwargs):
+                self.messages.append(message)
+
+        # A throwaway subclass, NEVER `type(chrome).sp = ...`. Assigning the
+        # property onto ScreenChrome itself mutates the class every TUI screen
+        # inherits from, for the rest of the session: doing that here took 209
+        # unrelated tests down with it.
+        class Chrome(ScreenChrome):
+            def __init__(self):
+                self._stub = StubApp()
+
+            @property
+            def sp(self):
+                return self._stub
+
+        return Chrome()
+
+    def test_the_copy_action_writes_the_file_private(self, cache):
+        chrome = self._chrome()
+        chrome._deliver("● MEM  rows to copy", "row")
+        path = cache / "clip.txt"
+        assert path.exists(), "the copy action should have written the fallback"
+        assert os.stat(path).st_mode & 0o777 == 0o600
+
+    def test_the_copy_action_still_reports_where_it_wrote(self, cache):
+        """The notification names the path, and a rewrite of the write path must
+        not silently turn that into the 'could not write' branch."""
+        chrome = self._chrome()
+        chrome._deliver("rows", "view")
+        assert any("also written to" in m for m in chrome.sp.messages), chrome.sp.messages
+
+    def test_an_unwritable_location_is_reported_not_raised(self, cache, monkeypatch):
+        """The control on the error branch. `_write_clip` raises OSError where the
+        old inline `open` did, and `y` must not throw out of a UI action."""
+        monkeypatch.setattr("slurmpast.tui._write_clip", self._boom)
+        chrome = self._chrome()
+        chrome._deliver("rows", "row")
+        assert chrome.sp.messages
+        assert not any("also written to" in m for m in chrome.sp.messages), chrome.sp.messages
+
+    @staticmethod
+    def _boom(path, text):
+        raise OSError("read-only file system")
+
+
+class TestAnUnreadableRowIsNotARunningJob:
+    """SP-25. `open_ended` was inferred from a missing `End` alone, so a row the
+    parser could not read -- no state, no name, no fields -- was reported to the
+    user as an unterminated job.
+
+    Measured on the reporting cluster: `137 unterminated, excluded` against 0
+    jobs running and 0 records lacking an `End`. Every one of the 137 had
+    `state == ""` and a shell fragment where its job id should be.
+
+    `patterns.goodput` already documents two buckets and why they are separate:
+    *"an unterminated record has an Elapsed measured to \\*now\\*, while a closed
+    record with no Elapsed at all was simply never accounted. Counting both as
+    'unterminated' made the report state something false about the second kind."*
+    This is the third kind, and it landed in the first bucket -- producing exactly
+    the false statement that comment exists to prevent.
+    """
+
+    def _job(self, **kw):
+        return parse(make_text(row(**kw)), fields=_FIELDS)[0]
+
+    def test_a_row_with_no_state_is_not_open_ended(self):
+        assert self._job(JobID="12345", State="", End="").open_ended is False
+
+    def test_a_running_job_still_is(self):
+        assert self._job(JobID="12346", State="RUNNING", End="").open_ended is True
+
+    def test_a_pending_job_still_is(self):
+        """The control that rejects the reported fix as written.
+
+        The suggestion was `elapsed is not None and end is None`, but a queued job
+        has neither an elapsed nor an end and is genuinely open -- and the
+        throttled-array meta-record (`900_[3-6]`) depends on being counted here,
+        which is the behaviour SP-1's round pinned. Requiring a *state* keeps
+        PENDING while still rejecting the stateless row.
+        """
+        assert self._job(JobID="12347", State="PENDING", End="").open_ended is True
+
+    def test_a_completed_job_is_not(self):
+        job = self._job(
+            JobID="12348", State="COMPLETED", End="2026-08-25T01:00:00", ElapsedRaw="60"
+        )
+        assert job.open_ended is False
+
+    def test_a_cancelled_job_with_no_end_is_not_open(self):
+        """Terminal states were already excluded and must stay excluded: the
+        `bool(state)` guard is an extra condition, not a replacement."""
+        assert self._job(JobID="12349", State="CANCELLED by 1000", End="").open_ended is False
+
+
+class TestUnreadableRowsAreCountedSeparately:
+    """The accounting half of SP-25: `excluded_no_elapsed` read 0 while 137 rows
+    went unaccounted, because they were absorbed by `excluded_open_records`."""
+
+    def _stats(self):
+        from slurmpast.patterns import goodput
+
+        jobs = parse(
+            make_text(
+                row(JobID="12345", State="", End=""),
+                row(JobID="12346", State="RUNNING", End=""),
+                row(
+                    JobID="12348",
+                    State="COMPLETED",
+                    ExitCode="0:0",
+                    End="2026-08-25T01:00:00",
+                    ElapsedRaw="60",
+                    NCPUS="1",
+                    AllocCPUS="1",
+                    NNodes="1",
+                ),
+            ),
+            fields=_FIELDS,
+        )
+        return goodput(jobs), jobs
+
+    def test_the_unreadable_row_lands_in_its_own_bucket(self):
+        stats, _ = self._stats()
+        assert stats["excluded_unparsed"] == 1
+        assert stats["excluded_open_records"] == 1, "the RUNNING job, and only it"
+
+    def test_every_row_is_accounted_for(self):
+        """The property that actually matters: no row may vanish. Three in, and
+        the four buckets must sum to three with none counted twice."""
+        stats, jobs = self._stats()
+        total = (
+            stats["jobs"]
+            + stats["excluded_open_records"]
+            + stats["excluded_unparsed"]
+            + stats["excluded_no_elapsed"]
+        )
+        assert total == len(jobs) == 3
+        assert stats["excluded_no_elapsed"] >= 0, "the residual must not go negative"
+
+    def test_the_reader_is_told_rather_than_the_row_dropped_silently(self):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_overview
+
+        _, jobs = self._stats()
+        # History computes its own stats from the same jobs, so this exercises the
+        # real path rather than a hand-built dict that could drift from it.
+        text = render_overview(History(jobs, window="last 7 days"), style=Style(enabled=False))
+        assert "1 unreadable" in text, text
+        assert "1 unterminated" in text, text
+
+
+class TestEveryRatedJobLandsInABucket:
+    """SP-26. `completed` / `cancelled` / `failed` are not exhaustive over Slurm's
+    state list, so a `REQUEUED` record was counted in `jobs`, classified nowhere,
+    and silently deflated `completion_rate`.
+
+    Measured on the reporting cluster: user mariaace over 30 days,
+    `1434 + 100 + 283 = 1817` against `jobs = 1820`, the three missing records
+    being that user's three REQUEUED jobs. Independent of SP-1 -- these are
+    well-formed records.
+
+    Only one test in this suite touched `completion_rate` before this, and only
+    its `None` case, which is why the denominator could be wrong for as long as it
+    was.
+    """
+
+    def _stats(self, *states):
+        from slurmpast.patterns import goodput
+
+        rows = []
+        for n, state in enumerate(states):
+            rows.append(
+                row(
+                    JobID=str(9000 + n),
+                    JobName="w",
+                    User="u",
+                    Partition="p",
+                    State=state,
+                    ExitCode="0:0",
+                    Submit="2026-08-25T00:00:00",
+                    Start="2026-08-25T00:59:00",
+                    End="2026-08-25T01:00:00",
+                    ElapsedRaw="60",
+                    NCPUS="1",
+                    AllocCPUS="1",
+                    NNodes="1",
+                )
+            )
+        return goodput(parse(make_text(*rows), fields=_FIELDS))
+
+    def test_state_buckets_sum_to_the_total(self):
+        """The reporter's own suggested test, and the property that matters: no
+        rated record may fall through every bucket."""
+        stats = self._stats("COMPLETED", "CANCELLED", "FAILED", "REQUEUED")
+        total = stats["completed"] + stats["failed"] + stats["cancelled"] + stats["unclassified"]
+        assert total == stats["jobs"] == 4
+
+    def test_a_requeued_job_is_not_counted_as_a_failure(self):
+        stats = self._stats("COMPLETED", "REQUEUED")
+        assert stats["unclassified"] == 1
+        assert stats["failed"] == 0, "REQUEUED has not failed; it has not finished"
+
+    def test_the_rate_is_over_the_classified_population(self):
+        stats = self._stats("COMPLETED", "FAILED", "CANCELLED", "REQUEUED")
+        assert stats["completion_rate"] == pytest.approx(1 / 3)
+
+    def test_the_rate_is_unchanged_where_nothing_is_unclassified(self):
+        """The control. This fix must not move the number on the overwhelming
+        majority of histories, which contain no such state at all."""
+        stats = self._stats("COMPLETED", "COMPLETED", "FAILED", "CANCELLED")
+        assert stats["unclassified"] == 0
+        assert stats["completion_rate"] == pytest.approx(0.5)
+
+    def test_the_resource_totals_still_include_it(self):
+        """`jobs` and the core-hours are deliberately left alone: a requeued run
+        consumed real time, and dropping it from the resource sums would trade one
+        wrong number for another."""
+        with_requeue = self._stats("COMPLETED", "REQUEUED")
+        without = self._stats("COMPLETED")
+        assert with_requeue["jobs"] == 2
+        assert with_requeue["core_hours_total"] > without["core_hours_total"]
+
+    def test_an_unfamiliar_state_is_caught_the_first_time_it_appears(self):
+        """Why an `else` and not a `_NOT_YET_DECIDED` tuple. A state this codebase
+        has never seen must land in the bucket without anyone extending a list."""
+        stats = self._stats("COMPLETED", "SOME_FUTURE_SLURM_STATE")
+        assert stats["unclassified"] == 1
+        assert stats["completed"] + stats["failed"] + stats["cancelled"] + 1 == stats["jobs"]
+
+    def test_node_fail_is_still_a_failure(self):
+        """The control that keeps the bucket narrow. The reported round checked
+        this too: NODE_FAIL was already handled and must not drift into the new
+        bucket."""
+        stats = self._stats("NODE_FAIL", "COMPLETED")
+        assert stats["failed"] == 1
+        assert stats["unclassified"] == 0
+
+    def test_the_reader_is_told_and_not_on_the_excluded_line(self):
+        """These are counted in `jobs` and their core-hours are in the totals, so
+        saying "excluded" about them would be false."""
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_overview
+
+        rows = []
+        for n, state in enumerate(("COMPLETED", "REQUEUED")):
+            rows.append(
+                row(
+                    JobID=str(9100 + n),
+                    JobName="w",
+                    User="u",
+                    Partition="p",
+                    State=state,
+                    ExitCode="0:0",
+                    Submit="2026-08-25T00:00:00",
+                    Start="2026-08-25T00:59:00",
+                    End="2026-08-25T01:00:00",
+                    ElapsedRaw="60",
+                    NCPUS="1",
+                    AllocCPUS="1",
+                    NNodes="1",
+                )
+            )
+        history = History(parse(make_text(*rows), fields=_FIELDS), window="last 7 days")
+        text = render_overview(history, style=Style(enabled=False))
+        assert "outside the completion rate" in text, text
+        line = next(
+            row_text for row_text in text.splitlines() if "outside the completion rate" in row_text
+        )
+        assert "excluded" not in line, line

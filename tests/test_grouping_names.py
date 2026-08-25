@@ -299,3 +299,106 @@ class TestTheColumnsReconcile:
         head = text.split("#    JOB NAME")[0].strip().splitlines()
         body = [ln for ln in head if ln.strip() and not set(ln.strip()) <= {"-"}]
         assert len(body) <= 4, body
+
+
+class TestEverySurfaceCallsAWorkloadTheSameThing:
+    """The label rule reached the overview table but not the cross-run findings.
+
+    `GroupStats.label` shows a group's one real job name instead of the fold, on
+    the stated grounds that ``#`` "hides the one name it is standing in for and
+    invents a family that does not exist". The findings in `patterns` named their
+    groups `key[0]` -- the raw fold -- so one report said both things about one
+    workload. Measured on pythia (Slurm 24.11.5), a two-day cluster-wide window:
+
+        overview   m110_robustness_current_source_20260823_c9ea44e_v1   20 runs
+        patterns   20 of 20 runs of m#_robustness_current_source_#_c#ea#e_v# failed
+
+    Both surfaces now read the rule from :func:`patterns.workload_label`.
+
+    Every name here carries digits on purpose. The suite already had tests for the
+    table's half of this rule, and they passed throughout, because their fixtures
+    are named `cot-exp` and `rc-tok-github_code` -- no digits, so the fold is the
+    identity and a surface printing the fold is indistinguishable from one
+    printing the name.
+    """
+
+    def _series(self, job, names, state="TIMEOUT"):
+        return [
+            job._replace(job_id=str(48000000 + i), name=name, state=state)
+            for i, name in enumerate(names)
+        ]
+
+    def test_workload_label_prefers_the_one_real_name(self, healthy_job):
+        from slurmpast.patterns import workload_label
+
+        jobs = self._series(healthy_job, ["m110_robust_20260823_v1"] * 6)
+        assert workload_label("m#_robust_#_v#", jobs) == "m110_robust_20260823_v1"
+
+    def test_workload_label_keeps_the_fold_for_a_real_family(self, healthy_job):
+        """The control. Two names *are* a family, and the fold is what names it."""
+        from slurmpast.patterns import workload_label
+
+        jobs = self._series(healthy_job, ["m110_robust_20260823_v1", "m110_robust_20260824_v1"])
+        assert workload_label("m#_robust_#_v#", jobs) == "m#_robust_#_v#"
+
+    def test_workload_label_does_not_depend_on_member_order(self, healthy_job):
+        """`GroupStats.jobs` is sorted newest-first; the lists in `patterns` are
+        not sorted at all, so the shared rule may not read position 0."""
+        from slurmpast.patterns import workload_label
+
+        jobs = self._series(healthy_job, ["run_2026_a7"] * 4)
+        assert workload_label("run_#_a#", list(reversed(jobs))) == "run_2026_a7"
+
+    def test_the_repeat_failure_finding_uses_the_name_not_the_fold(self, healthy_job):
+        from slurmpast.patterns import find_repeat_failures
+
+        jobs = self._series(healthy_job, ["m110_robust_20260823_v1"] * 8)
+        findings = find_repeat_failures(jobs)
+        assert findings, "8 identical timeouts should be a repeat-failure group"
+        evidence = " ".join(f.evidence for f in findings)
+        assert "m110_robust_20260823_v1" in evidence, evidence
+        assert "m#_robust_#_v#" not in evidence, evidence
+
+    def test_the_repeat_failure_finding_still_folds_a_real_family(self, healthy_job):
+        """The control on the fix, not on the bug: with two names the fold is
+        right, and a fix that always substituted a real name would be wrong here."""
+        from slurmpast.patterns import find_repeat_failures
+
+        names = ["m110_robust_20260823_v1"] * 4 + ["m110_robust_20260824_v1"] * 4
+        findings = find_repeat_failures(self._series(healthy_job, names))
+        assert findings
+        evidence = " ".join(f.evidence for f in findings)
+        assert "m#_robust_#_v#" in evidence, evidence
+
+    def test_the_overview_and_the_patterns_section_agree(self, healthy_job):
+        """The property that matters, stated over the rendered surfaces rather than
+        the helper: one workload, one name, whatever is reading it.
+
+        Both renderers are called, because `render_overview` draws only the table
+        -- the cross-run section is `render_patterns`, and the CLI composes the
+        two. Asserting over the overview alone made this test pass with the defect
+        still in place, which is the failure mode this suite keeps producing.
+        """
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_overview, render_patterns
+
+        history = History(self._series(healthy_job, ["m110_robust_20260823_v1"] * 8))
+        plain = Style(enabled=False)
+        table = render_overview(history, style=plain)
+        patterns = render_patterns(history, style=plain)
+        assert "cross-run patterns" in patterns, "the finding has to be on screen to be named"
+        for surface, text in (("overview", table), ("patterns", patterns)):
+            assert "m110_robust_20260823_v1" in text, (surface, text)
+            assert "m#_robust_#_v#" not in text, (surface, text)
+
+    def test_the_memory_search_finding_uses_the_name_too(self, oom_series):
+        """The third and fourth `key[0]` sites, on the OOM path. Renamed onto a
+        digit-bearing single name, because `rc-tok-github_code` cannot show this."""
+        from slurmpast.patterns import find_memory_search
+
+        renamed = [j._replace(name="tok110_shard7") for j in oom_series]
+        findings = find_memory_search(renamed)
+        assert findings, "the bisection series should still be found"
+        evidence = " ".join(f.evidence for f in findings)
+        assert "tok110_shard7" in evidence, evidence
+        assert "tok#_shard#" not in evidence, evidence

@@ -29,11 +29,10 @@ from .patterns import (
     find_memory_search,
     find_repeat_failures,
     find_requeues,
-    fold_erased_the_name,
     goodput,
     group_key,
-    newest_name,
     usable,
+    workload_label,
 )
 
 # Core-hours one GPU-hour is worth when ranking mixed workloads. See
@@ -106,26 +105,7 @@ class GroupStats(NamedTuple):
         called -- they take the rule from one place, `patterns`, for the reason
         `render` exists.
         """
-        if self.distinct_names == 1 and self.jobs:
-            return self.jobs[0].name or self.name
-        if fold_erased_the_name(self.name):
-            real = newest_name(self.jobs)
-            if not real:
-                return self.name
-            # `+N` when the fold covers more than one raw name, because this
-            # substitution is the one case where showing a real name is a claim
-            # the row cannot support. `#` was uninformative but honest: it was
-            # visibly a fold. `20260822` on a row that also holds `20260821`'s run
-            # is specific, real and wrong, and `RUNS 2` then reads as two runs of
-            # one workload rather than one run each of two.
-            #
-            # `distinct_names` was kept off the table in an earlier round as
-            # clutter beside the name, and that judgement stands for the ordinary
-            # row -- which is why this is not the count, and appears only where
-            # the fold erased the name *and* the group holds more than one. On
-            # every other row nothing changes.
-            return "%s +%d" % (real, self.distinct_names - 1) if self.distinct_names > 1 else real
-        return self.name
+        return workload_label(self.name, self.jobs)
 
     @property
     def failure_rate(self) -> float | None:
