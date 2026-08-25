@@ -325,6 +325,38 @@ class TestWhoTheQueryIsAbout:
         # this line is the only thing telling the reader whose window came back.
         assert "no jobs for alice" in message
 
+    def test_the_partition_filter_is_named_when_it_is_why(self):
+        """`--failed` was named and `-p` was not, so a partition name that does not
+        exist at this site was reported as an empty *window*.
+
+        The one argument that never survives being carried between clusters:
+        midway3 has `caslake`, mercury `standard`, pythia `standard_hopper`.
+        Measured on mercury, where the window it called empty held 18 jobs:
+
+            $ slurmpast -p nonexistent_xyz -S now-30days --plain
+            slurmpast: no jobs for youzhi since now-30days
+        """
+        _, message = self._scope("-p", "nonexistent_xyz")
+        assert "--partition nonexistent_xyz" in message, message
+
+    def test_both_narrowing_filters_are_named_together(self):
+        _, message = self._scope("--failed", "-p", "gpu")
+        assert "--failed" in message and "--partition gpu" in message, message
+
+    def test_the_end_of_the_window_is_named_when_given(self):
+        """`-E` is half the window, and naming only `-S` described a query nobody
+        ran."""
+        _, message = self._scope("-S", "2019-01-01", "-E", "2019-01-02")
+        assert "since 2019-01-01" in message and "until 2019-01-02" in message, message
+
+    def test_an_unnarrowed_query_says_nothing_extra(self):
+        """The control. With no filter to blame, the message stays the sentence it
+        was -- no dangling "matching", no invented `--until`."""
+        _, message = self._scope("-u", "alice")
+        assert "matching" not in message, message
+        assert "until" not in message, message
+        assert message.startswith("no jobs for alice since "), message
+
     def test_a_list_of_users_is_handed_to_sacct_whole(self):
         kwargs, _ = self._scope("-u", "alice,bob")
         assert kwargs["user"] == "alice,bob"

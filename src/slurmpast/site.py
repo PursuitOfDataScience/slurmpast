@@ -33,6 +33,7 @@ class Site(NamedTuple):
     jobacct_gather_type: str = ""
     accounting_storage_type: str = ""
     tres: tuple = ()
+    jobacct_gather_frequency: str = ""
 
     @property
     def known(self) -> bool:
@@ -49,6 +50,38 @@ class Site(NamedTuple):
         if not self.jobacct_gather_type:
             return None
         return "cgroup" in self.jobacct_gather_type
+
+    @property
+    def sampling_seconds(self) -> int | None:
+        """How often the accounting sampler looks, in seconds, or None.
+
+        ``JobAcctGatherFrequency`` is either a bare integer or a per-type list --
+        ``30``, or ``task=30,network=60``. Only ``task`` gathers RSS, so that is
+        the one that decides whether a memory peak could have been missed; a bare
+        integer applies to every type and therefore to ``task`` as well.
+
+        ``0`` means the sampler is off entirely (Slurm gathers only at task exit),
+        which is not a frequency and is returned as None -- a caller asking "how
+        many samples fit in this job" gets no answer rather than a division by
+        zero.
+        """
+        raw = (self.jobacct_gather_frequency or "").strip()
+        if not raw:
+            return None
+        if "=" not in raw:
+            candidate = raw
+        else:
+            candidate = ""
+            for part in raw.split(","):
+                name, sep, value = part.partition("=")
+                if sep and name.strip().lower() == "task":
+                    candidate = value.strip()
+                    break
+        try:
+            seconds = int(candidate)
+        except ValueError:
+            return None
+        return seconds if seconds > 0 else None
 
     @property
     def tracks_gpu(self) -> bool | None:
@@ -98,6 +131,7 @@ def _parse_config(text):
         jobacct_gather_type=values.get("jobacctgathertype", ""),
         accounting_storage_type=values.get("accountingstoragetype", ""),
         tres=tuple(t.strip() for t in tres.split(",") if t.strip()),
+        jobacct_gather_frequency=values.get("jobacctgatherfrequency", ""),
     )
 
 
@@ -150,6 +184,75 @@ def maxrss_caveat(known_site=None):
     return (
         "MaxRSS sums RSS across the process tree under %s, double-counting shared "
         "pages, so treat it as an upper bound" % current.jobacct_gather_type
+    )
+
+
+# Below this many samples the peak is a coin flip rather than a measurement. The
+# reporter suggested 3-5; 5 is the generous end, chosen because the cost of the
+# note is one clause and the cost of omitting it is a reader sizing --mem from a
+# figure that never saw the spike.
+SPARSE_SAMPLE_COUNT = 5
+
+
+def sample_count(elapsed_seconds, known_site=None):
+    """How many times the accounting sampler could have looked at a job, or None.
+
+    A sampler firing every ``f`` seconds over an ``e``-second job gets one look at
+    the start and one per interval after, so ``floor(e / f) + 1`` -- 3 for the
+    89-second job that prompted this, not 2. It is an upper bound on the looks:
+    Slurm does not promise the first sample lands at t=0.
+    """
+    current = known_site if known_site is not None else site()
+    interval = current.sampling_seconds
+    if interval is None or elapsed_seconds is None:
+        return None
+    try:
+        elapsed = float(elapsed_seconds)
+    except (TypeError, ValueError):
+        return None
+    if elapsed < 0:
+        return None
+    return int(elapsed // interval) + 1
+
+
+def maxrss_sampling_note(elapsed_seconds, known_site=None):
+    """The clause saying MaxRSS is also a *floor*, when too few samples were taken.
+
+    :func:`maxrss_caveat` words the direction MaxRSS overstates -- a sum over the
+    process tree double-counts shared pages. This is the other direction, and the
+    two are not symmetric. Over-counting inflates a figure that is still an
+    observation; a missed sample means the figure is unrelated to the peak, and
+    the reader has no way to tell from the number itself.
+
+    Reported against a real ``OUT_OF_MEMORY`` job on a cluster with
+    ``JobAcctGatherFrequency=30``: an 89-second job, at most three samples, and a
+    sampled peak of 188.6 MiB against the 4.0 GiB limit the kernel killed it for
+    reaching -- the figure understating by 21x while every sentence around it
+    pointed the other way.
+
+    Empty when the interval is unknown, when the sampler is off, or when the job
+    ran long enough for the sample count to stop being the interesting fact --
+    saying "this is a sample" about a 10-hour job with 1,200 of them is noise.
+
+    Applies to both gather plugins. ``jobacct_gather/cgroup`` reads a truer number
+    per sample, which is what :func:`maxrss_caveat` says; it does not read it any
+    more often.
+    """
+    current = known_site if known_site is not None else site()
+    samples = sample_count(elapsed_seconds, current)
+    if samples is None or samples > SPARSE_SAMPLE_COUNT:
+        return ""
+    # No article before the figures: "a 89s job" and "an 89s job" are both wrong
+    # for some interval, and the numbers read fine without one.
+    return (
+        "the sampler runs every %ds and the job ran %ds, so at most %d sample%s \u2014 "
+        "a spike between polls is not recorded"
+        % (
+            current.sampling_seconds,
+            int(float(elapsed_seconds)),
+            samples,
+            "" if samples == 1 else "s",
+        )
     )
 
 

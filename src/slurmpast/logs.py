@@ -39,6 +39,7 @@ is worse than no log, because it invents a cause.
 import os
 import re
 import shlex
+import stat
 
 # Ordered most- to least-specific. ``{jid}`` is the base job id.
 _PATTERNS = (
@@ -289,8 +290,21 @@ def candidate_paths(job, extra_dirs=None):
     return out
 
 
+def _is_null_device(path):
+    """Whether ``path`` names the null device -- the idiom for throwing output away.
+
+    Compared as a path rather than by ``os.path.samefile``, because the question is
+    what the submitter *asked for*: ``--output=/dev/null`` is a statement of intent
+    that survives the device being unstattable, and `samefile` needs two successful
+    stats to answer at all. ``os.devnull`` rather than the literal, since that is
+    the name the stdlib gives this concept.
+    """
+    return os.path.normpath(path or "") == os.path.normpath(os.devnull)
+
+
 def probe_path(path):
-    """``"found"``, ``"absent"``, ``"unreadable"`` or ``"unknown"`` for one path.
+    """``"found"``, ``"absent"``, ``"discarded"``, ``"special"``, ``"unreadable"``
+    or ``"unknown"`` for one path.
 
     `os.path.isfile` answers False for ENOENT and EACCES alike -- it swallows the
     `OSError` -- so a caller holding only that boolean can say a file is missing
@@ -305,9 +319,25 @@ def probe_path(path):
     findings elsewhere in this family -- a failed call's own explanation discarded
     and the gap filled with a guess -- so this returns the distinction rather than
     a boolean and lets the caller word it.
+
+    ``discarded`` and ``special`` exist because the final line used to fold "exists
+    but is not a regular file" into ``absent``, and ``/dev/null`` is a character
+    device: ``os.path.isfile`` is False for it, so the single most common way to
+    say "I do not want this output" was reported as a log that had been *moved or
+    deleted*, with ``--log-dir points at it`` offering a recovery that cannot
+    exist. Measured on pythia over three days, ``StdOut=/dev/null`` on 152 of 2,675
+    records -- 5.7%, and the fourth most common log path on the cluster.
+
+    That is the same error this function was written to stop making one branch up:
+    a stat that succeeded is not a stat that found a file, just as a stat that
+    failed is not a stat that found nothing.
     """
+    # Before the stat, not after: the intent is in the path, and a site where
+    # /dev/null is missing or unstattable should still not be told its log moved.
+    if _is_null_device(path):
+        return "discarded"
     try:
-        os.stat(path)
+        info = os.stat(path)
     except FileNotFoundError:
         return "absent"
     except NotADirectoryError:
@@ -317,7 +347,11 @@ def probe_path(path):
         return "unreadable"
     except OSError:
         return "unknown"
-    return "found" if os.path.isfile(path) else "absent"
+    if stat.S_ISREG(info.st_mode):
+        return "found"
+    # A directory, a fifo, another device. Rare next to /dev/null, but it is
+    # present and unreadable-as-a-log, which is neither "found" nor "absent".
+    return "special"
 
 
 def find_log(job, extra_dirs=None, exists=os.path.isfile):

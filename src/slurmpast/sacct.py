@@ -821,8 +821,19 @@ def parse(text, fields=None, delimiter="|", stats=None):
             std_out=get(row, "StdOut"),
             std_err=get(row, "StdErr"),
             submit_line=get(row, "SubmitLine"),
-            open_ended=(not end_raw)
-            and (state.split()[0] if state else "") not in _TERMINAL_STATES,
+            # A *state* is required, not merely a missing End. Without the
+            # `bool(state)` guard an empty state is "not terminal", so any row the
+            # parser could not make sense of -- no state, no name, no fields --
+            # was reported to the reader as an unterminated job. Measured on the
+            # reporting cluster: "137 unterminated, excluded" against 0 running
+            # and 0 records lacking an End, every one of the 137 a shell fragment
+            # with `state == ""`.
+            #
+            # PENDING is why the test is emptiness rather than the reporter's
+            # suggested `elapsed is not None and end is None`: a queued job has
+            # neither an elapsed nor an end and is still genuinely open, and the
+            # throttled-array meta-record depends on being counted here.
+            open_ended=bool(state) and (not end_raw) and state.split()[0] not in _TERMINAL_STATES,
         )
         key = (raw_id, get(row, "Submit"))
         allocations[key] = job

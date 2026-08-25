@@ -380,12 +380,28 @@ def _load(args, sacct):
         # Name the scope. A site with `PrivateData=jobs` answers `-u alice` with an
         # empty set and no error, so "no jobs for alice" is the only thing telling
         # the reader they got someone else's window and not their own.
+        # Every filter that could be responsible, not just `--failed`. A partition
+        # name is the one argument that reliably does not survive being carried to
+        # another cluster -- midway3 has `caslake`, mercury `standard`, pythia
+        # `standard_hopper` -- so `-p` holding a name this site has never heard of
+        # is the ordinary way to reach here, and reporting it as "no jobs since
+        # now-30days" states something false about the window. Measured on mercury:
+        # `-p nonexistent_xyz -S now-30days` said exactly that, with 18 jobs in the
+        # window.
+        narrowed = []
+        if args.failed:
+            narrowed.append("--failed")
+        if args.partition:
+            narrowed.append("--partition %s" % args.partition)
         raise SacctError(
-            "no jobs for %s since %s%s"
+            "no jobs for %s since %s%s%s"
             % (
                 "any user" if all_users else user,
                 args.since,
-                " matching --failed" if args.failed else "",
+                # The window is two-sided whenever `-E` is given, and naming only
+                # its start described a query nobody ran.
+                " until %s" % args.until if args.until else "",
+                " matching %s" % " and ".join(narrowed) if narrowed else "",
             )
         )
     return _mark_open_records(jobs, runner=runner, user=user, all_users=all_users)
