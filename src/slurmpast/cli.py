@@ -11,6 +11,7 @@ import contextlib
 import copy
 import json
 import re
+import signal
 import sys
 
 from . import report
@@ -20,8 +21,15 @@ from .duration import humanize_window
 from .index import History, filter_jobs, sort_groups
 from .logs import assign_logs, read_tail
 from .model import severity_rank
-from .nodes import Workload, note_for_allocation
-from .sacct import Sacct, SacctError, controller_log_paths, current_user, live_job_ids
+from .nodes import Workload, expand_nodelist, note_for_allocation
+from .sacct import (
+    Sacct,
+    SacctError,
+    controller_log_paths,
+    current_user,
+    live_job_ids,
+    merge_live_metrics,
+)
 
 EPILOG = """\
 examples:
@@ -357,7 +365,10 @@ def _load(args, sacct):
         # record -- and then reconciled it against `squeue --me`, which has never
         # heard of their job, so a live job of theirs read as a stale record. Same
         # latent inconsistency round four fixed one level down in `live_job_ids`.
-        return _mark_open_records(jobs, runner=runner, user=args.user, all_users=all_users)
+        return merge_live_metrics(
+            _mark_open_records(jobs, runner=runner, user=args.user, all_users=all_users),
+            runner=runner,
+        )
 
     user = None if all_users else (args.user or current_user())
     # DEADLINE alongside the rest: `Job.failed` counts it, so leaving it out here
@@ -404,7 +415,13 @@ def _load(args, sacct):
                 " matching %s" % " and ".join(narrowed) if narrowed else "",
             )
         )
-    return _mark_open_records(jobs, runner=runner, user=user, all_users=all_users)
+    # One `sstat` call, and only when some job is still going: `sacct` has not
+    # flushed those, and every memory or CPU figure read from them is a
+    # measurement of a different step. See `sacct.read_live_metrics`.
+    return merge_live_metrics(
+        _mark_open_records(jobs, runner=runner, user=user, all_users=all_users),
+        runner=runner,
+    )
 
 
 def _with_controller_paths(targets, args):
@@ -457,14 +474,76 @@ def _logs_for_all(targets, args):
 
 
 def _node_note(job, history):
-    if history is None or len(history) <= 20:
+    if history is None:
         return ""
-    # The whole allocation, not just its first node -- see note_for_allocation.
+    # The whole allocation, not just its first node -- see note_for_allocation,
+    # which also holds the MIN_HISTORY floor this used to spell for itself.
     # The job's OWN workload, user included: `history` may span users under
     # `-u alice,bob` or `--all-users`, and a bare name pools whoever shares it.
     return note_for_allocation(
         history.usable_jobs, job.node_list, workload=Workload(job.name, job.user)
     )
+
+
+def _node_history(args, sacct, history, targets):
+    """The population a node note is computed from: the window, on every branch.
+
+    A node's reliability is a property of the WINDOW, not of the job asked about.
+    Everywhere except `-j` that was already true -- `history` there is the whole
+    query. On the explicit-id branch `_load` returns only the records asked for,
+    so `slurmpast <one id>` computed the note from a history of one, where no node
+    can reach `nodes.MIN_SAMPLES` and the answer is always "". The dashboard, which
+    holds the window whichever screen is open, drew the sentence from the same
+    function for the same id:
+
+        $ slurmpast 53363721_35 --plain --no-logs -S now-30days   # before
+          (no node finding)
+        dashboard JobScreen(53363721_35), same 30-day window:
+          INFO  Node has a history with your jobs
+                midway3-0250 failed 32 of 33 placements there (97.0%, 95% CI
+                84.7-99.5%) against 1.0% on every other node for caai-p10b_scan.
+
+    Same `note_for_allocation`, same wording, different `jobs` argument -- which
+    is the drift `render.py` exists to prevent, arriving through the one door it
+    cannot watch: not what the sentence says but whether it is reached at all. The
+    reader of `--plain` was told nothing about a node that had failed 32 of their
+    33 runs there.
+
+    **Widened, rather than lowering the floor.** Deleting the `len(history) > 20`
+    gate fixes nothing: measured on this cluster, a one-record history yields ``''``
+    with the gate gone, because `node_table` drops every node under MIN_SAMPLES and
+    one placement is one. The population was the defect; the gate was downstream of
+    it.
+
+    **The job's own record still comes from `sacct -j`**, so `-j` keeps ignoring
+    the window for the post-mortem itself and an id older than `-S` still reports.
+    Only the comparison population is taken from the window -- and it is taken
+    through `_load`, so `-p`, `-u`, `--all-users` and `--failed` narrow it exactly
+    as they narrow the dashboard's. Agreeing with the other surface is the point;
+    a second, differently-filtered population would just be new drift.
+
+    Cost, measured rather than assumed (90-day history, 50,604 sacct rows):
+    `sacct` for the default `now-7days` window is 0.26 s against the 0.20 s the id
+    query already costs, and `-S now-30days` is 9.3 s for 13,075 rows -- the same
+    query every other mode of the tool already runs for that window. So it is
+    loaded lazily and once: nothing is queried unless some target job actually has
+    an allocation to say something about, and an empty or failing window leaves the
+    note "" rather than turning a post-mortem into an error.
+    """
+    if not args.job_ids:
+        return history  # already the window
+    if not any(expand_nodelist(job.node_list) for job in targets):
+        return None
+    scoped = copy.copy(args)
+    scoped.job_ids = []
+    try:
+        return History(_load(scoped, sacct), window=history.window)
+    except SacctError:
+        # No jobs in the window is a reason to stay silent, not to fail: the
+        # record the reader asked about was found, and that is what they asked
+        # for. `_load` raises here for an empty window, a `-p` this site has
+        # never heard of, and a `PrivateData=jobs` refusal alike.
+        return None
 
 
 def _parse_warnings(sacct):
@@ -564,6 +643,13 @@ def _job_json(job, log_path, verdict, no_logs=False):
             "exit_code": job.exit_code,
             "signal": job.signal,
             "derived_exit_code": job.derived_exit_code,
+            # The signal half of `DerivedExitCode`, published because it is the
+            # half that carries the finding: a job whose steps were killed is
+            # `0:9`, so `derived_exit_code` alone is 0 on every one of them and a
+            # consumer reading only that number cannot tell it from a clean run.
+            # Not recoverable from `steps` either -- the roll-up is the job row's
+            # own field and survives a step purge that empties that array.
+            "derived_signal": job.derived_signal,
             "reason": job.reason,
             "failed": job.failed,
             "completed": job.completed,
@@ -690,9 +776,49 @@ def _job_json(job, log_path, verdict, no_logs=False):
             # MaxRSS sums RSS across the process tree and can exceed the cgroup
             # limit; when it does, it is not a working set and must not be used
             # to size --mem.
-            "peak_trustworthy": not (
-                job.mem_limit_bytes and job.max_rss and job.max_rss > job.mem_limit_bytes
+            #
+            # A running job is the second way this can be false, and it used to
+            # read `true` on a figure that was 0.5% of the truth: `sacct` had not
+            # flushed the live steps and the peak came from a 1-second monitoring
+            # step. Now the figure comes from `sstat` where that is available --
+            # and either way a job that is still going has not reached its peak,
+            # so nothing here may call the reading final.
+            "peak_trustworthy": bool(
+                not job.in_progress
+                and not (job.mem_limit_bytes and job.max_rss and job.max_rss > job.mem_limit_bytes)
             ),
+            # Why, rather than only whether: three states, and only one of them
+            # asks the reader to go and look elsewhere.
+            # A fourth state, because three collapsed two different facts into
+            # one word. `sstat` is owner-only, so for another user's running job
+            # the live figure is not late -- it is unavailable to this reader,
+            # permanently. Under --all-users that is the majority of live rows.
+            "peak_source": (
+                None
+                if job.max_rss is None
+                else "sstat (live)"
+                if job.peak_is_live_reading
+                else "sacct (final)"
+                if not job.in_progress
+                else "sacct (unflushed, sstat is owner-only)"
+                if job.peak_unmeasurable_by_permission
+                else "sacct (unflushed)"
+            ),
+            # `peak_source` names where a figure came FROM, so it is null when
+            # there is no figure -- which for a running job is the ordinary case,
+            # since its live steps carry no flushed MaxRSS. That left the reader a
+            # null with no account of itself, so the reason is its own field
+            # rather than an overload of the other one.
+            "peak_unavailable_reason": (
+                None
+                if job.max_rss is not None
+                else "foreign_owner_sstat_is_owner_only"
+                if job.peak_unmeasurable_by_permission
+                else "in_progress_unflushed"
+                if job.in_progress
+                else "not_gathered"
+            ),
+            "job_in_progress": job.in_progress,
         },
         "filesystem": {
             "read_bytes": job.read_bytes,
@@ -850,6 +976,43 @@ def _make_output_encode_safe():
 
 
 def main(argv=None) -> int:
+    """Entry point.
+
+    A thin wrapper for one reason: Ctrl-C is a normal way to stop this, so it is
+    reported as one. Without it a SIGINT during the `sacct` query escaped as a
+    `KeyboardInterrupt` traceback out of `subprocess.communicate`'s selector poll
+    -- and this tool is the likeliest of the family to be interrupted, because its
+    query timeout is 300 s by design (an accounting database can genuinely take
+    minutes) where its siblings bound a live-controller call at 30-45 s. Five
+    minutes of silence is exactly when a user reaches for Ctrl-C.
+
+    130 is the shell's convention for "terminated by SIGINT", so a wrapper script
+    can tell a cancellation from a failure.
+
+    SIGPIPE gets the same treatment for the same reason. `slurmpast --json | jq`
+    and `slurmpast --plain | head` are how a long report actually gets read, and
+    Python's default disposition turns that into noise: it ignores SIGPIPE, so
+    the write raises, the interpreter flushes a closed stdout at shutdown and
+    prints "Exception ignored in: <_io.TextIOWrapper name='<stdout>'>
+    BrokenPipeError: [Errno 32] Broken pipe" *after* the output the reader
+    wanted -- then exits 120, which is neither a convention nor a decision.
+    Restoring the default makes this behave like every other Unix filter and
+    like the rest of the family: nodetop restores it the same way, rapidu and
+    slurmwatch catch the error and exit 0. This was the one tool of the four
+    with no handling at all.
+    """
+    if hasattr(signal, "SIGPIPE"):  # POSIX only; Windows has no SIGPIPE
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    try:
+        return _main(argv)
+    except KeyboardInterrupt:
+        # A newline first: the ^C is echoed at the cursor, so without it the next
+        # shell prompt lands mid-line.
+        sys.stderr.write("\n")
+        return 130
+
+
+def _main(argv=None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(_glue_negative_values(raw))
@@ -858,6 +1021,19 @@ def main(argv=None) -> int:
         # output is scoped to something the reader did not ask for, and nothing on
         # screen says which of the two flags was ignored.
         parser.error("--all-users and -u/--user ask for different things; pick one")
+    # The same argument, for the spelling a shell produces by accident. `-u ''`
+    # was accepted and fell through to the current user, so output identical to
+    # passing no `-u` at all -- and a script doing `-u "$WHO"` with `WHO` unset
+    # reported the caller's OWN history under someone else's name, confidently and
+    # at rc=0. That is the failure the line above exists to prevent, arriving by a
+    # different route: the report is scoped to something the reader did not ask
+    # for and nothing on screen says so.
+    for flag, value in (("-u/--user", args.user), ("-p/--partition", args.partition)):
+        if value is not None and not str(value).strip():
+            parser.error(
+                '%s was given an empty value; drop the flag to mean "yours" '
+                "(or --all-users for everyone), or check the variable you passed" % flag
+            )
     args.since = normalize_time_spec(args.since)
     args.until = normalize_time_spec(args.until)
     if args.demo:
@@ -871,6 +1047,24 @@ def main(argv=None) -> int:
         # machine-dependent again, which is the exact thing DEMO_SITE was added to
         # stop: the demo has to render the same on a login node and a laptop.
         args.no_logs = True
+
+    # After the `--demo` assignment above, so `--demo --log-dir X` is covered by
+    # the same line: either way `--log-dir` was asked for and will not be used.
+    #
+    # A warning rather than an error, matching how the sibling package words this
+    # exact shape ("--append has no effect without --log; ignoring"): `--no-logs`
+    # is an unambiguous off switch, so there is a clear winner and nothing to pick
+    # between. And not silent, unlike the `--plain` degrade below: that one is
+    # silent because `--plain` carries the same information, so the fallback did
+    # what was wanted -- here a request for extra search directories is simply
+    # dropped, which is not what was wanted at all.
+    if args.no_logs and args.log_dir:
+        why = "--demo" if args.demo else "--no-logs"
+        sys.stderr.write(
+            "slurmpast: --log-dir has no effect with %s (no logs are read); "
+            "ignoring %s\n" % (why, ", ".join(args.log_dir))
+        )
+
     style = report.Style(enabled=False if args.no_color else None)
     sacct = Sacct()
 
@@ -1138,6 +1332,10 @@ def main(argv=None) -> int:
     # `render_list`'s "... N more"); on this branch no renderer ever does, because
     # a post-mortem block has nowhere to put such a line.
     targets = matches if args.job_ids else matches[: args.limit]
+    # The node note's population, decided once for both renderings below --
+    # see `_node_history`. On the `-j` branch this is a second `sacct` query;
+    # everywhere else it is `history` itself and costs nothing.
+    node_history = _node_history(args, sacct, history, targets)
 
     if args.json:
         payload = []
@@ -1145,7 +1343,7 @@ def main(argv=None) -> int:
         json_critical = False
         for job in targets:
             log_path, log_text, _inferred = resolved[job.job_id]
-            verdict = diagnose(job, log_text=log_text, node_note=_node_note(job, history))
+            verdict = diagnose(job, log_text=log_text, node_note=_node_note(job, node_history))
             payload.append(_job_json(job, log_path, verdict, no_logs=args.no_logs))
             json_critical |= any(f.severity == "critical" for f in verdict.findings)
         body = {
@@ -1202,7 +1400,7 @@ def main(argv=None) -> int:
                 job,
                 log_path=log_path,
                 log_text=log_text,
-                node_note=_node_note(job, history),
+                node_note=_node_note(job, node_history),
                 style=style,
                 show_steps=args.steps,
                 ascii_mode=args.ascii,
@@ -1233,7 +1431,7 @@ def main(argv=None) -> int:
         strict_jobs = args.strict and any(
             f.severity == "critical"
             for job in targets
-            for f in diagnose(job, node_note=_node_note(job, history)).findings
+            for f in diagnose(job, node_note=_node_note(job, node_history)).findings
         )
         worst_critical = strict_jobs or any(f.severity == "critical" for f in history.patterns)
 

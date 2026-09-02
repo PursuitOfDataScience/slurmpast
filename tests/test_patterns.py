@@ -764,3 +764,91 @@ class TestAWorkloadThatKeepsBeingRequeued:
         """
         stale = self._jobs(4, 10, earlier_state="RUNNING", earlier_end="")
         assert find_requeues(stale) == []
+
+
+class TestTheDominantFailureStateDoesNotDependOnRowOrder:
+    """One workload, one history, two verdicts in one session.
+
+    `find_repeat_failures` picked the dominant failure state with
+    ``max(states.items(), key=lambda kv: kv[1])`` -- count only. A tie therefore
+    fell to dict insertion order, i.e. to the order the records arrived in, and
+    `index` hands this function the SAME group in two different orders:
+    `History.patterns` passes `self.jobs`, which is sacct order, while
+    `History.group_patterns` passes `GroupStats.jobs`, which `build_groups` sorted
+    newest-first. Three TIMEOUT and three FAILED runs of one workload were read as
+    TIMEOUT on the cross-run panel and FAILED on that workload's own screen -- and
+    the two states choose different advice, "raise --time" against "stop
+    resubmitting, the failure is deterministic".
+
+    `find_requeues`, three functions below, has always broken its tie on the state
+    name. This is the same rule, in the same module, applied to the same shape of
+    dict.
+    """
+
+    @staticmethod
+    def _rows(states):
+        rows = []
+        for offset, state in enumerate(states):
+            day = "2026-06-%02d" % (offset + 1)
+            job_id = str(100 + offset)
+            rows.append(
+                row(
+                    JobID=job_id,
+                    JobName="trainer",
+                    User="youzhi",
+                    Partition="test",
+                    State=state,
+                    ExitCode="1:0",
+                    Submit="%sT01:00:00" % day,
+                    Start="%sT01:00:01" % day,
+                    End="%sT01:30:01" % day,
+                    Elapsed="00:30:00",
+                    ElapsedRaw="1800",
+                    Timelimit="00:30:00",
+                    ReqCPUS="1",
+                    AllocTRES="cpu=1,mem=8G,node=1",
+                    NodeList="n1",
+                    NTasks="1",
+                    TotalCPU="20:00",
+                )
+            )
+        return parse(make_text(*rows))
+
+    def _tied(self):
+        return self._rows(["TIMEOUT"] * 3 + ["FAILED"] * 3)
+
+    def test_the_same_state_whichever_order_the_rows_arrive_in(self):
+        jobs = self._tied()
+        forward = find(find_repeat_failures(jobs), "repeat-failure")
+        reverse = find(find_repeat_failures(list(reversed(jobs))), "repeat-failure")
+        assert forward.evidence == reverse.evidence, (forward.evidence, reverse.evidence)
+        assert forward.action == reverse.action, (forward.action, reverse.action)
+
+    def test_the_two_screens_agree_about_one_workload(self):
+        """End to end, through the two call sites that disagreed."""
+        from slurmpast.index import History
+
+        history = History(self._tied())
+        panel = find(history.patterns, "repeat-failure")
+        drilled = find(history.group_patterns(history.groups[0]), "repeat-failure")
+        assert panel.evidence == drilled.evidence, (panel.evidence, drilled.evidence)
+        assert panel.action == drilled.action, (panel.action, drilled.action)
+        assert panel.severity == drilled.severity
+
+    def test_a_real_majority_still_wins(self):
+        """The control. A deterministic tie-break must not become a tie-break that
+        ignores the counts: five TIMEOUT against one FAILED is not a tie, and
+        FAILED sorts first alphabetically, so a rule that had quietly stopped
+        reading `kv[1]` would answer FAILED here."""
+        jobs = self._rows(["TIMEOUT"] * 5 + ["FAILED"])
+        finding = find(find_repeat_failures(jobs), "repeat-failure")
+        assert "5 were TIMEOUT" in finding.evidence, finding.evidence
+        assert "Raise --time" in finding.action, finding.action
+
+    def test_the_majority_still_wins_from_the_other_side(self):
+        """Second control, with the alphabetically-later state in the minority, so
+        neither half of the key can be dropped without failing one of the two."""
+        jobs = self._rows(["FAILED"] * 5 + ["TIMEOUT"])
+        finding = find(find_repeat_failures(jobs), "repeat-failure")
+        assert "5 were FAILED" in finding.evidence, finding.evidence
+        assert "Stop resubmitting" in finding.action, finding.action

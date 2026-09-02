@@ -807,3 +807,202 @@ class TestDiskTotalsSumTheStepsThatMovedTheData:
         `total_cpu` uses when no work step recorded a figure."""
         job = self._pipeline(steps=0, extern_gib=2)
         assert job.read_bytes == 2 * self.GIB
+
+
+class TestTaskImbalanceIsMeasuredInsideOneStep:
+    """`rss_task_imbalance` is a per-task claim, so both halves must come from
+    the same step. Transcribed from job 52853137 on midway3, whose `.extern`
+    step reports ``MaxRSS 10487884K`` against ``AveRSS 18607848K`` -- an average
+    1.8x the peak it is supposed to sit under -- while the only step that ran
+    more than one task holds 6496K against a 3166K mean over 4 tasks.
+    """
+
+    def _job(self, **over):
+        steps = [
+            row(
+                JobID="52853137",
+                JobName="amd_reserve",
+                State="CANCELLED by 940740146",
+                ExitCode="0:0",
+                Start="2026-07-31T14:37:02",
+                End="2026-08-03T16:19:00",
+                ElapsedRaw="265918",
+                AllocTRES="billing=6,cpu=6,mem=50G,node=1",
+                AllocCPUS="6",
+                NCPUS="6",
+                NNodes="1",
+                NTasks="4",
+                NodeList="midway3-0455",
+            ),
+            row(
+                JobID="52853137.batch",
+                State="CANCELLED",
+                NTasks="1",
+                MaxRSS="3952K",
+                AveRSS="3952K",
+                MaxRSSNode="midway3-0455",
+            ),
+            row(
+                JobID="52853137.extern",
+                State="COMPLETED",
+                NTasks="1",
+                MaxRSS=over.get("extern_max", "10487884K"),
+                AveRSS=over.get("extern_ave", "18607848K"),
+                MaxRSSNode="midway3-0455",
+            ),
+        ]
+        if over.get("multitask", True):
+            steps.append(
+                row(
+                    JobID="52853137.2",
+                    State="COMPLETED",
+                    NTasks="4",
+                    MaxRSS="6496K",
+                    AveRSS="3166K",
+                    MaxRSSNode="midway3-0455",
+                )
+            )
+        return parse("\n".join(steps))[0]
+
+    def test_the_extern_peak_no_longer_divides_a_work_steps_average(self):
+        """Was 190.7x: `.extern`'s 10.0 GiB over the work average of 3166K, two
+        populations. The step that actually had four tasks reports 2.05x."""
+        job = self._job()
+        assert job.max_rss == 10487884 * 1024, "the peak on screen is still extern's"
+        assert job.ave_rss == 3952 * 1024, "and the average is still the work steps'"
+        assert job.rss_task_imbalance == pytest.approx(6496 / 3166.0, abs=0.01)
+        assert job.rss_task_imbalance < 3.0, "not 190.7"
+
+    def test_the_finding_quotes_only_the_ratio_it_measured(self):
+        """The evidence used to name the job-level peak and average, which is the
+        pair the ratio is no longer built from."""
+        finding = find(self._job(), "task-memory-imbalance")
+        assert finding is not None
+        assert "2.1x" in finding.evidence
+        assert "10.0 GiB" not in finding.evidence
+        assert "53.7 MiB" not in finding.evidence
+
+    def test_no_multitask_step_means_no_imbalance_claim(self):
+        """The control with teeth. Every remaining step holds MaxRSS == AveRSS --
+        Slurm's shape for a single task -- so there is no evidence of one task
+        holding more than its peers, and the old ratio said 2651x."""
+        job = self._job(multitask=False)
+        assert job.rss_task_imbalance == pytest.approx(1.0)
+        assert "task-memory-imbalance" not in codes(job)
+
+    def test_a_genuine_single_step_imbalance_is_unchanged(self):
+        """The other control: the case the property exists for must report the
+        same figure it always did. One step, four tasks, 1000000K against a
+        250000K mean."""
+        job = build(
+            batch={"MaxRSS": "1000000K", "AveRSS": "250000K", "NTasks": "4"}, alloc={"NTasks": "4"}
+        )
+        assert job.rss_task_imbalance == pytest.approx(4.0)
+        assert "task-memory-imbalance" in codes(job)
+
+
+class TestTheSignalHalfOfDerivedExitCode:
+    """``DerivedExitCode`` is ``code:signal`` and only the code was kept.
+
+    `sacct.py` read the field as ``derived_code, _ = _parse_exit(...)``, so the
+    signal half was discarded at extraction and `render.job_sections`' "worst step
+    exit" gate -- ``derived_exit_code not in (None, job.exit_code)`` -- compared 0
+    against 0 and drew nothing. This is the same defect one field over from round
+    forty-four's: slurmdbd spells a signalled step with a **zero** code, so any
+    rule reading the number before the colon is blind to it.
+
+    Measured. Job 51554217 on this cluster::
+
+        $ sacct -j 51554217 -P -o JobID,State,ExitCode,DerivedExitCode
+        JobID|State|ExitCode|DerivedExitCode
+        51554217|COMPLETED|0:0|0:9
+        51554217.batch|COMPLETED|0:0|
+        ...
+        51554217.10|CANCELLED by 940740146|0:9|
+        ...
+        51554217.14|CANCELLED by 940740146|0:9|
+
+    -- a job reporting success with two of its 17 steps killed by SIGKILL, and
+    the whole report on it was `outcome`-less. 118 parent rows in a 90-day window
+    here carry that exact ``COMPLETED|0:0|0:9`` shape, array elements among them,
+    plus 38 ``CANCELLED``, 5 ``TIMEOUT``, 2 ``OUT_OF_MEMORY`` and 2 ``FAILED|1:0``.
+
+    The `FAILED|1:0|0:9` shape is the worse half: there the row *did* draw, as a
+    bare ``0`` beside ``exit code 1`` -- reading as "the worst step exited
+    cleanly" about a step that was killed.
+
+    `render.job_sections` is the only site tested for the surface because it is
+    the only site that draws it: the dashboard's detail pane and `--plain` both
+    read this function, which is why the fix is not in either of them.
+    """
+
+    @staticmethod
+    def _rows(job):
+        from slurmpast.render import job_sections
+
+        return {label: value for _title, block in job_sections(job) for label, value, _bar in block}
+
+    def test_the_signal_half_is_kept(self):
+        """Both halves off the wire, in the shape sacct actually writes."""
+        job = build(alloc={"State": "COMPLETED", "ExitCode": "0:0", "DerivedExitCode": "0:9"})
+        assert (job.exit_code, job.signal) == (0, 0)
+        assert (job.derived_exit_code, job.derived_signal) == (0, 9)
+
+    def test_a_signalled_step_under_a_completed_job_reaches_the_table(self):
+        """The defect itself. The job says COMPLETED at 0:0 and something inside it
+        was SIGKILLed; before this the reader saw no `outcome` section at all."""
+        job = build(alloc={"State": "COMPLETED", "ExitCode": "0:0", "DerivedExitCode": "0:9"})
+        assert self._rows(job).get("worst step exit") == "0 (signal 9)"
+
+    def test_the_row_names_the_signal_beside_a_nonzero_status(self):
+        """Job 52428481's shape, `FAILED|1:0|0:9`: the row drew a bare ``0``, which
+        is not an absent claim but a wrong one."""
+        job = build(alloc={"State": "FAILED", "ExitCode": "1:0", "DerivedExitCode": "0:9"})
+        rows = self._rows(job)
+        assert rows.get("exit code") == "1"
+        assert rows.get("worst step exit") == "0 (signal 9)", rows
+
+    def test_the_machine_surface_publishes_the_signal_half(self):
+        """`--json`'s promise is "if the tool read it, this emits it", and
+        `derived_exit_code` alone is 0 on every one of these jobs. Not recoverable
+        from `steps` either: the roll-up is the job row's own field and outlives a
+        step purge that empties that array."""
+        from slurmpast.cli import _job_json
+
+        job = build(alloc={"State": "COMPLETED", "ExitCode": "0:0", "DerivedExitCode": "0:9"})
+        outcome = _job_json(job, None, diagnose(job))["outcome"]
+        assert outcome["derived_exit_code"] == 0
+        assert outcome["derived_signal"] == 9
+
+    def test_a_roll_up_that_repeats_the_job_draws_no_row(self):
+        """CONTROL. The direction this could have been written wrong: the row is
+        not "print the field whenever it is there". A clean job whose steps were
+        also clean has nothing to add to the header line, and ``worst step exit 0``
+        on a COMPLETED run is the same noise round forty-four removed from the
+        `exit code` row."""
+        job = build(alloc={"State": "COMPLETED", "ExitCode": "0:0", "DerivedExitCode": "0:0"})
+        assert "worst step exit" not in self._rows(job)
+
+    def test_a_nonzero_derived_code_still_reads_as_the_bare_number(self):
+        """CONTROL. `derived_exit_code`'s meaning is unchanged -- the shape the
+        pre-existing `test_derived_exit_code` pins, held to its rendered form too,
+        so widening the gate cannot quietly restyle the case it already covered."""
+        job = build(alloc={"State": "FAILED", "ExitCode": "0:0", "DerivedExitCode": "2:0"})
+        assert job.derived_exit_code == 2
+        assert self._rows(job).get("worst step exit") == "2"
+
+    def test_an_unrecorded_roll_up_draws_no_row(self):
+        """CONTROL. Slurm leaves `DerivedExitCode` empty on every step row and on
+        clusters that never wrote it, and ``None`` must not become a printed
+        ``signal None`` or a row at all."""
+        job = build()
+        assert (job.derived_exit_code, job.derived_signal) == (None, None)
+        assert "worst step exit" not in self._rows(job)
+
+    def test_the_jobs_own_exit_code_row_is_unchanged(self):
+        """CONTROL for the shared formatter. Both rows now go through one function,
+        so round forty-four's wording has to survive it: every OUT_OF_MEMORY job is
+        ``0:125``, and 125 is not a signal -- it is Slurm's OOM marker in the
+        signal half -- but the row reads the same as it did before."""
+        job = build(alloc={"State": "OUT_OF_MEMORY", "ExitCode": "0:125"})
+        assert self._rows(job).get("exit code") == "0 (signal 125)"

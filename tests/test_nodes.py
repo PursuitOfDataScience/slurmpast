@@ -4,6 +4,7 @@ import pytest
 
 from slurmpast.nodes import (
     _bh_reject,
+    _informative,
     compress_nodelist,
     dominant_workload,
     excluded_tail,
@@ -407,11 +408,16 @@ class TestOneTestPerNodeIsStillManyTests:
             table = node_table(jobs, workload="w")
             if table["held_back"]:
                 found = True
+                # Against `baseline`, the rate the screens actually print. This
+                # recomputed the count off each row's leave-one-out `comparison`
+                # instead -- the same wrong reference the implementation used, so
+                # the assertion held whatever either did. See
+                # TestHeldBackIsCountedAgainstTheBaselineTheScreenPrints.
                 clears = [
                     r
                     for r in table["rows"]
                     if r["verdict"] == "inconclusive"
-                    and (r["ci_low"] > r["comparison"] or r["ci_high"] < r["comparison"])
+                    and (r["ci_low"] > table["baseline"] or r["ci_high"] < table["baseline"])
                 ]
                 assert len(clears) == table["held_back"]
                 break
@@ -1113,3 +1119,360 @@ class TestADegenerateBaselineIsNamedRatherThanBlamedOnSampleSize:
 
         said = nodes_empty_reason(self._table(0.0, 40), "failure", "t#")
         assert "nothing to attribute to a node" in said, said
+
+
+class TestAnOutOfMemoryKillIsNotTheNodesDoing:
+    """The failure metric counted `OUT_OF_MEMORY` against the node, and that put a
+    healthy machine into a paste-ready `#SBATCH --exclude=`.
+
+    Slurm records OUT_OF_MEMORY when the job's cgroup passed the memory *the job
+    asked for*. That limit is a property of `--mem`, and every node that honours
+    the request enforces the same number, so the outcome says nothing about which
+    node ran it. Unlike a cancellation -- which `_informative` already censors as
+    "ambiguous" -- this one was in the *numerator*.
+
+    The module's own docstring names the class of confound ("most of that is 51
+    `cot-exp` timeouts, i.e. a code bug, not the node") and offers the workload
+    control as the answer. The control cannot reach this one, because one array's
+    elements do not all need the same memory. Reproduced on a real 90-day history:
+    `caai-p10b_scan` requested `mem=6G` for all 142 elements of array 53363721 and
+    71 died OUT_OF_MEMORY across ten different nodes, so `--nodes` printed
+
+        midway3-0250             32/33    97.0%       84.7 - 99.5% worse
+        midway3-0187             14/21    66.7%       45.4 - 82.8% worse
+        #SBATCH --exclude=midway3-[0187,0250]
+
+    while `scontrol show node` gives midway3-0187 and midway3-0200 identical
+    hardware -- 48 CPUs and 184320 MB each -- and midway3-0200 went 0/16 on the
+    same workload. All 14 of midway3-0187's "failures" were OOM.
+    """
+
+    WORKLOAD = "caai-p10b_scan"
+
+    @staticmethod
+    def _runs(node, name, counter, **states):
+        """Placements on one node. States are spelled as `sacct` writes them."""
+        from slurmpast.model import Job
+
+        out = []
+        for state, count in states.items():
+            for _ in range(count):
+                counter[0] += 1
+                out.append(
+                    Job(
+                        job_id="53363721_%d" % counter[0],
+                        name=name,
+                        node_list=node,
+                        elapsed=600.0,
+                        timelimit=3600.0,
+                        state=state.upper(),
+                    )
+                )
+        return out
+
+    def _history(self):
+        """The real shape of `caai-p10b_scan`, node by node."""
+        counter = [0]
+        jobs = []
+        for node, states in (
+            ("midway3-0187", {"out_of_memory": 14, "completed": 7}),
+            ("midway3-0200", {"completed": 16}),
+            ("midway3-0250", {"failed": 32, "completed": 1}),
+            ("midway3-0376", {"out_of_memory": 17, "completed": 47}),
+            ("midway3-0330", {"out_of_memory": 7, "failed": 2, "completed": 36}),
+        ):
+            jobs += self._runs(node, self.WORKLOAD, counter, **states)
+        return jobs
+
+    def test_a_node_whose_every_failure_was_oom_is_not_offered_to_exclude(self):
+        """The defect. midway3-0187 was `14/21, 66.7%, worse` and on the exclude
+        line; censoring leaves it 0 of 7 informative placements, i.e. below
+        MIN_SAMPLES, which is what this module already says it wants to answer
+        when the informative sample really is that small."""
+        table = node_table(self._history(), workload=self.WORKLOAD, metric="failure")
+        assert "midway3-0187" not in suggest_exclude(table)
+        assert "midway3-0187" not in [r["node"] for r in table["rows"]]
+        # And nothing else took its place on the line. Asserted here rather than
+        # in the control below, because "one node, not two" is the defect --
+        # a control has to hold in both states and this one cannot.
+        assert suggest_exclude(table) == ["midway3-0250"]
+
+    def test_the_node_that_really_failed_is_still_named(self):
+        """The control, and the point of the fix: it narrows the claim without
+        costing the signal. midway3-0250's 32 failures are FAILED rows, so it
+        scores worse, sorts first, and stays on the exclude line -- before and
+        after. Only what is *also* on that line moves."""
+        table = node_table(self._history(), workload=self.WORKLOAD, metric="failure")
+        assert "midway3-0250" in suggest_exclude(table)
+        worst = table["rows"][0]
+        assert worst["node"] == "midway3-0250"
+        assert worst["verdict"] == "worse"
+        assert worst["bad"] == 32
+
+    def test_the_hang_metric_keeps_them_because_there_they_are_informative(self):
+        """The other control, unchanged in both states. A job that got far enough
+        to be killed for its memory is evidence the node did NOT hang, so for the
+        hang metric the placement counts -- all 179 of them."""
+        table = node_table(self._history(), workload=self.WORKLOAD, metric="hang")
+        assert table["trials"] == 179
+
+    def test_a_timeout_is_still_the_nodes_business(self):
+        """The control that keeps the fix from over-reaching. A wall-clock kill
+        really can be the machine -- a wedged mount, a stuck GPU -- and it is the
+        metric this module was built on, so TIMEOUT stays in the failure rate."""
+        from slurmpast.nodes import _informative
+
+        counter = [0]
+        timed_out = self._runs("midway3-0385", self.WORKLOAD, counter, timeout=1)[0]
+        assert _informative(timed_out, "failure") is True
+
+
+class TestTheWorkloadChosenMustBeOneTheTableCanTest:
+    """`dominant_workload` ranked workloads by raw `_bad` count while `node_table`
+    tested only the informative placements, so it could pick a stratum whose every
+    failure the table then censors -- the exact "eight rows of nothing" its own
+    docstring was written to prevent.
+
+    Reachable on a real 90-day history, in 92 distinct `-S`/`-E` windows. The
+    largest case: `rd-r7-recon` has 16 failures in 33 runs and every one is
+    OUT_OF_MEMORY, so over `-S 2026-08-10 -E 2026-08-14` it outranked
+    `nemotron-api`'s 12 genuine FAILED rows, won the selection, and arrived at the
+    table with `tested_nodes=0, hits=0`. Selecting over the same censored view
+    picks `nemotron-api` and gets a node tested against 12 real failures.
+    """
+
+    @staticmethod
+    def _history():
+        maker = TestAnOutOfMemoryKillIsNotTheNodesDoing._runs
+        counter = [0]
+        jobs = []
+        # More runs than the other workload, deliberately -- see the control.
+        jobs += maker("midway3-0173", "rd-r7-recon", counter, out_of_memory=16, completed=60)
+        jobs += maker("midway3-0376", "nemotron-api", counter, failed=12, completed=9)
+        jobs += maker("midway3-0380", "nemotron-api", counter, completed=21)
+        return jobs
+
+    def test_it_does_not_pick_a_workload_whose_failures_the_table_censors(self):
+        jobs = self._history()
+        workload = dominant_workload(jobs, metric="failure")
+        assert workload.name == "nemotron-api"
+        table = node_table(jobs, workload=workload, metric="failure")
+        assert table["hits"] == 12
+        assert table["tested_nodes"] == 2
+
+    def test_without_a_metric_the_choice_is_still_by_run_count(self):
+        """The control. With no metric named there is nothing to be informative
+        about, so the ranking is runs -- and `rd-r7-recon` has 76 of them against
+        `nemotron-api`'s 42. Unchanged in both states."""
+        assert dominant_workload(self._history()).name == "rd-r#-recon"
+
+    def test_the_hang_metric_selection_is_untouched(self):
+        """The other control: `_informative` is True for every placement under the
+        hang metric, so nothing about that ranking moves."""
+        jobs = self._history()
+        assert dominant_workload(jobs, metric="hang") is not None
+
+
+class TestHeldBackIsCountedAgainstTheBaselineTheScreenPrints:
+    """`held_back` was counted against each row's leave-one-out `comparison`, a
+    number that appears nowhere the reader can see, while `render.held_back_note`
+    says "N intervals clear THE BASELINE on their own" -- and the baseline the
+    screens print is the pooled one from `render.nodes_baseline`.
+
+    So the sentence written to stop the table contradicting its own CI column
+    could itself send the reader hunting for a row that is not there. It
+    over-counts in one direction only, and always that one: `baseline` is a convex
+    combination of a row's own rate and its `comparison`, and a Wilson interval
+    always contains its own rate, so clearing the baseline implies clearing the
+    comparison and never the reverse.
+
+    Reproduced on the default screen of a real 90-day history -- `slurmpast
+    --nodes` over `rd-s#-run`, baseline 8.2% across 987 placements, 34 nodes
+    tested:
+
+        midway3-0316              7/32    21.9%       11.0 - 38.8% inconclusive
+        midway3-0039              1/65     1.5%        0.3 -  8.2% inconclusive
+        2 intervals clear the baseline on their own -- ...
+
+    Two claimed, one findable. midway3-0039's interval ends at 0.08214 against a
+    printed baseline of 0.08207 -- indistinguishable at one decimal place, and
+    above it -- but below its comparison of 0.08677, so it was counted.
+    """
+
+    @staticmethod
+    def _table(head, filler):
+        """One node of interest plus filler, as `_placements` shapes them."""
+        jobs = list(_placements(head[0], head[1], head[2], name="rd-s7-run"))
+        base = 5000
+        for node, bad, total in filler:
+            jobs += _placements(node, bad, total, name="rd-s7-run", job_id_base=base)
+            base += 1000
+        return node_table(jobs, workload="rd-s7-run", metric="failure")
+
+    @classmethod
+    def _clears_comparison_only(cls):
+        """1/65 against 76/900: interval 0.0027-0.08214, baseline 0.07979,
+        comparison 0.08444. The real midway3-0039 shape, exactly."""
+        filler = [("midway3-%04d" % (300 + i), 4, 45) for i in range(16)]
+        filler += [("midway3-%04d" % (320 + i), 3, 45) for i in range(4)]
+        return cls._table(("midway3-0039", 1, 65), filler)
+
+    def test_a_row_clearing_only_the_comparison_is_not_counted(self):
+        table = self._clears_comparison_only()
+        row = next(r for r in table["rows"] if r["node"] == "midway3-0039")
+        # The shape the defect needs, asserted so a later reader can see the
+        # fixture still reproduces it rather than passing vacuously.
+        assert row["verdict"] == "inconclusive"
+        assert row["ci_high"] < row["comparison"], row
+        assert row["ci_high"] > table["baseline"], row
+        assert table["held_back"] == 0
+
+    def test_every_row_counted_is_one_the_reader_can_find(self):
+        """The invariant `held_back_note` needs, rather than a magic number."""
+        for table in (self._clears_comparison_only(), self._clears_the_baseline()):
+            baseline = table["baseline"]
+            findable = [
+                r
+                for r in table["rows"]
+                if r["verdict"] == "inconclusive"
+                and (r["ci_low"] > baseline or r["ci_high"] < baseline)
+            ]
+            assert table["held_back"] == len(findable), table
+
+    @classmethod
+    def _clears_the_baseline(cls):
+        """7/32 against 60/900: interval 0.1102-0.3876 over a 0.0719 baseline."""
+        filler = [("midway3-%04d" % (400 + i), 3, 45) for i in range(20)]
+        return cls._table(("midway3-0316", 7, 32), filler)
+
+    def test_a_row_clearing_the_printed_baseline_is_still_counted(self):
+        """The control, and it has to pass in both states: the note exists for
+        this row, and the fix must not silence it. midway3-0316's interval starts
+        at 11.0% over a 7.2% baseline, and the correction still withholds the
+        verdict."""
+        table = self._clears_the_baseline()
+        row = next(r for r in table["rows"] if r["node"] == "midway3-0316")
+        assert row["verdict"] == "inconclusive"
+        assert row["ci_low"] > table["baseline"], row
+        assert table["held_back"] == 1
+
+
+class TestTheNotesDenominatorIsNotCalledTheReadersJobCount:
+    """`_note_from_row` said "failed %d of your %d jobs there", and since round
+    forty-seven that `%d` is the *informative* placement count: `_informative`
+    censors cancellations, and for the failure metric `OUT_OF_MEMORY` as well.
+    So the one sentence that addresses the reader in the second person put a
+    possessive claim on a deliberately censored number.
+
+    Reproduced on a real 90-day history. `sacct` holds 36 `caai-p10b_scan` rows
+    on `midway3-0250` -- 32 FAILED, 1 COMPLETED, 3 CANCELLED -- and the job screen
+    said, on both surfaces:
+
+        midway3-0250 failed 32 of your 33 jobs there (97.0%, 95% CI 84.7-99.5%)
+        against 1.0% on every other node for caai-p10b_scan.
+
+    Three short of the count it attributes to the reader, and it would be fourteen
+    short on `midway3-0187`, whose 21 rows are 7 informative. Censoring the
+    denominator is right -- every node enforces the same `--mem`, so an OOM says
+    nothing about the machine -- but a reader who checks "your 33 jobs" against
+    `sacct` finds 36 and concludes the tool cannot count.
+
+    The noun is settled against the other screen rather than invented here:
+    `render.nodes_baseline` prints the *pooled* value of the same field as
+    `baseline 14.0% over 242 placements`, so one field had two nouns across two
+    screens and only one of them was possessive.
+    """
+
+    WORKLOAD = "caai-p10b_scan"
+
+    #: The real per-node shape of `caai-p10b_scan` over 90 days, in the states
+    #: `sacct` writes here. Every node that reaches MIN_SAMPLES is exact.
+    NAMED = (
+        ("midway3-0376", {"cancelled": 14, "completed": 47, "out_of_memory": 17}),
+        ("midway3-0330", {"cancelled": 28, "completed": 36, "failed": 2, "out_of_memory": 7}),
+        ("midway3-0250", {"cancelled": 3, "completed": 1, "failed": 32}),
+        ("midway3-0187", {"completed": 7, "out_of_memory": 14}),
+        ("midway3-0386", {"cancelled": 1, "completed": 16, "out_of_memory": 1}),
+        ("midway3-0308", {"cancelled": 6, "completed": 10, "out_of_memory": 2}),
+        ("midway3-0200", {"completed": 16}),
+    )
+    #: And the 27 nodes below the threshold, as their informative placement counts
+    #: really are distributed -- nine of 1, six of 2, four of 3, four of 4, two of
+    #: 6, two of 7 = 75. None of them failed anything, so the table totals the real
+    #: 242 placements and 34 failures and the row's leave-one-out comparison is the
+    #: real 2/209. Without them it would be 2/108 and the sentence would read 1.9%.
+    TAIL = (1,) * 9 + (2,) * 6 + (3,) * 4 + (4,) * 4 + (6,) * 2 + (7,) * 2
+
+    @classmethod
+    def _history(cls):
+        runs = TestAnOutOfMemoryKillIsNotTheNodesDoing._runs
+        counter = [0]
+        jobs = []
+        for node, states in cls.NAMED:
+            jobs += runs(node, cls.WORKLOAD, counter, **states)
+        for index, completed in enumerate(cls.TAIL):
+            jobs += runs("midway3-%04d" % (600 + index), cls.WORKLOAD, counter, completed=completed)
+        return jobs
+
+    def _note(self, node="midway3-0250"):
+        return note_for_node(self._history(), node, workload=self.WORKLOAD)
+
+    def test_the_denominator_is_not_presented_as_the_readers_job_count(self):
+        jobs = self._history()
+        # Counted off the fixture, not off the row the sentence is formatted from.
+        # A denominator recomputed from `row["trials"]` would agree with the
+        # implementation whichever of the two was right -- the failure mode round
+        # five named and round forty-seven found a third instance of.
+        raw = sum(1 for job in jobs if job.node_list == "midway3-0250")
+        censored = sum(
+            1
+            for job in jobs
+            if job.node_list == "midway3-0250" and not _informative(job, "failure")
+        )
+        assert (raw, censored) == (36, 3), "the fixture must reproduce the real rows"
+        note = note_for_node(jobs, "midway3-0250", workload=self.WORKLOAD)
+        assert "failed 32 of %d placements there" % (raw - censored) in note, note
+        assert "jobs" not in note, note
+        assert note == (
+            "midway3-0250 failed 32 of 33 placements there (97.0%, 95% CI 84.7-99.5%) "
+            "against 1.0% on every other node for caai-p10b_scan."
+        )
+
+    def test_both_screens_call_the_field_the_same_thing(self):
+        """The render decision round forty-seven deferred. `nodes_baseline` draws
+        the pooled `trials` and this draws one row's, both surfaces draw both, so
+        the noun has to be one word -- and it is the word that already existed."""
+        from slurmpast.render import nodes_baseline
+
+        jobs = self._history()
+        table = node_table(jobs, workload=self.WORKLOAD, metric="failure")
+        assert "over 242 placements" in nodes_baseline(table)
+        assert "33 placements" in note_for_node(jobs, "midway3-0250", workload=self.WORKLOAD)
+
+    def test_only_the_noun_moved(self):
+        """The control, and it passes in both states: every figure in the sentence
+        is untouched. A wording fix that moved a number would be a different
+        defect, and this is what says it did not."""
+        note = self._note()
+        assert note.startswith("midway3-0250 failed 32 of ")
+        assert note.endswith(
+            "(97.0%, 95% CI 84.7-99.5%) against 1.0% on every other node for caai-p10b_scan."
+        )
+
+    def test_the_censoring_that_made_the_wording_wrong_is_still_in_place(self):
+        """The other control, in both states. 33 is the right number -- the fix is
+        what it is called, not what it counts. The three cancellations stay out,
+        and midway3-0187's fourteen OOM kills leave it 7 informative placements,
+        below MIN_SAMPLES, so it is still not accused at all."""
+        jobs = self._history()
+        table = node_table(jobs, workload=self.WORKLOAD, metric="failure")
+        row = next(r for r in table["rows"] if r["node"] == "midway3-0250")
+        assert (row["bad"], row["trials"]) == (32, 33)
+        assert (table["trials"], table["hits"]) == (242, 34)
+        assert note_for_node(jobs, "midway3-0187", workload=self.WORKLOAD) == ""
+
+    def test_a_node_that_behaved_is_still_given_no_sentence(self):
+        """The control on the guard above the wording: only a `worse` verdict
+        produces a note, so midway3-0200 -- 0 of 16 on the same workload, and the
+        same hardware as midway3-0187 -- stays unnamed before and after."""
+        assert self._note("midway3-0200") == ""

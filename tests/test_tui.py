@@ -1323,7 +1323,7 @@ class TestProseIsWrappedToTheWidgetNotTheScreen:
     it because the constant was guessed rather than measured.
 
     Reproduced on the node-history finding, whose evidence is the longest the
-    dashboard draws: "midway3-0385 failed 12 of your 12 jobs there (100.0%, 95% CI
+    dashboard draws: "midway3-0385 failed 12 of 12 placements there (100.0%, 95% CI
     75.7-100.0%) against 25.0% on every other node for cot-exp."
     """
 

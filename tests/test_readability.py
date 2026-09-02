@@ -11,6 +11,7 @@ that the reader has no way to interpret.
 """
 
 import os
+import re
 
 import pytest
 
@@ -1915,3 +1916,129 @@ class TestAWorkloadNameWithNoSpacesInIt:
             await pilot.pause()
             title = app.screen.summary_text.plain.splitlines()[0]
         assert "…" not in title, title
+
+
+# The exchange rate as (number, unit, number, unit) -- the facts a reader takes off
+# whichever surface drew it, rather than the sentence that carried them. Compared
+# this way a rate that moved, or that changed unit, fails on either surface.
+_RATE = re.compile(r"(\d+(?:\.\d+)?)\s+(GPU-hours?)\s*=\s*(\d+(?:\.\d+)?)\s+(CPU-hours?)")
+
+
+def _rate_facts(text):
+    """The one exchange rate `text` quotes, or `None` if it quotes none."""
+    found = {(m[1], m[2], m[3], m[4]) for m in _RATE.finditer(text)}
+    # A surface that says it twice has to say it the same way both times.
+    assert len(found) <= 1, "one surface quoted two rates: %r" % (sorted(found),)
+    return found.pop() if found else None
+
+
+class TestOneExchangeRateAcrossBothSurfaces:
+    """`render.py` exists so "the dashboard and `--plain` cannot drift", and the
+    GPU/CPU-hour exchange rate is the fact that proved the rule: the dashboard
+    ranked every workload it listed by a weighting it named nowhere, while a paste
+    of the same table explained itself. `render.gpu_hours_equivalence` fixed that
+    by giving both front ends one string to place.
+
+    Only the `--plain` half of it was pinned --
+    `TestColumnNames.test_plain_report_explains_the_ranking_without_the_jargon`
+    above -- so the dashboard could lose the note again, or quote a different
+    number or unit, with nothing failing.
+
+    So these compare the two surfaces against each other, and both against
+    `render.gpu_hours_equivalence()` itself, rather than asserting a literal on
+    each. What that does and does not settle, said plainly: a rate missing from
+    one surface, or one quoting 8 where the other quotes 16, or "CPU-hour" against
+    "core-hour", all fail. A `tui.py` that happened to spell the same sentence out
+    by hand would still pass, because its note is built once at import and cannot
+    be re-rendered against a changed constant -- so its side is pinned by being
+    character-identical to the shared string, and `--plain`'s side, which does
+    re-render, is pinned to the constant directly by the second control below.
+    """
+
+    @staticmethod
+    async def _dashboard_facts(jobs):
+        """What the dashboard tells a reader about the rate, rendered headlessly.
+
+        The overview is where both hour columns are on screen, and `?` is where
+        the dashboard explains that table -- the same position the `--plain`
+        caption occupies above it.
+        """
+        app = make_app(jobs, no_logs=True)
+        async with app.run_test(size=(150, 60)) as pilot:
+            await pilot.pause()
+            await pilot.press("question_mark")
+            await pilot.pause()
+            assert isinstance(app.screen, tui.HelpScreen)
+            return _rate_facts(app.screen.help_text.plain)
+
+    @staticmethod
+    def _plain_facts(jobs):
+        from slurmpast.report import Style, render_overview
+
+        return _rate_facts(render_overview(History(jobs), style=Style(enabled=False)))
+
+    @pytest.mark.asyncio
+    async def test_the_dashboard_quotes_the_rate_the_plain_caption_does(self):
+        """`--demo`'s history, so the comparison is over fixed content."""
+        from slurmpast.index import GPU_CORE_EQUIVALENT
+
+        jobs = history()
+        plain = self._plain_facts(jobs)
+        dashboard = await self._dashboard_facts(jobs)
+        assert plain is not None, "the --plain caption names no exchange rate"
+        assert dashboard is not None, "the dashboard names no exchange rate"
+        assert plain == dashboard, "the two surfaces quote different rates: %r vs %r" % (
+            plain,
+            dashboard,
+        )
+        # And what they agree on is the shared string, not a coincidence: same
+        # number, same units, sourced from `render`.
+        assert plain == _rate_facts(render.gpu_hours_equivalence())
+        assert plain == ("1", "GPU-hour", "%d" % GPU_CORE_EQUIVALENT, "CPU-hours"), plain
+
+    @pytest.mark.asyncio
+    async def test_they_still_agree_with_a_real_record_in_the_history(self, healthy_job):
+        """Realism over the demo: job 51170455 as `sacct` reported it -- 3 GPUs for
+        1h52m, so it moves both of the hour columns the rate is there to explain.
+        """
+        assert healthy_job.gpu_count, "the fixture should carry GPU hours"
+        jobs = [*history(), healthy_job]
+        plain = self._plain_facts(jobs)
+        dashboard = await self._dashboard_facts(jobs)
+        assert plain is not None
+        assert plain == dashboard, (plain, dashboard)
+
+    @pytest.mark.asyncio
+    async def test_the_comparison_can_see_the_two_surfaces_drift(self, monkeypatch):
+        """The control, and the reason the tests above are a comparison rather than
+        two independent literals: move one surface off the shared string and the
+        comparison must fail.
+
+        `report` calls `render.gpu_hours_equivalence` on every render, so patching
+        the name it imported moves `--plain` alone; the dashboard's note is built
+        once at import from that same function, which is what keeps the two
+        together when nobody is patching anything. Without this, the assertion
+        `plain == dashboard` would pass just as happily on two `None`s.
+        """
+        from slurmpast import report
+
+        monkeypatch.setattr(report, "gpu_hours_equivalence", lambda: "1 GPU-hour = 3 CPU-hours")
+        jobs = history()
+        plain = self._plain_facts(jobs)
+        dashboard = await self._dashboard_facts(jobs)
+        assert plain == ("1", "GPU-hour", "3", "CPU-hours"), plain
+        assert dashboard is not None, "nothing was compared against"
+        assert plain != dashboard, "a rate that drifted on one surface went unnoticed"
+
+    def test_the_plain_caption_follows_the_constant_rather_than_a_literal(self, monkeypatch):
+        """The second control, on the surface that can carry one: `report` builds
+        its caption per render, so if the number there were a literal instead of
+        `GPU_CORE_EQUIVALENT` every assertion above would still pass.
+
+        Patching `render`'s copy of the constant -- the one
+        `gpu_hours_equivalence` reads -- is the whole chain from the weight the
+        ranking is actually computed at through to the sentence on screen.
+        """
+        monkeypatch.setattr(render, "GPU_CORE_EQUIVALENT", 3.0)
+        assert _rate_facts(render.gpu_hours_equivalence()) == ("1", "GPU-hour", "3", "CPU-hours")
+        assert self._plain_facts(history()) == ("1", "GPU-hour", "3", "CPU-hours")

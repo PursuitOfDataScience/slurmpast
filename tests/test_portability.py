@@ -16,7 +16,7 @@ from datetime import datetime
 
 import pytest
 
-from slurmpast import logs, model
+from slurmpast import logs, model, report
 from slurmpast import sacct as sacct_mod
 from slurmpast.duration import parse_bytes, parse_mem_limit
 from slurmpast.nodes import expand_nodelist
@@ -34,7 +34,7 @@ from slurmpast.sacct import (
 )
 from slurmpast.site import Site, gpu_utilization_note, maxrss_caveat, site
 
-from .conftest import make_text, row
+from .conftest import RECORDED_SITE, make_text, row
 
 _SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "slurmpast"
 
@@ -404,6 +404,33 @@ class TestGpuUtilizationWhereRecorded:
         # Nothing known about the cluster: no claim about why.
         assert gpu_utilization_note(Site()) == "not recorded by Slurm"
 
+    def test_an_unread_tres_list_does_not_buy_a_diagnosis(self):
+        """None is "cannot say", so an *absent* `AccountingStorageTRES` must not
+        assert a site cause. `known` is true here -- `scontrol show config`
+        answered, with a version and a gather plugin -- and that is exactly the
+        case the note used to fall through on, telling a reader to go set
+        `AutoDetect=nvml` on the strength of a TRES list it had never seen.
+        """
+        read_but_silent = Site(slurm_version="20.11.8", jobacct_gather_type="jobacct_gather/linux")
+        assert read_but_silent.known, "the scheduler did answer"
+        assert read_but_silent.tracks_gpu_utilization is None
+        note = gpu_utilization_note(read_but_silent)
+        assert "AutoDetect=nvml" not in note, "a cause it has no fact for"
+        assert "this cluster" not in note
+        assert note == "not recorded by Slurm"
+
+    def test_a_tres_list_that_was_read_still_earns_the_site_cause(self):
+        """Control. The diagnosis is *right* when the list is really there and
+        `gres/gpuutil` is really missing from it -- the recorded configuration of
+        the cluster this tool was written against. Passes before and after, and
+        it is what stops the third arm from swallowing the other two: the hedge
+        is for an unread list only, never for a read one.
+        """
+        assert RECORDED_SITE.tracks_gpu_utilization is False
+        assert "AutoDetect=nvml" in gpu_utilization_note(RECORDED_SITE)
+        gathered = RECORDED_SITE._replace(tres=RECORDED_SITE.tres + ("gres/gpuutil",))
+        assert gpu_utilization_note(gathered) == "not recorded for this job"
+
 
 class TestPerNodeMemory:
     """AllocTRES `mem=` totals the allocation; MaxRSS is one task's peak and
@@ -637,6 +664,60 @@ class TestSiteConfiguration:
     def test_a_cluster_not_tracking_gpus_in_tres_is_distinguishable(self):
         found = Site(tres=("cpu", "mem", "node"), jobacct_gather_type="jobacct_gather/linux")
         assert found.tracks_gpu is False
+
+    def test_an_unset_key_is_slurms_sentinel_and_not_a_value(self):
+        """`scontrol show config` prints `(null)` for a string key that is not
+        set -- 59 keys do on the cluster this was measured on, among them
+        `AccountingStorageParameters` and `JobAcctGatherParams`. Kept as a value
+        it is *truthy*, so it skipped every "cannot say" arm in the module and
+        then got printed inside the sentence: *"MaxRSS sums RSS across the
+        process tree under (null), double-counting shared pages"*.
+        """
+        from slurmpast.site import cpu_caveat
+
+        found = site(
+            runner=lambda _a: (
+                "Configuration data as of 2026-09-01T00:00:00\n"
+                "AccountingStorageTRES   = (null)\n"
+                "JobAcctGatherType       = (null)\n"
+                "SLURM_VERSION           = 20.11.8\n"
+            ),
+            refresh=True,
+        )
+        assert found.known, "the scheduler answered; it just said nothing here"
+        assert found.tres == ()
+        assert found.jobacct_gather_type == ""
+        assert found.rss_from_cgroup is None
+        assert found.tracks_gpu is None
+        assert found.tracks_gpu_utilization is None
+        for sentence in (maxrss_caveat(found), cpu_caveat(found), gpu_utilization_note(found)):
+            assert "(null)" not in sentence, sentence
+        assert "depending on this cluster" in maxrss_caveat(found)
+
+    def test_a_key_that_is_set_survives_the_sentinel_check(self):
+        """Control. The real published values of the cluster this was measured
+        on still parse whole, and a per-type frequency keeps the `=` inside its
+        own value. Passes before and after; it is what stops the sentinel check
+        from eating configuration that is actually there.
+        """
+        found = site(
+            runner=lambda _a: (
+                "SLURM_VERSION           = 20.11.8\n"
+                "AccountingStorageType   = accounting_storage/slurmdbd\n"
+                "AccountingStorageTRES   = cpu,mem,energy,node,billing,"
+                "fs/disk,vmem,pages,gres/gpu\n"
+                "JobAcctGatherType       = jobacct_gather/linux\n"
+                "JobAcctGatherFrequency  = task=30,network=60\n"
+            ),
+            refresh=True,
+        )
+        assert found.tres == RECORDED_SITE.tres
+        assert found.jobacct_gather_type == "jobacct_gather/linux"
+        assert found.tracks_gpu is True
+        assert found.tracks_gpu_utilization is False
+        assert found.rss_from_cgroup is False
+        assert found.sampling_seconds == 30
+        assert "jobacct_gather/linux" in maxrss_caveat(found)
 
 
 class TestPackageSurface:
@@ -2537,6 +2618,117 @@ class TestTheSingleJobPostMortemOnAMultiLineWrap:
         _code, out = self._report(monkeypatch, capsys)
         for line in self.WRAP.split("\n"):
             assert line in out, line
+
+
+class TestADumbTerminalGetsNoColour:
+    """`TERM=dumb` is a terminal that cannot render escape sequences, and it is a
+    tty -- so `isatty()` alone answered "colour" for it.
+
+    An Emacs shell buffer, a CI log and a serial console all set it. This was the
+    only tool in the family that coloured one: `rapidu` and `slurmate` already
+    pair the check with NO_COLOR, and rapidu's `ui` module names both in its
+    docstring. Measured before the fix with `script -qec ... TERM=dumb`: 7 SGR
+    colour sequences reached the stream.
+    """
+
+    class _Tty:
+        def isatty(self):
+            return True
+
+    def test_term_dumb_disables_colour(self, monkeypatch):
+        monkeypatch.setenv("TERM", "dumb")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        assert report.Style(stream=self._Tty()).enabled is False
+
+    def test_the_control_a_real_terminal_still_gets_colour(self, monkeypatch):
+        """The control, deliberately: a test that only asserted the `dumb` case
+        would also pass if colour were switched off everywhere."""
+        monkeypatch.setenv("TERM", "xterm-256color")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        assert report.Style(stream=self._Tty()).enabled is True
+
+    def test_no_color_is_still_independently_honoured(self, monkeypatch):
+        monkeypatch.setenv("TERM", "xterm-256color")
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert report.Style(stream=self._Tty()).enabled is False
+
+    def test_an_explicit_enabled_flag_still_overrides_both(self, monkeypatch):
+        """`--no-color` passes `enabled=False` and the TUI passes `enabled=True`;
+        neither may be second-guessed by the environment."""
+        monkeypatch.setenv("TERM", "dumb")
+        assert report.Style(enabled=True, stream=self._Tty()).enabled is True
+        monkeypatch.setenv("TERM", "xterm-256color")
+        assert report.Style(enabled=False, stream=self._Tty()).enabled is False
+
+
+class TestAClosedPipeIsNotAnError:
+    """`slurmpast --json | head` printed "Exception ignored in: <_io.TextIOWrapper
+    name='<stdout>'> BrokenPipeError: [Errno 32] Broken pipe" *after* the output
+    the reader wanted, then exited **120**.
+
+    120 is neither a convention nor a decision -- it is CPython failing to flush a
+    closed stdout at shutdown. Restoring the default SIGPIPE disposition makes this
+    behave like every other Unix filter. nodetop restores it the same way; rapidu
+    and slurmwatch catch the error and exit 0. This was the one tool of the four
+    with no handling at all.
+    """
+
+    def test_main_restores_the_default_sigpipe_disposition(self, monkeypatch):
+        import signal
+
+        from slurmpast import cli
+
+        seen = {}
+
+        def fake_main(argv=None):
+            seen["handler"] = signal.getsignal(signal.SIGPIPE)
+            return 0
+
+        previous = signal.getsignal(signal.SIGPIPE)
+        monkeypatch.setattr(cli, "_main", fake_main)
+        try:
+            assert cli.main([]) == 0
+            assert seen["handler"] is signal.SIG_DFL
+        finally:
+            signal.signal(signal.SIGPIPE, previous)
+
+    def test_the_control_the_interpreter_default_is_sig_ign(self):
+        """The control, in a fresh interpreter so this test's own signal handling
+        cannot supply the answer: Python ignores SIGPIPE, which is exactly what
+        turns the write into a BrokenPipeError and the shutdown flush into the
+        "Exception ignored" line. Without the restore there is a real defect to fix.
+        """
+        got = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import signal; print(signal.getsignal(signal.SIGPIPE) is signal.SIG_IGN)",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert got.stdout.strip() == "True", got.stderr
+
+    def test_a_closed_stdout_leaves_no_noise_on_stderr(self):
+        """End to end, which is the form the reader actually meets: the shutdown
+        message went to stderr, so a caller that only redirected stdout still saw
+        it."""
+        env = dict(os.environ, PYTHONPATH=str(_SRC.parent), PYTHONDONTWRITEBYTECODE="1")
+        reader = subprocess.Popen(
+            ["head", "-c", "40"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL
+        )
+        writer = subprocess.Popen(
+            [sys.executable, "-m", "slurmpast", "--demo", "--json"],
+            stdout=reader.stdin,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        assert writer.stdin is None
+        reader.stdin.close()
+        err = writer.communicate(timeout=180)[1].decode("utf-8", "replace")
+        reader.wait(timeout=60)
+        assert "Exception ignored" not in err, err
+        assert "BrokenPipeError" not in err, err
 
 
 class TestARedirectMustNotLaunchTheDashboard:
@@ -5077,6 +5269,9 @@ class TestTheClipboardFallbackIsPrivate:
 
         class FakeApp:
             load_error = None
+            # Textual's `App` always has this; `tui.run` reads it to propagate a
+            # signalled exit (143/129/130), so a double without it is incomplete.
+            return_code = 0
 
             def __init__(self, *args, **kwargs):
                 pass
@@ -5407,3 +5602,103 @@ class TestEveryRatedJobLandsInABucket:
             row_text for row_text in text.splitlines() if "outside the completion rate" in row_text
         )
         assert "excluded" not in line, line
+
+
+class TestTheAnalysisLayerImportsNothingThirdParty:
+    """README: "The analysis modules import no third-party package."
+
+    A public claim under an "As a library" heading, so a reader takes it as
+    permission to `from slurmpast.sizing import recommend` inside their own
+    pipeline — on a cluster where `rich` and `textual` may not be installed and
+    where the analysis half has no need of them.
+
+    Nothing checked it. The sibling rule ("only the presentation modules may touch
+    rich/textual") was likewise enforced only by habit, and habit had already
+    drifted: the presentation set is `render`, `theme`, `tui` — `theme` acquired a
+    `textual` import, and `report`, which the written rule permits, imports
+    nothing third-party at all. This test states the truth and fails on either
+    kind of change.
+    """
+
+    #: The library surface: importable without a terminal UI stack present.
+    ANALYSIS = (
+        "sacct",
+        "model",
+        "diagnose",
+        "patterns",
+        "nodes",
+        "index",
+        "sizing",
+        "logs",
+        "site",
+        "duration",
+    )
+    #: The modules that may import a rendering package. `report` is permitted by
+    #: the written rule and currently needs nothing, so it is not listed: adding
+    #: it here pre-emptively would make this test pass for a change nobody made.
+    PRESENTATION = ("render", "theme", "tui")
+
+    @staticmethod
+    def _third_party(name):
+        import ast
+        import pathlib
+        import sys
+
+        import slurmpast
+
+        path = pathlib.Path(slurmpast.__file__).parent / f"{name}.py"
+        assert path.exists(), f"no such module: {name}"
+        local = {p.stem for p in path.parent.glob("*.py")} | {"slurmpast"}
+        stdlib = set(sys.stdlib_module_names)
+        found = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            roots = []
+            if isinstance(node, ast.Import):
+                roots = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                roots = [node.module.split(".")[0]]
+            found |= {r for r in roots if r not in stdlib and r not in local}
+        return found
+
+    @pytest.mark.parametrize("module", ANALYSIS)
+    def test_an_analysis_module_imports_nothing_third_party(self, module):
+        found = sorted(self._third_party(module))
+        assert not found, (
+            f"slurmpast.{module} imports {found}; the README offers these modules "
+            f"as a library on a cluster that may have neither installed"
+        )
+
+    def test_nothing_outside_the_presentation_set_touches_a_render_package(self):
+        import pathlib
+
+        import slurmpast
+
+        offenders = {}
+        for path in sorted(pathlib.Path(slurmpast.__file__).parent.glob("*.py")):
+            if path.stem in self.PRESENTATION:
+                continue
+            hit = sorted(self._third_party(path.stem) & {"rich", "textual"})
+            if hit:
+                offenders[path.stem] = hit
+        assert not offenders, (
+            f"{offenders} — render.py exists so the dashboard and --plain cannot "
+            f"drift; a third module drawing its own output defeats that"
+        )
+
+    def test_the_presentation_set_is_the_real_one(self):
+        """Both directions, so the list cannot rot into a fiction.
+
+        A module listed here that stops importing a render package is not a bug —
+        but it does mean the list is describing history rather than the tree, which
+        is how `report` came to be named in the written rule.
+        """
+        idle = [m for m in self.PRESENTATION if not (self._third_party(m) & {"rich", "textual"})]
+        assert not idle, (
+            f"{idle} are listed as presentation modules but import neither rich "
+            f"nor textual; drop them from PRESENTATION"
+        )
+
+    def test_the_detector_finds_a_real_import(self):
+        # The control: every assertion above is a negative, so the detector
+        # returning nothing for everything would pass all of them.
+        assert self._third_party("tui") >= {"rich", "textual"}

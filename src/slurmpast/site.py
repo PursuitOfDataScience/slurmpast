@@ -112,19 +112,36 @@ class Site(NamedTuple):
 _CACHE: list = []
 
 
+# What ``scontrol show config`` prints for a string key that is not set -- 59 of
+# them on the cluster this was written against, ``AccountingStorageParameters``
+# and ``JobAcctGatherParams`` among them. It is a sentinel, and reading it as a
+# value is worse than not reading the key at all: ``"(null)"`` is truthy, so it
+# turns every "cannot say" arm in this module into a confident claim and then
+# prints the sentinel inside the sentence -- *"MaxRSS sums RSS across the process
+# tree under (null)"*. Normalised at the read so no property has to know.
+_UNSET = "(null)"
+
+
 def _parse_config(text):
     """Pull the handful of keys that matter out of ``scontrol show config``.
 
     The format is ``Key  = value`` per line, with keys that vary in case between
     releases (``SLURM_VERSION`` against ``JobAcctGatherType``), so lookup is
     case-insensitive.
+
+    An unset key is dropped rather than stored as ``(null)``, which is how this
+    module's None -- "cannot say" -- reaches a caller when the scheduler answered
+    but had nothing to say about that key.
     """
     values = {}
     for line in (text or "").splitlines():
         key, sep, value = line.partition("=")
         if not sep:
             continue
-        values[key.strip().lower()] = value.strip()
+        # `partition` on the FIRST `=` only, so a per-type value keeps its own
+        # `=`: `JobAcctGatherFrequency = task=30,network=60`.
+        found = value.strip()
+        values[key.strip().lower()] = "" if found.lower() == _UNSET else found
     tres = values.get("accountingstoragetres", "")
     return Site(
         slurm_version=values.get("slurm_version", ""),
@@ -383,12 +400,27 @@ def cpu_caveat(known_site=None):
 
 
 def gpu_utilization_note(known_site=None):
-    """Why no GPU utilization figure is shown, in terms of this cluster's config."""
+    """Why no GPU utilization figure is shown, in terms of this cluster's config.
+
+    Three arms, for the same reason :func:`maxrss_caveat` has three: naming a site
+    setting as the thing to change is only earned once ``AccountingStorageTRES``
+    has actually been read. ``tracks_gpu_utilization`` is None when it has not
+    been -- ``scontrol`` unreachable, or reachable and printing the key unset --
+    and None is not False per this module's rule, so an absent list buys the
+    neutral wording rather than the diagnosis.
+
+    The condition is that property, not ``known``. ``known`` is true of a config
+    that was read but carried no TRES list, which is precisely the case that used
+    to fall through to the confident claim; sharing the real condition instead of
+    a similar-looking one is the discipline `_io_explains_idle_cpu` sets in
+    `diagnose` and that :func:`cpu_total_is_complete` exists to serve.
+    """
     current = known_site if known_site is not None else site()
-    if current.tracks_gpu_utilization:
+    tracked = current.tracks_gpu_utilization
+    if tracked is None:
+        return "not recorded by Slurm"
+    if tracked:
         # Configured but absent from the record: MIG devices report no utilization
         # through NVML, and a step that ended before the first sample has none.
         return "not recorded for this job"
-    if not current.known:
-        return "not recorded by Slurm"
     return "not gathered by this cluster (needs AutoDetect=nvml in gres.conf)"

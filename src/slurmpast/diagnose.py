@@ -575,22 +575,111 @@ _SIGKILL_ALREADY_EXPLAINED = frozenset(
 )
 
 
+#: What to tell a user whose job died because the NODE did, not their code.
+#:
+#: One sentence for both `NODE_FAIL` and `BOOT_FAIL`: the cause differs (a node
+#: that fell over mid-job against one that never came up) but the remedy does
+#: not, and it was written out at each. Two copies of a remedy is how the same
+#: advice comes to be worded two ways for two findings a reader sees side by side.
+_NODE_FAULT_REMEDY = (
+    "Not your code: resubmit. If one node keeps doing this, the nodes screen "
+    "tests whether it fails more than the rest."
+)
+
+
+#: Signal numbers spelled out, for the finding that names the killer.
+#:
+#: A table rather than ``signal.Signals(n).name``: that raises ``ValueError`` for
+#: a number the running platform does not define, and this cluster's accounting
+#: carries a record with signal 40. Anything the table does not hold still
+#: reports as a number, which is what ``sacct`` itself prints.
+_SIGNAL_NAMES = {
+    1: "SIGHUP",
+    2: "SIGINT",
+    3: "SIGQUIT",
+    6: "SIGABRT",
+    9: "SIGKILL",
+    11: "SIGSEGV",
+    13: "SIGPIPE",
+    15: "SIGTERM",
+    24: "SIGXCPU",
+    25: "SIGXFSZ",
+}
+
+
+def _signal_name(number):
+    """``15`` -> ``"SIGTERM"``; a number with no name -> ``"signal 40"``."""
+    return _SIGNAL_NAMES.get(number) or "signal %d" % number
+
+
+def _cancelled_by(state):
+    """The uid out of ``sacct``'s ``CANCELLED by <uid>``, or ``""``.
+
+    ``_canonical_state`` preserves that suffix on purpose -- "`Job.state` carries
+    it, `Job.base_state` drops it, and **both are read**" -- and this is the
+    reader. Only the exact three-token numeric shape counts: a bare ``CANCELLED``,
+    or a name where the uid should be, returns ``""`` so the caller says nothing
+    rather than guessing at a canceller.
+    """
+    parts = (state or "").split()
+    if len(parts) == 3 and parts[0] == "CANCELLED" and parts[1] == "by" and parts[2].isdigit():
+        return parts[2]
+    return ""
+
+
 def _exit_rules(job, log_text, add):
     code, signal = job.exit_code, job.signal
     state = job.base_state
     lowered = (log_text or "").lower()
 
     if state == "CANCELLED":
-        add(
-            Finding(
-                INFO,
-                "cancelled",
-                "Cancelled, not failed",
-                "A deliberate kill and an abandoned run are identical in accounting, so this "
-                "is excluded from failure statistics.",
-                "",
+        # WHO cancelled it, when the record says and it was not the submitter.
+        # The single sentence below offers a reader two possibilities -- "a
+        # deliberate kill" and "an abandoned run" -- and both of them are the
+        # submitter's own, so on a job somebody else cancelled neither is true.
+        # Three jobs in this cluster's 90-day history are `CANCELLED by 0`,
+        # including a 3-day reservation, and each was reported as though the owner
+        # had killed it.
+        #
+        # Claimed only when BOTH uids are on the record and they differ. An empty
+        # `UID` means the comparison cannot be made, not that it came back False
+        # -- the same rule `site` states for a missing configuration fact -- and
+        # the ordinary self-cancellation keeps the wording, the code and the empty
+        # action it has always had.
+        canceller = _cancelled_by(job.state)
+        if canceller and job.uid and canceller != job.uid:
+            if canceller == "0":
+                title = "Cancelled by root, not by you"
+                detail = (
+                    "sacct records this as CANCELLED by 0 — root — while the job belongs to "
+                    "uid %s. An administrator or the scheduler ended it, so how far it got "
+                    "says nothing about whether the job was healthy." % job.uid
+                )
+                action = (
+                    "Nothing in the script chose this. Look for a maintenance window, a "
+                    "policy or QOS limit, or a dependency that could never be satisfied "
+                    "before resubmitting it unchanged."
+                )
+            else:
+                title = "Cancelled by another user, not by you"
+                detail = (
+                    "sacct records this as CANCELLED by %s while the job belongs to uid %s, "
+                    "so somebody else ran the scancel — an account, reservation or allocation "
+                    "you share." % (canceller, job.uid)
+                )
+                action = "Find out who holds uid %s before resubmitting." % canceller
+            add(Finding(INFO, "cancelled-by-other", title, detail, action))
+        else:
+            add(
+                Finding(
+                    INFO,
+                    "cancelled",
+                    "Cancelled, not failed",
+                    "A deliberate kill and an abandoned run are identical in accounting, so this "
+                    "is excluded from failure statistics.",
+                    "",
+                )
             )
-        )
 
     # NODE_FAIL and PREEMPTED get named for the same reason CANCELLED does: the
     # state is the whole explanation, and without a finding to say so the only
@@ -606,8 +695,7 @@ def _exit_rules(job, log_text, add):
                 "Slurm ended this as NODE_FAIL, so the job did not choose to stop and its "
                 "last accounting sample may never have been taken — a CPU or memory total "
                 "near zero here is missing data, not a measurement.",
-                "Not your code: resubmit. If one node keeps doing this, the nodes screen "
-                "tests whether it fails more than the rest.",
+                _NODE_FAULT_REMEDY,
             )
         )
 
@@ -620,8 +708,7 @@ def _exit_rules(job, log_text, add):
                 "Slurm ended this as BOOT_FAIL, so the allocation was made and the node "
                 "failed to boot into it. Nothing in the record is a measurement of your "
                 "work, because none of it ran.",
-                "Not your code: resubmit. If one node keeps doing this, the nodes screen "
-                "tests whether it fails more than the rest.",
+                _NODE_FAULT_REMEDY,
             )
         )
 
@@ -667,15 +754,37 @@ def _exit_rules(job, log_text, add):
                 "activated before the interpreter is invoked.",
             )
         )
-    if (signal == 9 or code == 137) and state not in _SIGKILL_ALREADY_EXPLAINED:
+    # ANY terminating signal, not only 9. `sacct` spells a signal kill
+    # `0:<signal>` -- the number before the colon is 0 -- so `signal == 9` named
+    # SIGKILL and nothing else, and SIGTERM is the signal every supervisor sends
+    # *first*: `timeout`, a shell trap, a watchdog, a queue system layered over
+    # Slurm. Over this cluster's 90-day history the FAILED jobs whose kill came
+    # from outside are `0:15`, and each produced no finding at all -- the only
+    # thing on screen was the noop rule's "Allocation did essentially nothing ->
+    # Find the blocking call", about a job something else had terminated. That is
+    # the identical defect NODE_FAIL, BOOT_FAIL and DEADLINE were each given a
+    # finding for above.
+    #
+    # `code == 137` stays as its own arm: that is the shell's 128+9, which a
+    # wrapper can propagate as the exit status with no signal recorded beside it.
+    #
+    # The suppression set and the action carry over unaltered, because their
+    # reasoning does: Slurm sends SIGTERM *before* SIGKILL on scancel, the wall
+    # clock, an eviction and a cgroup OOM, so on those states neither signal
+    # carries anything the state has not already given.
+    #
+    # `sigkill` keeps its finding code for signal 9 so no `--json` consumer sees a
+    # rename; the signals it never covered get `signal-kill`.
+    killer = signal if signal else (9 if code == 137 else None)
+    if killer and state not in _SIGKILL_ALREADY_EXPLAINED:
         add(
             Finding(
                 CRITICAL,
-                "sigkill",
-                "Killed by SIGKILL",
-                "Exit signal 9, and nothing in the accounting record accounts for it: the "
+                "sigkill" if killer == 9 else "signal-kill",
+                "Killed by %s" % _signal_name(killer),
+                "Exit signal %d, and nothing in the accounting record accounts for it: the "
                 "state is %s, not OUT_OF_MEMORY, TIMEOUT, CANCELLED, PREEMPTED or NODE_FAIL, "
-                "each of which would name its own killer." % (state or "unrecorded"),
+                "each of which would name its own killer." % (killer, state or "unrecorded"),
                 "Look for a wrapper or watchdog killing it — a queue system layered over "
                 "Slurm, a `timeout` in the batch script, or the node's own OOM killer "
                 "reaping a process Slurm was not accounting for.",
@@ -698,7 +807,11 @@ def _exit_rules(job, log_text, add):
             # *within* one finding, reappearing between two. The log is still worth
             # asking for on these -- it says which command, and where -- so the
             # finding stays and only its claim changes.
-            named_above = code in (127, 137) or signal == 9
+            # `bool(signal)`, not `signal == 9`: the rule above now fires for any
+            # signal, so this has to agree with it or the report contradicts
+            # itself again -- "Killed by SIGTERM" over "an exit status does not
+            # name a cause" is the same pair of lines the comment above records.
+            named_above = code in (127, 137) or bool(signal)
             # Named for the code actually recorded. Hardcoding "Exit 1" put a
             # finding on screen whose title said "Exited 3" and whose evidence
             # discussed exit 1 -- self-contradictory in the same paragraph.
@@ -1082,9 +1195,15 @@ def _parallel_rules(job, add):
                 INFO,
                 "task-memory-imbalance",
                 "Memory use is uneven across tasks",
-                "Peak task held %s against a %s average (%.1fx). The job's memory "
-                "ceiling has to cover the largest task, not the mean."
-                % (format_bytes(job.max_rss), format_bytes(job.ave_rss), imbalance),
+                # The two byte figures this used to print came from the job-level
+                # peak and the job-level average, which `rss_task_imbalance` no
+                # longer divides -- see its docstring. Quoting the ratio alone
+                # keeps the evidence and the number it is evidence for measured
+                # over the same tasks, as the `straggler` finding above already
+                # does with its percentage.
+                "One task held %.1fx the mean of its peers inside a single step, across "
+                "%d tasks. The job's memory ceiling has to cover the largest task, "
+                "not the mean." % (imbalance, job.task_count),
                 "",
             )
         )

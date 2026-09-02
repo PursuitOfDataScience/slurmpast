@@ -37,6 +37,32 @@ def severity_rank(severity: str) -> int:
     return _SEVERITY_RANK.get(severity, 99)
 
 
+#: States in which a job or step has not finished, so its accounting is still
+#: being written -- or, for the live rows, has not been written at all.
+#:
+#: `sacct` flushes a step's counters when the step ENDS. Until then MaxRSS is
+#: empty on every live row and the only populated ones belong to steps that have
+#: already finished, which for a running job are stragglers rather than its work.
+#: Reading the max over that set reported a job holding 462 MiB as using 2.2 MiB.
+IN_PROGRESS_STATES = frozenset(
+    {
+        "RUNNING",
+        "PENDING",
+        "SUSPENDED",
+        "CONFIGURING",
+        "COMPLETING",
+        "RESIZING",
+        "REQUEUED",
+        "REQUEUE_HOLD",
+        "REQUEUE_FED",
+        "SIGNALING",
+        "STAGE_OUT",
+        "STOPPED",
+        "SPECIAL_EXIT",
+    }
+)
+
+
 class Step(NamedTuple):
     """One accounting step: ``.batch``, ``.extern``, or an srun step.
 
@@ -104,6 +130,12 @@ class Step(NamedTuple):
         return self.step_id.endswith(".extern")
 
     @property
+    def in_progress(self) -> bool:
+        """Whether this step has not ended, so its counters are unflushed."""
+        base = (self.state or "").split()[0] if self.state else ""
+        return base in IN_PROGRESS_STATES
+
+    @property
     def read_bytes(self) -> int | None:
         """Bytes read. ``TRESUsageInTot`` is authoritative; MaxDiskRead is a fallback."""
         value = _tres_bytes(self.tres_in_tot, "fs/disk")
@@ -166,6 +198,13 @@ class Job(NamedTuple):
     exit_code: int | None = None
     signal: int | None = None
     derived_exit_code: int | None = None
+    # ``DerivedExitCode`` is ``code:signal`` exactly like ``ExitCode``, and slurmdbd
+    # writes a signalled step the same way it writes a signalled job: with a ZERO
+    # code. So the two halves have to be kept apart. On this cluster 118 parent rows
+    # in a 90-day window are ``COMPLETED|0:0|0:9`` -- a job that reports success
+    # while the worst thing that happened inside it was a SIGKILL -- and reading
+    # only the code half makes every one of them indistinguishable from a clean run.
+    derived_signal: int | None = None
     reason: str = ""
     flags: str = ""
 
@@ -228,6 +267,21 @@ class Job(NamedTuple):
     submit_line: str = ""
 
     steps: tuple = ()
+    #: True when `sstat` was read and its figures were written into the live
+    #: steps -- so a measurement on a running job is a live reading rather than a
+    #: finished straggler's.  See `sacct.read_live_metrics`.
+    live_metrics: bool = False
+    #: True when this job belongs to somebody else, so `sstat` can never read it.
+    #:
+    #: `sstat` is owner-only by design: asking about another user's step returns
+    #: `Invalid user id`, with exit 0 and an empty answer. For a job of theirs
+    #: that is still running, the live figures are therefore *structurally*
+    #: unavailable rather than merely late -- and a reader comparing their own
+    #: running job (measured) against a colleague's (unflushed) is owed the
+    #: difference, because "wait and it will fill in" is true of one and false of
+    #: the other. slurmwatch reports the same fact as `foreign_owner`; the name
+    #: is deliberately the same one.
+    foreign_owner: bool = False
     open_ended: bool = False
     # What squeue said about an open record, when it was asked and could answer:
     # True = still queued or running, False = squeue has never heard of it, so the
@@ -250,6 +304,55 @@ class Job(NamedTuple):
     def base_state(self) -> str:
         """State without the ``by <uid>`` suffix sacct appends to CANCELLED."""
         return (self.state or "").split()[0] if self.state else ""
+
+    @property
+    def in_progress(self) -> bool:
+        """Whether the job has not finished, so `sacct` has not flushed its work.
+
+        The distinction this property exists for is not cosmetic: for a job in
+        one of these states the memory and CPU counters on the live rows are
+        empty, and every figure derived from the *other* rows is a measurement of
+        something else.  See :data:`IN_PROGRESS_STATES`.
+
+        ``live is False`` overrides the state, because it is a *measurement* and
+        the state is not.  A stale open record -- ``State=RUNNING``,
+        ``End=Unknown``, and ``squeue`` asked and answering that it has never
+        heard of the id -- is the case this module already documents at
+        :attr:`open_ended` and :attr:`live`: sacct kept a record open for a job
+        that died long ago, so nothing is going to flush and nothing is still
+        going.  Four such records are in this cluster's history.
+
+        The choice is between two wrong answers, and this is the less wrong one.
+        Calling a dead record "in progress" made `measured_steps` drop every step
+        it has -- they have all ended -- so a record whose steps DID flush a real
+        MaxRSS before the job died reported ``None`` and lost a measurement that
+        exists and is final.  Calling it finished reports those flushed figures,
+        which is what they are.  What is given up is small and is already
+        disclosed elsewhere: `Elapsed` on such a record is measured to *now*, and
+        the open-record finding says so, so the derived *utilizations* stay
+        suspect either way and the record stays out of the aggregates.
+
+        ``live is None`` -- not asked, or ``squeue`` unreachable -- deliberately
+        does NOT trigger this.  Three values, not two: "no answer" is not
+        evidence the job is gone, and treating it as such would turn every
+        offline-`squeue` run into a claim about jobs that may well be running.
+        """
+        if self.live is False:
+            return False
+        return self.base_state in IN_PROGRESS_STATES
+
+    @property
+    def measured_steps(self) -> tuple:
+        """The steps whose counters may stand for this job.
+
+        Every step once the job has ended.  While it is still going, only the
+        steps that are *also* still going: a finished step of a running job is a
+        straggler -- very often an `srun --overlap` monitor somebody attached --
+        and its figures are not this job's.
+        """
+        if not self.in_progress:
+            return tuple(self.steps)
+        return tuple(s for s in self.steps if s.in_progress)
 
     @property
     def failed(self) -> bool:
@@ -391,23 +494,59 @@ class Job(NamedTuple):
         against work steps that all report zero, for a reservation holder that
         genuinely did nothing. See :attr:`max_rss` for the same artefact in memory.
         """
-        values = [getattr(s, attr) for s in self.work_steps if getattr(s, attr) is not None]
+        running = self.in_progress
+        steps = [s for s in self.work_steps if not running or s.in_progress]
+        values = [getattr(s, attr) for s in steps if getattr(s, attr) is not None]
+        if running:
+            # A live step's CPU counter reads `00:00:00` until Slurm flushes it,
+            # and that is not zero CPU -- it is no reading. Rendered as a
+            # confident `0.0%` / `0.0 of 6 cores busy`, it was the CPU half of
+            # the same defect as the memory gauge: a job spinning at 100% of a
+            # core reported as having done nothing.
+            #
+            # A genuinely idle running job is indistinguishable from an
+            # unflushed one here, so both come back as unmeasured. That is the
+            # right way round: "not yet known" costs the reader a second look,
+            # "0.0%" sends them to fix a problem that may not exist.
+            values = [v for v in values if v]
         return sum(values) if values else None
 
     @property
     def total_cpu(self) -> float | None:
+        """CPU seconds the job's work steps consumed.
+
+        The allocation row's ``TotalCPU`` is the fallback for a job that has
+        ENDED and reported no per-step figure. It is deliberately not a fallback
+        while the job is running: the two clusters this was measured on disagree
+        about whether that field is even updated live -- one showed ``16:58`` for
+        a job whose steps summed to five seconds, the other ``00:00.452`` for a
+        job spinning at 100% of a core -- and a ratio built from an unflushed
+        numerator over an elapsed-to-*now* denominator is the confident-wrong
+        answer this module exists to avoid. ``None`` means "not yet measured",
+        which is what the reader needs to know.
+        """
         value = self._from_steps("total_cpu")
-        return value if value is not None else self.total_cpu_alloc
+        if value is not None:
+            return value
+        return None if self.in_progress else self.total_cpu_alloc
 
     @property
     def user_cpu(self) -> float | None:
         value = self._from_steps("user_cpu")
-        return value if value is not None else self.user_cpu_alloc
+        if value is not None:
+            return value
+        # See `total_cpu`: the allocation row is not a fallback for a job whose
+        # steps have not flushed.
+        return None if self.in_progress else self.user_cpu_alloc
 
     @property
     def system_cpu(self) -> float | None:
         value = self._from_steps("system_cpu")
-        return value if value is not None else self.system_cpu_alloc
+        if value is not None:
+            return value
+        # See `total_cpu`: the allocation row is not a fallback for a job whose
+        # steps have not flushed.
+        return None if self.in_progress else self.system_cpu_alloc
 
     @property
     def system_cpu_fraction(self) -> float | None:
@@ -567,18 +706,42 @@ class Job(NamedTuple):
         :attr:`mem_utilization` -- the plain max stands and the caller is told the
         figure is an upper bound.
         """
-        values = [s.max_rss for s in self.steps if s.max_rss is not None]
+        candidates = self.measured_steps
+        values = [s.max_rss for s in candidates if s.max_rss is not None]
         if not values:
+            # For a running job this is the answer, not a gap to paper over: the
+            # live rows carry no MaxRSS and the finished ones belong to other
+            # work. `n/a` is what a reader can act on; the max over stragglers
+            # is a 210x error presented as a measurement.
             return None
         peak = max(values)
         limit = self.mem_limit_bytes
         if not limit or peak <= limit:
             return peak
-        work = [s.max_rss for s in self.work_steps if s.max_rss is not None]
+        work = [s.max_rss for s in candidates if s.max_rss is not None and not s.is_extern]
         if not work or max(work) > limit:
             return peak
-        extern = [s.max_rss for s in self.steps if s.is_extern and s.max_rss is not None]
+        extern = [s.max_rss for s in candidates if s.is_extern and s.max_rss is not None]
         return max(work) if extern and max(extern) == peak else peak
+
+    @property
+    def peak_unmeasurable_by_permission(self) -> bool:
+        """Whether the missing live reading is a permission, not a delay.
+
+        The state a caller must not describe as "not yet flushed": nothing will
+        flush it for this reader, ever.
+        """
+        return bool(self.in_progress and self.foreign_owner and not self.live_metrics)
+
+    @property
+    def peak_is_live_reading(self) -> bool:
+        """Whether the peak came from a reading of the job as it runs.
+
+        False for a finished job (where the accounting is final and the question
+        does not arise) and False for a running job whose figure came from
+        `sacct` alone -- which is the case a caller must not present as final.
+        """
+        return bool(self.in_progress and self.live_metrics and self.max_rss is not None)
 
     @property
     def max_rss_node(self) -> str:
@@ -598,20 +761,68 @@ class Job(NamedTuple):
 
     @property
     def ave_rss(self) -> int | None:
-        values = [s.ave_rss for s in self.work_steps if s.ave_rss is not None]
+        # `measured_steps`, not `work_steps` -- see the note on :attr:`max_rss`.
+        # Routing only the peak through the live-step population left this reading
+        # the finished stragglers, and the two figures then contradicted each other
+        # on adjacent lines of the same report. Job 53834744 on midway3, running:
+        #
+        #     ● MEM  0.0%  · 12.7 MiB of the 50.0 GiB limit so far
+        #     memory
+        #       average          2.2 GiB
+        #
+        # An average 181x the peak is not a memory profile, it is two measurements
+        # of two different sets of processes printed under one heading. `.extern` is
+        # still excluded here, as it was before: that is a separate question from
+        # which steps are live.
+        values = [
+            s.ave_rss for s in self.measured_steps if not s.is_extern and s.ave_rss is not None
+        ]
         return max(values) if values else None
 
     @property
     def rss_task_imbalance(self) -> float | None:
-        """``MaxRSS / AveRSS``. Above 1 means one task holds far more than its peers."""
-        peak, average = self.max_rss, self.ave_rss
-        if not peak or not average:
-            return None
-        return peak / float(average)
+        """``MaxRSS / AveRSS`` *within one step* -- the widest such ratio, or None.
+
+        A per-task claim, so both halves have to describe the same step's tasks.
+        Dividing the job's peak by the job's average did not: :attr:`max_rss` is
+        the largest MaxRSS over every measured step *including* ``.extern``,
+        while :attr:`ave_rss` is the largest AveRSS over the work steps only, so
+        the two routinely measured different sets of processes. Job 52853137 came
+        out at 190.7x -- ``.extern``'s 10.0 GiB over step ``.20``'s 53.7 MiB --
+        and the `task-memory-imbalance` finding built on it told the reader
+        "Peak task held 10.0 GiB against a 53.7 MiB average" for a job in which
+        no task did anything of the kind. Its real imbalance is step ``.2``:
+        6496K peak against a 3166K mean across 4 tasks, 2.05x.
+
+        ``.extern`` is excluded outright rather than merely deprioritised,
+        because its own two figures contradict each other -- 52853137's extern
+        row reads ``MaxRSS 10487884K`` against ``AveRSS 18607848K``, an average
+        1.8x the peak it is supposed to sit under.
+
+        No task-count gate is needed, and that is why this stays a plain max over
+        steps: Slurm reports MaxRSS == AveRSS on a single-task step, which
+        contributes exactly 1.0 and cannot raise the figure. Round eighty-one
+        routed both halves through :attr:`measured_steps` and recorded the intent
+        -- "the ratios built from them are now ratios of one population" -- which
+        is the rule this finishes.
+        """
+        ratios = [
+            step.max_rss / float(step.ave_rss)
+            for step in self.measured_steps
+            if not step.is_extern and step.max_rss and step.ave_rss
+        ]
+        return max(ratios) if ratios else None
 
     @property
     def max_vmsize(self) -> int | None:
-        values = [s.max_vmsize for s in self.steps if s.max_vmsize is not None]
+        # `measured_steps` for the reason given on :attr:`ave_rss`, and here the
+        # contradiction was arithmetic rather than merely odd: `vmsize_to_rss`
+        # divides this by :attr:`max_rss`, so a virtual size taken from a finished
+        # straggler over a peak taken from the live steps reported job 53834744 at
+        # `virtual_to_resident: 5852.9` -- a ratio the docstring below explains as
+        # a CUDA address-space artefact, invented here by dividing two populations.
+        # `.extern` stays included, as before.
+        values = [s.max_vmsize for s in self.measured_steps if s.max_vmsize is not None]
         return max(values) if values else None
 
     @property
@@ -638,8 +849,14 @@ class Job(NamedTuple):
 
         (Taking the *max* across all steps, including extern, remains correct
         and is what :attr:`max_rss` does -- that is a different question.)
+
+        Restricted to :attr:`measured_steps` for the reason given on
+        :attr:`ave_rss`: a spread between one live step and one finished straggler
+        is a spread between two jobs' worth of processes. It reported job 53834744
+        at ``step_spread: 1142.4`` beside a peak of 12.7 MiB, which is the ratio
+        between the straggler and the live step and nothing about this job.
         """
-        values = [s.max_rss for s in self.work_steps if s.max_rss]
+        values = [s.max_rss for s in self.measured_steps if not s.is_extern and s.max_rss]
         if len(values) < 2:
             return None
         low = min(values)
@@ -714,7 +931,10 @@ class Job(NamedTuple):
 
     @property
     def max_pages(self) -> int | None:
-        values = [s.max_pages for s in self.steps if s.max_pages is not None]
+        # `measured_steps`, as for the rest of the peak counters: a page-fault count
+        # belonging to a step that has already exited says nothing about the job the
+        # reader is looking at. See :attr:`ave_rss`.
+        values = [s.max_pages for s in self.measured_steps if s.max_pages is not None]
         return max(values) if values else None
 
     # -------------------------------------------------------------------- disk

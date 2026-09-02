@@ -141,7 +141,12 @@ ignore = ["UP031"]
 "tools/*" = ["T201"]
 # Tests deliberately accept arguments they do not use (stub runners that must
 # match a real signature) and build fixtures with sacct's own CamelCase names.
-"tests/*" = ["ARG", "N802", "N803", "N806", "N815"]
+# `ARG` only: the four naming codes that used to be here (`N802`, `N803`, `N806`,
+# `N815`) now fire zero times across `tests/`, so they were exempting nothing while
+# implying the suite violates the project's naming rules. Verified by re-running
+# each code with `lint.per-file-ignores = {}` -- ruff otherwise reads the very
+# entry under test and reports a clean result either way.
+"tests/*" = ["ARG"]
 
 [tool.ruff.format]
 quote-style = "double"

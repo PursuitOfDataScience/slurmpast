@@ -375,7 +375,39 @@ _HINTS = (
     ),
     (
         ("invalid user", "unknown user", "no such user"),
-        "Check the -u argument; sacct wants a login name, not a display name.",
+        # Two causes, and the advice used to name only the one that is wrong on a
+        # compute node. Measured there: `sacct` said `Invalid user id: youzhi`
+        # with no `-u` passed and `youzhi` being the login name -- the node simply
+        # cannot resolve it (`getent passwd <uid>` fails, so `pwd.getpwuid` does
+        # too), which is the ordinary state of a diskless compute node and not a
+        # typo. Sending the reader to check an argument they did not give is a
+        # dead end; the second sentence names the cause they can act on.
+        "Check the -u argument if you passed one; sacct wants a login name, not a "
+        "display name.\n  If you did not, this node may be unable to resolve your "
+        "name at all \u2014 compute nodes often have no passwd entry for the user. "
+        "Try `getent passwd $(id -u)`, and run this from a login node, or pass "
+        "-u <login name> explicitly.",
+    ),
+    (
+        ("invalid time specification",),
+        # sacct's own text, passed straight through, reads
+        # `Invalid time specification (pos=4): now-6months` -- a byte offset into
+        # a string the user did not type in that form (`-6months` is rewritten to
+        # `now-6months` by `normalize_time_spec`), and no word about which
+        # spellings work. `-S` is this tool's most-used option, so that was the
+        # cryptic message on the most-travelled failure path.
+        #
+        # The forms below are not guessed: they are the set this repo already
+        # verified and recorded, re-checked here against Slurm 20.11.8 on the
+        # reporting cluster. Months and years really are refused -- `now-6months`,
+        # `now-2months` and `now-1year` all come back `Invalid time
+        # specification` -- while every day and week spec returns rows. That is
+        # why the advice names weeks for a long window instead of months.
+        "sacct takes days and weeks but NOT months or years: `now-1day`, "
+        "`now-7days`, `now-30days`, `now-12weeks`, `now-52weeks` (about a year) "
+        "all work, and `now-6months` is rejected.\n  An absolute "
+        "`YYYY-MM-DD` or `YYYY-MM-DDTHH:MM:SS` works too, and a bare "
+        "`-7days` is accepted here and rewritten to `now-7days` for you.",
     ),
 )
 
@@ -448,6 +480,10 @@ def resolve_fields(available=None):
         elif name not in _OPTIONAL:
             out.append(spellings[0])
     return out
+
+
+#: How many distinct strings one parse may share.  See `get` inside `parse`.
+_SHARED_STRING_CAP = 100_000
 
 
 def _field_index(fields):
@@ -590,6 +626,10 @@ def _starts_record(line, delimiter):
     return bool(found) and _looks_like_job_id(head.strip())
 
 
+#: Any whitespace character, for :func:`_looks_like_job_id`.
+_WHITESPACE_RE = re.compile(r"\s")
+
+
 def _looks_like_job_id(value):
     """Whether a first field could be a JobID sacct printed.
 
@@ -601,7 +641,12 @@ def _looks_like_job_id(value):
     seen. Those two properties are enough: the shell fragments that used to reach
     this point (``echo "--- $m ---"``, ``2>&1 | tail -1``) fail one or the other.
     """
-    return value[:1].isdigit() and not any(ch.isspace() for ch in value)
+    # One C-level scan, not a Python generator per character. This is called
+    # once per output line -- 305,931 times for a 30-day window -- and the
+    # `any(ch.isspace() for ch in value)` form spent 1.06s of a profiled parse
+    # walking short strings one character at a time. `\s` is the same predicate
+    # `str.isspace` applies, so the loose contract above is unchanged.
+    return value[:1].isdigit() and _WHITESPACE_RE.search(value) is None
 
 
 def parse(text, fields=None, delimiter="|", stats=None):
@@ -625,11 +670,71 @@ def parse(text, fields=None, delimiter="|", stats=None):
         # This used to surface as a bare KeyError from inside the row loop.
         raise SacctError("JobID must be among the requested fields; got: %s" % ", ".join(fields))
 
+    # One object per distinct value, for the whole parse.
+    #
+    # A history is fully materialised, and the records are mostly repeated text:
+    # over 13,321 real jobs, `uid` and `account` each had **one** distinct value
+    # held as 13,321 separate string objects, `state` seven, `flags` three,
+    # `work_dir` 35, `req_tres` 205. Measured across every string field of those
+    # jobs: 19.4 MB of payload, of which ~10 MB in the top fourteen fields alone
+    # was exact duplication -- before the 30,339 step rows, which repeat the same
+    # states and node names again.
+    #
+    # `sys.intern` would do it in one call and is the wrong tool: its table is
+    # global and never freed, so a long-lived process (the TUI reloading, or a
+    # library caller) would accumulate every job id and timestamp it ever saw.
+    # A dict scoped to this parse is dropped when the parse ends, and the strings
+    # it shared stay shared for exactly as long as the records that hold them.
+    #
+    # Capped, because two fields are genuinely unique per row (`job_id`, and the
+    # timestamps to a lesser degree) and caching those buys nothing but growth.
+    # The cap is generous: a cluster has tens of partitions, a handful of states
+    # and a few hundred TRES shapes, so the fields that benefit never approach it.
+    shared: dict = {}
+
+    # Each field name resolved ONCE, not once per access.
+    #
+    # `get` is the hot path of the whole parser: **1,975,028 calls** for a
+    # 30-day window on one user, and it lowercased its `name` argument on every
+    # one of them -- then handed the same string to `_clean`, which lowercased
+    # it again to test `_FREE_TEXT`. The names are a fixed set of 85
+    # compile-time constants, so all of that was recomputing a constant:
+    # profiled at **7,095,157 `str.lower()` calls**, 2.53s in `get` and 1.77s
+    # in `_clean` over 2,263,954 calls.
+    #
+    # `plan` maps the name to `(column, is_free_text)`. Filled lazily rather
+    # than from `fields`, because callers pass literal names that a short
+    # `--format` may not contain, and `index.get` returning None for those is
+    # the existing contract.
+    plan: dict = {}
+
     def get(row, name):
-        pos = index.get(name.lower())
+        entry = plan.get(name)
+        if entry is None:
+            low = name.lower()
+            entry = plan[name] = (index.get(low), low in _FREE_TEXT)
+        pos, free_text = entry
         if pos is None or pos >= len(row):
             return ""
-        return _clean(row[pos], field=name)
+        # `_clean` inlined, not reimplemented: strip, exempt the free-text
+        # fields, blank a sentinel. Kept as a function for its other callers
+        # (`_int`, `_seconds`, the sstat parser), which are not hot.
+        value = row[pos].strip()
+        if not value:
+            return ""
+        # A leading digit rules the sentinels out without lowering the string:
+        # every member of `_UNSET` starts with a letter or `(`. That matters
+        # because this branch runs once per non-empty field -- 3.2M `str.lower()`
+        # calls over a 30-day window -- and a large share of 85 sacct fields are
+        # numbers (`ElapsedRaw`, `ReqCPUS`, `Priority`, `UID`, byte counts).
+        if not free_text and not value[0].isdigit() and value.lower() in _UNSET:
+            return ""
+        seen = shared.get(value)
+        if seen is not None:
+            return seen
+        if len(shared) < _SHARED_STRING_CAP:
+            shared[value] = value
+        return value
 
     # Optional and mutated in place, so no existing caller's signature or return
     # type changes -- the report's own suggestion for how to carry this without
@@ -746,7 +851,9 @@ def parse(text, fields=None, delimiter="|", stats=None):
         req_mem = get(row, "ReqMem")
         end_raw = get(row, "End")
         state = _canonical_state(get(row, "State"))
-        derived_code, _ = _parse_exit(get(row, "DerivedExitCode"))
+        # Both halves. `DerivedExitCode` is `code:signal` and the signal half is
+        # where a killed step shows up -- slurmdbd rolls one up as `0:9`, code zero.
+        derived_code, derived_signal = _parse_exit(get(row, "DerivedExitCode"))
 
         # TimelimitRaw is in MINUTES, unlike every other *Raw field.
         timelimit_raw = _int(get(row, "TimelimitRaw"))
@@ -773,6 +880,7 @@ def parse(text, fields=None, delimiter="|", stats=None):
             exit_code=exit_code,
             signal=signal,
             derived_exit_code=derived_code,
+            derived_signal=derived_signal,
             reason=get(row, "Reason"),
             flags=get(row, "Flags"),
             submit=get(row, "Submit") or None,
@@ -1154,6 +1262,252 @@ class Sacct:
         if partition:
             extra += ["-r", partition]
         return self._query(extra)
+
+
+#: What `sstat` is asked for, in this order.  Deliberately short: every field is
+#: one a live step actually populates and one `Step` already has a home for.
+_SSTAT_FIELDS = (
+    "JobID",
+    "MaxRSS",
+    "MaxRSSNode",
+    "MaxRSSTask",
+    "AveRSS",
+    "MaxVMSize",
+    "MaxPages",
+    "AveCPU",
+    "MinCPU",
+    "NTasks",
+)
+
+#: The parsed keys that are MEASUREMENTS, as opposed to labels for one
+#: (`max_rss_node`, `max_rss_task`) or a description of the step's shape
+#: (`ntasks`). A row with none of these carries no reading and is dropped.
+#:
+#: Named explicitly because the guard that used to do this -- `all(v in (None,
+#: "") for v in measured.values())` -- did not do what its wording implied.
+#: `NTasks=0` is neither `None` nor `""`, so a row whose only content was a zero
+#: task count survived and was stored with every useful field empty. Real case,
+#: job 53834744 on midway3:
+#:
+#:     53834744.extern|||||||213503982334-14:25:51||0
+#:
+#: -- an overflowed `AveCPU` that `_SSTAT_MAX_CPU_SECONDS` correctly discards, and
+#: a `0` in the last column that kept the row alive. Harmless downstream, because
+#: `_apply_live_metrics` only fills fields that are `None`, but it meant the
+#: "nothing measured" test was passing rows that had measured nothing.
+_SSTAT_MEASUREMENT_FIELDS = (
+    "max_rss",
+    "ave_rss",
+    "max_vmsize",
+    "max_pages",
+    "ave_cpu",
+)
+
+#: Slurm writes an overflowed counter rather than an empty field, and `sstat` on
+#: an `.extern` step produced `213503982334-14:25:51` -- 585 million years -- on
+#: the first cluster this was tried against.  A CPU time longer than any job can
+#: run is not a measurement, and `parse_duration` will happily return it.
+_SSTAT_MAX_CPU_SECONDS = 366 * 24 * 3600
+
+
+def read_live_metrics(job_ids, runner=None):
+    """``{job_id: {step_id: Step-shaped dict}}`` from ``sstat``, for live steps.
+
+    **`sacct` only flushes a step's accounting when the step ENDS.**  For a job
+    that is still running the live rows carry no ``MaxRSS`` at all, and the only
+    populated ones are whatever short-lived steps have already finished -- so a
+    job holding 462 MiB against ``--mem=512M`` reported **2.2 MiB, 0.4%**, taken
+    from a 1-second monitoring step, on the gauge whose entire purpose is to say
+    whether memory was the problem.  A 210x understatement, published with
+    ``peak_trustworthy: true``.
+
+    What makes it likely rather than exotic: the finished step is often created
+    *by watching the job*.  An `srun --overlap` monitor -- slurmwatch's own node
+    hop, or an interactive probe -- leaves a ~2 MiB step behind, and that becomes
+    the reported peak.  A job nobody watched reports ``n/a`` instead, which is
+    honest only by luck of the draw.  So the two sibling tools interacted badly:
+    using slurmwatch on a job made slurmpast's post-mortem of it worse.
+
+    ``sstat`` has the right number at the same instant, it is available to the
+    job's owner from a login node, and slurmwatch already uses it.  One call for
+    every live job rather than one per job: ``-j`` takes a comma-separated list.
+
+    Returns ``{}`` on any failure -- another user's job, a job that just ended, a
+    site that does not run ``jobacct_gather`` -- because the caller's fallback is
+    to report the field as unmeasured, which is the correct answer and not a
+    degradation.
+    """
+    wanted = [str(j).split(".")[0] for j in job_ids if str(j).strip()]
+    if not wanted:
+        return {}
+    run = runner or _run
+    try:
+        out = run(
+            [
+                "sstat",
+                "--allsteps",
+                "--noheader",
+                "--parsable2",
+                "--jobs=%s" % ",".join(dict.fromkeys(wanted)),
+                "--format=%s" % ",".join(_SSTAT_FIELDS),
+            ]
+        )
+    except SacctError:
+        return {}
+    return _parse_live_metrics(out)
+
+
+def _parse_live_metrics(text):
+    """Parse ``sstat --parsable2`` output into per-job, per-step measurements."""
+    found = {}
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
+        fields = line.split("|")
+        if len(fields) < len(_SSTAT_FIELDS):
+            continue
+        row = dict(zip(_SSTAT_FIELDS, fields, strict=False))
+        step_id = _clean(row.get("JobID"))
+        if not step_id or "." not in step_id:
+            continue
+        ave_cpu = parse_duration(_clean(row.get("AveCPU")))
+        if ave_cpu is not None and (ave_cpu < 0 or ave_cpu > _SSTAT_MAX_CPU_SECONDS):
+            # See `_SSTAT_MAX_CPU_SECONDS`: an overflowed counter, not a time.
+            ave_cpu = None
+        measured = {
+            "max_rss": parse_bytes(_clean(row.get("MaxRSS"))),
+            "max_rss_node": _clean(row.get("MaxRSSNode")),
+            "max_rss_task": _clean(row.get("MaxRSSTask")),
+            "ave_rss": parse_bytes(_clean(row.get("AveRSS"))),
+            "max_vmsize": parse_bytes(_clean(row.get("MaxVMSize"))),
+            # `parse_bytes`, matching the `sacct` row path rather than `_int`.
+            # The two disagreed on a suffixed value -- `_int("2K")` is None where
+            # `parse_bytes("2K")` is 2048 -- and the `sacct` site says in a
+            # comment that the suffix handling is load-bearing because THIS
+            # cluster emits bare values and others need not. One field, one rule:
+            # otherwise `page_faults` reads null for a running job on any site
+            # whose `sstat` suffixes it, and a row whose only measurement were a
+            # suffixed MaxPages would be dropped as "nothing measured".
+            "max_pages": parse_bytes(_clean(row.get("MaxPages"))),
+            "ave_cpu": ave_cpu,
+            "ntasks": _int(_clean(row.get("NTasks"))),
+        }
+        if all(measured[field] is None for field in _SSTAT_MEASUREMENT_FIELDS):
+            continue
+        found.setdefault(_base_job_id(step_id), {})[step_id] = measured
+    return found
+
+
+def _own_name_or_blank():
+    """``current_user()``, or ``""`` when identity cannot be established.
+
+    `current_user()` raises `SacctError` when every fallback fails, which is
+    right for "whose history do I read?" -- the tool cannot proceed. It is wrong
+    here: not knowing who we are makes one optimisation unavailable, not the
+    report impossible, and letting it raise would turn a working query into a
+    failure on exactly the nodes that motivated `current_user`'s own fallbacks.
+    """
+    try:
+        return current_user()
+    except SacctError:
+        return ""
+
+
+def merge_live_metrics(jobs, runner=None, user=None):
+    """Fill in what ``sacct`` has not flushed for jobs that are still going.
+
+    A no-op for a history of finished jobs, which is the common case: nothing is
+    asked unless some job is in a non-terminal state.
+
+    Also records WHY a live job has no live reading, which is two different facts
+    wearing one label.  ``sstat`` is owner-only: asked about another user's step
+    it answers ``Invalid user id`` on stderr with **exit 0 and empty stdout**, so
+    the outcome is identical to "the job just ended" or "this site runs no
+    ``jobacct_gather``" -- and only one of those clears if you wait.  Under
+    ``--all-users`` that is the majority case, not an edge one.  ``user`` is the
+    reader whose PERMISSIONS apply -- not the user being asked about. Those differ
+    on every `-u <someone-else>` run, and passing `args.user` here would decide
+    that a foreign job belongs to the reader and query it after all, which is the
+    18-second call this exists to avoid. Resolved from the environment when not
+    given, which is the only caller so far.
+    """
+    live = [j for j in jobs if j.in_progress]
+    if not live:
+        return jobs
+    me = user or _own_name_or_blank()
+
+    def _foreign(job):
+        # Only when the owner is KNOWN to differ, and every uncertainty resolves
+        # to "ask anyway". Three of them, all reachable:
+        #
+        # * a narrow `--format` carries no `User` at all;
+        # * `current_user()` can fail outright, and now raises inside this call
+        #   path where it did not before;
+        # * on a cluster whose nodes have no passwd entry, `current_user()`
+        #   deliberately falls back to the numeric uid while `sacct` reports a
+        #   name -- so the two are not comparable and inequality means nothing.
+        #
+        # Treating any of those as "somebody else's" would silently drop the live
+        # reading on the reader's OWN job, which is the whole point of
+        # `read_live_metrics`. Losing a reading is a wrong number; asking and
+        # getting nothing is only a slow one.
+        if not me or not job.user:
+            return False
+        if me.isdigit() != str(job.user).isdigit():
+            return False
+        return job.user.lower() != me.lower()
+
+    mine = [j for j in live if not _foreign(j)]
+    # Not asked about at all, rather than asked and discarded. `sstat` is
+    # owner-only, so the answer for somebody else's step is known before the call
+    # -- and the call is not free: measured here, 20 of another user's running
+    # jobs cost **18.1 s** and produced **7,840** `sstat: error: ... Invalid user
+    # id` lines, because the client contacts every node of every step. A full
+    # `--all-users` sweep of this cluster's 288 running jobs spent minutes on a
+    # query that cannot succeed, and a `-u <someone-else>` report timed out
+    # entirely. The stderr never reached the terminal (`_run` pipes it and drops
+    # it on exit 0, which is how this failure exits), so the cost was wall-clock
+    # and not noise -- but it was paid on every run.
+    measured = read_live_metrics([j.job_id for j in mine], runner=runner) if mine else {}
+    out = []
+    for job in jobs:
+        rows = measured.get(job.job_id.split(".")[0]) if job.in_progress else None
+        if rows:
+            out.append(_apply_live_metrics(job, rows))
+        elif job.in_progress and _foreign(job):
+            out.append(job._replace(foreign_owner=True))
+        else:
+            out.append(job)
+    return out
+
+
+def _apply_live_metrics(job, rows):
+    """One job's steps, with ``sstat``'s figures written into the live ones.
+
+    Only fields ``sacct`` left empty are filled: a step that has ended has real
+    accounting and `sstat` has nothing to say about it.  ``sstat``'s own
+    ``AveCPU`` is per task, so it is scaled by the step's task count to give the
+    same quantity ``TotalCPU`` carries.
+    """
+    updated = []
+    for step in job.steps:
+        row = rows.get(step.step_id)
+        if row is None or not step.in_progress:
+            updated.append(step)
+            continue
+        changes = {}
+        for field in ("max_rss", "ave_rss", "max_vmsize", "max_pages"):
+            if getattr(step, field) is None and row.get(field) is not None:
+                changes[field] = row[field]
+        for field in ("max_rss_node", "max_rss_task"):
+            if not getattr(step, field) and row.get(field):
+                changes[field] = row[field]
+        if step.total_cpu in (None, 0.0) and row.get("ave_cpu"):
+            tasks = row.get("ntasks") or step.ntasks or 1
+            changes["total_cpu"] = row["ave_cpu"] * max(1, tasks)
+            changes["ave_cpu"] = row["ave_cpu"]
+        updated.append(step._replace(**changes) if changes else step)
+    return job._replace(steps=tuple(updated), live_metrics=True)
 
 
 def live_job_ids(runner=None, user=None, all_users=False):

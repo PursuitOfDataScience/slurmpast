@@ -939,3 +939,284 @@ class TestNothingWasComputedIsNotSaidOverTerabytes:
         assert "18.4 TiB" in text, text
         assert "Nothing was computed" not in text, text
         assert "Find the blocking call" not in text, text
+
+
+class TestTheSignalHalfOfExitCodeIsRead:
+    """``ExitCode`` is ``code:signal``, and only the code was being read.
+
+    ``sacct`` spells a signal kill with a **zero** code -- ``0:15`` -- so a rule
+    written as ``signal == 9`` named SIGKILL and nothing else, and SIGTERM is the
+    signal a supervisor sends *first*: ``timeout``, a shell trap, a watchdog, a
+    queue system layered over Slurm. Three jobs in this cluster's 90-day history
+    are ``FAILED`` at ``0:15``, and the whole report about one of them was:
+
+        $ sacct -j 53412513 -P -o State,ExitCode,Elapsed,Timelimit,TotalCPU
+        State|ExitCode|Elapsed|Timelimit|TotalCPU
+        FAILED|0:15|00:18:46|00:20:00|00:01.595
+
+        $ slurmpast 53412513 --plain --no-logs
+          [FAIL] Allocation did essentially nothing
+                 -> Find the blocking call ...
+
+    -- sending the reader to hunt a blocking call in their own code for a job
+    something outside it had terminated, which is the identical defect NODE_FAIL,
+    BOOT_FAIL and DEADLINE were each given a finding for. The ``outcome`` table
+    was silent for the same reason: ``if job.exit_code:`` is the code alone, so
+    the row that would have printed ``0 (signal 15)`` never appeared, and neither
+    did the ``0 (signal 125)`` of every OUT_OF_MEMORY job.
+    """
+
+    @staticmethod
+    def _killed(base, signal, code=0, state="FAILED"):
+        return base._replace(state=state, exit_code=code, signal=signal)
+
+    def test_a_sigterm_kill_is_named(self, healthy_job):
+        finding = find(diagnose(self._killed(healthy_job, 15)), "signal-kill")
+        assert finding is not None
+        assert finding.title == "Killed by SIGTERM", finding.title
+        assert "Exit signal 15" in finding.evidence, finding.evidence
+        assert "wrapper or watchdog" in finding.action
+
+    def test_the_record_shape_sacct_actually_writes_reaches_the_finding(self):
+        """Not `_replace`: the ``0:15`` string through `sacct.parse`, because the
+        suite's own signal tests all used ``exit_code=137``, which is the *shell's*
+        128+9 convention and not a value this cluster's accounting ever holds."""
+        from slurmpast.sacct import parse
+
+        from .conftest import _row, make_text
+
+        job = parse(
+            make_text(
+                _row(
+                    JobID="53412513",
+                    JobName="exp-a5-n11",
+                    State="FAILED",
+                    ExitCode="0:15",
+                    ElapsedRaw="1126",
+                    TimelimitRaw="20",
+                    ReqCPUS="4",
+                    AllocTRES="billing=4,cpu=4,gres/gpu=1,mem=32G,node=1",
+                ),
+                _row(
+                    JobID="53412513.batch",
+                    JobName="batch",
+                    State="FAILED",
+                    ExitCode="0:15",
+                    ElapsedRaw="1126",
+                    TotalCPU="00:01.595",
+                    MaxRSS="",
+                ),
+            )
+        )[0]
+        assert (job.exit_code, job.signal) == (0, 15)
+        verdict = diagnose(job)
+        assert "signal-kill" in codes(verdict), codes(verdict)
+
+    def test_a_signal_number_with_no_name_still_reports_the_number(self, healthy_job):
+        """``signal.Signals(40)`` raises on this platform and sacct here holds a
+        record with signal 40, so the table falls back rather than the lookup."""
+        finding = find(diagnose(self._killed(healthy_job, 40)), "signal-kill")
+        assert finding.title == "Killed by signal 40", finding.title
+
+    @pytest.mark.parametrize(
+        "state", ["OUT_OF_MEMORY", "TIMEOUT", "CANCELLED by 1234", "PREEMPTED", "NODE_FAIL"]
+    )
+    def test_the_state_that_explains_the_kill_still_wins(self, healthy_job, state):
+        """Slurm sends SIGTERM *before* SIGKILL on every one of these, so the
+        broadened rule inherits the suppression unchanged -- and must, or a
+        cancelled job gains a CRITICAL the palette declines to assert in colour."""
+        verdict = diagnose(self._killed(healthy_job, 15, state=state))
+        found = codes(verdict)
+        assert "signal-kill" not in found, found
+        assert "sigkill" not in found, found
+        assert found, "a state this specific must still produce a finding"
+
+    def test_out_of_memorys_own_marker_signal_is_suppressed_too(self, healthy_job):
+        """Slurm records the cgroup OOM kill as ``0:125``. 125 is not a signal at
+        all, and the state already names the killer."""
+        verdict = diagnose(self._killed(healthy_job, 125, state="OUT_OF_MEMORY"))
+        assert "signal-kill" not in codes(verdict), codes(verdict)
+        assert "host-oom" in codes(verdict), codes(verdict)
+
+    def test_signal_nine_keeps_its_finding_code_and_its_wording(self, healthy_job):
+        """CONTROL. `sigkill` is published in ``--json`` under ``code``, so
+        broadening the rule must not rename the case it already covered, and the
+        SIGKILL sentence must read exactly as it did."""
+        finding = find(diagnose(self._killed(healthy_job, 9)), "sigkill")
+        assert finding is not None
+        assert finding.title == "Killed by SIGKILL", finding.title
+        assert "Exit signal 9" in finding.evidence, finding.evidence
+        assert finding.severity == CRITICAL
+
+    def test_exit_137_with_no_signal_recorded_still_fires_as_sigkill(self, healthy_job):
+        """CONTROL. 137 is the shell's 128+9, which a wrapper can propagate as the
+        status with no signal beside it. That arm is why the rule is not simply
+        `if signal`."""
+        finding = find(diagnose(self._killed(healthy_job, None, code=137)), "sigkill")
+        assert finding is not None
+        assert "Exit signal 9" in finding.evidence, finding.evidence
+
+    @pytest.mark.parametrize("signal", [0, None])
+    def test_a_job_with_no_signal_draws_no_kill_finding(self, healthy_job, signal):
+        """CONTROL. The direction this fix could have been written wrong: a plain
+        non-zero status is not a signal kill, and `None` is not a small number."""
+        found = codes(diagnose(self._killed(healthy_job, signal, code=1)))
+        assert "signal-kill" not in found, found
+        assert "sigkill" not in found, found
+        assert "exit-nonzero-nolog" in found, found
+
+    def test_the_no_log_finding_agrees_with_the_signal_finding(self, healthy_job):
+        """A status the rule above named must not then be called meaningless -- the
+        self-contradiction `named_above` exists to prevent, which was keyed on
+        ``signal == 9`` and so missed every other signal."""
+        verdict = diagnose(self._killed(healthy_job, 15, code=3))
+        assert "signal-kill" in codes(verdict), codes(verdict)
+        nolog = find(verdict, "exit-nonzero-nolog")
+        assert nolog is not None
+        assert "named above" in nolog.evidence, nolog.evidence
+        assert "indistinguishable" not in nolog.evidence, nolog.evidence
+
+    def test_the_outcome_row_shows_a_signal_kill_whose_code_is_zero(self, healthy_job):
+        """The other surface of the same defect, tested where both front ends read
+        it: `render.job_sections` feeds `report.render_job` and the dashboard's
+        detail pane alike, so this cannot drift between them."""
+        from slurmpast.render import job_sections
+
+        rows = {
+            label: value
+            for _title, block in job_sections(self._killed(healthy_job, 15))
+            for label, value, _bar in block
+        }
+        assert rows.get("exit code") == "0 (signal 15)", rows
+
+    def test_a_code_half_that_is_empty_does_not_print_the_word_none(self, healthy_job):
+        """The row is only reachable from a signal alone now, so it has to survive
+        an ``ExitCode`` whose code half is empty -- `str(None)` in a table cell is a
+        placeholder that reads like a value."""
+        from slurmpast.render import job_sections
+
+        rows = {
+            label: value
+            for _title, block in job_sections(healthy_job._replace(exit_code=None, signal=15))
+            for label, value, _bar in block
+        }
+        assert rows.get("exit code") == "signal 15", rows
+
+    def test_a_clean_job_still_has_no_exit_code_row(self, healthy_job):
+        """CONTROL. ``exit code 0`` on a COMPLETED run restates the header and was
+        once the whole `outcome` section; only a recorded signal brings the row
+        back."""
+        from slurmpast.render import job_sections
+
+        labels = [label for _title, block in job_sections(healthy_job) for label, _v, _bar in block]
+        assert (healthy_job.exit_code, healthy_job.signal) == (0, 0)
+        assert "exit code" not in labels, labels
+
+
+class TestWhoCancelledIt:
+    """``CANCELLED by <uid>`` was preserved and never read.
+
+    `sacct._canonical_state` keeps that suffix on purpose -- "`Job.state` carries
+    it, `Job.base_state` drops it, and **both are read**" -- and nothing read it.
+    So a job an administrator killed drew the sentence written for the submitter's
+    own two possibilities, neither of which was true:
+
+        $ sacct -j 53439966 -P -o State,Elapsed,Timelimit,UID
+        State|Elapsed|Timelimit|UID
+        CANCELLED by 0|3-03:08:11|10-00:00:00|940740146
+
+        $ slurmpast 53439966 --plain --no-logs
+          [INFO] Cancelled, not failed
+                 A deliberate kill and an abandoned run are identical in
+                 accounting, ...
+
+    Three jobs in this cluster's 90-day history are ``CANCELLED by 0`` -- root,
+    i.e. an administrator or the scheduler -- including a three-day reservation.
+    """
+
+    @staticmethod
+    def _cancelled(base, by, uid):
+        return base._replace(state="CANCELLED by %s" % by, uid=uid, exit_code=0, signal=0)
+
+    def test_root_is_not_reported_as_your_own_kill(self, healthy_job):
+        verdict = diagnose(self._cancelled(healthy_job, "0", "940740146"))
+        finding = find(verdict, "cancelled-by-other")
+        assert finding is not None, codes(verdict)
+        assert "root" in finding.title, finding.title
+        assert "940740146" in finding.evidence, finding.evidence
+        assert finding.action, "an admin kill has something to do about it"
+        assert "cancelled" not in codes(verdict), "one verdict, not two"
+
+    def test_the_record_shape_sacct_actually_writes_reaches_the_finding(self):
+        """Through `sacct.parse`, so the suffix survives `_canonical_state` and the
+        ``UID`` column lands on the field the comparison reads."""
+        from slurmpast.sacct import parse
+
+        from .conftest import _row, make_text
+
+        job = parse(
+            make_text(
+                _row(
+                    JobID="53439966",
+                    JobName="amd_reserve",
+                    User="youzhi",
+                    UID="940740146",
+                    State="CANCELLED by 0",
+                    ExitCode="0:0",
+                    ElapsedRaw="270491",
+                    TimelimitRaw="14400",
+                    ReqCPUS="6",
+                    AllocTRES="billing=6,cpu=6,mem=50G,node=1",
+                )
+            )
+        )[0]
+        assert job.base_state == "CANCELLED"
+        assert job.uid == "940740146"
+        assert "cancelled-by-other" in codes(diagnose(job))
+
+    def test_another_users_scancel_names_the_uid_rather_than_guessing(self, healthy_job):
+        finding = find(
+            diagnose(self._cancelled(healthy_job, "12345", "940740146")), "cancelled-by-other"
+        )
+        assert "another user" in finding.title.lower(), finding.title
+        assert "12345" in finding.evidence, finding.evidence
+        assert "root" not in finding.evidence.lower(), finding.evidence
+
+    def test_your_own_scancel_keeps_its_wording_and_its_empty_action(self, healthy_job):
+        """CONTROL. The common case, and the one `test_audit` renders to prove no
+        arrow is drawn for an actionless finding -- so the code, the title and the
+        empty action all have to survive untouched."""
+        verdict = diagnose(self._cancelled(healthy_job, "940740146", "940740146"))
+        finding = find(verdict, "cancelled")
+        assert finding is not None, codes(verdict)
+        assert finding.title == "Cancelled, not failed", finding.title
+        assert finding.action == "", repr(finding.action)
+        assert "cancelled-by-other" not in codes(verdict)
+
+    def test_an_absent_owner_uid_makes_no_claim(self, healthy_job):
+        """CONTROL, and the one that separates this fix from a wrong one: with no
+        ``UID`` on the record there is nobody to compare the canceller against, so
+        the honest answer is the ordinary sentence. A fix keyed on the suffix alone
+        would announce a stranger's scancel on every cancelled job."""
+        verdict = diagnose(self._cancelled(healthy_job, "0", ""))
+        assert "cancelled" in codes(verdict), codes(verdict)
+        assert "cancelled-by-other" not in codes(verdict), codes(verdict)
+
+    @pytest.mark.parametrize("state", ["CANCELLED", "CANCELLED by root", "CANCELLED by +"])
+    def test_a_suffix_that_is_not_a_uid_makes_no_claim(self, healthy_job, state):
+        """CONTROL. Only the exact three-token numeric shape counts; anything else
+        is a spelling this reader does not know, and guessing at a canceller from
+        it would be worse than the sentence it replaced."""
+        verdict = diagnose(healthy_job._replace(state=state, uid="940740146"))
+        assert "cancelled" in codes(verdict), codes(verdict)
+        assert "cancelled-by-other" not in codes(verdict), codes(verdict)
+
+    def test_nothing_here_is_graded_a_failure(self, healthy_job):
+        """CONTROL. `theme.STATE_HEALTH` grades CANCELLED "none" because "colouring
+        it red asserts a judgement the data does not support", and a CRITICAL
+        finding is what `slurmpast <jobid>` computes its exit code from. Naming the
+        canceller is information, not a verdict."""
+        for by, uid in (("0", "940740146"), ("12345", "940740146"), ("940740146", "940740146")):
+            verdict = diagnose(self._cancelled(healthy_job, by, uid))
+            assert not [f for f in verdict.findings if f.severity == CRITICAL], by
+            assert all(f.severity == INFO for f in verdict.findings if "cancel" in f.code), by

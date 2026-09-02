@@ -43,6 +43,20 @@ from .diagnose import looks_like_noop
 from .patterns import fold_erased_the_name, newest_name, normalize_name, usable
 
 MIN_SAMPLES = 10
+# The smallest loaded history :func:`note_for_allocation` will draw a conclusion
+# from. Distinct from MIN_SAMPLES, which floors the placements on the node being
+# judged: this floors the whole population the comparison is drawn against, and
+# nothing else does. `node_table` has no minimum on `other_trials`, so 10 failures
+# on one node beside 2 clean runs on another already clears MIN_SAMPLES, BH and
+# the Wilson interval and says "against 0.0% on every other node" -- an "every
+# other node" of two placements. That is the case this floor exists for.
+#
+# It lived in both front ends as a bare `20` (`cli._node_note`, `tui.JobScreen.
+# render_body`), which is how the two came to disagree about whether the note
+# exists at all: same literal, different `jobs` argument, and no single place to
+# read the rule out of. `render.py` cannot hold it -- the analysis modules may not
+# import `render` -- so it sits beside the other thresholds it is one of.
+MIN_HISTORY = 20
 Z = 1.96  # 95%, and the interval the table displays stays a plain 95% interval
 # The false-discovery rate the table as a whole is held to. Not a per-row alpha:
 # the user reads every row at once and pastes whatever tripped into --exclude, so
@@ -289,10 +303,33 @@ def _informative(job, metric):
     `looks_like_noop`, a job that held its allocation and computed nothing until
     someone killed it. Dropping those would throw away the primary signal for the
     metric that is the default.
+
+    ``OUT_OF_MEMORY`` is censored for the same reason and with less ambiguity than
+    a cancellation, because it was in the *numerator*: Slurm records it when the
+    job's cgroup passed the memory the job itself asked for, which is a property
+    of ``--mem`` and is enforced identically by every node that honours the
+    request. The workload control cannot remove this confound the way it removes a
+    code bug, because one array's elements do not all need the same memory: on a
+    real 90-day history `caai-p10b_scan` asked `mem=6G` for all 142 elements and
+    71 of them died OOM across ten nodes, and the table put `midway3-0187` --
+    identical hardware to `midway3-0200`, 48 CPUs and 184320 MB each -- into a
+    paste-ready ``#SBATCH --exclude=`` on the strength of 14 OOM placements out of
+    21. Censoring leaves it 0 of 7 informative placements, i.e. below MIN_SAMPLES,
+    which is again the honest answer. `midway3-0250`, whose 32 failures are real
+    FAILED rows, still scores worse and is still suggested -- so this narrows the
+    claim without costing the signal.
+
+    The hang metric keeps OOM too, and that is likewise not an inconsistency: a
+    job that got far enough to be killed for its memory is evidence the node did
+    *not* hang, so there the placement is informative.
     """
     if metric == "hang":
         return True
-    return not job.cancelled
+    # TIMEOUT deliberately stays. It is the metric this module was built on -- the
+    # docstring's founding measurement is 19 hangs in 36 on midway3-0385 -- and a
+    # wall-clock kill really can be the machine (a wedged mount, a stuck GPU),
+    # which is exactly what holding the workload fixed is there to separate.
+    return not job.cancelled and job.base_state != "OUT_OF_MEMORY"
 
 
 class Workload(str):
@@ -445,17 +482,31 @@ def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
         elif row["direction"] == "better" and row["ci_high"] < row["comparison"]:
             row["verdict"] = "better"
 
-    # Rows the table will show with an interval clear of the comparison and no
+    # Rows the table will show with an interval clear of the baseline and no
     # verdict beside it. Counted from the verdict actually reached, not from the
     # branch that reached it, so it cannot drift from what the screens then claim.
     # They need it: the interval is on display, and a user reading it against the
     # verdict column deserves to be told why the two disagree rather than left to
     # conclude the tool is broken.
+    #
+    # Against `baseline` -- the one rate the screens print (`render.nodes_baseline`)
+    # -- and not against the per-row leave-one-out `comparison`, which appears
+    # nowhere the reader can see. `render.held_back_note` says "N intervals clear
+    # THE BASELINE on their own", so N has to be countable off the CI column beside
+    # the printed baseline or the sentence sends the reader looking for a row that
+    # is not there. `comparison` over-counts, always in that direction: `baseline`
+    # is a convex combination of this row's rate and `comparison`, and a Wilson
+    # interval always contains its own rate, so clearing `baseline` implies
+    # clearing `comparison` but not the reverse. On a real 90-day history the
+    # default screen said "2 intervals clear the baseline on their own" over a
+    # table holding one -- midway3-0039 at 1/65, whose 0.3-8.2% interval clears
+    # comparison 8.68% but not the 8.2% baseline printed two lines above it.
     held_back = sum(
         1
         for row in rows
         if row["verdict"] == "inconclusive"
-        and (row["ci_low"] > row["comparison"] or row["ci_high"] < row["comparison"])
+        and baseline is not None
+        and (row["ci_low"] > baseline or row["ci_high"] < baseline)
     )
 
     rows.sort(key=lambda r: -r["rate"])
@@ -522,8 +573,18 @@ def dominant_workload(jobs, metric=None):
     # tested the sweep's genuinely bad node at all.
     # Keyed by (name, user), not by name: see Workload. Under the single-user query
     # that is the default this changes nothing, because the user is constant.
+    #
+    # Counted over the placements :func:`node_table` will actually test, not over
+    # every usable record -- see :func:`_informative`. Selecting on events the
+    # table then censors picks a stratum in which the question is no longer
+    # answerable, which is the precise failure this function was written to avoid:
+    # a workload whose failures are all OUT_OF_MEMORY wins the selection and then
+    # arrives at the table with nothing left in the numerator. Falls back to the
+    # whole set when the censoring empties it, so a window of nothing but
+    # cancellations still names a workload rather than raising on max(()).
+    scored = [j for j in records if predicate is None or _informative(j, metric)] or records
     counts, events, members = {}, {}, {}
-    for job in records:
+    for job in scored:
         key = (normalize_name(job.name), job.user)
         counts[key] = counts.get(key, 0) + 1
         members.setdefault(key, []).append(job)
@@ -624,9 +685,24 @@ def note_for_allocation(jobs, nodelist, workload=None):
     One table for the whole allocation rather than one per node: :func:`node_table`
     walks the entire history, and the family the correction is applied over has to
     be the table, not a per-node slice of it.
+
+    ``MIN_HISTORY`` is applied here, once, rather than by each caller. Both front
+    ends used to hold their own copy of it and hand this function a different
+    population, so ``slurmpast <one id> --plain`` was silent about a node that had
+    failed 32 of 33 placements while the dashboard's screen for that same id drew
+    the sentence. Whoever asks gets the same answer for the same records now, which
+    is the only way the two surfaces can be kept from drifting.
     """
     nodes = expand_nodelist(nodelist)
     if not nodes:
+        return ""
+    # `> MIN_HISTORY`, not `>=`, because that is what both front ends spelled and
+    # this move is not the place to shift the number. Counted over `usable` -- the
+    # records the table can actually use -- where `cli` counted `len(history)`,
+    # every parsed row including the ones `node_table` then discards. On the
+    # history this was measured against that is 15,040 against 15,046, so no
+    # reader's note changes; it is the quantity the threshold claims to be about.
+    if len(usable(jobs)) <= MIN_HISTORY:
         return ""
     table = node_table(jobs, workload=workload, metric="failure")
     wanted = set(nodes)
@@ -635,22 +711,83 @@ def note_for_allocation(jobs, nodelist, workload=None):
     # its placement is the problem, not a list of eight intervals.
     for row in table["rows"]:
         if row["node"] in wanted:
-            note = _note_from_row(row, workload)
+            note = _note_from_row(row, workload, table["trials"] - row["trials"])
             if note:
                 return note
     return ""
 
 
-def _note_from_row(row, workload=None):
-    """The note one table row supports, or "" when it supports none."""
+def _note_from_row(row, workload=None, other_trials=None):
+    """The note one table row supports, or "" when it supports none.
+
+    **The comparison gets a denominator too.** The sentence was scrupulous about
+    its own -- "failed 32 of 33 placements there" -- and then gave the thing it
+    was compared against as a bare "against 3.4% on every other node", with no
+    indication whether that rate came from 13,000 placements or from two. On this
+    cluster's real history it is 13,497 and the omission costs nothing; the
+    reachable case is a short window, because ``node_table`` applies no
+    ``MIN_HISTORY`` and ``--nodes`` calls it directly. Round fifty measured that
+    and declined to add a floor -- the p-value already prices a thin comparison
+    arm, and a count floor suppressed a p=0.0007 finding the demo exists to show
+    -- which leaves this: say how big the comparison is and let the reader weigh
+    it. No verdict changes.
+
+    **Only when the comparison is the weaker half**, and that bar is derived from
+    the row rather than picked: below ``row["trials"]``, the thing being compared
+    against rests on fewer placements than the node being accused, and the
+    reader is entitled to know which side is thin. Above it the number is never
+    surprising -- on this cluster's 90-day history it is 13,497 against a node's
+    344 -- and spending 25 characters of a one-line job-screen note to say so
+    would cost every reader something to tell almost none of them anything.
+    That also keeps a previous round's control honest: every figure the sentence
+    already carried is untouched, and in the common case so is its wording.
+
+    ``over N placements`` is ``render.nodes_baseline``'s phrasing for the pooled
+    value of this very field ("baseline 3.4% over 2675 placements"), and that
+    line owns the noun. ``None`` keeps the old wording, for a caller holding a row
+    but not the table it came from.
+
+    **``placements``, not "your N jobs".** The denominator is ``row["trials"]``,
+    and since :func:`_informative` began censoring cancellations -- and then
+    ``OUT_OF_MEMORY`` for the failure metric -- that is no longer a count of runs
+    the reader submitted. It is the count of runs whose outcome could have been
+    the *node's* doing. On a real 90-day history `sacct` holds 36
+    ``caai-p10b_scan`` rows on `midway3-0250` (32 FAILED, 1 COMPLETED, 3
+    CANCELLED) and this sentence's denominator is 33; `midway3-0187` has 21 and
+    it is 7, because 14 of them are OOM. Censoring the denominator is right --
+    an OOM says nothing about the machine, since every node enforces the same
+    ``--mem`` -- but "your 33 jobs there" then asserts something about the
+    reader's own submissions that is false by three, and invites them to check it
+    against `sacct` and conclude the tool cannot count. The possessive is what
+    turns a count into that claim, so it goes with the noun.
+
+    **The noun is ``render.nodes_baseline``'s, deliberately.** That sentence
+    prints the *pooled* value of this very field -- ``baseline 3.4% over 2675
+    placements`` is ``table["trials"]`` where this is ``row["trials"]`` -- so one
+    field carried two nouns across two screens and only one of them was
+    possessive. ``nodes_empty_reason`` ("No node reached the 10 placements a
+    comparison needs") and this module's own docstrings use the same word; the
+    table's ``N`` column and ``--json``'s ``trials``/``bad`` are keys rather than
+    prose and are left alone. Reusing the word that already exists is the rule
+    ``render`` is there to enforce, and it cannot be enforced *from* ``render``
+    here: ``render`` imports this module (and ``rich``), which the analysis
+    modules may not, so the sentence stays in the one place both front ends
+    already share and takes render's vocabulary with it rather than being spelled
+    out twice.
+    """
     # The rate the verdict was actually reached against -- every other node --
     # rather than the fleet-wide figure this row is itself part of.
     comparison = row.get("comparison")
     if row["verdict"] != "worse" or comparison is None:
         return ""
+    # Pre-formatted so the sentence stays in ONE place: a second full spelling of
+    # it under an `if` is exactly the drift `render.py` exists to prevent.
+    against = "%.1f%%" % (100 * comparison)
+    if other_trials is not None and other_trials < row["trials"]:
+        against += " over %d placements" % other_trials
     return (
-        "%s failed %d of your %d jobs there (%.1f%%, 95%% CI %.1f-%.1f%%) against "
-        "%.1f%% on every other node%s."
+        "%s failed %d of %d placements there (%.1f%%, 95%% CI %.1f-%.1f%%) against "
+        "%s on every other node%s."
         % (
             row["node"],
             row["bad"],
@@ -658,7 +795,7 @@ def _note_from_row(row, workload=None):
             100 * row["rate"],
             100 * row["ci_low"],
             100 * row["ci_high"],
-            100 * comparison,
+            against,
             (" for %s" % workload) if workload else "",
         )
     )
@@ -675,5 +812,5 @@ def note_for_node(jobs, node, workload=None):
     table = node_table(jobs, workload=workload, metric="failure")
     for row in table["rows"]:
         if row["node"] == node:
-            return _note_from_row(row, workload)
+            return _note_from_row(row, workload, table["trials"] - row["trials"])
     return ""

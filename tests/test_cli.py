@@ -89,6 +89,20 @@ class TestTextViews:
         assert run("--demo", view, "--no-color") == 0
         assert capsys.readouterr().out.strip()
 
+    @pytest.mark.parametrize("view", ["--overview", "--patterns", "--nodes", "--sizing"])
+    def test_strict_does_not_make_a_reporting_view_judge(self, view, capsys):
+        """`--help` says the reporting views ALWAYS exit 0; `--strict` is the one
+        flag that looks like it should change that.
+
+        It is documented as folding per-job findings back into the exit code, so a
+        script author who wants `--sizing` to signal would reach for it first. The
+        claim in the epilog is unconditional, and the demo history really does carry
+        critical findings (see `TestJsonReportsSeverityInItsExitCode`), so this is a
+        test of "report rather than judge" and not of an empty history.
+        """
+        assert run("--demo", view, "--strict", "--no-color") == 0
+        assert capsys.readouterr().out.strip()
+
     def test_the_window_is_named_as_synthetic_in_demo_mode(self, capsys):
         run("--demo", "--overview", "--plain", "--no-color")
         assert "synthetic demo data" in capsys.readouterr().out
@@ -250,6 +264,83 @@ class TestTheDemoStaysSynthetic:
         assert payload["jobs"][0]["log"] is None
         codes = {f["code"] for f in payload["jobs"][0]["findings"]}
         assert not codes & {"cuda-oom", "traceback", "import-error", "nccl"}
+
+    def test_the_host_cluster_cannot_change_the_demo(self, capsys, tmp_path, monkeypatch):
+        """The other half of the same promise, and the half nothing checked.
+
+        The two tests around this one pin the LOG side: a synthetic job must never
+        be handed a real file. `DEMO_SITE` and `DEMO_PARTITIONS` exist for the
+        CLUSTER side — `site()` learns Slurm's version and accounting config by
+        running `scontrol`, and `sizing.cpu_advice` learns a partition's ceiling by
+        running `sinfo`, so without them `--demo` on a login node asks the *real*
+        cluster and the demo changes by machine. The comment above says that is
+        "the exact thing DEMO_SITE was added to stop"; this asserts it.
+
+        Driven by giving the host a cluster that answers ABSURDLY rather than by
+        removing Slurm: an absent `scontrol` and a lying one are different failures,
+        and only the second can silently move the numbers.
+        """
+        import os
+        import pathlib
+        import subprocess
+        import sys
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+
+        def demo_output(bindir, *extra):
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(root / "src"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "NO_COLOR": "1",
+                "COLUMNS": "200",
+            }
+            if bindir is not None:
+                env["PATH"] = f"{bindir}:{os.environ.get('PATH', '')}"
+            done = subprocess.run(
+                [sys.executable, "-m", "slurmpast", "--demo", *extra],
+                capture_output=True,
+                text=True,
+                timeout=280,
+                cwd=str(tmp_path),
+                env=env,
+            )
+            assert done.returncode in (0, 1), done.stderr[-300:]
+            return done.stdout
+
+        liar = tmp_path / "bin"
+        liar.mkdir()
+        # A version and accounting config unlike this cluster's, and a partition
+        # ceiling far BELOW what the synthetic history asks for, so a leak would
+        # move `--sizing`'s advice rather than merely its prose.
+        (liar / "scontrol").write_text(
+            "#!/bin/bash\n"
+            "echo 'SLURM_VERSION = 99.99.99'\n"
+            "echo 'JobAcctGatherType = jobacct_gather/none'\n"
+            "echo 'AccountingStorageType = accounting_storage/none'\n"
+            "echo 'AccountingStorageTRES = cpu'\n"
+        )
+        # The real call is `sinfo -h -p <part> -N -o "%c %m"`, i.e. one line per
+        # NODE with cores and MB. Two cores is far below the synthetic history's
+        # largest ask (16), so an unpinned ceiling clamps `--sizing`'s advice
+        # visibly -- which is the point: the first version of this stub echoed a
+        # shape `partition_ceiling` does not parse, so the check passed while
+        # `pin_partition_ceilings` was removed.
+        (liar / "sinfo").write_text("#!/bin/bash\necho '2 1024'\n")
+        for stub in ("scontrol", "sinfo"):
+            (liar / stub).chmod(0o755)
+
+        # BOTH surfaces, because they are pinned by different constants and only
+        # one is reachable from `--json`: unpinning `site()` moves the JSON, while
+        # unpinning the partition ceilings moves nothing until `--sizing` asks
+        # `sinfo` how big the nodes are. Checked separately, after the first
+        # version of this test passed with `pin_partition_ceilings` removed.
+        for extra in (("--json",), ("--sizing", "--plain")):
+            honest, lying = demo_output(None, *extra), demo_output(liar, *extra)
+            assert honest == lying, (
+                f"`--demo {' '.join(extra)}` moved when the host cluster answered "
+                f"differently -- DEMO_SITE/DEMO_PARTITIONS no longer pin it"
+            )
 
     def test_the_whole_demo_history_reads_no_logs(self, capsys, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

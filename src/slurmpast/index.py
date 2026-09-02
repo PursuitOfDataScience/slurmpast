@@ -412,12 +412,32 @@ def filter_groups(
             continue
         # Same as filter_jobs: LAST RUN is a column here, so its date has to be
         # searchable. first_seen too -- it bounds the same range and costs nothing.
+        #
+        # The member job names, not just the fold. JOB NAME on screen is
+        # `GroupStats.label`, and `label` shows a real job name wherever the fold
+        # would stand in for exactly one -- which is the ordinary case, 639 of 879
+        # workloads on a real 30-day history. Matching `name` alone meant the
+        # overview printed `exp-a45` and then found nothing when you typed it,
+        # because the only name in the haystack was `exp-a#`. That is precisely
+        # what `filter_jobs` above calls "the worst kind of empty result", on the
+        # landing screen, for three rows in four; round thirteen fixed the *promise*
+        # this box makes and left the promise unmet for the value it displays.
+        #
+        # The raw names rather than `label` itself: `label` walks the group to find
+        # its newest run, which costs 8.4 ms across 879 groups against 0.5 ms for
+        # the whole filter -- and this runs on every keystroke. The name set is
+        # 0.9 ms and is a superset, so every displayed label matches (checked: 0
+        # of 879 uncovered) and so does any other name the fold covers. It also
+        # answers round thirteen's cost objection to widening this haystack, which
+        # was about folding in ids, states and node lists -- a much larger string
+        # per group than the one or two names a workload actually has.
         haystack = " ".join(
             (
                 group.name,
                 group.partition,
                 (group.last_seen or "").replace("T", " "),
                 (group.first_seen or "").replace("T", " "),
+                *sorted({job.name for job in group.jobs if job.name}),
             )
         ).lower()
         if needle and needle not in haystack:

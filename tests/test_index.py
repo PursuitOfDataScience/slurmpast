@@ -508,3 +508,108 @@ class TestAFoldedNodeListIsSearchableByHostname:
         assert "midway3-0003" in shown, text
         for hostname in shown:
             assert filter_jobs([job], query=hostname) == [job], hostname
+
+
+class TestTheNameOnTheOverviewIsSearchable:
+    """JOB NAME on the overview is `GroupStats.label`, and the search box matched
+    `GroupStats.name` -- the fold.
+
+    `label` shows a real job name wherever the fold would otherwise stand in for
+    exactly one, which is the ordinary case rather than the exception: 639 of 879
+    workloads on a real 30-day history. So the table printed `exp-a45` and typing
+    it returned nothing, because the only name in the haystack was `exp-a#`. That
+    is the failure `filter_jobs` names in its own comment -- "typing what you can
+    plainly see and getting an empty list is the worst kind of empty result" -- on
+    the landing screen, for three rows in four.
+
+    Round thirteen fixed the *promise* this box makes (`GROUP_SEARCH_FIELDS` says
+    "name") and left the promise unmet for the value it displays. Its test could
+    not catch this: it samples a job name out of the demo history, and every demo
+    workload has a name the fold leaves alone, so `label == name` for all eight and
+    the assertion held vacuously.
+    """
+
+    @staticmethod
+    def _rows(name, count, partition="test"):
+        from tests.conftest import row
+
+        rows = []
+        for offset in range(count):
+            day = "2026-06-%02d" % (offset + 1)
+            rows.append(
+                row(
+                    JobID=str(200 + offset),
+                    JobName=name,
+                    User="youzhi",
+                    Partition=partition,
+                    State="COMPLETED",
+                    ExitCode="0:0",
+                    Submit="%sT01:00:00" % day,
+                    Start="%sT01:00:01" % day,
+                    End="%sT01:30:01" % day,
+                    Elapsed="00:30:00",
+                    ElapsedRaw="1800",
+                    Timelimit="01:00:00",
+                    ReqCPUS="1",
+                    AllocTRES="cpu=1,mem=8G,node=1",
+                    NodeList="midway3-0602",
+                    NTasks="1",
+                    TotalCPU="20:00",
+                )
+            )
+        return rows
+
+    @staticmethod
+    def _parse(rows):
+        from slurmpast.sacct import parse
+        from tests.conftest import make_text
+
+        return parse(make_text(*rows))
+
+    def _groups(self):
+        return build_groups(self._parse(self._rows("s1e20", 3)))
+
+    def test_the_fold_hides_a_real_name_on_this_fixture(self):
+        """The premise, asserted rather than assumed: without a group whose label
+        differs from its fold there is nothing here to test, and that is exactly
+        how the round-thirteen test passed while the defect stood."""
+        group = self._groups()[0]
+        assert group.name == "s#e#"
+        assert group.label == "s1e20"
+
+    def test_the_displayed_label_finds_the_group(self):
+        groups = self._groups()
+        assert filter_groups(groups, "all", "s1e20") == groups
+
+    def test_every_label_in_a_history_is_findable(self):
+        """The general rule, over the demo history and the fixture together."""
+        from slurmpast.demo import history
+
+        jobs = [j for j in history() if not j.open_ended]
+        jobs += self._parse(self._rows("mid85_059", 4))
+        groups = build_groups(jobs)
+        assert len(groups) == 9
+        for group in groups:
+            assert filter_groups(groups, "all", group.label), group.label
+
+    def test_the_fold_still_matches(self):
+        """First control: widening the haystack must not cost the pattern itself,
+        which is what a reader who has learned the `#` notation types."""
+        groups = self._groups()
+        assert filter_groups(groups, "all", "s#e#") == groups
+
+    def test_the_overview_still_cannot_be_searched_by_job_id_or_state(self):
+        """Second control, and the one this change could plausibly have broken:
+        round thirteen's whole finding was that the box must not invite job id,
+        state or node here, and its test asserts those three still return nothing.
+        A haystack widened by whole `Job` records rather than by their names would
+        satisfy this class and silently reopen that one."""
+        from slurmpast.index import GROUP_SEARCH_FIELDS
+
+        groups = self._groups()
+        for field, query in (("job id", "200"), ("state", "COMPLETED"), ("node", "midway3-0602")):
+            assert field not in GROUP_SEARCH_FIELDS, field
+            assert filter_groups(groups, "all", query) == [], (field, query)
+
+    def test_a_miss_is_still_a_miss(self):
+        assert filter_groups(self._groups(), "all", "s2e20") == []

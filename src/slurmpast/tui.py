@@ -18,7 +18,12 @@ and blocking the first paint on it would feel broken.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import os
+import signal
+import sys
+from collections.abc import Generator
 from typing import Any, ClassVar, cast
 
 from rich.text import Text
@@ -164,13 +169,25 @@ def _write_clip(path: str, text: str) -> None:
     import os
 
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # The close is guarded to the window in which the descriptor is still OURS.
+    # It used to wrap the write as well, and `os.fdopen` takes ownership -- so a
+    # write that failed was closed once by the `with` and again here, and the
+    # second close raised `EBADF`, which then REPLACED the real error. Measured
+    # under `RLIMIT_FSIZE`:
+    #
+    #     raised:  OSError: [Errno 9] Bad file descriptor
+    #     masking: OSError: [Errno 27] File too large
+    #
+    # A full filesystem or an exceeded quota -- the two reasons this actually
+    # fails -- both arrived as "Bad file descriptor", which points nowhere.
     try:
         os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text if text.endswith("\n") else text + "\n")
+        handle = os.fdopen(fd, "w", encoding="utf-8")
     except BaseException:
         os.close(fd)
         raise
+    with handle:
+        handle.write(text if text.endswith("\n") else text + "\n")
 
 
 def _discard_clip() -> None:
@@ -292,8 +309,10 @@ def _header() -> Header:
 # is a third of the workload and is why its numbers do not add up.
 QUALIFIER_SHARE = 0.10
 
+# A floor and deliberately no ceiling: `_elide_budget` measures against the width
+# there is, because whether a path wraps is a function of the width there is. A
+# `_MAX_PATH_WIDTH` was carried here unused; it would elide a path that fits.
 _MIN_PATH_WIDTH = 28
-_MAX_PATH_WIDTH = 62
 _DEFAULT_TABLE_WIDTH = 96
 _MIN_TABLE_WIDTH = 40
 _SCROLLBAR = 2
@@ -314,7 +333,7 @@ def _text_width(screen) -> int:
     100-cell screen. Two cells is enough: a finding wrapped to 90 was drawn at
     8 + 90 = 98, Textual soft-wrapped the overflow, and the reader got
 
-        midway3-0385 failed 12 of your 12 jobs there (100.0%, ...) against 25.0%
+        midway3-0385 failed 12 of 12 placements there (100.0%, ...) against 25.0%
     on
         every other node for cot-exp.
 
@@ -695,8 +714,15 @@ _HELP_NOTES = (
     "failure can be expected. COMPLETED plus FLAGGED can be less than RUNS: a "
     "cancelled run is neither, since a deliberate kill and an abandoned one are "
     "identical in accounting.",
+    # The rate is not decoration: the CPU / GPU-HOURS column pair is on screen
+    # here, so a row with fewer CPU-hours ranked above one with more looks
+    # arbitrary without it. `--plain` has always printed it in the caption above
+    # the same table, and `report.py` asserted in a comment that "the dashboard
+    # puts the same two facts under `?`" -- the digit fold was, the rate never
+    # was. Read from `render`, so the two surfaces cannot quote different rates.
     "Groups are ranked by resources burned, not run count: a 5-run group that cost "
-    "400 GPU-hours outranks 400 two-second probes.",
+    "400 GPU-hours outranks 400 two-second probes. Weighted at %s."
+    % render.gpu_hours_equivalence(),
     "Selecting text: just drag. Mouse capture is off by default, so your terminal "
     "handles selection exactly as it does elsewhere. Press M to hand the mouse to "
     "the app instead (enables clicking and wheel scrolling, disables drag-select), "
@@ -1680,12 +1706,17 @@ class JobScreen(ScreenChrome, Screen[Any]):
 
         history: History | None = self.sp.history
         note = ""
-        if history is not None and len(history) > 20:
+        if history is not None:
             from .nodes import Workload, note_for_allocation
 
             # The whole allocation, not just its first node -- a multi-node job's
             # bad node is rarely the one Slurm happened to list first.
             # The job's own workload, user included -- see nodes.Workload.
+            # No `len(history) > 20` here any more: this screen and `cli._node_note`
+            # each held their own copy of that floor, which is how the two surfaces
+            # came to disagree about whether the note exists at all. It is
+            # `nodes.MIN_HISTORY`, applied inside `note_for_allocation`, so there is
+            # one place to read it from and one place to change it.
             note = note_for_allocation(
                 history.usable_jobs, job.node_list, workload=Workload(job.name, job.user)
             )
@@ -2198,6 +2229,30 @@ class SlurmpastApp(App[Any]):
     def on_mount(self) -> None:
         self.register_theme(theme.theme())  # type: ignore[arg-type]
         self.theme = "slurmpast"
+        # Leave the terminal the way we found it, whichever way the run ends.
+        #
+        # Measured in a real pty: a `q` and a SIGINT both tore the screen down
+        # cleanly, while **SIGTERM and SIGHUP killed the app mid-draw and left the
+        # alternate screen open** -- the user's scrollback replaced by a dead
+        # dashboard until they run `reset`. Both are ordinary: slurmstepd SIGTERMs
+        # the step when a job running `srun --pty slurmpast` is cancelled, and a
+        # tmux pane being killed or an IDE terminal closing SIGHUPs the foreground
+        # group.
+        #
+        # SIGINT is handled too, for the EXIT CODE rather than the screen: it
+        # already restored the terminal but exited 0, so `kill -INT` and a clean
+        # `q` were indistinguishable to a supervisor or a `timeout --signal=INT`.
+        # A ctrl-c TYPED into the dashboard is unaffected -- in raw mode that
+        # arrives as the byte 0x03 and is handled as a key.
+        #
+        # 128+signum, so anything reading the status sees "signalled" rather than a
+        # crash. The sibling package reached the same three handlers by the same
+        # route (its SW-26), which is where the numbers come from.
+        with contextlib.suppress(Exception):
+            loop = asyncio.get_running_loop()
+            loop.add_signal_handler(signal.SIGTERM, lambda: self.exit(return_code=143))
+            loop.add_signal_handler(signal.SIGHUP, lambda: self.exit(return_code=129))
+            loop.add_signal_handler(signal.SIGINT, lambda: self.exit(return_code=130))
         # The overview renders its own "loading…" state, so it can be pushed
         # immediately and filled in when the worker lands. An earlier version
         # pushed a separate LoadingScreen and then popped back to it, which
@@ -2458,6 +2513,62 @@ def _elide(path: str, keep: int = 46) -> str:
     return shortened if len(shortened) <= keep else _clip(path, keep)
 
 
+#: Undo everything the dashboard turns on, in one write. Idempotent: sending it
+#: when the terminal is already restored costs nothing, so no caller has to know
+#: whether it was needed.
+_TERMINAL_RESET = "\033[?1049l\033[?25h\033[?2026l\033[?2004l\033[0m\r"
+
+
+@contextlib.contextmanager
+def _guard_startup_window() -> Generator[None, None, None]:
+    """Cover the gap before `on_mount` installs the app's own signal handlers.
+
+    `SlurmpastApp.on_mount` handles SIGTERM/SIGHUP/SIGINT, which covers a
+    *running* dashboard. It does not cover getting there. Measured in a real pty,
+    signalling the instant the alternate-screen sequence appears -- at which point
+    only **8 bytes** have been emitted, i.e. just that sequence, because Textual
+    writes it as its very first output:
+
+        without this guard   4/4  killed by signal, screen left open
+        with it              4/4  exit 143, screen restored
+
+    The user's scrollback is replaced by a dead dashboard until they run `reset`.
+    Both signals are ordinary: slurmstepd SIGTERMs the step when a job running
+    `srun --pty slurmpast` is cancelled, and a killed tmux pane or a closing IDE
+    terminal SIGHUPs the foreground group -- and a cancel racing startup is exactly
+    when this window is open.
+
+    `os._exit(128 + signum)`, not a re-raise: the codes then match what the
+    post-mount handlers report (143/129), so a supervisor sees one story either
+    side of the window. A normal exit would run handlers that write to the screen
+    we have just torn down. The sibling package's `_TerminalGuard` makes the same
+    call for the same reason.
+    """
+    previous: list[tuple[signal.Signals, signal._HANDLER]] = []
+
+    def _restore_and_die(signum: int, _frame: object) -> None:
+        stream = (
+            sys.stdout if sys.stdout.isatty() else (sys.stderr if sys.stderr.isatty() else None)
+        )
+        if stream is not None:
+            with contextlib.suppress(OSError, ValueError):
+                stream.write(_TERMINAL_RESET)
+                stream.flush()
+        os._exit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        with contextlib.suppress(ValueError, OSError, AttributeError):
+            previous.append((signum, signal.signal(signum, _restore_and_die)))
+    try:
+        yield
+    finally:
+        # Put back what was there: a dashboard that could not start falls through
+        # to the caller in this same process.
+        for signum, handler in previous:
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(signum, handler)
+
+
 def run(
     loader, window: str, ascii_mode=False, no_logs=False, log_dirs=(), mouse=False, since=None
 ) -> int:
@@ -2475,7 +2586,16 @@ def run(
     # and drag-select behaves normally. Textual 0.89 has no in-app selection
     # API, so this is the only way to get selection at all.
     try:
-        app.run(mouse=mouse)
+        with _guard_startup_window():
+            app.run(mouse=mouse)
     finally:
         _discard_clip()
-    return 2 if app.load_error else 0
+    # A load failure outranks everything: the reader got no data, and that is what
+    # a script needs to know first.
+    if app.load_error:
+        return 2
+    # Then whatever a signal handler set (143/129/130 -- see `on_mount`). Without
+    # this the handlers restored the terminal and still exited 0, so `kill -TERM`
+    # and a clean `q` were indistinguishable to a supervisor or to
+    # `timeout --signal=INT` -- which is half the reason for handling them.
+    return int(app.return_code or 0)

@@ -921,6 +921,156 @@ class TestTheFragmentsBothSurfacesDrawComeFromOnePlace:
         assert nodes_title("hang") in _nodes_screen_text(history())
 
 
+def _job_screen_text(jobs, job, size=(100, 60)):
+    """The dashboard's post-mortem for ONE job, as plain lines.
+
+    ``_screen_text`` above navigates from the overview with keystrokes, which
+    cannot be aimed at a particular job. The finding under test belongs to a
+    specific record, so the screen is pushed directly -- the same thing
+    ``test_tui.py`` does when it needs a chosen job on screen.
+    """
+    import asyncio
+
+    pytest.importorskip("textual")
+    from slurmpast import tui
+
+    async def run():
+        app = tui.SlurmpastApp(lambda: list(jobs), window="test", no_logs=True)
+        async with app.run_test(size=size) as pilot:
+            await pilot.pause()
+            app.push_screen(tui.JobScreen(job))
+            await pilot.pause()
+            return "\n".join(
+                "".join(segment.text for segment in strip).rstrip()
+                for strip in app.screen._compositor.render_strips()
+            )
+
+    return asyncio.run(run())
+
+
+class TestAnArrowIsOnlyDrawnWhenItPointsAtSomething:
+    """The class above a second time, on the same two characters.
+
+    Round fourteen centralised WHICH arrow both surfaces draw and left them
+    disagreeing about WHETHER to draw one. Several findings carry ``action=""`` on
+    purpose -- "Cancelled, not failed", the traceback tail, the end-of-log tail,
+    the uneven-memory note, and both ``--patterns`` tail counters -- because for
+    those the evidence is the whole story and there is nothing to do about it.
+    ``render.wrap("")`` returns ``[""]``, one empty line rather than none, so
+    ``report.py`` ran its loop once and emitted ``"        \u2192 "``: an arrow
+    pointing at nothing, with a trailing space after it. ``tui._finding_lines``
+    has read ``if finding.action:`` since it was written, so the dashboard never
+    drew it and only the pipeable surface did.
+
+    Reproduced on this cluster before it was written down, on both sites:
+
+        $ slurmpast 53100939_8 --plain --no-logs | tail -4 | cat -A
+          [INFO] Cancelled, not failed$
+                A deliberate kill and an abandoned run are identical in ...$
+                failure statistics.$
+                M-bM-^FM-^R $
+
+        $ slurmpast -S now-30days --patterns --plain | tail -3 | cat -A
+          [INFO] 2 further groups show the same repeat-failure pattern$
+                Together they account for 11 more failed runs. ...$
+                M-bM-^FM-^R $
+    """
+
+    @staticmethod
+    def _bare_arrows(text):
+        from slurmpast.render import ACTION_ARROW
+
+        mark = ACTION_ARROW.strip()
+        return [line for line in text.split("\n") if line.strip() == mark]
+
+    @staticmethod
+    def _pointed_arrows(text):
+        """Lines where the arrow is followed by actual advice."""
+        from slurmpast.render import ACTION_ARROW
+
+        return [
+            line
+            for line in text.split("\n")
+            if ACTION_ARROW in line and line.split(ACTION_ARROW, 1)[1].strip()
+        ]
+
+    @staticmethod
+    def _cancelled_job():
+        job = next(j for j in history() if j.base_state == "CANCELLED")
+        return job
+
+    def _many_failing_groups(self, repeat_timeouts, count=7):
+        jobs = []
+        for group in range(count):
+            for index, job in enumerate(repeat_timeouts):
+                jobs.append(
+                    job._replace(
+                        job_id="%d%03d" % (group + 1, index),
+                        name="workload-" + "abcdefghij"[group],
+                    )
+                )
+        return jobs
+
+    def test_the_job_report_draws_no_arrow_for_an_actionless_finding(self):
+        from slurmpast.report import Style, render_job
+
+        job = self._cancelled_job()
+        text, verdict = render_job(job, style=Style(enabled=False), no_logs=True)
+        assert [f for f in verdict.findings if f.code == "cancelled" and not f.action], (
+            "the fixture must still carry the actionless finding"
+        )
+        assert "Cancelled, not failed" in text
+        assert not self._bare_arrows(text), self._bare_arrows(text)
+
+    def test_the_patterns_tail_counter_draws_no_arrow(self, repeat_timeouts):
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_patterns
+
+        jobs = self._many_failing_groups(repeat_timeouts)
+        text = render_patterns(History(jobs), style=Style(enabled=False))
+        assert "3 further groups" in text, text
+        assert not self._bare_arrows(text), self._bare_arrows(text)
+
+    def test_both_surfaces_agree_on_the_actionless_finding(self):
+        """The point of the fix: one record, two front ends, one answer."""
+        from slurmpast.report import Style, render_job
+
+        job = self._cancelled_job()
+        plain, _ = render_job(job, style=Style(enabled=False), no_logs=True)
+        dashboard = _job_screen_text(history(), job)
+        assert "Cancelled, not failed" in dashboard, dashboard
+        assert not self._bare_arrows(dashboard), "the dashboard is the reference surface"
+        assert not self._bare_arrows(plain), self._bare_arrows(plain)
+
+    def test_an_action_that_exists_still_gets_its_arrow(self, repeat_timeouts):
+        """Control. Passes before the fix and after it: the guard must suppress the
+        arrow over an empty action without touching the ones that carry advice.
+
+        Written against both sites and both surfaces, because a guard that
+        swallowed every arrow would satisfy the three tests above.
+        """
+        from slurmpast.index import History
+        from slurmpast.report import Style, render_job, render_patterns
+
+        tail = render_patterns(
+            History(self._many_failing_groups(repeat_timeouts)), style=Style(enabled=False)
+        )
+        assert "Stop resubmitting" in tail or self._pointed_arrows(tail), tail
+        assert self._pointed_arrows(tail), tail
+
+        job = next(j for j in history() if j.base_state == "OUT_OF_MEMORY")
+        plain, verdict = render_job(job, style=Style(enabled=False), no_logs=True)
+        assert [f for f in verdict.findings if f.action], "this fixture needs an action"
+        assert self._pointed_arrows(plain), plain
+        assert self._pointed_arrows(_job_screen_text(history(), job)), "dashboard lost its arrow"
+
+    def test_the_guard_is_the_same_test_on_both_sides(self):
+        """The source-level half, so the two cannot drift apart again. `tui.py` has
+        always satisfied this; `report.py` is the side that did not."""
+        for name in ("report.py", "tui.py"):
+            assert "if finding.action:" in (SRC / name).read_text(), name
+
+
 class TestTheJsonPayloadKeepsItsPromise:
     """`_job_json` says "Deliberately exhaustive: if the tool read it, this emits
     it", and `docs/details.md` says "a test fails if a field is read but never
@@ -971,6 +1121,17 @@ class TestTheJsonPayloadKeepsItsPromise:
         # Derived views of emitted numbers.
         "cores_busy": "cpu.utilization x shape.cpus",
         "fs_disk_bytes": "deprecated alias of filesystem.read_bytes",
+        # -> memory.peak_source: the flag says whether `sstat` was read for a
+        # running job, and the string it decides ("sstat (live)" against "sacct
+        # (unflushed)") is the fact a consumer needs. Emitting the boolean too
+        # would be the same claim twice.
+        "live_metrics": "memory.peak_source",
+        # -> memory.peak_source / memory.peak_unavailable_reason. Same argument
+        # as `live_metrics`: the boolean's whole job is to pick which of those two
+        # strings the reader gets ("sacct (unflushed, sstat is owner-only)" and
+        # "foreign_owner_sstat_is_owner_only"), and both name the condition
+        # outright. `user` is emitted too, so a consumer can also derive it.
+        "foreign_owner": "memory.peak_source + memory.peak_unavailable_reason",
         # `cpu_freq_hz` was here, justified as "cpu.frequency". It is not
         # recoverable from that string and never was -- see
         # TestTheResolvedClockIsMachineReadable below. An allow-list whose entries
@@ -985,11 +1146,18 @@ class TestTheJsonPayloadKeepsItsPromise:
     # Containers of values emitted in their own right, and predicates over them.
     STRUCTURAL = {
         "steps",
+        # The subset of `steps` whose counters may stand for the job: every step
+        # once it has ended, only the live ones while it is running. Each step is
+        # emitted in its own right and carries its own state, so which subset was
+        # used is recoverable -- and `memory.peak_source` names it outright.
+        "measured_steps",
         "work_steps",
         "batch_step",
         "extern_step",
         "is_batch",
         "is_extern",
+        # A predicate over the step's own `state`, which is emitted.
+        "in_progress",
         "name",
     }
 
@@ -1392,3 +1560,228 @@ class TestTheSdistShipsASuiteThatCanRun:
             if "tests.conftest" in p.read_text()
         ]
         assert len(importers) >= 5, importers
+
+
+def _placement_rows(node, bad, total, name="node-evaluation", job_id_base=1000):
+    """``total`` rows on ``node``, ``bad`` of them FAILED, as sacct text.
+
+    ``tests/test_nodes.py`` has a ``_placements`` that returns parsed ``Job``s.
+    This returns the text a fake ``sacct`` would print, because the finding below
+    is about which *query* a surface computes from and that only shows up when the
+    two queries answer differently.
+    """
+    return [
+        row(
+            JobID=str(job_id_base + index),
+            JobName=name,
+            User="youzhi",
+            Partition="test",
+            State="FAILED" if index < bad else "COMPLETED",
+            ExitCode="9:0" if index < bad else "0:0",
+            Submit="2026-01-01T00:00:00",
+            Start="2026-01-01T00:00:00",
+            End="2026-01-01T00:10:00",
+            Elapsed="00:10:00",
+            Timelimit="01:00:00",
+            ReqMem="40Gn",
+            ReqCPUS="8",
+            AllocTRES="billing=8,cpu=8,mem=40G,node=1",
+            NodeList=node,
+        )
+        for index in range(total)
+    ]
+
+
+class TestWhetherTheNodeNoteExistsAtAll:
+    """The two surfaces disagreed about whether a finding was there to be had.
+
+    Round forty-eight fixed the note's wording, verified the two front ends build
+    the *string* from one function, and recorded that on `--plain` the sentence was
+    "all but unreachable": `cli._node_note` needed ``len(history) > 20`` and the
+    job-ids branch of `_load` returns only the records asked for, so
+    ``slurmpast <one id>`` had a history of one and printed nothing, while the
+    dashboard drew it from the whole window. It took all 403 ids to make `--plain`
+    say anything.
+
+    That is `render.py`'s drift arriving where `render.py` cannot see it: not what
+    the sentence says, but whether it is reached. Reproduced on this cluster
+    against 13,075 real `sacct` rows over 30 days, on both surfaces, before it was
+    changed:
+
+        $ slurmpast 53363721_35 --plain --no-logs -S now-30days
+          [WARN] Exited 9, but no log was found to explain it
+                ...
+          (no node finding)
+
+        dashboard JobScreen(53363721_35), same window:
+          INFO  Node has a history with your jobs
+                midway3-0250 failed 32 of 33 placements there (97.0%, 95% CI
+                84.7-99.5%) against 1.0% on every other node for caai-p10b_scan.
+
+    Fixed by widening the population `--plain` computes from, not by lowering the
+    floor: with the floor removed a one-record history still yields ``''``, because
+    `node_table` drops every node under `nodes.MIN_SAMPLES` and one placement is
+    one. See `cli._node_history`.
+
+    The fleet here is 40 clean placements on ``midway3-0600`` and 30 of 40 failing
+    on ``midway3-0607``. Every figure asserted below is read off that construction
+    -- 30 of 40 is 75.0%, and 0 of 40 elsewhere is 0.0% -- and not off the
+    implementation, which is how two of this suite's tests came to pin a buggy
+    value.
+    """
+
+    FLEET = _placement_rows("midway3-0600", 0, 40) + _placement_rows(
+        "midway3-0607", 30, 40, job_id_base=5000
+    )
+    BAD_NODE_JOB = "5000"  # a FAILED placement on midway3-0607
+    GOOD_NODE_JOB = "1000"  # a COMPLETED placement on midway3-0600
+    # Facts about the fixture, computed by hand from FLEET above.
+    FROM_THE_FIXTURE = (
+        "midway3-0607",
+        "failed 30 of 40 placements",
+        "(75.0%",
+        "against 0.0% on every other node",
+    )
+
+    @classmethod
+    def _runner(cls, job_id):
+        """A fake Slurm where `-j <id>` answers with that row and nothing else.
+
+        Which is what real `sacct` does, and the whole reason the defect existed:
+        a runner that answered every query with the same text could not have shown
+        it.
+        """
+        from slurmpast.sacct import SAFE_DELIMITER
+
+        def encode(rows):
+            return "\n".join(rows).replace("|", SAFE_DELIMITER)
+
+        one = encode([r for r in cls.FLEET if r.split("|")[0] == job_id])
+        window = encode(cls.FLEET)
+
+        def run(args):
+            if "--helpformat" in args:
+                return " ".join(_FIELDS)
+            if args and args[0] in ("squeue", "scontrol", "sstat"):
+                return ""
+            return one if "-j" in args else window
+
+        return run
+
+    def _plain(self, monkeypatch, capsys, job_id, *extra):
+        from slurmpast import cli
+
+        monkeypatch.setattr("slurmpast.sacct._run", self._runner(job_id))
+        code = cli.main([job_id, "--plain", "--no-color", "--no-logs", *extra])
+        return code, capsys.readouterr().out
+
+    def _dashboard(self, job_id):
+        jobs = parse("\n".join(self.FLEET))
+        job = next(j for j in jobs if j.job_id == job_id)
+        return _job_screen_text(jobs, job)
+
+    @staticmethod
+    def _flat(text):
+        """One line, so a comparison is not a comparison of wrap widths.
+
+        The dashboard's body is 96 cells inside a bordered screen and `--plain`'s
+        is 100, so the same sentence breaks in different places on the two. That
+        difference is legitimate; disagreeing about the sentence is not.
+        """
+        return " ".join(text.split())
+
+    def test_plain_reaches_the_note_the_dashboard_already_drew(self, monkeypatch, capsys):
+        _code, out = self._plain(monkeypatch, capsys, self.BAD_NODE_JOB)
+        dashboard = self._flat(self._dashboard(self.BAD_NODE_JOB))
+        plain = self._flat(out)
+        for fact in self.FROM_THE_FIXTURE:
+            assert fact in dashboard, "dashboard lost it: %s" % fact
+            assert fact in plain, "--plain never reached it: %s\n%s" % (fact, out)
+
+    def test_the_post_mortem_is_still_only_the_job_that_was_asked_about(self, monkeypatch, capsys):
+        """The control on what widening the load is allowed to touch.
+
+        The note's population is now the window -- 80 records here -- while the
+        post-mortem, the `--json` summary and the exit code still come from the
+        `-j` query alone. Folding the window into `history` instead would print 80
+        post-mortems for a one-id question and recount `summary.jobs` off a
+        different population, and this passes both before and after the change.
+        """
+        _code, out = self._plain(monkeypatch, capsys, self.BAD_NODE_JOB)
+        assert out.count("● TIME") == 1, out
+        assert "job %s  FAILED" % self.BAD_NODE_JOB in out
+        assert self.GOOD_NODE_JOB not in out.split("findings")[0]
+
+    def test_a_clean_node_is_not_accused_on_either_surface(self, monkeypatch, capsys):
+        """The control on over-firing: a job on the good node still gets silence.
+
+        Passes before the change (where `--plain` was silent about every node) and
+        after (where it is silent about this one because the statistics say so), so
+        a fix that simply printed the note unconditionally fails here.
+        """
+        _code, out = self._plain(monkeypatch, capsys, self.GOOD_NODE_JOB)
+        for surface in (out, self._dashboard(self.GOOD_NODE_JOB)):
+            assert "placements there" not in surface, surface
+            assert "midway3-0607" not in surface, surface
+
+
+class TestOneFloorForBothSurfaces:
+    """``MIN_HISTORY`` was a bare ``20`` in `cli.py` and again in `tui.py`.
+
+    Two copies of the rule that decides whether a finding exists, one per front
+    end, is the shape of the drift above: the literals agreed and the arguments did
+    not, and there was no single place to read the rule out of. It is now applied
+    inside `nodes.note_for_allocation`, so both surfaces inherit it.
+
+    **What the floor is for, since `MIN_SAMPLES` did not make it redundant.**
+    `node_table` floors the placements on the node being *judged* and nothing
+    floors the population it is judged *against*: 10 failures on one node beside 2
+    clean runs on another clears MIN_SAMPLES, the Benjamini-Hochberg step-up and
+    the Wilson interval, and says "against 0.0% on every other node" of an every-
+    other-node of two placements. Measured, not argued -- the smallest population
+    that earns a verdict is 12 records. This floor is the only thing standing in
+    front of that, which is why it is kept at its old value rather than dropped.
+    """
+
+    @staticmethod
+    def _fleet(bad, bad_total, good_total):
+        from tests.test_nodes import _placements
+
+        return _placements("midway3-0607", bad, bad_total) + _placements(
+            "midway3-0600", 0, good_total, job_id_base=5000
+        )
+
+    def test_the_floor_is_applied_where_the_note_is_built(self):
+        """A verdict the table itself reaches, and no sentence drawn from it."""
+        from slurmpast.nodes import MIN_HISTORY, node_table, note_for_allocation
+
+        # Exactly MIN_HISTORY records, and a thinner 12-record case besides.
+        for bad, bad_total, good_total in ((10, 10, MIN_HISTORY - 10), (10, 10, 2)):
+            jobs = self._fleet(bad, bad_total, good_total)
+            assert len(jobs) <= MIN_HISTORY
+            table = node_table(jobs, workload="node-evaluation")
+            judged = next(r for r in table["rows"] if r["node"] == "midway3-0607")
+            assert judged["verdict"] == "worse", judged
+            assert note_for_allocation(jobs, "midway3-0607", workload="node-evaluation") == "", len(
+                jobs
+            )
+
+    def test_one_more_record_is_where_it_starts_speaking(self):
+        """The other side of the same boundary, so the floor is pinned rather than
+        merely present. ``MIN_HISTORY + 1`` records, and the note appears."""
+        from slurmpast.nodes import MIN_HISTORY, note_for_allocation
+
+        jobs = self._fleet(10, 10, MIN_HISTORY + 1 - 10)
+        assert len(jobs) == MIN_HISTORY + 1
+        note = note_for_allocation(jobs, "midway3-0607", workload="node-evaluation")
+        assert "failed 10 of 10 placements" in note, note
+
+    def test_a_population_well_above_the_floor_is_unchanged(self):
+        """The control: moving the floor into `nodes.py` must not have narrowed
+        what a real history says. Passes before and after."""
+        from slurmpast.nodes import note_for_allocation
+
+        jobs = self._fleet(30, 40, 40)
+        note = note_for_allocation(jobs, "midway3-0607", workload="node-evaluation")
+        assert "failed 30 of 40 placements" in note, note
+        assert "against 0.0% on every other node" in note, note

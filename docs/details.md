@@ -71,7 +71,7 @@ Two were entirely invisible with a narrow `--format`: **disk writes** (one run
 read 112 GB and wrote 139 GB) and the **user/kernel CPU split** (791 of 6,582
 jobs exceed 30% kernel time — syscall overhead no other tool surfaces).
 
-`--json` emits all of it — 99 values per job, plus 40 for every step. Nothing is
+`--json` emits all of it — 103 values per job, plus 40 for every step. Nothing is
 captured and then hidden: a test reads `cli._job_json` itself and holds every
 `Job` and `Step` value to it, so a measurement that does not reach the payload
 has to be argued for by name in that test's exemption list rather than dropped.
@@ -113,6 +113,15 @@ an innocent node to `--exclude` in 54.8% of 20-node tables and 77.8% of 40-node
 ones, because its error rate was a function of how many nodes were tested. A
 Benjamini–Hochberg correction across the rows holds that near 2.7% and, more to
 the point, flat as the table grows.
+
+The same verdict is attached to a single job's post-mortem as a finding, and it is
+computed from **the window (`-S`), not from the ids you named** — a node's record
+is a property of the history, and one job is one placement, which no test can
+reach a conclusion from. So `slurmpast <jobid>` runs the window query too, and
+`slurmpast <jobid> -S now-30days` and the dashboard's screen for that same job
+say the same thing. Both surfaces also share one minimum on how much history will
+support the claim at all (`nodes.MIN_HISTORY`), which is separate from the
+per-node minimum: nothing else floors the population a node is compared *against*.
 
 ## Gauges
 

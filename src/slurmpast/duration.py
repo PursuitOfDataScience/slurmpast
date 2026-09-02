@@ -183,14 +183,25 @@ def format_duration(seconds):
 
     Under a minute the value stays in seconds, deliberately. A hung job's evidence
     is "0.52s of CPU", and ``00:00:00`` would erase the single number this whole
-    tool exists to surface.
+    tool exists to surface. Two decimals below a second and one below a minute,
+    for the same reason: the sub-second tier exists to carry "0.52s", and a
+    tenth is all the resolution the tier above it needs.
+
+    **Each tier is chosen for the value as PRINTED, not as stored.** This is the
+    rule :func:`format_bytes` states in this same module -- and `_ROUNDS_UP_AT`
+    exists there to enforce -- and this function did not follow it. Measured: a
+    59.95s elapsed printed "60.0s" and 59.99 printed "60.0s", naming the boundary
+    in the unit below it exactly as "1024.0 MiB" did before that fix, and 0.999
+    printed "1.00s" out of the tier reserved for values that are not yet a
+    second. Rounding is what the boundary has to be tested against, because
+    rounding is what the reader is shown.
     """
     if seconds is None or not math.isfinite(float(seconds)):
         return "n/a"
     seconds = float(seconds)
-    if seconds < 1:
+    if round(seconds, 2) < 1:
         return "%.2fs" % seconds
-    if seconds < 60:
+    if round(seconds, 1) < 60:
         return "%.1fs" % seconds
     total = int(round(seconds))
     days, rem = divmod(total, 86400)
@@ -201,8 +212,13 @@ def format_duration(seconds):
     return "%02d:%02d:%02d" % (hours, minutes, secs)
 
 
+#: Where ``"%.1f"`` starts reading ``1024.0`` instead of ``1023.9``, as a fraction
+#: of a unit. The threshold for promoting to the next unit; see `format_bytes`.
+_ROUNDS_UP_AT = 1023.95 / 1024.0
+
+
 def format_bytes(value):
-    """Bytes -> TiB/GiB/MiB/KiB string. ``None`` renders as ``n/a``, never ``0``.
+    """Bytes -> PiB/TiB/GiB/MiB/KiB string. ``None`` renders as ``n/a``, never ``0``.
 
     The KiB tier is not decoration. Without it the ladder fell from MiB straight
     to raw bytes, so a job detail printed ``read 9.5 GiB`` and ``rate 488928 B/s``
@@ -216,8 +232,34 @@ def format_bytes(value):
     if value is None or not math.isfinite(float(value)):
         return "n/a"
     value = float(value)
-    for unit, scale in (("TiB", 1024**4), ("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024)):
-        if value >= scale:
+    # The unit is chosen for the value as PRINTED, not as stored. Comparing the raw
+    # value against the scale picked MiB for anything below 1 GiB -- including
+    # values that `%.1f` then rounds to `1024.0`, and "1024.0 MiB" means the ladder
+    # failed: the whole point of taking the largest unit above 1 is to stay below
+    # 1024. Measured on real records rather than argued: MaxRSS 1073692672, one of
+    # 13,426 distinct byte values in a 90-day window here, printed "1024.0 MiB"
+    # where it should read "1.0 GiB".
+    #
+    # `slurmwatch.units.format_bytes` documents the same case as its A5 and fixes
+    # it by comparing the rounded figure; the ladder here descends and keeps a
+    # `%d B` floor, so the equivalent is to promote as soon as the figure would
+    # round up into the unit. `%.1f` flips to `1024.0` at 1023.95, so the boundary
+    # is `scale * 1023.95 / 1024` -- which leaves "1000 B" and "1023 B" exactly
+    # where they were, below 1 KiB, as the docstring above requires.
+    # PiB is the same defect at the ceiling: with TiB as the top tier there was no
+    # unit to promote INTO, so anything from ~1024 TiB up printed "1024.0 TiB",
+    # "2048.0 TiB" and so on. Not a memory figure -- no job has a petabyte of RAM --
+    # but `read_bytes`/`write_bytes`/`io_rate` come through here too, and the
+    # largest real value in a 90-day window on this cluster is 30.9 TiB of disk
+    # read, which puts 1 PiB a factor of 33 away rather than out of reach.
+    for unit, scale in (
+        ("PiB", 1024**5),
+        ("TiB", 1024**4),
+        ("GiB", 1024**3),
+        ("MiB", 1024**2),
+        ("KiB", 1024),
+    ):
+        if value >= scale * _ROUNDS_UP_AT:
             return "%.1f %s" % (value / scale, unit)
     return "%d B" % int(value)
 

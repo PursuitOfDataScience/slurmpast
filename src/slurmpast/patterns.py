@@ -291,7 +291,19 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
         states = {}
         for job in failures:
             states[job.base_state] = states.get(job.base_state, 0) + 1
-        dominant, count = max(states.items(), key=lambda kv: kv[1])
+        # Tie broken on the state name, exactly as `find_requeues` below already
+        # does it. On the count alone a tie fell to dict insertion order, i.e. to
+        # the order sacct happened to return the rows -- and the two call sites in
+        # `index` hand this function the SAME group in two different orders:
+        # `History.patterns` passes `self.jobs` (sacct order) while
+        # `History.group_patterns` passes `GroupStats.jobs`, which `build_groups`
+        # sorted newest-first. So three TIMEOUT and three FAILED runs of one
+        # workload were read as TIMEOUT on the patterns panel and FAILED on that
+        # workload's own screen, and the two states pick different actions --
+        # "raise --time" against "stop resubmitting, the failure is
+        # deterministic". One workload, one history, two verdicts in one session,
+        # which is the drift `render` exists to prevent.
+        dominant, count = max(states.items(), key=lambda kv: (kv[1], kv[0]))
 
         limits = {format_duration(j.timelimit) for j in failures if j.timelimit is not None}
         hung = [j for j in failures if looks_like_noop(j)]
@@ -682,6 +694,11 @@ def goodput(jobs):
         "excluded_open_records": open_ended,
         "excluded_unparsed": unparsed,
         "excluded_no_elapsed": len(jobs) - len(records) - open_ended - unparsed,
+        # Rows, not jobs: a job plus its steps is what was parsed and what is
+        # held, and the steps outnumber the jobs better than two to one. This is
+        # the figure the memory footprint is proportional to -- see
+        # `report._BYTES_PER_ROW`.
+        "parsed_rows": len(jobs) + sum(len(job.steps) for job in jobs),
     }
     for job in records:
         gpu_h = job.gpu_hours or 0.0

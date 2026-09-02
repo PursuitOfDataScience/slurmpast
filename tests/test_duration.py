@@ -189,3 +189,102 @@ class TestAValueThatIsNotANumberIsNotAMeasurement:
         assert duration.format_duration(0.52) == "0.52s"
         assert duration.format_bytes(0) == "0 B"
         assert duration.format_percent(0.0) == "0.0%"
+
+
+class TestTheUnitLadderNeverPrintsAFigureOfTenTwentyFour:
+    """`format_bytes` chose its unit from the raw value, then rounded the figure.
+
+    The two steps disagreed just under every boundary: `1073692672` is below
+    1 GiB, so MiB was selected, and `%.1f` of `1023.99969...` reads `1024.0`.
+    "1024.0 MiB" means the ladder failed -- the whole point of taking the largest
+    unit above 1 is to stay *below* 1024.
+
+    Not hypothetical. That value is a real `MaxRSS`, one of 13,426 distinct byte
+    values in a 90-day window on this cluster, and it printed "1024.0 MiB".
+    `slurmwatch.units.format_bytes` documents the identical case as its A5 and
+    resolves it the same way; these are sibling tools reporting the same
+    quantities, and they disagreed on this input.
+
+    The ceiling was the same defect with no unit to promote INTO: with TiB on top,
+    everything from ~1024 TiB up read "1024.0 TiB", "2048.0 TiB". No job has a
+    petabyte of RAM, but `read_bytes`/`write_bytes`/`io_rate` come through here
+    too and the largest real value in that window is 30.9 TiB of disk read, which
+    puts 1 PiB a factor of 33 away rather than out of reach.
+    """
+
+    #: The measured record, and the boundary each unit sits just below.
+    PROMOTES = [
+        (1073692672, "1.0 GiB"),  # the real MaxRSS
+        (1024**2 - 1, "1.0 MiB"),
+        (1024**3 - 1, "1.0 GiB"),
+        (1024**4 - 1, "1.0 TiB"),
+        (1024**5 - 1, "1.0 PiB"),
+    ]
+
+    @pytest.mark.parametrize("value,expected", PROMOTES)
+    def test_a_figure_that_would_round_to_1024_promotes(self, value, expected):
+        assert format_bytes(value) == expected
+
+    def test_no_near_boundary_value_prints_1024_or_more(self):
+        """The invariant, swept rather than spot-checked.
+
+        Stated as a property so a later change to the tier list or the format
+        string cannot reintroduce it at one tier while fixing another.
+        """
+        import re
+
+        offenders = []
+        for exponent in range(10, 60):
+            for delta in range(1, 200):
+                value = 2**exponent - delta
+                if value <= 0:
+                    continue
+                text = format_bytes(value)
+                match = re.match(r"^([\d.]+) (B|KiB|MiB|GiB|TiB|PiB)$", text)
+                assert match, (value, text)
+                figure, unit = float(match.group(1)), match.group(2)
+                # PiB is the top of the ladder: there is nothing above to promote
+                # into, so it is the one unit allowed to exceed 1024.
+                if unit != "PiB" and figure >= 1024.0:
+                    offenders.append((value, text))
+        assert offenders == [], offenders[:5]
+
+    def test_the_two_sibling_tools_now_agree(self):
+        """slurmwatch solved this first and documents it; they must not disagree.
+
+        Skipped rather than failed if slurmwatch is not importable — it is a
+        sibling checkout, not a dependency of this package.
+        """
+        import sys
+
+        sys.path.insert(0, "/home/youzhi/slurmwatch/src")
+        try:
+            from slurmwatch.units import format_bytes as sibling
+        except ImportError:  # pragma: no cover - sibling not checked out
+            pytest.skip("slurmwatch not available")
+        for value, _ in self.PROMOTES:
+            mine, theirs = format_bytes(value), sibling(float(value))
+            assert mine.split()[1] == theirs.split()[1], (value, mine, theirs)
+
+    def test_bytes_remain_the_floor_below_one_kib(self):
+        """CONTROL — passes in both states, and pins what the docstring promises.
+
+        A promotion rule expressed as "round the figure to 1.0" would take 1000 B
+        to "1.0 KiB", because 1000/1024 rounds to 1.0 at one decimal. The
+        docstring requires bytes below 1 KiB and `0` as `0 B`, so the threshold is
+        where `%.1f` flips to 1024.0, not where it flips to 1.0.
+        """
+        assert format_bytes(0) == "0 B"
+        assert format_bytes(1) == "1 B"
+        assert format_bytes(1000) == "1000 B"
+        assert format_bytes(1023) == "1023 B"
+
+    def test_the_ordinary_figures_are_untouched(self):
+        """CONTROL — every value not near a boundary reads exactly as before."""
+        assert format_bytes(1024) == "1.0 KiB"
+        assert format_bytes(1536) == "1.5 KiB"
+        assert format_bytes(1024**2) == "1.0 MiB"
+        assert format_bytes(200 * 1024**2) == "200.0 MiB"
+        assert format_bytes(4 * 1024**3) == "4.0 GiB"
+        assert format_bytes(33935225257984) == "30.9 TiB"  # the real disk-read peak
+        assert format_bytes(None) == "n/a"

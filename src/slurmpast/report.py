@@ -13,7 +13,7 @@ import sys
 
 from .diagnose import diagnose
 from .duration import format_bytes, format_duration, format_percent
-from .index import GPU_CORE_EQUIVALENT, SORTS, History, sort_groups, sort_label
+from .index import SORTS, History, sort_groups, sort_label
 from .model import severity_rank
 from .nodes import (
     compress_nodelist,
@@ -45,6 +45,7 @@ from .render import (
     cores_text,
     cpu_only_columns,
     fit_columns,
+    gpu_hours_equivalence,
     gpu_hours_total,
     held_back_note,
     hours_pair_text,
@@ -72,6 +73,19 @@ from .render import (
     wrap_or_clip,
 )
 from .sizing import MIN_RUNS, recommend, sbatch_lines
+
+#: Parsed rows after which the window's memory footprint is worth a line.
+#:
+#: A job plus its steps is typically four rows, so this is a few thousand jobs --
+#: comfortably past any ordinary week and comfortably short of the windows that
+#: run into gigabytes.
+_FOOTPRINT_NOTE_ROWS = 20_000
+
+#: Bytes retained per parsed row, measured over 43,660 real rows (13,321 jobs and
+#: 30,339 steps) after the parser began sharing one object per distinct string:
+#: 44.5 MB, or 1,020 B/row -- down from 2,034 B/row, where `uid` and `account`
+#: each had ONE distinct value held as 13,321 separate string objects.
+_BYTES_PER_ROW = 1024
 
 _CODES = {
     "reset": "\033[0m",
@@ -223,8 +237,17 @@ class Style:
     def __init__(self, enabled=None, stream=None):
         stream = stream or sys.stdout
         if enabled is None:
+            # TERM=dumb belongs next to NO_COLOR, not apart from it: an Emacs
+            # shell buffer, a CI log and a serial console all set it, and all
+            # three are a tty, so isatty() alone said "colour". This was the
+            # only tool in the family that coloured a dumb terminal -- rapidu
+            # and slurmate already pair the two checks, and rapidu's ui module
+            # names both in its docstring.
             enabled = (
-                hasattr(stream, "isatty") and stream.isatty() and not os.environ.get("NO_COLOR")
+                hasattr(stream, "isatty")
+                and stream.isatty()
+                and not os.environ.get("NO_COLOR")
+                and os.environ.get("TERM", "") != "dumb"
             )
         self.enabled = bool(enabled)
 
@@ -439,11 +462,22 @@ def render_job(
                 )
             for line in wrap(finding.evidence, _prose_width(8)):
                 out.append("        " + line)
-            for index, line in enumerate(wrap(finding.action, _prose_width(ACTION_INDENT))):
-                out.append(
-                    "        %s%s"
-                    % (style(ACTION_ARROW if index == 0 else ACTION_HANG, "grey"), line)
-                )
+            # Guarded, the way `tui._finding_lines` has always guarded it. `wrap("")`
+            # is `[""]` -- one empty line, not none -- so a finding whose action is
+            # deliberately empty drew an arrow pointing at nothing, with a trailing
+            # space after it. Five findings are written that way on purpose
+            # ("Cancelled, not failed", the traceback tail, the end-of-log tail, the
+            # uneven-memory note) because the evidence IS the whole story, and the
+            # dashboard renders them with no arrow. Only `--plain` drew one, which is
+            # the drift `render` centralising the glyph did not catch: round fourteen
+            # made both surfaces agree on WHICH arrow and left them disagreeing on
+            # whether to draw one.
+            if finding.action:
+                for index, line in enumerate(wrap(finding.action, _prose_width(ACTION_INDENT))):
+                    out.append(
+                        "        %s%s"
+                        % (style(ACTION_ARROW if index == 0 else ACTION_HANG, "grey"), line)
+                    )
     out.append("")
     return _fold("\n".join(out), ascii_mode), verdict
 
@@ -516,6 +550,28 @@ def render_overview(history: History, style=None, limit=25, sort="cost", ascii_m
         kinds.append("%d unreadable" % stats["excluded_unparsed"])
     if kinds:
         out.append(style("  %s, excluded" % " and ".join(kinds), "grey"))
+    # What this window cost to hold, once it is large enough to matter.
+    #
+    # A history is fully materialised, so memory grows with the window: measured
+    # at **~1 KB per parsed row** retained (a job plus its steps is typically
+    # four rows), so 43,660 rows needed about 43 MB and a 30-day query on a busy
+    # cluster runs into gigabytes. Nothing bounded it and nothing said so -- what
+    # actually stopped users hitting it was `SLURMPAST_TIMEOUT`, at 300 s,
+    # failing on time before it failed on memory. An undocumented memory cap.
+    #
+    # Said rather than left to the OOM killer, and it names the knob: `-S` is
+    # what narrows the window, and the cost is proportional to it. Only above
+    # the threshold, because on an ordinary window this is a line in the way.
+    rows = stats.get("parsed_rows") or 0
+    if rows >= _FOOTPRINT_NOTE_ROWS:
+        out.append(
+            style(
+                "  %s rows parsed, about %s held — a window ten times longer "
+                "costs ten times that; narrow it with -S"
+                % (f"{rows:,}", format_bytes(rows * _BYTES_PER_ROW)),
+                "grey",
+            )
+        )
     if stats.get("unclassified"):
         # Its own line, deliberately: these are NOT excluded. They are counted in
         # the job total and their core-hours are in the resource sums -- the only
@@ -555,7 +611,7 @@ def render_overview(history: History, style=None, limit=25, sort="cost", ascii_m
             claim = "ordered by compute used"
         else:
             claim = "ordered by %s" % sort_label(sort)
-        notes.append("%s (1 GPU-hour = %d CPU-hours)" % (claim, GPU_CORE_EQUIVALENT))
+        notes.append("%s (%s)" % (claim, gpu_hours_equivalence()))
     elif sort != SORTS[0][0]:
         notes.append("ordered by %s" % sort_label(sort))
     if any("#" in g.label for g in shown):
@@ -695,10 +751,16 @@ def render_patterns(history: History, style=None, ascii_mode=False):
             )
         for line in wrap(finding.evidence, _prose_width(8)):
             body.append("        " + line)
-        for index, line in enumerate(wrap(finding.action, _prose_width(ACTION_INDENT))):
-            body.append(
-                "        %s%s" % (style(ACTION_ARROW if index == 0 else ACTION_HANG, "grey"), line)
-            )
+        # Same guard as the job report above, for the same reason: the
+        # "%d further groups show the same repeat-failure pattern" tail and the
+        # requeue tail both carry `action=""`, and this surface pointed an arrow at
+        # the empty string on the last line of `--patterns`.
+        if finding.action:
+            for index, line in enumerate(wrap(finding.action, _prose_width(ACTION_INDENT))):
+                body.append(
+                    "        %s%s"
+                    % (style(ACTION_ARROW if index == 0 else ACTION_HANG, "grey"), line)
+                )
         body.append("")
     return _fold("\n".join(_titled("cross-run patterns", body, style)), ascii_mode)
 
@@ -970,7 +1032,37 @@ def render_sizing(history, style=None, limit=12, sort="cost", ascii_mode=False):
         # Green is reserved for the genuine all-clear. A no-data screen is grey,
         # like the `no advice` rows it is standing in for -- the least-informed
         # state should not be rendered in the most reassuring colour.
-        if no_data_groups and not shown_judged:
+        if not (no_data_groups or shown_judged):
+            # NOTHING was considered, which the green branch below also matched:
+            # `no_data_groups` and `shown_judged` are both 0, so an empty result
+            # set read as "every workload is already about right" -- the
+            # least-informed state in the most reassuring colour, which is the
+            # defect the other two branches were added to fix and which this one
+            # walked straight past.
+            #
+            # Two ways in, and the second is the consequential one: an empty
+            # window, and a **named RUNNING job**, which is filtered out before
+            # the counting and so registers as neither category. A job at 94.5%
+            # of its memory limit was told it was about right.
+            # `history.jobs`, not `history.groups`: an unfinished record is
+            # excluded from the groups before any of this counting -- which is
+            # precisely why it registered as neither category -- so the groups
+            # cannot say that a running job is the reason the screen is empty.
+            loaded = list(getattr(history, "jobs", ()) or ())
+            running = [j for j in loaded if j.in_progress]
+            if len(running) == 1 and len(loaded) == 1:
+                sentence = (
+                    "job %s is still running — --sizing needs a finished run, "
+                    "because it sizes from what a run actually used." % running[0].job_id
+                )
+            elif running:
+                sentence = "no finished runs in this window to size from (%d still running)." % len(
+                    running
+                )
+            else:
+                sentence = "no finished runs in this window to size from."
+            colour = "grey"
+        elif no_data_groups and not shown_judged:
             sentence = (
                 "no workload has the %d completed runs --sizing needs "
                 "(%d workload%s, %d run%s)."

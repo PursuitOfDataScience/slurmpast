@@ -395,6 +395,9 @@ class TestMouseCapture:
             def __init__(self, *a, **kw):
                 seen["ctor"] = kw.get("mouse")
                 self.load_error = None
+                # As on the real Textual `App`; `tui.run` reads it to propagate a
+                # signalled exit (143/129/130).
+                self.return_code = 0
 
             def run(self, **kw):
                 seen["run"] = kw.get("mouse")

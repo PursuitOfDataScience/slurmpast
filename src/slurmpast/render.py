@@ -19,6 +19,7 @@ from .duration import (
     format_percent,
     plural,
 )
+from .index import GPU_CORE_EQUIVALENT
 from .model import Job, severity_rank
 from .nodes import MIN_SAMPLES
 
@@ -205,10 +206,10 @@ def state_text(state: str, ascii_mode: bool = False):
 
 
 # The four-cell tag a finding is announced with, and the one place it is spelled.
-# `report._SEV` carried a second copy of these three labels beside its ANSI colour
-# names, so "FAIL"/"WARN"/"INFO" were written twice in two files -- agreeing today,
-# with nothing to keep them agreeing tomorrow. Four cells exactly, including the
-# `----` fallback, because the plain renderer indents a wrapped title by
+# `report._SEV_COLOR` carried a second copy of these three labels beside its ANSI
+# colour names, so "FAIL"/"WARN"/"INFO" were written twice in two files -- agreeing
+# today, with nothing to keep them agreeing tomorrow. Four cells exactly, including
+# the `----` fallback, because the plain renderer indents a wrapped title by
 # ``len(tag) + 2`` and a five-cell tag would step that hang out of line.
 SEVERITY_TAG = {"critical": "FAIL", "warning": "WARN", "info": "INFO"}
 SEVERITY_TAG_UNKNOWN = "----"
@@ -707,6 +708,19 @@ def nodes_baseline(table) -> str:
     ``report`` said "below threshold" and ``tui`` said "below sample threshold",
     and when round five wrapped the two prose lines above this one it wrapped them
     in ``report`` only. A sentence both surfaces show is a shared renderable.
+
+    **This line owns the noun for ``trials``: "placements".** Every prose sentence
+    about that field takes it -- :func:`nodes_empty_reason` below, and
+    ``nodes._note_from_row``, which prints the per-row value of the same field on
+    the job screen and said "your %d jobs there" until round forty-eight. Two
+    nouns for one field is the drift this module exists to stop, and the
+    possessive one was also wrong: since ``nodes._informative`` censors
+    cancellations and ``OUT_OF_MEMORY``, ``trials`` counts the runs whose outcome
+    could have been the node's doing, not the runs the reader submitted -- 33 of
+    `midway3-0250`'s 36 ``caai-p10b_scan`` rows. "Placements" carries no such
+    claim, which is why it is the word and why a third one should not be coined.
+    The table's ``N`` column and ``--json``'s ``trials``/``bad`` are keys, not
+    prose, and are deliberately outside this rule.
     """
     skipped = table["skipped_nodes"]
     tail = ""
@@ -959,6 +973,25 @@ def nothing_matches(noun: str, filter_label: str = "", search: str = "") -> str:
 def patterns_empty() -> str:
     """Why the cross-run screen is empty. A real answer, not a blank."""
     return "no cross-run pattern met its evidence threshold."
+
+
+def gpu_hours_equivalence() -> str:
+    """``1 GPU-hour = 16 CPU-hours`` -- the rate the workload ranking is computed at.
+
+    Load-bearing wherever both hour columns are on screen, and both front ends put
+    them there: a row with fewer CPU-hours outranking one with more looks arbitrary
+    until you know a GPU-hour is weighted. ``report.py`` said so in a comment --
+    "the facts are load-bearing ... the dashboard puts the same two facts under
+    `?`" -- and half of that was untrue. The digit fold is under `?`; the rate was
+    written once, in ``report.py``, and shown on one surface. So the dashboard
+    ranked every workload it listed by a weighting it never named anywhere, while a
+    paste of the same table explained itself.
+
+    Here for the reason the sentences above are: the plain string, for each caller
+    to place, wrap and colour -- the caption on one surface, a help note on the
+    other. What must not differ is the number, and it now cannot.
+    """
+    return "1 GPU-hour = %d CPU-hours" % GPU_CORE_EQUIVALENT
 
 
 def gpu_hours_total(hours: float) -> str:
@@ -1229,6 +1262,26 @@ def requeue_summary(job) -> str:
     return "%dx · %s" % (n, attempts)
 
 
+def exit_pair_text(code, signal) -> str:
+    """``(0, 9)`` -> ``0 (signal 9)``; ``(2, 0)`` -> ``2``; ``(None, 15)`` -> ``signal 15``.
+
+    One formatter for both halves of an ``ExitCode``-shaped pair, because the
+    ``outcome`` table draws two of them -- the job's own ``ExitCode`` and the
+    ``DerivedExitCode`` roll-up of its steps -- and a signal that renders as
+    ``0 (signal 9)`` on one row and as a bare ``0`` on the other is the same
+    drift `render.py` exists to prevent.
+
+    A missing code half prints the signal alone: ``str(None)`` in a table cell is
+    a placeholder that reads like a value.
+    """
+    if code is None:
+        return "signal %d" % signal if signal else ""
+    text = str(code)
+    if signal:
+        text += " (signal %d)" % signal
+    return text
+
+
 def job_sections(job, summarized: bool = False):
     """Everything known about a finished job, as ``(title, [(label, value, bar)])``.
 
@@ -1401,10 +1454,16 @@ def job_sections(job, summarized: bool = False):
     # there is nothing to average over -- so on 98% of job screens this row was a
     # second copy of a figure three lines above it. It earns its place on the other
     # 2%, where a footprint that grew is the thing you came to find.
+    #
+    # No "(Nx the average)" annotation any more. It read as a ratio of the two
+    # figures on this screen and was not one: `rss_task_imbalance` is measured
+    # inside a single step, while this row and the MEM gauge above it are
+    # job-level maxima that can come from different steps. Job 52853137 printed
+    # "average 53.7 MiB   (190.7x the average)" against a 10.0 GiB peak that
+    # belonged to `.extern`. The finding carries the ratio, where the text can
+    # say which population it covers.
     if job.ave_rss is not None and not _matches(job.ave_rss, job.max_rss):
-        imbalance = job.rss_task_imbalance
-        extra = "   (%.1fx the average)" % imbalance if imbalance and imbalance >= 1.5 else ""
-        mem.append(("average", "%s%s" % (format_bytes(job.ave_rss), extra), None))
+        mem.append(("average", format_bytes(job.ave_rss), None))
     # MaxVMSize is deliberately NOT here. It was shown to explain the figure rather
     # than let it alarm, and it did the opposite: on this history it runs at a median
     # of 44x the resident figure, has reached 5,449,406x, and has printed 43.2 TiB --
@@ -1463,16 +1522,35 @@ def job_sections(job, summarized: bool = False):
 
     # -- outcome -------------------------------------------------------------
     outcome = []
-    if job.exit_code:
+    if job.exit_code or job.signal:
         # Only when non-zero. "exit code 0" on a COMPLETED job restates the state
         # in the header line, and for a clean run it was the entire `outcome`
         # section -- a heading over one line that said nothing.
-        text = str(job.exit_code)
-        if job.signal:
-            text += " (signal %d)" % job.signal
-        outcome.append(("exit code", text, None))
-    if job.derived_exit_code not in (None, job.exit_code):
-        outcome.append(("worst step exit", str(job.derived_exit_code), None))
+        #
+        # `or job.signal` because `ExitCode` is `code:signal` and the half before
+        # the colon is not the whole answer: `sacct` records a signal kill as
+        # `0:15`, so testing the code alone hid the row on exactly the jobs it had
+        # something to say about -- job 53412513 here, FAILED at `0:15`, showed no
+        # exit code anywhere while `sacct -o ExitCode` printed `0:15`. Every
+        # OUT_OF_MEMORY job is `0:125` and was equally silent.
+        # An ExitCode whose code half is empty prints the signal alone; `sacct`
+        # always writes both, so that is not a shape seen in the wild, but the row
+        # is only reachable at all now that a signal alone opens it.
+        outcome.append(("exit code", exit_pair_text(job.exit_code, job.signal), None))
+    # `DerivedExitCode` is `code:signal` too, and the signal half is the whole
+    # point of this row: slurmdbd rolls a killed step up with a ZERO code, so
+    # `derived_exit_code not in (None, job.exit_code)` compared 0 against 0 and
+    # drew nothing. Job 51554217 here is `COMPLETED|0:0|0:9` with two of its 17
+    # steps `CANCELLED ... 0:9`, and 118 parent rows in a 90-day window on this
+    # cluster carry that exact shape -- a job that reports success while something
+    # inside it was signalled. Same defect one field over from `ExitCode`'s, above.
+    #
+    # The pair, not either half: the row earns its place when the roll-up says
+    # something the job's own outcome does not, and is suppressed when it merely
+    # repeats it.
+    derived = (job.derived_exit_code, job.derived_signal)
+    if derived != (None, None) and derived != (job.exit_code, job.signal):
+        outcome.append(("worst step exit", exit_pair_text(*derived), None))
     if job.reason:
         outcome.append(("reason", job.reason, None))
     if job.energy_joules is not None:
@@ -1684,11 +1762,46 @@ def resource_rows(
             instead="limit reached",
         )
     else:
+        # A running job has not reached its peak, so the caption says what the
+        # figure IS -- a reading taken now -- rather than letting it read as the
+        # job's footprint.
+        #
+        # This gauge used to be flatly wrong on a running job rather than merely
+        # unqualified: `sacct` flushes a step's MaxRSS only when the step ends, so
+        # the peak was taken over whatever short-lived steps had already finished.
+        # A job holding 462 MiB against `--mem=512M` reported 2.2 MiB and 0.4%,
+        # from a one-second monitoring step somebody had attached to watch it.
+        # The figure now comes from `sstat` (see `sacct.read_live_metrics`) and is
+        # labelled for what it is.
+        detail = "%s of the %s limit" % (
+            format_bytes(job.max_rss),
+            format_bytes(job.mem_limit_bytes),
+        )
+        if job.in_progress:
+            if job.peak_is_live_reading:
+                detail += " so far"
+            elif job.peak_unmeasurable_by_permission:
+                # Not "not yet": nothing will flush this for this reader. `sstat`
+                # is owner-only, so on another user's running job the figure is
+                # blocked by permission rather than by timing -- and a reader
+                # comparing their own running job (measured) against a
+                # colleague's would otherwise read one caption in both places.
+                #
+                # Reached with no figure at all, which is the ordinary case: a
+                # running job's live steps carry no flushed MaxRSS, so this
+                # renders beside `n/a` and is the only thing on screen that says
+                # why. The old guard required a figure to exist before saying
+                # anything, so the most common state was the least explained.
+                detail += " — sstat cannot read another user's running job"
+            elif job.max_rss is None:
+                detail += " — sacct flushes a step's peak only when the step ends"
+            else:
+                detail += " — not yet flushed by sacct"
         row(
             "MEM",
             theme.MEM_COLOR,
             job.mem_utilization,
             format_percent(job.mem_utilization),
-            "%s of the %s limit" % (format_bytes(job.max_rss), format_bytes(job.mem_limit_bytes)),
+            detail,
         )
     return rows
