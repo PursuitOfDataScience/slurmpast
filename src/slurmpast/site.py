@@ -312,10 +312,24 @@ def partition_ceiling(partition, runner=None):
         return _PARTITION_CEILING[partition]
     run = runner or _run
     cores, mb = None, None
+    # Did the query ANSWER? Not the same as whether it found anything. The cache
+    # below is for a measured ceiling, and a failed `sinfo` is not one -- caching
+    # it turns one transient failure (no `sinfo` on PATH yet, a timeout, an EINTR)
+    # into a permanent `(None, None)` for that partition, so the clamp this
+    # function exists to provide stays off for the rest of the process. Measured:
+    # one failing call then a working one returning `128 256000` still answered
+    # `(None, None)` and never re-ran `sinfo`, which is the exact defect the
+    # docstring above describes -- `--cpus-per-task=34` advised on 28-core nodes,
+    # refused by `sbatch` -- reintroduced by a query that merely blinked.
+    #
+    # The return contract is unchanged: still `(None, None)`, still never raises.
+    # Only the memo is withheld, so the next caller gets another look.
+    answered = True
     try:
         text = run(["sinfo", "-h", "-p", partition, "-N", "-o", "%c %m"])
     except (SacctError, OSError):
         text = ""
+        answered = False
     for line in (text or "").splitlines():
         parts = line.split()
         if len(parts) != 2:
@@ -330,7 +344,11 @@ def partition_ceiling(partition, runner=None):
             cores = got[0] if cores is None else max(cores, got[0])
         if got[1] is not None:
             mb = got[1] if mb is None else max(mb, got[1])
-    _PARTITION_CEILING[partition] = (cores, mb)
+    # Output that answered but would not parse IS a measurement about this
+    # partition, so that still caches -- the distinction is the query, not the
+    # verdict.
+    if answered:
+        _PARTITION_CEILING[partition] = (cores, mb)
     return cores, mb
 
 

@@ -1065,6 +1065,37 @@ def _main(argv=None) -> int:
             "ignoring %s\n" % (why, ", ".join(args.log_dir))
         )
 
+    # The same shape and the same wording, one flag over. `--demo` replaces the
+    # window with the tape's own -- both render sites read
+    # `"synthetic demo data" if args.demo` -- and nulls `since` on the way into
+    # the query (`since=None if (args.demo or args.until)`), so a window asked
+    # for here is dropped exactly as `--log-dir` was. Measured: `--demo
+    # -S now-1days` and `--demo -S now-365days` render byte-identical output to
+    # `--demo` alone. `--all-users` is the same by a different route: the tape is
+    # 58 jobs belonging to one synthetic user, so there is nobody to widen to.
+    #
+    # Compared against the parser's OWN default rather than truthiness, because
+    # `--since` defaults to `now-7days` and is always set -- so a truthiness test
+    # would warn on every `--demo` run and say nothing about what the caller
+    # typed. `args.since` is already normalised by the line above, so the
+    # default is normalised too or the comparison fires on spelling alone.
+    if args.demo:
+        dropped = [
+            flag
+            for flag, value, default in (
+                ("-S/--since", args.since, normalize_time_spec(parser.get_default("since"))),
+                ("-E/--until", args.until, normalize_time_spec(parser.get_default("until"))),
+            )
+            if value != default
+        ]
+        if args.all_users:
+            dropped.append("--all-users")
+        if dropped:
+            sys.stderr.write(
+                "slurmpast: %s has no effect with --demo (a fixed tape of one "
+                "user's jobs); ignoring\n" % ", ".join(dropped)
+            )
+
     style = report.Style(enabled=False if args.no_color else None)
     sacct = Sacct()
 
@@ -1076,6 +1107,38 @@ def _main(argv=None) -> int:
     # at 20 s with rc=137, and identical under `| cat`. Under cron or CI the job
     # simply never finishes.
     #
+    # `--mouse` is consumed at exactly one place -- `tui.run(mouse=args.mouse)`
+    # -- so in every text mode it is a flag that was typed and will not be used.
+    # Same rule and same wording as `--log-dir` above; `--steps` a few lines
+    # below takes the stricter remedy for the same class, and its comment says
+    # why: "It used to evaporate, so a caller who forgot the id got the ordinary
+    # overview and no hint that the flag they typed did nothing." A warning
+    # rather than an error here because the report asked for is still exactly
+    # what arrives -- only the mouse preference is moot.
+    #
+    # Read BEFORE the `_has_terminal()` degrade below, and placed above it for
+    # that reason -- measured, because the first version sat AFTER it and a
+    # plain pipe (`--demo --mouse | cat`) warned about a mouse the caller had
+    # not asked to drop. That degrade
+    # sets `args.plain` itself and is silent for a reason it states ("a note on
+    # stdout would corrupt the very file being written, and one on stderr would
+    # be noise in every CI log for a fallback that did what was wanted") -- so a
+    # redirect must not start warning about a mouse nobody asked to drop. Only an
+    # explicit text mode counts, which is what `args.plain` still means here.
+    #
+    # Components mirror `wants_text` below and take the section names from
+    # `SECTION_ORDER`, so a sixth section reaches both or neither.
+    if args.mouse and (
+        args.plain
+        or args.json
+        or args.job_ids
+        or any(getattr(args, name) for name in SECTION_ORDER)
+    ):
+        sys.stderr.write(
+            "slurmpast: --mouse has no effect without the dashboard (it is a "
+            "text mode here); ignoring\n"
+        )
+
     # Degrading is right rather than erroring: `--plain` carries the same
     # information, so a redirect should just work. Silently, too -- a note on
     # stdout would corrupt the very file being written, and one on stderr would
@@ -1279,6 +1342,14 @@ def _main(argv=None) -> int:
                                 "cancelled": g.cancelled,
                                 "noop": g.noop,
                                 "gpu_hours": g.gpu_hours,
+                                # The GPU-hours behind `problems`, on the same
+                                # grounds as the breakdown above: FLAGGED is a run
+                                # count and says nothing about what the runs cost,
+                                # so two workloads whose flagged runs burned 2 and
+                                # 90 GPU-hours emitted byte-identical objects here.
+                                # This was the one measured field of `GroupStats`
+                                # that reached no surface at all.
+                                "wasted_gpu_hours": g.wasted_gpu_hours,
                                 "core_hours": g.core_hours,
                                 "severity": g.severity,
                                 "last_seen": g.last_seen,

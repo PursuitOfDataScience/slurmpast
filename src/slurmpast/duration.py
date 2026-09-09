@@ -300,15 +300,92 @@ def plural(count, word: str) -> str:
     return word if round(count or 0) == 1 else word + "s"
 
 
+def format_rate_range(low, high):
+    """Two rates as a percentage range: ``24.6 – 57.7%``.
+
+    **One spelling for one interval, and this is its third home.** `render.ci_range`
+    was created because `report` wrote ``"%.1f - %.1f%%"`` and `tui` wrote
+    ``"%.1f – %.1f%%"``, so a hyphen and an en dash stood in the same table cell
+    depending on which screen you were on. The node note then spelled it a third
+    way -- ``95% CI 84.7-99.5%``, hyphenated and unspaced -- because `nodes` is an
+    analysis module and may not import `render`.
+
+    Round forty-eight recorded that and left it, reading the options as "duplicate
+    the format, re-creating exactly the drift `ci_range` prevents" or "move the
+    sentence out, a four-file change". There is a third: put the rule where both
+    can reach it. `duration` imports nothing but ``math``, `render` already imports
+    from it, and `nodes` may -- so the format lives here and both call it.
+
+    An en dash is what a numeric range takes, and ``render.ascii_fold`` maps it to
+    a hyphen, so ``--ascii`` and piped output are byte-identical to what they were.
+    `report._fold` applies that once per view over the finished text, which is how
+    the note gets folded too.
+
+    **Each end goes through :func:`format_percent`**, so the interval is spelled
+    the way every other percentage in this tool is. Its own ``%.1f`` flipped an
+    interior value to a boundary it had not reached -- the defect `format_percent`
+    was fixed for, one helper over: ``format_rate_range(0.9996, 1.0)`` read
+    ``100.0 – 100.0%``, presenting [99.96%, 100%] as a degenerate interval, and a
+    range whose two ends print identically says the measurement was exact when it
+    was not. Round fifty-six recorded this and left it open, reading the choice as
+    ``>99.9 – 100.0%`` against widening the precision; the first is what this
+    package already decided for a single value at the same boundary, and reusing
+    it invents no precision and adds no third spelling.
+
+    The exact ends are untouched -- 0.0 is ``0.0%`` and 1.0 is ``100.0%``, both
+    true -- so every pinned string (``75.7 – 100.0%``, ``95% CI 72.2 – 100.0%``)
+    is byte-identical. Only the strictly interior band moves, which is the band
+    `format_percent` already governs.
+    """
+    return "%s – %s" % (format_percent(low).rstrip("%"), format_percent(high))
+
+
 def format_percent(value):
     """Fraction -> percent string. ``None`` renders as ``n/a``, never ``0%``.
 
     Inherited from slurmwatch's number audit (finding A2): printing ``0%`` for a
     failed read is indistinguishable from a real measurement of zero.
+
+    **The figure is chosen for the value as PRINTED, not as stored** -- the rule
+    :func:`format_bytes` states in this module and ``_ROUNDS_UP_AT`` exists there
+    to enforce, and the one :func:`format_duration` was fixed for. ``%.1f`` flips
+    to ``100.0`` at 99.95 and to ``0.0`` anywhere below 0.05, so an interior value
+    was printed as a boundary it had not reached -- the same defect as
+    ``1024.0 MiB`` and ``60.0s``, and here the boundary is a *claim*:
+
+    * ``report`` and ``tui`` print ``format_percent(completion_rate)`` followed by
+      the word "completed". From **2000 jobs with a single failure** the rate is
+      0.9995 and the line read "100.0% completed"; at the 13,051 parent jobs a
+      30-day window holds on this cluster, one failure gives 0.999923 and the
+      same "100.0% completed". A reader is told nothing failed by the tool whose
+      job is to say what did.
+    * The other end is the docstring's own case one step in. One failure in
+      13,051 is 0.0077%, which printed ``0.0%`` -- so that string meant both
+      "none" and "some, but under a tenth", which is exactly the ambiguity the
+      ``n/a`` rule above exists to refuse for a failed read.
+    * ``walltime_used`` at 99.96% of the limit printed "100.0%" for a job that
+      did NOT hit the wall, and distinguishing those two is what a TIMEOUT
+      diagnosis turns on.
+
+    So an interior value is given a BOUND rather than a wrong figure. That is the
+    spelling the sibling tools already use for "nonzero but below the resolution"
+    -- ``rapidu.fmt`` returns ``<0.01x`` and ``nodetop.core.duration`` returns
+    ``<1m`` -- and it invents no precision, which printing ``0.1%`` for 0.0077%
+    would (13x).
+
+    **The exact boundaries still print as boundaries**: 0.0 is ``0.0%`` and 1.0 is
+    ``100.0%``, because those are true and two tests pin them. Only the strictly
+    interior band moves. Values above 1.0 are untouched -- MEM% legitimately reads
+    ``102.6%`` when a job exceeded its request -- and so is anything negative.
     """
     if value is None or not math.isfinite(float(value)):
         return "n/a"
-    return "%.1f%%" % (100.0 * value)
+    figure = 100.0 * float(value)
+    if 0.0 < figure < 0.05:
+        return "<0.1%"
+    if 99.95 <= figure < 100.0:
+        return ">99.9%"
+    return "%.1f%%" % figure
 
 
 # Plausible sustained CPU clock range. Below the floor a value is not a clock

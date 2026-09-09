@@ -28,11 +28,14 @@ from .render import (
     ACTION_INDENT,
     CAUTION_HANG,
     CAUTION_MARK,
+    CI_COLUMN,
     DETAIL_BAR_GAP,
     DETAIL_BAR_WIDTH,
     HOURS_PAIR_LABEL,
     JOB_COLUMNS,
     NODE_COLUMNS,
+    NOTHING_TO_FLAG,
+    OVER_LIMIT_MARK,
     OVERVIEW_COLUMNS,
     PAIR_LABEL_WIDTH,
     PAIR_VALUE_WIDTH,
@@ -41,6 +44,7 @@ from .render import (
     WORKLOAD_CONTROL_ASIDE,
     ascii_fold,
     bar,
+    capped_label,
     ci_range,
     cores_text,
     cpu_only_columns,
@@ -51,7 +55,9 @@ from .render import (
     hours_pair_text,
     hours_text,
     idle_hours_note,
+    idle_workload_note,
     job_sections,
+    log_inferred_note,
     log_miss_detail,
     nodes_baseline,
     nodes_correction_note,
@@ -293,7 +299,7 @@ def render_job(
         out.append(style("  " + title, "bold"))
 
         def cell(label, value, pad):
-            flag = "red" if "ABOVE THE LIMIT" in value else None
+            flag = "red" if OVER_LIMIT_MARK in value else None
             text = "%-*s" % (pad, value) if pad else value
             return "%-*s %s" % (PAIR_LABEL_WIDTH, label, style(text, flag) if flag else text)
 
@@ -389,12 +395,29 @@ def render_job(
         #
         # Say when the path was inferred from timing rather than read off a name: a
         # wrong log invents a cause, so the basis has to travel with it.
-        note = "(matched by timing, not by name — verify before trusting it)"
+        #
+        # The words come from `render.log_inferred_note` -- the other branch of this
+        # same if/elif has gone through `render.log_miss_detail` since round
+        # thirty-three, and this half was left writing its own copy, which the
+        # dashboard also wrote out at tui.py. The parentheses are layout, not
+        # wording: they mark the note as an aside where it rides on the path's line,
+        # and they come off where it gets a line of its own, which is the only
+        # layout the dashboard has. So the sentence both surfaces draw is now
+        # byte-identical, and the aside cue survives with colour off.
+        sentence = log_inferred_note()
+        note = "(%s)" % sentence
         inline = "  log %s  %s" % (log_path, note)
+        # `yellow` is what this module spells the dashboard's `HEALTH_COLOR["warn"]`
+        # as -- the pairing render_overview already makes for `idle_hours_note`.
+        # This was `grey`, the hue used for bookkeeping and for the word `log` two
+        # cells to its left, so the one line on the screen warning that the evidence
+        # below it may belong to another job was the quietest thing on it, while the
+        # dashboard shouted the same words. `logs.find_log_by_time` settles which is
+        # right: "a wrong log invents a cause, which is worse than no log".
         if log_inferred and len(inline) <= _plain_width():
             # Unchanged where the pair fits, which is every short path on a wide
             # terminal.
-            out.append("  %s %s  %s" % (style("log", "grey"), log_path, style(note, "grey")))
+            out.append("  %s %s  %s" % (style("log", "grey"), log_path, style(note, "yellow")))
         else:
             out.append("  %s %s" % (style("log", "grey"), log_path))
             # The note is prose, and riding on that line it added 58 cells to
@@ -403,8 +426,8 @@ def render_job(
             # wrapped line, indented under the path, so what overruns above is the
             # path alone.
             if log_inferred:
-                for line in wrap(note.strip("()"), _prose_width(6)):
-                    out.append("      " + style(line, "grey"))
+                for line in wrap(sentence, _prose_width(6)):
+                    out.append("      " + style(line, "yellow"))
     elif not no_logs:
         # Guarded, because both spellings below are claims about the filesystem and
         # under `--no-logs` nothing was stat'd. "none found" reported a search that
@@ -441,7 +464,7 @@ def render_job(
     out.append("")
     findings = sorted(verdict.findings, key=lambda f: severity_rank(f.severity))
     if not findings:
-        out.append(style("  nothing to flag.", "green"))
+        out.append(style("  " + NOTHING_TO_FLAG, "green"))
     else:
         out.append(style("  findings", "bold"))
         for finding in findings:
@@ -564,14 +587,20 @@ def render_overview(history: History, style=None, limit=25, sort="cost", ascii_m
     # the threshold, because on an ordinary window this is a line in the way.
     rows = stats.get("parsed_rows") or 0
     if rows >= _FOOTPRINT_NOTE_ROWS:
-        out.append(
-            style(
-                "  %s rows parsed, about %s held — a window ten times longer "
-                "costs ten times that; narrow it with -S"
-                % (f"{rows:,}", format_bytes(rows * _BYTES_PER_ROW)),
-                "grey",
+        # Wrapped, like every other paragraph here. This one is 109 cells on a real
+        # history (`40,994 rows parsed, ...`) and went out at that length whatever
+        # the terminal was, so on the 90- and 100-column terminals people actually
+        # use it hard-broke mid-sentence -- the exact fault `_prose_width` exists to
+        # stop, in the one note that was not using it.
+        sentence = (
+            "%s rows parsed, about %s held — a window ten times longer "
+            "costs ten times that; narrow it with -S"
+            % (
+                f"{rows:,}",
+                format_bytes(rows * _BYTES_PER_ROW),
             )
         )
+        out.extend(style("  " + line, "grey") for line in wrap(sentence, _prose_width(2)))
     if stats.get("unclassified"):
         # Its own line, deliberately: these are NOT excluded. They are counted in
         # the job total and their core-hours are in the resource sums -- the only
@@ -668,6 +697,24 @@ def render_overview(history: History, style=None, limit=25, sort="cost", ascii_m
             }
         )
     out.extend(text_table(layout, rows, style=style))
+    # Where the window's idle GPU-hours actually sit. The summary above says how
+    # many never computed; FLAGGED counts the runs but not what they cost, so the
+    # table cannot answer "which workload" -- and the figure that can,
+    # `GroupStats.wasted_gpu_hours`, was summed on every walk and read by
+    # nothing. Below the table rather than beside the total, because
+    # `test_the_summary_is_brief` caps everything above it at four lines on
+    # purpose; the dashboard puts the same sentence on its summary line, which is
+    # the same split `gpu_hours_equivalence` already makes.
+    #
+    # Wrapped to the terminal rather than emitted as one line: a folded workload
+    # label is site-controlled and unbounded, so the sentence is not, and an
+    # unwrapped footer soft-wrapping to column 0 under a table that lines up
+    # perfectly reads as a rendering fault. `wrap`, not `wrap_or_clip` -- the two
+    # figures are the point of the sentence and they sit at the end of it.
+    worst = history.idle_workload
+    if worst is not None:
+        note = idle_workload_note(worst[0].label, worst[1], worst[0].gpu_hours)
+        out.extend(style("  " + line, "yellow") for line in wrap(note, _prose_width(2)))
     # Handed the list that was actually sliced. Left to slice `history.groups`
     # itself, this line described the cost-ranked tail under every sort: at
     # `--sort name -n 3` on the demo it said "23 runs holding 10.9% of the compute"
@@ -675,7 +722,11 @@ def render_overview(history: History, style=None, limit=25, sort="cost", ascii_m
     # corrected for this once already; the footer below it was not.
     tail = history.tail_summary(limit, ordered=groups)
     if tail:
-        out.append(style("  … " + tail, "grey"))
+        # Hanging indent under the leader, so a continuation reads as part of the
+        # same note rather than as a new row of the table above it. 63 cells on a
+        # real history against `PLAIN_MIN_WIDTH`'s floor of 60.
+        for index, line in enumerate(wrap(tail, _prose_width(4))):
+            out.append(style(("  … " if index == 0 else "    ") + line, "grey"))
     out.append("")
     return _fold("\n".join(out), ascii_mode)
 
@@ -836,7 +887,7 @@ def render_nodes(history: History, metric="hang", controlled=True, style=None, a
                     "NODE": row["node"],
                     "N": "%d/%d" % (row["bad"], row["trials"]),
                     "RATE": "%.1f%%" % (100 * row["rate"]),
-                    "95% CI": ci_range(row["ci_low"], row["ci_high"]),
+                    CI_COLUMN: ci_range(row["ci_low"], row["ci_high"]),
                     "VERDICT": (
                         row["verdict"],
                         {"worse": "red", "better": "green"}.get(row["verdict"]),
@@ -975,9 +1026,7 @@ def render_sizing(history, style=None, limit=12, sort="cost", ascii_mode=False):
                 # have it here. The basis line carries the measurement and the
                 # caution names the way out, so both are printed rather than the
                 # flag line alone.
-                out.append(
-                    "    %-17s %s" % (a.flag, style("at this partition's ceiling", "yellow"))
-                )
+                out.append("    %-17s %s" % (a.flag, style(capped_label(), "yellow")))
                 for line in wrap(a.basis, _prose_width(8)):
                     out.append("        " + style(line, "grey"))
                 for index, line in enumerate(wrap(a.caution, _prose_width(8 + len(CAUTION_MARK)))):

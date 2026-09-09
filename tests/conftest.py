@@ -12,8 +12,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from slurmpast.sacct import _FIELDS, parse  # noqa: E402
-from slurmpast.site import Site, reset_cache  # noqa: E402
+from slurmpast.sacct import _FIELDS, parse
+from slurmpast.site import Site, reset_cache
 
 FIELDS = _FIELDS
 

@@ -3,6 +3,7 @@ import random
 import pytest
 
 from slurmpast.nodes import (
+    FDR_ALPHA,
     _bh_reject,
     _informative,
     compress_nodelist,
@@ -13,6 +14,7 @@ from slurmpast.nodes import (
     node_table,
     note_for_allocation,
     note_for_node,
+    selected_direction_p_value,
     suggest_exclude,
     wilson_interval,
 )
@@ -306,11 +308,19 @@ class TestOneTestPerNodeIsStillManyTests:
     """
 
     @staticmethod
-    def _null_tables(n_nodes, tables, seed, jobs_per=30, rate=0.20):
+    def _null_tables(n_nodes, tables, seed, jobs_per=30, rate=0.20, verdict="worse"):
         """Fraction of tables flagging at least one node, with every node identical.
 
         Jobs are built directly rather than through `parse` -- this generates tens
         of thousands of records and the sacct reader is far too slow for that.
+
+        ``verdict`` picks which half of the family to count. ``"worse"`` counts what
+        `suggest_exclude` offers, which is what this class's figures and the
+        module's were measured on. ``"any"`` counts a verdict in either direction,
+        which is what `FDR_ALPHA` is a promise about: one BH pass corrects both
+        halves, and a reader acts on both. Measuring only the first half is what
+        left the second one unpriced for seven rounds -- see
+        `TestTheDirectionIsPricedBecauseTheDataChoseIt`.
         """
         from slurmpast.model import Job
 
@@ -330,8 +340,12 @@ class TestOneTestPerNodeIsStillManyTests:
                             state="FAILED" if rng.random() < rate else "COMPLETED",
                         )
                     )
-            if suggest_exclude(node_table(jobs, workload="w")):
-                flagged += 1
+            table = node_table(jobs, workload="w")
+            if verdict == "any":
+                hit = any(row["verdict"] in ("worse", "better") for row in table["rows"])
+            else:
+                hit = bool(suggest_exclude(table))
+            flagged += hit
         return flagged / float(tables)
 
     def test_an_innocent_node_is_rarely_offered_to_exclude(self):
@@ -1434,7 +1448,7 @@ class TestTheNotesDenominatorIsNotCalledTheReadersJobCount:
         assert "failed 32 of %d placements there" % (raw - censored) in note, note
         assert "jobs" not in note, note
         assert note == (
-            "midway3-0250 failed 32 of 33 placements there (97.0%, 95% CI 84.7-99.5%) "
+            "midway3-0250 failed 32 of 33 placements there (97.0%, 95% CI 84.7 – 99.5%) "
             "against 1.0% on every other node for caai-p10b_scan."
         )
 
@@ -1456,7 +1470,7 @@ class TestTheNotesDenominatorIsNotCalledTheReadersJobCount:
         note = self._note()
         assert note.startswith("midway3-0250 failed 32 of ")
         assert note.endswith(
-            "(97.0%, 95% CI 84.7-99.5%) against 1.0% on every other node for caai-p10b_scan."
+            "(97.0%, 95% CI 84.7 – 99.5%) against 1.0% on every other node for caai-p10b_scan."
         )
 
     def test_the_censoring_that_made_the_wording_wrong_is_still_in_place(self):
@@ -1476,3 +1490,111 @@ class TestTheNotesDenominatorIsNotCalledTheReadersJobCount:
         produces a note, so midway3-0200 -- 0 of 16 on the same workload, and the
         same hardware as midway3-0187 -- stays unnamed before and after."""
         assert self._note("midway3-0200") == ""
+
+
+class TestTheDirectionIsPricedBecauseTheDataChoseIt:
+    """`node_table` reads each row's direction off that row's own rate and then
+    tests the tail the data has already fallen in. That is two looks, and a
+    one-sided tail charges for one.
+
+    The module's 2.7% / 2.8% / 2.4% was measured off `--exclude`, so it counted
+    only the `worse` half of a family that holds both halves and corrects them in
+    one BH pass. Re-measured on the same null as the share of tables reaching
+    *any* verdict, the unpriced family ran at 4.5% at 30 placements a node and a
+    0.20 rate -- and then 5.5% at a 0.35 rate, 6.5% at 50 placements, 7.8% at 100
+    and 8.2% at 200, against the 5% `FDR_ALPHA` promises. Priced, the same cells
+    give 2.4% / 2.7% / 3.2% / 3.7% / 4.4%. The unpriced figure passes only where
+    Fisher's discreteness at 30 placements is doing the work instead of the
+    correction, and `--all-workloads` on a real 90-day window here puts 26 of its
+    308 rows past 100 placements, the busiest at 713.
+    """
+
+    WORKLOAD = "node-evaluation"
+
+    # 0 failures in 20 placements against 6 in 30. The tail has a single term --
+    # P(0 of a 20-draw are marked | 50 placements, 6 of them marked) -- and the
+    # binomials cancel to a product of six ratios. Written out rather than called
+    # so that nothing below takes its expectation from the code it is checking.
+    CLEAN_TAIL = (30 * 29 * 28 * 27 * 26 * 25) / float(50 * 49 * 48 * 47 * 46 * 45)
+
+    def _restated_history(self):
+        """One node failing 6 of 10, beside two that went 0 for 20.
+
+        All three rows are the same fact. Every one of the 6 failures in the
+        leave-one-out rate the two clean nodes are measured against is the first
+        node's, so "these two are better than the fleet" is "that one is worse"
+        said twice more.
+        """
+        return (
+            _placements("node000", 6, 10, name=self.WORKLOAD)
+            + _placements("node001", 0, 20, name=self.WORKLOAD, job_id_base=5000)
+            + _placements("node002", 0, 20, name=self.WORKLOAD, job_id_base=7000)
+        )
+
+    def test_the_row_carries_twice_the_tail_the_data_picked(self):
+        """1 failure in 10 placements beside 0 in 500. The one-sided tail there is
+        exactly 10/510 -- hand-computed in `TestNodePValue`, and this round does
+        not move it. But the direction it was taken in came out of 10% against
+        0%, so the number BH is handed has to be 20/510."""
+        jobs = _placements("midway3-0009", 1, 10) + _placements(
+            "midway3-0010", 0, 500, job_id_base=5000
+        )
+        rows = {r["node"]: r for r in node_table(jobs, workload=self.WORKLOAD)["rows"]}
+        assert rows["midway3-0009"]["direction"] == "worse"
+        assert rows["midway3-0009"]["p_value"] == pytest.approx(20 / 510.0)
+
+    def test_a_better_verdict_that_only_restated_the_bad_node_is_withdrawn(self):
+        """Unpriced, both clean rows cleared BH's loosest step at 0.0373 and were
+        published as `better`: a three-row table asserting three findings out of
+        one node's six failures. Twice 0.0373 clears nothing in that table."""
+        assert self.CLEAN_TAIL < FDR_ALPHA
+        assert 2 * self.CLEAN_TAIL > FDR_ALPHA
+        table = node_table(self._restated_history(), workload=self.WORKLOAD)
+        rows = {r["node"]: r for r in table["rows"]}
+        assert rows["node001"]["direction"] == "better"
+        assert rows["node001"]["p_value"] == pytest.approx(2 * self.CLEAN_TAIL)
+        assert rows["node001"]["verdict"] == "inconclusive"
+        assert rows["node002"]["verdict"] == "inconclusive"
+
+    def test_the_node_the_evidence_is_actually_about_keeps_its_verdict(self):
+        """CONTROL, and it passes in both states. Same table: the row the six
+        failures belong to is `worse` either way and stays the whole of the
+        `--exclude` line. Pricing the direction withdraws the rows that were
+        handing one node's failures back as two other nodes' virtue. It does not
+        withdraw the node."""
+        table = node_table(self._restated_history(), workload=self.WORKLOAD)
+        rows = {r["node"]: r for r in table["rows"]}
+        assert rows["node000"]["verdict"] == "worse"
+        assert suggest_exclude(table) == ["node000"]
+
+    def test_the_tail_itself_is_untouched_and_still_one_sided(self):
+        """CONTROL, passing in both states, and the one that pins *where* the
+        charge belongs. `node_p_value` stays the plain one-sided tail: it is
+        cross-checked against `scipy.stats.fisher_exact` over 5,986 comparisons
+        (issues.md, round thirty-three) and against hand arithmetic here, and a
+        caller that names its direction in advance owes nothing. Folding the
+        factor of two into it would break both of those checks while leaving every
+        other test in this class green."""
+        assert node_p_value(1, 10, 0, 500, "worse") == pytest.approx(10 / 510.0)
+        assert node_p_value(0, 20, 6, 30, "better") == pytest.approx(self.CLEAN_TAIL)
+        assert selected_direction_p_value(1, 10, 0, 500, "worse") == pytest.approx(
+            2 * node_p_value(1, 10, 0, 500, "worse")
+        )
+
+    def test_a_certainty_stays_a_certainty(self):
+        """CONTROL, passing in both states. A factor of two cannot be what decides
+        a finding that is eleven orders of magnitude clear of the line, and the
+        cap keeps the priced value a p-value: 19 of 36 hangs against 12 of 218 on
+        identical work is the signal this module exists for."""
+        assert selected_direction_p_value(19, 36, 12, 218, "worse") < 1e-9
+        assert selected_direction_p_value(6, 12, 30, 60, "worse") == 1.0
+
+    def test_the_whole_family_and_not_just_the_exclude_line_stays_flat(self):
+        """CONTROL, passing in both states -- and the measurement gap that let this
+        item sit open through seven rounds. `_null_tables` counted
+        `suggest_exclude`, which is one half of the family; the bound `FDR_ALPHA`
+        states is about a table offering a verdict at all."""
+        both = TestOneTestPerNodeIsStillManyTests._null_tables(
+            20, tables=120, seed=4242, verdict="any"
+        )
+        assert both < 0.15, "%.1f%% of null tables reached a verdict" % (100 * both)

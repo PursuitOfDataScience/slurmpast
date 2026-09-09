@@ -59,6 +59,7 @@ import math
 import os
 import re
 import subprocess
+import threading
 
 from .duration import mem_scope, parse_bytes, parse_duration, parse_mem_limit
 from .model import Job, Step
@@ -178,6 +179,34 @@ SAFE_DELIMITER = "\x1f"
 # query takes 2.26 s here, so this is not a performance bound -- it is there so an
 # unreachable slurmdbd reports a timeout instead of hanging the dashboard forever.
 DEFAULT_TIMEOUT = 300.0
+
+#: Budget for the LIVE (`sstat`) query specifically, which is an enrichment and
+#: not the data. `DEFAULT_TIMEOUT` is for the accounting database; `sstat` is a
+#: different cost with a different shape -- it contacts each job's `slurmstepd`,
+#: so it scales with how many jobs the reader has RUNNING, not with the window.
+#:
+#: `merge_live_metrics` already names the number it was designed around: "the
+#: 18-second call this exists to avoid". Measured on midway3 with 60 running
+#: array tasks, the one batched call this module makes took **119.76s** for 2,160
+#: rows -- 6.6x the cost the module calls out as unacceptable -- and nothing
+#: bounded it but the 300s accounting budget. `slurmpast --plain` therefore sat
+#: for two minutes before printing anything.
+#:
+#: A timeout here lands on the fallback `read_live_metrics` already documents as
+#: "the correct answer and not a degradation": the field reads unmeasured. Waiting
+#: two minutes to avoid saying "unmeasured" is the wrong trade.
+#:
+#: No new environment variable -- `SLURMPAST_TIMEOUT` is documented as "the
+#: package's only environment variable". It is respected as a CEILING instead: a
+#: site that lowers it lowers this too, while raising it does not extend an
+#: enrichment, because that is not what the reader raised it for.
+LIVE_METRICS_TIMEOUT_S = 15.0
+
+#: The cap in force for the CURRENT thread's query, or unset for the full budget.
+#: Thread-local because the dashboard runs its load in a Textual thread worker
+#: while the main thread is live, so a module-level value would leak one view's
+#: cap into another's.
+_query_cap = threading.local()
 
 # A terminal job is over even if the End timestamp is missing; inferring "still
 # running" from a blank End would suppress every diagnosis on such a record. The
@@ -325,7 +354,18 @@ def _run(args):
     # nothing kills it on that path, because the only cleanup is in the
     # TimeoutExpired branch below. It also costs nothing to refuse a bad setting
     # without starting a query first.
-    budget = _timeout()
+    # `_timeout()` first either way, so a bad SLURMPAST_TIMEOUT is still refused
+    # before any spawn (see the comment below), and so a cap can only ever SHORTEN
+    # the wait -- never extend a budget the reader deliberately lowered.
+    #
+    # The cap arrives through `_query_cap`, NOT through this signature, and that is
+    # deliberate. `site.py` does `from .sacct import _run`, and seven tests replace
+    # `slurmpast.sacct._run` with a ONE-ARGUMENT double; adding a parameter here
+    # broke `test_cli.py`'s `lambda args: ...` under mypy and would have handed those
+    # doubles a keyword they cannot take. A caller-set cap keeps this funnel's
+    # signature, and every existing double, exactly as they were.
+    cap = getattr(_query_cap, "value", None)
+    budget = _timeout() if cap is None else min(_timeout(), cap)
     try:
         proc = subprocess.Popen(
             args,
@@ -1340,20 +1380,26 @@ def read_live_metrics(job_ids, runner=None):
     wanted = [str(j).split(".")[0] for j in job_ids if str(j).strip()]
     if not wanted:
         return {}
+    argv = [
+        "sstat",
+        "--allsteps",
+        "--noheader",
+        "--parsable2",
+        "--jobs=%s" % ",".join(dict.fromkeys(wanted)),
+        "--format=%s" % ",".join(_SSTAT_FIELDS),
+    ]
+    # The cap is set around the call rather than passed to it, so `runner`'s
+    # one-argument protocol is untouched and a patched `sacct._run` still
+    # intercepts this query exactly as it did before.
     run = runner or _run
+    previous = getattr(_query_cap, "value", None)
+    _query_cap.value = LIVE_METRICS_TIMEOUT_S
     try:
-        out = run(
-            [
-                "sstat",
-                "--allsteps",
-                "--noheader",
-                "--parsable2",
-                "--jobs=%s" % ",".join(dict.fromkeys(wanted)),
-                "--format=%s" % ",".join(_SSTAT_FIELDS),
-            ]
-        )
+        out = run(argv)
     except SacctError:
         return {}
+    finally:
+        _query_cap.value = previous
     return _parse_live_metrics(out)
 
 

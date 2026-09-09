@@ -114,11 +114,20 @@ def newest_name(jobs) -> str:
     """The most recent run's ``JobName`` in a group, or ``""`` if none recorded.
 
     The representative to show when the folded signature cannot be
-    (:func:`fold_erased_the_name`). Ordered the way :func:`index.build_groups`
-    orders a group's members -- start, falling back to submit -- with
-    :func:`numeric_job_id` breaking the tie, so records carrying no usable
+    (:func:`fold_erased_the_name`). Ordered by start, falling back to submit, with
+    :func:`numeric_job_id` breaking the tie -- so records carrying no usable
     timestamp still resolve to the last one submitted rather than to whichever
     happened to arrive first from sacct.
+
+    That tie-break is this function's own, and it is one key MORE than
+    :func:`index.build_groups` applies: that sorts on ``_stamp`` alone
+    (``index.py``), with no second key. This docstring used to describe the two as
+    the same ordering, which was the wrong half of the pair -- ties are the
+    ORDINARY case here, because an array's tasks share a Submit, so without a
+    second key the answer would follow whatever order sacct returned. Nothing in
+    ``src`` indexes ``GroupStats.jobs[0]``, and ``workload_label`` deliberately
+    calls this function rather than doing so, which is why the difference is
+    harmless -- but it is a difference, and the claim of equivalence was not true.
     """
     best = None
     for job in jobs:
@@ -305,6 +314,22 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
         # which is the drift `render` exists to prevent.
         dominant, count = max(states.items(), key=lambda kv: (kv[1], kv[0]))
 
+        # ONE `sbatch --array` is one submission, however many tasks it fans out into.
+        # `group_key` folds an array's elements into a single workload and that is
+        # right -- each element is an allocation that really ran and burned resource,
+        # which `TestArraySiblingsAlreadyCountAsEvidence` pins deliberately -- but the
+        # ACTION text assumed there had been M submissions. Measured on a 30-day
+        # history: `cpas_audit` is 11 tasks of ONE array, 3 of them COMPLETED, and it
+        # was told "Stop resubmitting; the failure is deterministic" -- two claims in
+        # one sentence, both false. The master id is the whole distinction and it is
+        # already in the record: everything before the `_` in an array task's JobID.
+        masters = {str(j.job_id).split("_")[0] for j in members if j.job_id}
+        one_array = len(masters) == 1 and len(members) > 1
+        # A workload with a successful run is not failing deterministically, whatever
+        # its failure fraction: `REPEAT_FAIL_FRACTION` is well below 1, so this branch
+        # is reached with completions present (8 of 11 is 0.73).
+        finished_well = [j for j in members if j.completed]
+
         limits = {format_duration(j.timelimit) for j in failures if j.timelimit is not None}
         hung = [j for j in failures if looks_like_noop(j)]
         wasted = sum(j.gpu_hours or 0.0 for j in failures)
@@ -321,6 +346,13 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
             "was" if count == 1 else "were",
             dominant,
         )
+        if one_array:
+            # The count was already honest about the tasks; this says whose they are,
+            # so a reader can tell fan-out from repetition without counting ids.
+            evidence += " All %d are tasks of one array (job %s)." % (
+                len(members),
+                next(iter(masters)),
+            )
         if dominant == "TIMEOUT" and len(limits) == 1:
             evidence += " Every one used the same --time=%s." % limits.pop()
         if wasted > 1.0:
@@ -358,7 +390,22 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
                 "not the fix."
             )
         else:
-            action = "Stop resubmitting; the failure is deterministic. Reproduce interactively."
+            unit = "tasks" if one_array else "runs"
+            if one_array:
+                # There is nothing to stop: the array was submitted once.
+                action = (
+                    "One array submission, not repeated ones: reproduce a single task "
+                    "interactively rather than resubmitting the array."
+                )
+            elif finished_well:
+                action = "Reproduce interactively."
+            else:
+                action = "Stop resubmitting; the failure is deterministic. Reproduce interactively."
+            if finished_well:
+                action += (
+                    " %d of %d %s completed, so the failure is not deterministic — compare a "
+                    "failed one against a completed one." % (len(finished_well), len(members), unit)
+                )
 
         findings.append(
             (
@@ -425,6 +472,25 @@ def _mem_walk(values):
     return " -> ".join(rendered[:head] + ["... %d more ..." % dropped] + rendered[-tail:])
 
 
+def _abandoned_time_note(burned) -> str:
+    """``The abandoned attempts ran 12-12:00:00 between them.``, or ``""``.
+
+    One spelling, because :func:`find_requeues` reports this figure twice: once for
+    each workload it prints, and once for the tail its cap hides. It is the figure
+    that rule is *ranked* by -- "a requeued allocation really ran, and its hours
+    appear in no other total the tool prints" -- so the two places that report it
+    must not word it differently. That is the reason ``render`` exists, applied
+    inside one module; ``render`` itself cannot hold this sentence, because it
+    imports ``rich`` and the analysis modules may not.
+
+    ``""`` when nothing was burned. An earlier attempt can end carrying no Elapsed
+    at all, and "ran 00:00:00" reads as a measurement where there is none.
+    """
+    if burned is None or burned <= 0:
+        return ""
+    return "The abandoned attempts ran %s between them." % format_duration(burned)
+
+
 def find_requeues(jobs, min_runs=REQUEUE_MIN, fraction=REQUEUE_FRACTION, limit=REPEAT_REPORT_LIMIT):
     """Workloads Slurm keeps requeueing.
 
@@ -488,8 +554,9 @@ def find_requeues(jobs, min_runs=REQUEUE_MIN, fraction=REQUEUE_FRACTION, limit=R
             "was" if count == 1 else "were",
             dominant,
         )
-        if burned > 0:
-            evidence += " The abandoned attempts ran %s between them." % format_duration(burned)
+        note = _abandoned_time_note(burned)
+        if note:
+            evidence += " " + note
 
         if dominant == "NODE_FAIL":
             action = (
@@ -527,13 +594,32 @@ def find_requeues(jobs, min_runs=REQUEUE_MIN, fraction=REQUEUE_FRACTION, limit=R
     kept = [row[1] for row in findings[:limit]]
     hidden = findings[limit:]
     if hidden:
+        # The tail's own abandoned time. `hidden` was read for `len()` and nothing
+        # else, so this line published how MANY workloads the cap dropped and
+        # withheld the one quantity the rule sorts on -- the quantity each of the
+        # four findings directly above it prints for itself. Two histories whose
+        # hidden tail burned 00:03:00 and 1-00:00:00 came out byte for byte
+        # identical on `--plain --patterns`, on the dashboard's patterns panel and
+        # in `--patterns --json`, which is the whole loss: a reader deciding
+        # whether to spend a second, narrower query had nothing to decide with,
+        # and this rule's own docstring calls that figure the number that makes
+        # the case.
+        #
+        # Figure first, then the instruction, totalled over the hidden rows -- the
+        # shape `find_repeat_failures` above already uses for its own tail
+        # ("Together they account for %d more failed runs. Shown in full with a
+        # narrower --since window ...").
+        evidence = "Shown in full with a narrower --since window."
+        note = _abandoned_time_note(sum(row[0] for row in hidden))
+        if note:
+            evidence = "%s %s" % (note, evidence)
         kept.append(
             Finding(
                 INFO,
                 "requeue-repeat-more",
                 "%d further %s requeued as often"
                 % (len(hidden), "workload is" if len(hidden) == 1 else "workloads are"),
-                "Shown in full with a narrower --since window.",
+                evidence,
                 "",
             )
         )

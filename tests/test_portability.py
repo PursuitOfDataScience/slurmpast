@@ -2178,16 +2178,77 @@ class TestNothingImportsPastTheDeclaredPythonFloor:
                         )
         assert not offenders, "; ".join(offenders)
 
+    @staticmethod
+    def _tomllib_guards(tree):
+        """`(lineno, falls_back_to_tomli)` for each `try:` importing `tomllib`."""
+        import ast
+
+        out = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            body = set()
+            for stmt in node.body:
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, ast.Import):
+                        body.update(alias.name for alias in sub.names)
+            if "tomllib" not in body:
+                continue
+            handled = set()
+            for handler in node.handlers:
+                for sub in ast.walk(handler):
+                    if isinstance(sub, ast.Import):
+                        handled.update(alias.name for alias in sub.names)
+                    elif isinstance(sub, ast.ImportFrom) and sub.module:
+                        handled.add(sub.module)
+            out.append((node.lineno, "tomli" in handled))
+        return out
+
     def test_the_one_backfill_there_is_is_declared(self):
-        """The control on the fix: `tomllib` is guarded *and* `tomli` is in the dev
-        extra behind a marker, so 3.10 installs it and 3.11+ does not."""
+        """`tomllib` is guarded *and* `tomli` is in the dev extra behind a marker,
+        so 3.10 installs it and 3.11+ does not.
+
+        The marker's boundary is tied to `ADDED_IN` rather than matched as a
+        literal, so the two numbers that have to agree cannot drift apart.
+        """
+        import re
+
         root = pathlib.Path(__file__).resolve().parent.parent
         text = (root / "pyproject.toml").read_text()
-        assert "tomli>=" in text
-        assert "python_version < '3.11'" in text
-        source = (root / "tests" / "test_portability.py").read_text()
-        assert "except ModuleNotFoundError:" in source
-        assert "import tomli as tomllib" in source
+        marker = re.search(r'"tomli>=[\d.]+;\s*python_version\s*<\s*[\'"](\d+\.\d+)[\'"]"', text)
+        assert marker, "the tomli backfill marker is gone from pyproject.toml"
+        boundary = tuple(int(part) for part in marker.group(1).split("."))
+        assert boundary == self.ADDED_IN["tomllib"], (boundary, self.ADDED_IN["tomllib"])
+
+    def test_every_tomllib_guard_falls_back_to_tomli(self):
+        """Checked on the AST, and that is the whole point of this one.
+
+        It used to assert `"import tomli as tomllib" in source` against this
+        file. **Measured: that survives breaking a real fallback** -- the phrase
+        occurs four times here, two of them inside the test's own assertions and
+        its `ast.parse` fixture, so the substring can be satisfied by the
+        machinery that checks it. A guard whose handler quietly stops importing
+        `tomli` is the failure that matters: on 3.10 it turns a loud
+        `ModuleNotFoundError` into a silent loss of the parser.
+        """
+        import ast
+
+        root = pathlib.Path(__file__).resolve().parent.parent
+        here = pathlib.Path(__file__).resolve()
+        sites = {}
+        for path in sorted(
+            list((root / "src" / "slurmpast").glob("*.py"))
+            + list((root / "tests").glob("*.py"))
+            + list((root / "tools").glob("*.py"))
+        ):
+            tree = ast.parse(path.read_text())
+            for lineno, ok in self._tomllib_guards(tree):
+                # This file plants an unguarded `tomllib` in a fixture string,
+                # but that is parsed from text and is not a real import here.
+                sites["%s:%d" % (path.name, lineno)] = ok
+        assert sites, "no guarded tomllib import found at all"
+        assert sorted(name for name, ok in sites.items() if not ok) == [], sites
+        assert here.name == "test_portability.py"
 
     def test_it_would_have_caught_the_one_that_shipped(self):
         """The control that matters: an unguarded `import tomllib` is reported."""

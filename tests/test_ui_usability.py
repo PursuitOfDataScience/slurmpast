@@ -13,9 +13,9 @@ import pytest
 
 pytest.importorskip("textual")
 
-from slurmpast import render, theme, tui  # noqa: E402
-from slurmpast.demo import history  # noqa: E402
-from slurmpast.index import History  # noqa: E402
+from slurmpast import render, theme, tui
+from slurmpast.demo import history
+from slurmpast.index import History
 
 
 def make_app(jobs, **kw):

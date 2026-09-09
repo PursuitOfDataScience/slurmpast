@@ -10,6 +10,7 @@ import pathlib
 import re
 import shutil
 import tarfile
+import types
 
 import pytest
 
@@ -23,6 +24,16 @@ SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "slurmpast"
 
 def row(**kw):
     return "|".join(str(kw.get(name, "")) for name in _FIELDS)
+
+
+def tmp_source(text):
+    """``text`` behind the one method the source sweeps below call on a path.
+
+    So a sweep's own reach can be asserted against a line of source rather than
+    against whatever the package happens to contain today -- a control that reads
+    its expectation out of the file it is guarding proves nothing.
+    """
+    return types.SimpleNamespace(read_text=lambda: text)
 
 
 def _screen_text(jobs, keys, size=(100, 60)):
@@ -477,9 +488,40 @@ class TestTheTwoSurfacesCannotDriftApart:
     the source, and by the time it reaches a screen only one of the two is on it.
     """
 
-    @staticmethod
-    def _prose_literals(path):
-        """Every prose-shaped string constant in ``path`` that is not a docstring."""
+    #: Two copies of one sentence count as two copies however they are punctuated.
+    #:
+    #: The sweep used to key on the literal, byte for byte, past a 25-character
+    #: floor and skipping anything holding a newline. Every one of those three let
+    #: the inferred-log hedge through for rounds on end: `report` wrote
+    #: ``"(matched by timing, not by name — verify before trusting it)"`` and the
+    #: dashboard wrote ``"       matched by timing, not by name — verify before
+    #: trusting it\n"``. One sentence, two files, and the assertion whose whole job
+    #: is forbidding that saw two unrelated strings -- because one wore parentheses
+    #: and the other wore six spaces and a newline.
+    #:
+    #: So the key is the words: lowercased, with punctuation, padding and line
+    #: breaks discarded. Nothing a reader hears the difference between can hide a
+    #: copy any more.
+    _WORDS = re.compile(r"[a-z]{2,}")
+
+    #: Words a shared literal needs before it counts as prose.
+    #:
+    #: Three, not the old character count, and the two are not the same test:
+    #: 25 characters admits ``"    %-17s %s %s   %s"`` and excludes
+    #: ``"nothing to flag."``, which is exactly backwards. Below three words the
+    #: matches are `Column` keys (``WALL TIME``, ``PEAK MEM``, ``JOB NAME``) and
+    #: Slurm directives (``#SBATCH --exclude=``) -- a key legitimately appears on
+    #: both sides because it *is* the lookup into a spec `render` owns, and a
+    #: directive is what the reader types, not something this package phrases.
+    _MIN_WORDS = 3
+
+    @classmethod
+    def _prose_literals(cls, path):
+        """``{words: [lineno]}`` for every prose-shaped constant that is not a docstring.
+
+        Keyed on :attr:`_WORDS` rather than on the literal, so a copy that differs
+        only in punctuation or padding still collides with its twin.
+        """
         tree = ast.parse(path.read_text())
         docstrings = set()
         for node in ast.walk(tree):
@@ -495,12 +537,9 @@ class TestTheTwoSurfacesCannotDriftApart:
                 continue
             if node.lineno in docstrings:
                 continue
-            value = node.value.strip()
-            # Prose, not a format fragment or an identifier: several words, and
-            # long enough that two files sharing it is a copy rather than a
-            # coincidence.
-            if len(value) >= 25 and " " in value and "\n" not in value:
-                found.setdefault(value, []).append(node.lineno)
+            words = " ".join(cls._WORDS.findall(node.value.lower()))
+            if len(words.split()) >= cls._MIN_WORDS:
+                found.setdefault(words, []).append(node.lineno)
         return found
 
     def test_no_sentence_is_written_out_in_both_front_ends(self):
@@ -510,6 +549,33 @@ class TestTheTwoSurfacesCannotDriftApart:
         assert not shared, "duplicated between report.py and tui.py: %s" % "; ".join(
             "%r (report.py:%s, tui.py:%s)" % (s[:60], report[s], dashboard[s]) for s in shared
         )
+
+    def test_the_sweep_still_catches_a_copy_it_used_to_miss(self):
+        """The control on the sweep's own reach, and the reason it was widened.
+
+        Not a self-test: this is the exact pair of spellings that sat in
+        `report.render_job` and `tui.JobScreen`, fed to the same helper the
+        assertion above uses. Under the byte-for-byte key both were reported as
+        distinct strings, so the sweep was green over a duplicated sentence; under
+        the words key they collide. Green in both states -- it asserts what the
+        helper does, not what the source currently holds.
+        """
+        plain = tmp_source('note = "(matched by timing, not by name — verify before trusting it)"')
+        dash = tmp_source(
+            'body.append("       matched by timing, not by name — verify before trusting it\\n")'
+        )
+        report = self._prose_literals(plain)
+        dashboard = self._prose_literals(dash)
+        assert set(report) == set(dashboard) != set(), (report, dashboard)
+
+    def test_the_sweep_ignores_a_column_key_both_specs_look_up(self):
+        """The other side of the control: widening it must not make it fire on the
+        `Column` labels, which are *supposed* to appear in both front ends because
+        they are the lookup into one shared spec. Two words, so they sit below
+        `_MIN_WORDS` -- pinned here so lowering that bar has to break a test rather
+        than a screen."""
+        both = tmp_source('cells = {"WALL TIME": a, "PEAK MEM": b, "JOB NAME": c}')
+        assert self._prose_literals(both) == {}
 
     def test_the_disclaimer_that_drifted_is_now_one_string(self):
         """The control for the sweep above, naming the pair that came apart."""
@@ -546,6 +612,283 @@ class TestTheTwoSurfacesCannotDriftApart:
         assert nodes_nothing_to_exclude() in clean
 
         assert patterns_empty() in render_patterns(History([]), style=Style(enabled=False))
+
+    #: The dashboard wraps prose to its panel and `--plain` to `_plain_width()`,
+    #: so the same sentence arrives under different line breaks on the two sides.
+    #: Compared on the words for the reason `_WORDS` gives: a reader hears no
+    #: difference between them, and keying on bytes is what let the inferred-log
+    #: hedge hide for rounds.
+    @staticmethod
+    def _reaches(surface, sentence):
+        key = " ".join(re.findall(r"[a-z]{2,}", sentence.lower()))
+        assert key, "vacuous: the sentence contributed no words to compare"
+        return key in " ".join(re.findall(r"[a-z]{2,}", surface.lower()))
+
+    def test_the_dashboard_draws_the_quiet_half_of_the_exclude_block(self):
+        """The branch the dashboard half of this pair does not reach.
+
+        `test_tui.TestTheDashboardDrawsTheSharedSentences` covers the exclude
+        block when a node IS worse -- the disclaimer, the correction note, the
+        workload control -- and catches a call that stops painting. It only ever
+        drives the FLAGGED branch. The `else` beside it, `nodes_nothing_to_exclude`
+        ("no node is worse than the rest"), was asserted on `--plain` alone, and it
+        is the branch a healthy cluster sees every time: the reader who is told
+        nothing is wrong is the one with no way to tell a clean verdict from a
+        panel that failed to draw.
+
+        The route matters as much as the sentence. On a fleet where every node
+        behaves alike the branch is reached only under the FAILURE metric, and the
+        nodes view opens on `hang`, so this presses `m` -- and asserts the
+        sentence is absent before that press, so the key cannot quietly become
+        unnecessary and leave the test passing off the other branch.
+        """
+        from slurmpast.render import nodes_nothing_to_exclude
+
+        even = _uniform_placements()
+        assert self._reaches(_screen_text(even, ["n", "m"]), nodes_nothing_to_exclude())
+        assert not self._reaches(_screen_text(even, ["n"]), nodes_nothing_to_exclude())
+
+    def test_the_dashboard_draws_the_empty_pattern_sentence_with_no_jobs_at_all(self):
+        """`patterns_empty` on a history of zero jobs, not merely of healthy ones.
+
+        The sibling in `test_tui.py` uses the demo's completed subset -- runs
+        exist, none repeats. Zero jobs is the other way in, and it is what `-S`
+        over a quiet window gives: every count upstream is 0, so it is the state
+        where a divide or a `max()` on an empty sequence would raise instead of
+        rendering. Cheap to pin now that the harness is here.
+        """
+        from slurmpast.render import patterns_empty
+
+        assert self._reaches(_screen_text([], ["p"]), patterns_empty())
+
+
+class TestTheInferredLogHedgeIsOneSentenceInOneHue:
+    """The job screen's log line is one `if/elif`, and only the `elif` was shared.
+
+    `render.log_miss_detail` has owned the "no log" half since round thirty-three,
+    with a test on each surface. The half above it -- the hedge on a log matched by
+    *timing* rather than by name -- was written out in `report.render_job` and again
+    in `tui.JobScreen`, and nothing tested either copy. That made it the one piece
+    of prose in the package maintained in two files, and the sweep above could not
+    see it: `report` wore parentheses, the dashboard wore six spaces and a newline.
+
+    The visible half of the drift is the hue. `logs.find_log_by_time` states the
+    stake -- "a wrong log invents a cause, which is worse than no log" -- and the
+    dashboard drew the line in the warning hue accordingly. `--plain` drew it grey,
+    the hue this module uses for bookkeeping and for the word `log` two cells to its
+    left, so the sentence warning that the traceback below might belong to a
+    different job was the quietest thing on the screen.
+
+    Driven on both surfaces against the same job, because a source check is what
+    missed it. Real history: over `sacct -u youzhi -S now-30days` on midway3, 13,051
+    parent jobs, 469 of them resolve a log by timing rather than by name -- so this
+    is the ordinary case on a cluster whose scripts do not put the job id in the
+    filename, not a corner.
+    """
+
+    @staticmethod
+    def _job_with_a_timed_log(tmp_path):
+        """``(job, dir)`` where the only log in ``dir`` is found by mtime alone.
+
+        The name carries neither the job id nor any of the conventional spellings
+        and the record names no path, so `find_log_by_name` has nothing to match and
+        `find_log_by_time` is the only route to the file. Asserted, not assumed:
+        this fixture is worthless if the log comes back certain.
+        """
+        import datetime
+        import os
+
+        from slurmpast.logs import load_for
+
+        start = datetime.datetime(2026, 7, 1, 0, 0, 0)
+        end = datetime.datetime(2026, 7, 1, 2, 0, 0)
+        log = tmp_path / "shard-tokenize.out"
+        log.write_text("Traceback (most recent call last):\nRuntimeError: boom\n")
+        os.utime(log, (end.timestamp(), end.timestamp()))
+        job = parse(
+            row(
+                JobID="884411",
+                JobName="tokenize",
+                State="FAILED",
+                ExitCode="1:0",
+                Start=start.isoformat(),
+                End=end.isoformat(),
+                Elapsed="02:00:00",
+                Timelimit="04:00:00",
+                ReqMem="0n",
+                ReqCPUS="8",
+                AllocCPUS="8",
+                AllocTRES="cpu=8,mem=64G,node=1",
+                NodeList="n1",
+                Partition="p",
+                WorkDir=str(tmp_path),
+            )
+        )[0]
+        found, _text, inferred = load_for(job, extra_dirs=[str(tmp_path)])
+        assert found == str(log) and inferred is True, (found, inferred)
+        return job, tmp_path
+
+    @staticmethod
+    def _opening_code(text, needle):
+        """The ANSI wrapper that opens the styled run ``needle`` sits in.
+
+        `Style.__call__` puts the code immediately before its text, so this is the
+        colour the reader sees on that phrase -- read off the rendered view rather
+        than off the call site, which is the whole point.
+        """
+        found = re.search(r"(\033\[[0-9;]*m)" + re.escape(needle), text)
+        assert found, "no styled run around %r" % needle[:40]
+        return found.group(1)
+
+    @classmethod
+    def _warn_code(cls):
+        """The code `--plain` spells the dashboard's ``HEALTH_COLOR["warn"]`` as.
+
+        Taken from the overview's idle clause, which is the pairing this codebase
+        already makes: `report.render_overview` styles `render.idle_hours_note`
+        one way and `tui.OverviewScreen` styles the same sentence
+        `theme.HEALTH_COLOR["warn"]`. Anchoring here rather than on a colour name
+        means the expectation comes from a decision made elsewhere and already
+        tested, not from the line under test.
+        """
+        from slurmpast.index import History
+        from slurmpast.render import idle_hours_note
+        from slurmpast.report import Style, render_overview
+
+        one = History([history()[0]])
+        assert one.idle_gpu_hours is not None, "the fixture must trip the idle clause"
+        clause = idle_hours_note(*one.idle_gpu_hours[::-1])
+        return cls._opening_code(render_overview(one, style=Style(enabled=True)), clause)
+
+    def _plain(self, job, colour=False, path=None):
+        from slurmpast.report import Style, render_job
+
+        text, _ = render_job(
+            job,
+            log_path=path or str(job.work_dir + "/shard-tokenize.out"),
+            log_inferred=True,
+            style=Style(enabled=colour),
+        )
+        return text
+
+    def _dashboard(self, job, directory, width=120):
+        """The job screen's painted lines, with log resolution left switched on.
+
+        ``width`` is a parameter because one assertion below compares a sentence
+        that embeds an absolute path, and the runner chooses how long that path
+        is: pytest builds ``tmp_path`` under ``TMPDIR``, so a deep temp root
+        pushes the sentence past the panel and the dashboard clips it. Clipping
+        is correct -- the two surfaces are free to wrap to their own widths --
+        but a control that reddens because of the runner's temp directory is
+        measuring the wrong thing. Measured: under a 100-character ``TMPDIR``
+        the sentence ran to 150 characters and the 120-cell panel dropped its
+        tail, while ``/tmp`` passed.
+        """
+        import asyncio
+
+        pytest.importorskip("textual")
+        from slurmpast import tui
+
+        async def run():
+            app = tui.SlurmpastApp(
+                lambda: [job], window="test", log_dirs=[str(directory)], no_logs=False
+            )
+            async with app.run_test(size=(width, 44)) as pilot:
+                await pilot.pause()
+                app.push_screen(tui.JobScreen(job))
+                await pilot.pause()
+                await pilot.pause()
+                return "\n".join(
+                    "".join(segment.text for segment in strip).rstrip()
+                    for strip in app.screen._compositor.render_strips()
+                )
+
+        return asyncio.run(run())
+
+    def test_both_surfaces_print_the_shared_hedge(self, tmp_path):
+        """End to end on one job: the sentence on the dashboard is the sentence in
+        `--plain`, and it is the one `render` holds."""
+        from slurmpast.render import log_inferred_note
+
+        job, directory = self._job_with_a_timed_log(tmp_path)
+        sentence = log_inferred_note()
+        assert sentence in self._plain(job), self._plain(job)
+        painted = self._dashboard(job, directory)
+        assert sentence in " ".join(painted.split()), painted
+
+    def test_the_plain_hedge_is_in_the_warning_hue(self, tmp_path):
+        """The visible half of the drift. Grey is what this module paints the word
+        `log` beside it, so the two had to differ."""
+        from slurmpast.render import log_inferred_note
+
+        job, _directory = self._job_with_a_timed_log(tmp_path)
+        coloured = self._plain(job, colour=True)
+        hedge = self._opening_code(coloured, log_inferred_note())
+        assert hedge == self._warn_code(), hedge
+        # The label plus its reset, so the needle cannot pin the colour it is
+        # asserting about, and cannot drift onto the word "log" inside a finding.
+        assert hedge != self._opening_code(coloured, "log\033[0m "), hedge
+
+    def test_the_hedge_stays_shared_when_it_gets_its_own_line(self, tmp_path):
+        """Both of `--plain`'s layouts, so the fix is not width-dependent: a path too
+        long to share a line pushes the hedge onto its own, which is the only layout
+        the dashboard has."""
+        from slurmpast.render import log_inferred_note
+
+        job, _directory = self._job_with_a_timed_log(tmp_path)
+        long_path = "/scratch/dana/logs/" + "nemotron-batch-h200-tokenize-shards" * 2 + ".out"
+        wrapped = self._plain(job, colour=True, path=long_path)
+        assert log_inferred_note() in wrapped, wrapped
+        assert self._opening_code(wrapped, log_inferred_note()) == self._warn_code()
+
+    def test_the_label_beside_it_is_still_bookkeeping(self, tmp_path):
+        """The control against over-correcting: `log` and the path are chrome, and
+        painting the whole line the warning hue would say the path is suspect rather
+        than the match. Green before the fix and after it."""
+        job, _directory = self._job_with_a_timed_log(tmp_path)
+        coloured = self._plain(job, colour=True)
+        assert self._opening_code(coloured, "log\033[0m ") == "\033[90m"
+
+    def test_the_other_half_of_the_same_branch_was_already_shared(self, tmp_path):
+        """The control on the harness. `render.log_miss_detail` is the `elif` three
+        lines below the hedge and has been single-sourced since round thirty-three,
+        so driving both surfaces at one job has to show it agreeing -- green before
+        this round's fix and after it. If this one ever reddens, the finding is the
+        harness, not the hedge.
+        """
+        from slurmpast.render import log_miss_detail
+        from slurmpast.report import Style, render_job
+
+        job = parse(
+            row(
+                JobID="884412",
+                JobName="tokenize",
+                State="FAILED",
+                ExitCode="1:0",
+                Start="2026-07-01T00:00:00",
+                End="2026-07-01T02:00:00",
+                Elapsed="02:00:00",
+                TimelimitRaw="240",
+                ReqCPUS="8",
+                AllocCPUS="8",
+                AllocTRES="cpu=8,mem=64G,node=1",
+                NodeList="n1",
+                Partition="p",
+                WorkDir=str(tmp_path),
+                StdOut=str(tmp_path / "gone.out"),
+            )
+        )[0]
+        detail = log_miss_detail(job)
+        assert "moved or deleted" in detail, detail
+        # Whitespace-normalised on both sides: each surface wraps this sentence
+        # to its own prose width, which is exactly the per-surface freedom
+        # `render` leaves them -- the words are what may not differ.
+        plain = " ".join(render_job(job, style=Style(enabled=False))[0].split())
+        assert detail in plain, plain
+        # Wide enough that the panel cannot be what decides this, whatever the
+        # runner's TMPDIR made the path length -- see `_dashboard`.
+        wide = self._dashboard(job, tmp_path, width=max(120, len(detail) + 20))
+        assert detail in " ".join(wide.split())
 
 
 class TestTheHelpExamplesLineUp:

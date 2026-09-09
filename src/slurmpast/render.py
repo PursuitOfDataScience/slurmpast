@@ -17,11 +17,12 @@ from .duration import (
     format_cpu_freq,
     format_duration,
     format_percent,
+    format_rate_range,
     plural,
 )
 from .index import GPU_CORE_EQUIVALENT
 from .model import Job, severity_rank
-from .nodes import MIN_SAMPLES
+from .nodes import CONFIDENCE_PERCENT, MIN_SAMPLES
 
 
 def bar_cells(percent: float | None, width: int) -> int:
@@ -44,6 +45,21 @@ def bar_cells(percent: float | None, width: int) -> int:
     cells = min(width, round(percent / 100.0 * width))
     if cells == 0 and round(percent, 1) >= 1.0:
         cells = 1
+    # ...and the same rule at the TOP, which :func:`bar` states two paragraphs
+    # above ("the last eighth is withheld until the percentage rounds to 100, so a
+    # visually full bar always means 100%") and applies only on its Unicode path.
+    # Both other paths come through here -- `ascii_mode`, and `flat`, which is what
+    # the plain report draws with -- and neither reserved anything: rounding put
+    # `98.0%` of 8 cells at 8, so `--ascii` drew `########` where the Unicode bar
+    # drew `███████░` for the same figure, beside the same "98.0%" label. Measured
+    # at widths 8 and 18, every value from ~97% up disagreed between the two.
+    #
+    # Keyed on `round(percent, 1)` exactly as `bar()` keys it, because the labels
+    # here carry one decimal: at 99.96% the label reads "100.0%" and the bar is
+    # meant to be solid. That one-decimal test is the same one the low-end guard
+    # above uses, and for the same stated reason -- the two paths must not disagree.
+    if cells >= width and round(percent, 1) < 100.0:
+        cells = width - 1
     return int(cells)
 
 
@@ -191,12 +207,50 @@ def log_miss_detail(job) -> str:
     return "none at %s — moved or deleted; --log-dir points at it" % path
 
 
+def log_inferred_note() -> str:
+    """The hedge on a log matched by *timing* rather than by name.
+
+    The other branch of the same decision as :func:`log_miss_detail` -- a log was
+    found, or it was not, and each outcome needs a line -- and it is the branch
+    that was left behind when that one moved here. Both front ends wrote this
+    sentence out for themselves (``report.render_job`` and ``tui.JobScreen``), so
+    it was the one piece of prose in the package maintained in two files, and the
+    audit sweep that forbids exactly that could not see it: ``report`` wrapped its
+    copy in parentheses and the dashboard padded its own with spaces and a newline,
+    and the sweep compared literals byte for byte.
+
+    ``logs.find_log_by_time`` states the stake -- "it is still an inference either
+    way, so callers must label it as one: a wrong log invents a cause, which is
+    worse than no log" -- so this is a *warning*, not chrome. The dashboard already
+    drew it in the warning hue; ``--plain`` drew it in the same grey as the word
+    ``log`` beside it, which is the hue this codebase uses for bookkeeping. Both
+    surfaces now say it in one wording and one hue.
+    """
+    return "matched by timing, not by name — verify before trusting it"
+
+
 def health_dot(grade: str, ascii_mode: bool = False):
+    """One coloured glyph for a health grade. **Dashboard only, by pairing.**
+
+    Returns a rich ``Text``, and `--plain` does not draw one for this element: it
+    has its own spelling of the same fact. That is not a structural limit -- the
+    plain renderer reads `.plain` off a `Text` where sharing IS wanted, which is
+    what `report.py` does with :func:`bar` -- so a future caller on that side is a
+    decision, not a mistake. Said here because the module's whole purpose is that
+    the two surfaces cannot drift, and a builder that names no surface leaves the
+    next reader unable to tell a deliberate split from an oversight.
+    """
     glyphs = theme.HEALTH_GLYPH_ASCII if ascii_mode else theme.HEALTH_GLYPH
     return Text(glyphs.get(grade, glyphs["none"]), style=theme.HEALTH_COLOR.get(grade, theme.FAINT))
 
 
 def state_text(state: str, ascii_mode: bool = False):
+    """``● COMPLETED`` -- :func:`health_dot` plus the state word, one styled cell.
+
+    **Dashboard only**, for the same reason and with the same caveat as
+    :func:`health_dot`: it returns a rich ``Text``, and `--plain` writes the state
+    through its own column rather than reading `.plain` off this.
+    """
     grade = theme.STATE_HEALTH.get(state, "none")
     text = Text()
     text.append_text(health_dot(grade, ascii_mode))
@@ -216,11 +270,24 @@ SEVERITY_TAG_UNKNOWN = "----"
 
 
 def severity_tag(severity: str) -> str:
-    """``FAIL`` / ``WARN`` / ``INFO``, or ``----`` for a severity neither knows."""
+    """``FAIL`` / ``WARN`` / ``INFO``, or ``----`` for a severity neither knows.
+
+    **The string spelling, and what `--plain` prints.** :func:`severity_chip` is
+    the dashboard's coloured wrapper around this same call, so the labels have one
+    home; see the note there for what that split prevented.
+    """
     return SEVERITY_TAG.get(severity, SEVERITY_TAG_UNKNOWN)
 
 
 def severity_chip(severity: str):
+    """:func:`severity_tag`, coloured for the dashboard. **Dashboard only.**
+
+    The pair is the point, and it is the one place the split is load-bearing:
+    `severity_tag` is the four-cell STRING and is what `--plain` prints, this wraps
+    it in a rich ``Text`` with the grade's colour. Both read the same labels from
+    the same place, which is what stopped `report._SEV_COLOR` carrying a second
+    copy of "FAIL"/"WARN"/"INFO" (see the note above `severity_tag`).
+    """
     grade = theme.SEVERITY_HEALTH.get(severity, "none")
     return Text(
         severity_tag(severity), style="bold %s" % theme.HEALTH_COLOR.get(grade, theme.FAINT)
@@ -249,6 +316,24 @@ ACTION_INDENT = 8 + len(ACTION_ARROW)
 # until now only one of them drew this part of it at all.
 CAUTION_MARK = "! "
 CAUTION_HANG = "  "
+
+# The marker :func:`job_sections` writes into the `peak (MaxRSS)` value when the
+# reading is above the job's own ceiling, and which both front ends match on to
+# paint that row in the alarm hue.
+#
+# A name rather than the words, because the words were written out in three files
+# -- built here, then searched for by `report.render_job` and by `tui.JobScreen`
+# with `"ABOVE THE LIMIT" in value` -- so the one thing keeping the red on that row
+# was three string literals agreeing by luck. Nothing would have failed if this
+# module had rephrased its own note; the row would simply have stopped being red on
+# both surfaces at once, silently, which is the failure mode `render` exists to make
+# impossible.
+OVER_LIMIT_MARK = "ABOVE THE LIMIT"
+
+# The whole finding block when `diagnose` returned none. Shared for the reason
+# every other sentence here is: both front ends print it, and both used to spell it
+# out for themselves.
+NOTHING_TO_FLAG = "nothing to flag."
 
 
 class Column(NamedTuple):
@@ -466,6 +551,16 @@ _COLUMN_ALIGN: dict[str, str] = {}
 
 
 def register_alignment(*specs) -> None:
+    """Record each column's alignment under its label, for lookup by label alone.
+
+    Not a builder and not tied to a surface: it renders nothing, and the single
+    call is at import time below the column specs, so `_COLUMN_ALIGN` is populated
+    before either surface draws. Public only because the specs it reads are.
+
+    The indirection earns its keep because the two surfaces address a column
+    differently -- the dashboard holds the spec object, `--plain` has just the
+    header string it printed -- so the label is the one key both can offer.
+    """
     for spec in specs:
         for column in spec:
             _COLUMN_ALIGN[column.label] = column.align
@@ -571,6 +666,11 @@ def hours_pair_text(group) -> str:
     ``--no-color``, a pipe, and a colour-blind reader all still have the fixed
     order and the ``CPU / GPU-HOURS`` header. A cell distinguishable only by hue
     would be unreadable in half the places this output goes.
+
+    **`--plain` only**, and the colour sentence above is why: this is the
+    uncoloured spelling, :func:`hours_pair` is the dashboard's styled one. Both
+    lay the two figures out in the same fixed order and the same widths, so the
+    guarantee holds on either surface.
     """
     return "%*s / %-*s" % (
         _CPU_HOURS_WIDTH,
@@ -686,13 +786,27 @@ STEP_COLUMNS: tuple[Column, ...] = (
 # widget, so this table drops columns, tracks the terminal and spends the leftover
 # exactly as the other two do -- hardcoding them left it as the one screen that
 # stayed narrow while its neighbours filled, which reads as a broken layout.
+# The one spelling of the confidence-interval column, derived from `Z` like the
+# figure it heads: `nodes.CONFIDENCE_PERCENT` is `erf(Z / sqrt(2))` rounded, so
+# raising `Z` moves the label with the arithmetic instead of leaving it claiming
+# a level the interval no longer has.
+#
+# Round 69 pinned these three sites against the derived value rather than
+# building them from it, because the WIDTH is declared beside the label here and
+# `table_floor` records that `NODE_COLUMNS` bottoms out at 41 cells. Deriving the
+# same six characters changes no width -- checked -- so the pin can become the
+# thing it was standing in for. `report.py` and `tui.py` key their row dicts BY
+# this label, which is why it is exported rather than inlined.
+CI_COLUMN = "%s%% CI" % CONFIDENCE_PERCENT
+
+
 NODE_COLUMNS: tuple[Column, ...] = (
     Column("NODE", 18, flex=True, grow_to=26),
     Column("N", 11, align="right"),
     Column("RATE", 8, align="right"),
     # The interval before the verdict: the verdict is one word and recoverable
     # from the numbers, while the interval is the evidence for it.
-    Column("95% CI", 18, drop=1, align="right"),
+    Column(CI_COLUMN, 18, drop=1, align="right"),
     Column("VERDICT", 14, drop=2),
 )
 
@@ -903,7 +1017,7 @@ def ci_range(low: float, high: float) -> str:
     at. An en dash is what a numeric range takes, and it folds to the hyphen under
     ``--ascii``, so the piped output is byte-identical to what it always was.
     """
-    return "%.1f – %.1f%%" % (100 * low, 100 * high)
+    return format_rate_range(low, high)
 
 
 def nodes_correction_note(tested: int) -> str:
@@ -946,6 +1060,14 @@ def nothing_matches(noun: str, filter_label: str = "", search: str = "") -> str:
     and said nothing at all -- and on the overview it could not even say "showing
     0", because that clause was guarded by ``if shown and ...``. The one count that
     explains an empty screen was the one count suppressed.
+
+    **Dashboard only, and structurally so.** `--plain` filters too (`-p`,
+    `--failed`), but an empty result there never reaches a table: `cli.py` raises
+    first, naming the filter and its value ("no jobs for youzhi since now-7days
+    matching --partition nosuchpartition"; the demo path does the same at :355).
+    So on that surface there is no drawn header over blank space to repair. On the
+    dashboard the table is already on screen and the filter changes under it, which
+    is why the explanation has to live *in* the table.
 
     `PatternsScreen` has had the right treatment all along ("That is a real answer,
     not an empty screen") and `filter_jobs` states the rule in its own comment,
@@ -1010,6 +1132,19 @@ def gpu_hours_total(hours: float) -> str:
     return "%.0f %s total" % (hours, plural(hours, "GPU-hour"))
 
 
+def capped_label() -> str:
+    """``at this partition's ceiling`` -- the flag cell for a ``capped`` verdict.
+
+    Here rather than in `report`, because the dashboard draws it too now and this
+    module exists so the two cannot phrase it differently. `sizing` gives `capped`
+    its own verdict for a stated reason -- "Clamping alone turned 'raise to 34'
+    into 'already about right', which is a different wrong answer: the workload is
+    using 27.9 of its 28 cores and would take more" -- so the label has to say
+    something other than either.
+    """
+    return "at this partition's ceiling"
+
+
 def idle_hours_note(idle_hours: float, total_hours: float) -> str:
     """``, 91 of them never used`` -- the clause after :func:`gpu_hours_total`.
 
@@ -1023,6 +1158,37 @@ def idle_hours_note(idle_hours: float, total_hours: float) -> str:
     """
     pronoun = "it" if round(total_hours) == 1 else "them"
     return ", %.0f of %s never used" % (idle_hours, pronoun)
+
+
+def idle_workload_note(label: str, wasted_hours: float, total_hours: float) -> str:
+    """``flagged runs held the most GPU-hours in att-speed-#: 91 of its 503``.
+
+    :func:`idle_hours_note` says how much of the window never computed;
+    this says *where*. FLAGGED counts runs, so the column cannot: four flagged
+    runs read the same whether they died in their first minute or each held a
+    card for forty hours, and `index.History.idle_workload` records the two
+    histories that proved it identical. The figure it reads --
+    ``GroupStats.wasted_gpu_hours`` -- had no reader at all.
+
+    Both numbers, never the numerator alone: this is the slurmwatch lesson --
+    "91" is a different instruction at 91-of-100 than at 91-of-9000, and a share
+    on its own hides which one it is. The unit is named once, in the first clause,
+    so the pair after the colon does not repeat it.
+
+    Formatted through :func:`hours_text`, so these hours round exactly as the
+    CPU / GPU-HOURS column beside them does and a sliver reads ``<1`` rather than
+    a rounded ``0`` -- a workload that held cards for twenty idle minutes did not
+    waste zero.
+
+    Here rather than in either front end for the reason this module exists: the
+    plain report prints it under the table and the dashboard on its summary line,
+    and what must not differ is the sentence.
+    """
+    return "flagged runs held the most GPU-hours in %s: %s of its %s" % (
+        label,
+        hours_text(wasted_hours),
+        hours_text(total_hours),
+    )
 
 
 # The prose punctuation this codebase uses, and a one-cell ASCII stand-in for
@@ -1077,6 +1243,9 @@ def search_hint(fields) -> str:
     typing one returned an empty list. That is the same failure `filter_jobs`
     already names -- "typing what you can plainly see and getting an empty list is
     the worst kind of empty result -- it reads as missing data."
+
+    **Dashboard only**: both callers are interactive affordances, and `--plain` has
+    no search box or help screen to place a hint on.
     """
     items = list(fields)
     if not items:
@@ -1141,6 +1310,13 @@ def mem_text(job: Job) -> str:
 
 
 def sort_findings(findings):
+    """Findings worst-first, by :func:`severity_rank`.
+
+    **Dashboard only today, and incidentally so** -- unlike its neighbours this
+    returns no ``Text`` and renders nothing, so there is no reason `--plain` could
+    not order a list with it. Recorded as a fact about the callers rather than a
+    rule about the function, so a second caller needs no argument.
+    """
     return sorted(findings, key=lambda f: severity_rank(f.severity))
 
 
@@ -1426,7 +1602,7 @@ def job_sections(job, summarized: bool = False):
     if job.max_rss is not None:
         note = ""
         if job.mem_limit_bytes and job.max_rss > job.mem_limit_bytes:
-            note = "   ABOVE THE LIMIT - not a working set"
+            note = "   %s - not a working set" % OVER_LIMIT_MARK
         mem.append(
             (
                 "peak (MaxRSS)",

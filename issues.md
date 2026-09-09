@@ -752,6 +752,2470 @@
 > that was the login name. It now names the real cause -- the node cannot resolve it
 > -- and what to do about it.
 
+## Round eighty-four — the documented red is gone: the badge test was reading the wrong tree
+
+**Two reds going in, ZERO going out.** For eight consecutive rounds this file has ended with
+"one red going out and it is the documented badge test". It is no longer red, and not by being
+silenced.
+
+**SP-A (fixed) — the badge had been bumped to 2526 again, and it broke the same control again.**
+A helper working this tree set the README badge from 1969 to 2526 and was interrupted before
+committing anything, leaving the published README stating a count for a suite nobody can
+install. `test_badge_mismatch_diagnosis.py::TestControls::test_the_badge_still_states_the_committed_count`
+caught it — the test that exists precisely to catch it. Reverted to 1969, byte-identical to
+HEAD (`git diff -- README.md` empty). **This is the second time the same bump has been made and
+undone** — round eighty-three did it (1969 → 2319) and recorded the undo. The rule is unchanged
+and now has two incidents behind it: the badge moves in the same change that commits the tests,
+never before.
+
+**SP-B (fixed) — `test_the_test_badge_matches_the_suite` compared the badge against a tree that
+does not ship.** The badge documents the PUBLISHED package; the test collected the WORKING tree.
+Those differ for the whole life of a round, so the test failed on every round that left the tree
+dirty, and round seventy-six's response was to add a module explaining the failure rather than
+to correct the measurement. Explaining a permanent red is not the same as not having one: a test
+that always fails locally teaches everyone to skip past it, which is exactly how a genuinely
+stale badge would get through.
+
+It now collects **HEAD** — `git archive HEAD` into a temporary directory, collected there with
+that tree's own `src` first on `PYTHONPATH` so it imports the code that ships with it — and
+falls back to the working tree when git cannot answer (a tarball install, no git binary). That
+fallback is why `_badge_mismatch_reason` keeps its untracked branch: it is now the only path
+where untracked files can explain a mismatch.
+
+**Measured, and the obvious fix was wrong.** HEAD collects **1969** and its badge reads **1969**,
+so the committed state was self-consistent all along and CI was green for the right reason. The
+same tree live-collects **2526**. Dropping only the 27 untracked test files gives **1985**, not
+1969 — because uncommitted work also adds tests to files that ARE tracked (+16). So "ignore what
+is untracked", the fix this looked like from the diagnosis message, would still have failed by
+sixteen. Only collecting HEAD answers it.
+
+**Teeth, one site at a time.** Badge back to 2526 → the control fails **and** the badge test
+fails (2 failed, 10 passed). Branch-local override forcing the live collect, badge left correct
+→ the badge test fails (1 failed, 11 passed). And the check that the fix did not simply make the
+test toothless: fix in place, badge set to a genuinely stale 1900 → the badge test **still**
+fails. Ten controls pass in every one of those states; all twelve pass with both fixes in.
+
+**Gates:** `ruff check .`, `ruff format --check .`, `mypy src/ tests/` all clean; suite
+**2526 passed** in two halves (1015 + 1511), no reds.
+
+## Round eighty-three — landing rounds seventy-nine to eighty-two: three tests that could only pass on this cluster
+
+2518 collected before, **2526** after (+8); `ruff`, `ruff format` and `mypy src/ tests/`
+clean, coverage **97%** against a `--cov-fail-under=75` gate. The round has no red going
+out: the badge test that rounds seventy-six to eighty-two each recorded as an expected
+local failure closes here, because the tests it was counting are now committed.
+
+Found by running the suite the way CI runs it rather than the way this host runs it —
+**with Slurm stripped from PATH** (`sacct`, `sinfo`, `squeue`, `scontrol` and `sstat` all
+live in one directory here, so removing it is exact). Three tests written in the previous
+four rounds passed on a login node and could not have passed on a runner. That is the
+defect class this file has now named for the fourth time, in the tests rather than in the
+code, and the CI workflow already claims the property they broke: *"every test drives the
+parser and the dashboard through fixtures or the built-in synthetic history, so nothing
+here shells out to sacct."*
+
+### SP-30 (fixed) — a signal during dashboard startup restored nothing, and exited 143 anyway
+
+The genuine product defect of the round, found because the test written for round
+eighty-one's terminal guard failed **1 run in 5** with
+`{'opened': 1, 'closed': 0, 'signalled': False, 'code': 143}` — an exit code proving the
+handler had run beside a capture proving the screen was never restored.
+
+`_guard_startup_window`'s `_restore_and_die` (`tui.py:2615`) wrote `_TERMINAL_RESET`
+through `sys.stdout`, choosing between `sys.stdout` and `sys.stderr` on `isatty()`. But
+the window it exists to cover *opens* when Textual emits the alternate-screen sequence,
+and Textual replaces both streams with capture objects at about that same moment. Their
+`write` queues into the app instead of reaching the terminal and their `isatty()` still
+answers True, so the guard wrote the restore into a capture and `os._exit(143)` a
+microsecond later dropped the queue. Whether the signal beat the redirect decided it,
+which is why the real dashboard showed it only sometimes — and the exit code made every
+occurrence look handled.
+
+Reproduced deterministically with a stand-in capture in both streams, which is what the
+docstring predicted a capture would do:
+
+```
+                              TERM        HUP
+sys.stdout version            143, no \x1b[?1049l   129, no \x1b[?1049l
+descriptor version            143, restored          129, restored
+```
+
+The restore now goes to the terminal's **file descriptor** (`os.write` on 1, else 2,
+chosen by `os.isatty`), which nothing can redirect. Codes are unchanged (143/129) and the
+post-mount handlers are untouched.
+`tests/test_portability_round81.py::TestASignalInTheStartupWindowStillRestores`. Teeth:
+restoring the `sys.stdout` version reddens the deterministic test 2 of 2 and the live pty
+test intermittently. **The control** — the same child with its streams left alone — passes
+in both states, which is precisely why the defect could hide: unredirected, `sys.stdout`
+*is* the terminal.
+
+### SP-31 (fixed) — three tests asserted the answer this cluster gives
+
+Each reproduced with Slurm off PATH, then made to hold in both environments rather than
+skipped:
+
+* `TestAnEmptyIdentityIsRefused::test_a_real_value_and_an_absent_flag_are_untouched`
+  queried the live scheduler with `-u youzhi -p amd` — this cluster's login name and one
+  of its partitions — and asserted `rc in (0, 1)`. With no `sacct` that is rc=2 and
+  "cannot execute sacct", so the control passed where it was written and reddened
+  everywhere else. It now runs `--demo` on the tape's **own** user and partition, read out
+  of `demo.history()` rather than hardcoded. The empty-value check runs before the
+  `args.demo` branch in `_main`, so `--demo` reaches the same code with no scheduler in
+  the picture — pinned by a new test, without which the control could stop asserting
+  anything and still pass.
+* `TestASignalledDashboardRestoresTheTerminal` drove `python -m slurmpast` with no
+  `--demo`, so on a runner the child entered the alternate screen, failed its load and
+  returned the load error's 2 before any signal arrived: `SIGHUP` reported
+  `{'code': 2, 'entered': 1, 'left': 1}` against an expected 129, and the other three
+  cases found no live process to wait for. Both pty harnesses now drive `--demo`, which
+  needs no scheduler and renders identically on a login node and a runner.
+* `test_sizing_routing.py`'s `plain` fixture was **module-scoped**, so pytest built it
+  before `conftest`'s function-scoped autouse `_pinned_site` — the surface was rendered
+  against the host's `scontrol show config` while every `Advice.caution` compared against
+  it was computed under the pin. On this cluster the two strings happen to be equal, so
+  the ordering was invisible; with no `scontrol` the surface said "depending on this
+  cluster" and the caution said `jobacct_gather/linux`, and `test_the_caution_is_on_both`
+  failed for a reason that had nothing to do with routing. Function-scoped now, so the pin
+  is in place before the render.
+
+### SP-32 (fixed) — a harness that declared a hang without waiting, and one whose capture could lose the bytes it asserts on
+
+`TestASignalledDashboardRestoresTheTerminal._drive` polled with
+`for _ in range(40): pump(0.4)`, which reads as a 16-second budget and was not one: `pump`
+returns the moment the pty master reports EIO, and the master reports EIO at **0.22 s**
+after the signal while the child is reaped at **0.42 s**. So the loop spun forty times in
+microseconds and called it a hang — 2 failures in 3 runs, always "the dashboard did not
+exit", never the same signal twice. Bounded by the clock now, with a sleep pacing the poll
+once the stream is at EOF, and finite rather than a blocking `waitpid`, because a suite
+with no global timeout turns one of those into a wedged CI job instead of a failing test.
+
+The startup-window harness had the sibling problem in its capture: EOF on a pty master
+means the last slave fd is gone, and the kernel may drop whatever is queued at that
+moment, while both children here write their final bytes and `os._exit` microseconds
+later. The parent now holds a second fd on the slave for the whole run and closes it only
+after the child is reaped, which is what ends the drain. Recorded honestly: **nothing
+measured here was ever traced to that discard** — the loss that looked like it was SP-30 —
+but a harness whose result turns on which of two microseconds wins is not one to assert
+on. The plumbing is shared by both tests in the class now (`_drive_in_a_pty`) instead of
+duplicated, and it uses `pty.openpty` + `fork` rather than `pty.fork`, which closes the
+slave in the parent; `os.ptsname`, which would let the parent re-open it, is 3.13+ and
+this package's floor is 3.10.
+
+### The badge
+
+`tests-1969` in the README, **2526** collected. Round seventy-six added the diagnosis that
+tells the two causes apart, and it read this tree correctly for seven rounds: the badge
+states the count of the suite that SHIPS, twenty-eight test files were uncommitted, and
+bumping it early would have redded CI. Landing them is what closes it, so the bump belongs
+in the same commit as the files — set to a measured `--collect-only`, re-measured after
+every test edit in this round (2518 → 2519 → 2523 → 2526 as the fixes above added tests).
+
+One test of that diagnosis had the same shape as SP-31 in miniature:
+`test_it_reports_this_repo_s_untracked_tests` asserted the probe could see **its own
+file**, which is true only while that file is uncommitted and false the moment the round
+lands — a test that reds CI on the commit that adds it. It now asserts the property that
+holds in both states (everything reported is genuinely untracked, checked against
+`git ls-files`), and the positive case is arranged in a scratch repository the test builds
+itself rather than borrowed from this checkout.
+
+## Round eighty-two — the bar claimed full where its own label said 98%
+
+2416 collected before, **2518** after (+102); `ruff`, `ruff format` and `mypy src/ tests/` clean.
+One red going out and it is the documented badge test (round seventy-six).
+
+### SP-7 (fixed) — `bar_cells` never reserved its last cell, so two of three paths drew solid early
+
+`bar`'s docstring states the rule for the whole function: *"Two rules keep the bar honest against
+the number printed beside it: the last eighth is withheld until the percentage rounds to 100, so a
+visually full bar always means 100%; and anything that displays as >=1% keeps at least a sliver."*
+Its Unicode branch obeys both. The other two branches — `ascii_mode`, and `flat`, which is what
+the **plain report** draws with — delegate to `bar_cells`, which had only the sliver rule.
+
+Measured at widths 8 and 18, before:
+
+```
+        unicode      ascii        label
+98.0%   ███████░     ########     "98.0%"   <- ascii solid, unicode not
+99.6%   ███████░     ########     "99.6%"
+99.9%   ███████░     ████████     "99.9%"
+```
+
+Every value from roughly 97% up disagreed between the two paths, under one shared label. And
+`bar_cells`' own docstring already records fixing this exact class of disagreement at the LOW end:
+"Using a bare `>= 0.5` here instead made the ASCII and Unicode bars disagree over 0.5-0.94%: one
+lit a cell beside a label reading '0.7%', the other did not." The rule was stated; the top end had
+drifted from it.
+
+The reservation is keyed on `round(percent, 1) < 100.0`, exactly as `bar()` keys its own, because
+the labels here carry one decimal: at 99.96% the label reads "100.0%" and the bar is meant to be
+solid. Verified after: all three paths agree at every value tested, and the solid bar begins
+exactly where the label reads 100.0%.
+
+**Sibling of the slurmwatch fix in the same family.** There the LABEL rounded up to 100 and both
+bar guards keyed on the rounded value, so bar and label claimed 100% *together*; here the label
+was honest to one decimal and two of the bars were not. Same invariant, opposite halves.
+
+`tests/test_bar_fullness_agrees.py` (102 tests). Teeth: removing the reservation reddens **57**.
+**Twenty controls, all re-run green in the neutered state**, pinning every ordinary cell count as
+MEASURED (25% of 18 is 4.5, which `round` takes to 4 — banker's rounding, and an expectation
+written from the arithmetic said 5), the sliver rule, `None` and NaN drawing an empty track, zero
+width, an over-range clamp, and the Unicode path being untouched.
+
+## Round eighty-one — the repeat-failure advice said two things that were not true
+
+2400 collected before, **2416** after (+16); `ruff`, `ruff format` and `mypy src/ tests/` clean.
+One red going out and it is the documented badge test (round seventy-six).
+
+Both items were already written down in round five's **"Open — reported, not changed"**, and both
+were re-measured on a live 30-day history before anything was touched.
+
+### B (fixed) — "Stop resubmitting" to a workload submitted once, "deterministic" to one that succeeded
+
+Re-measured, and it is worse than the entry recorded — the determinism half is false on a second
+workload the entry never named:
+
+```
+cpas_audit  n=11  distinct_masters=1  {FAILED: 8, COMPLETED: 3}
+  Stop resubmitting; the failure is deterministic. Reproduce interactively.
+cpas_G1     n=100 distinct_masters=1  50 failed / 50 completed
+  Stop resubmitting; the failure is deterministic. Reproduce interactively.
+```
+
+`cpas_audit` is ONE `sbatch --array`: there is nothing to stop resubmitting. Three of its eleven
+tasks COMPLETED, so the failure is not deterministic either. `cpas_G1` completed **half** its runs
+and was told the same thing.
+
+After:
+
+```
+evidence: 8 of 11 runs of cpas_audit in test failed; 8 were FAILED. All 11 are tasks of one
+          array (job 53410199).
+action  : One array submission, not repeated ones: reproduce a single task interactively rather
+          than resubmitting the array. 3 of 11 tasks completed, so the failure is not
+          deterministic — compare a failed one against a completed one.
+```
+
+**The entry's own constraint is respected**: this is NOT fixed by exempting arrays from the
+grouping. The counts are untouched — "8 of 11 runs failed" stays, because those eleven
+allocations ran and burned resource, which `TestArraySiblingsAlreadyCountAsEvidence` pins
+deliberately. Only the advice moved. The two facts it needed were already in the record: the
+master id (everything before the `_`, exactly as the entry suggested) and `Job.completed`.
+Severity is still `fraction > 0.8` and no exit code moves — which is what separates this from
+item **A** in the same entry, still open because it *does* move a published severity and
+`cli.py`'s exit 1, and its own note says the decision is the maintainer's. Untouched.
+
+### C (fixed) — `newest_name`'s docstring described a tie-break `build_groups` does not have
+
+It claimed members are ordered "the way `index.build_groups` orders a group's members ... with
+`numeric_job_id` breaking the tie". `build_groups` is `members.sort(key=lambda j: _stamp(j),
+reverse=True)` — no second key. The tie-break is real but it is `newest_name`'s own, and ties are
+the ORDINARY case here because an array's tasks share a Submit. The docstring was the wrong half,
+as the entry said; it now describes what the function does and names the difference.
+
+`tests/test_repeat_failure_action_is_true.py` (16 tests). Teeth: neutering the array branch
+reddens 1, the determinism clause 3, the evidence sentence 1. **Eight controls, all re-run green
+in every neutered state**, pinning that the classic sentence is byte-identical, that no group
+starts or stops firing, that severity does not move (WARNING at 6/8, CRITICAL at 8/8), that the
+TIMEOUT and OUT_OF_MEMORY actions keep their own text, and that array siblings still count as
+evidence.
+
+## Round eighty — the interval round's own two tests could not have caught it
+
+2389 collected before, **2400** after (+11); `ruff check .`, `ruff format --check .` and
+`mypy src/ tests/` clean. One red going out and it is the documented badge test (see round
+seventy-six for why it stays).
+
+No production code changed. This round is an audit of round seventy-nine's own evidence, and
+it found two tests that pass with the fix reverted and one docstring claim wider than the fix.
+
+### SP-6a (fixed) — `test_the_dashboard_cell_agrees_with_the_helper` was a tautology
+
+It asserted `ci_range(0.9996, 1.0) == format_rate_range(0.9996, 1.0)`, and `render.ci_range`
+(`render.py:1005`) is literally `return format_rate_range(low, high)`. So it held with the
+local `%.1f` restored, and there is no input for which it could fail — it was the round's only
+claim that the *dashboard* carried the new spelling, and it made no claim about the dashboard
+at all.
+
+Agreement between the two surfaces cannot be the assertion, for the same reason: both call the
+one helper in either state. What can fail is the **bounded spelling reaching both screens**, so
+the interval is now driven into the band by the data and both real renderers are asked what
+they printed:
+
+```text
+nodeA: 8000 FAILED, nodeB: 200 COMPLETED   ->  wilson_interval(8000, 8000) = [99.952%, 100%]
+
+report.render_nodes(...)                        _nodes_screen_text(...)  (Textual harness)
+  nodeA   8000/8000  100.0%  >99.9 – 100.0%      nodeA  8000/8000  100.0%  >99.9 – 100.0%
+```
+
+7680 is the smallest table for which this package's own statistics reach the band at all, which
+is why the fixture is that size; it costs ~0.13 s to build and the whole file runs in 3.2 s.
+With the local `%.1f` restored **both** renderers print `100.0 – 100.0%` — measured, not
+assumed, and that is the test's teeth.
+
+### SP-6b (fixed) — `test_the_format_is_not_re_derived` asserted on source text
+
+It read `duration.py`, sliced out `format_rate_range`'s body and asserted `"%.1f" not in` it.
+That pins the implementation rather than the behaviour: it detects a *reverted edit* and would
+go red on a rewrite that spelled every band correctly by other means. Replaced by the property
+the fix actually claims, asserted on output — each end of a range is byte-identical to
+`format_percent` of that end — parametrised over eight values spanning every band
+`format_percent` distinguishes (`0.0`, `0.0004`, `0.0006`, `0.246`, `0.5`, `0.9994`, `0.9996`,
+`1.0`). No independently derived `%.1f` can satisfy it, because it disagrees at both bounded
+bands; two of the eight redden under the neuter.
+
+### SP-6c (narrowed) — the module docstring claimed more than the fix does
+
+It opened "a range whose two ends print identically says the measurement was exact, and this
+one is not". That is not true as a general rule and this change does not make it true. Measured
+**with the fix in place**:
+
+```pycon
+>>> format_rate_range(0.50001, 0.50009)
+'50.0 – 50.0%'
+>>> format_rate_range(0.0006, 0.0009)
+'0.1 – 0.1%'
+```
+
+Left alone deliberately, and a different thing: an interior tie is the printed *resolution*, the
+same one decimal place every `50.0%` in this tool carries, so a reader who takes it as exact is
+over-reading a rounded figure rather than being told something false. The two boundaries are
+claims of a different kind — `100.0%` of a failure rate means *nothing succeeded* and `0.0%`
+means *nothing failed*, each being where the reader stops looking — which is exactly the band
+`format_percent` governs. Closing the interior ties would mean `%.2f` on every interval the tool
+prints, the option round fifty-six weighed and declined, and would only move the tie to the
+third decimal. **The fix is not widened**; the docstring now says which two values are claims,
+and `TestControls::test_an_interior_tie_is_left_alone` (3) pins the three measurements above so
+the narrowed claim is asserted rather than only written.
+
+`tests/test_interval_boundary.py` is now **31 tests** (was 20). Teeth: restoring the local
+`%.1f` reddens **10** (was 8), the two new ones among them. **15 controls**, every one
+re-verified green in the neutered state — the eleven round seventy-nine had, plus the three
+interior ties and a fixture control asserting `wilson_interval(8000, 8000)` really reaches the
+band, without which the cross-surface test could pass on an ordinary interval.
+
+## Round seventy-nine — closing the interval defect round fifty-six left open
+
+2369 collected before, **2389** after (+20); `ruff`, `ruff format` and `mypy src/ tests/` clean.
+One red going out and it is the documented badge test (see round seventy-six for why it stays).
+
+### SP-6 (fixed) — `format_rate_range(0.9996, 1.0)` read `100.0 – 100.0%`
+
+Round fifty-six filed this under **Open — the same defect one helper over, NOT fixed here**, and
+its recorded reason has two halves. Both are answered here rather than stepped around.
+
+> "a range shows both ends, so it needs its own decision about whether `>99.9 – 100.0%` reads
+> better than widening the precision"
+
+The decision was already taken, one helper over: `format_percent` renders a single value in
+[99.95%, 100%) as `>99.9%`, and its docstring argues the case three ways (2000 jobs with one
+failure reading "100.0% completed"; one failure in 13,051 reading "0.0%"; `walltime_used` at
+99.96% reading "100.0%" for a job that did not hit the wall). Routing each end of the range
+through it adds no fourth spelling and invents no precision, where widening to `%.2f` would
+change every interval the tool prints in order to answer one boundary.
+
+> "and `ci_range`'s spelling is pinned in three places"
+
+Measured, and they do not move: `test_audit.py:1215` (`ci_range(0.757, 1.0) == "75.7 – 100.0%"`),
+`test_comparison_population_disclosure.py:108` (`95% CI 72.2 – 100.0%`) and
+`test_interval_spelling.py` (which pins that `ci_range` must not re-derive the format). The first
+two have ends that `format_percent` renders identically — the exact boundaries stay exact — and
+the third is about ownership, which is unchanged: `duration` still owns the one format. All three
+files were re-run with the fix in place: **97 passed**.
+
+The surviving case worth naming: when both ends fall in the same bounded band the range reads
+`>99.9 – >99.9%`. That is not the old defect renamed — it says neither end reached 100%, which is
+true, where `100.0 – 100.0%` said both were exactly 100%, which was false. Pinned.
+
+`tests/test_interval_boundary.py` (20 tests). Teeth: restoring the local `%.1f` reddens 8.
+Eleven controls, all verified green in the pre-fix state, covering every previously pinned
+string, the `--ascii` fold, the single `%` at the end, `ci_range`'s delegation, and
+`format_percent` itself being untouched.
+
+**Superseded by round eighty**: two of those twenty tests turned out to pass with the fix
+reverted, and this round's docstring claimed more than the fix does. The counts above are
+the ones as filed; the file is now 31 tests, 10 of which redden under the neuter, with 15
+controls.
+
+## Round seventy-eight — two `--plain` notes printed at whatever length they happened to be
+
+2348 collected before, **2369** after (+21); `ruff`, `ruff format` and `mypy src/ tests/` clean.
+Two reds going out, both known: the documented badge test (see round seventy-six) and
+`test_portability_round81.py::TestASignalledDashboardRestoresTheTerminal::test_a_clean_quit_is_still_zero`,
+which is the SP-2 quit-linger timing flake — it passes on its own and passed on a full re-run of
+its own file (90 passed).
+
+### SP-5 (fixed) — the footprint note and the truncation summary were the only paragraphs not wrapped
+
+Found by running the tool at several widths and measuring every painted line, rather than by
+reading the code:
+
+```
+$ COLUMNS=90 slurmpast --no-color -S now-14days --overview | awk 'length($0)>90'
+  40,994 rows parsed, about 40.0 MiB held — a window ten times longer costs ten times that; narrow it with -S
+$ COLUMNS=60 ... | awk 'length($0)>60'
+  … 354 more workloads (8262 runs) holding 14.0% of the compute
+```
+
+The footprint note is 109 cells and overran at **every** width tested (60, 70, 80, 90, 100),
+including the 90 and 100 a real terminal is. The truncation summary is 63 and overruns
+`PLAIN_MIN_WIDTH`, the floor `_plain_width` clamps to.
+
+`report.py` states the rule this breaks, in `_prose_width`'s own docstring: the paragraph widths
+"were hardcoded at 72, 82 and 84, so a finding hard-broke mid-sentence two thirds of the way
+across a wide terminal and overran a narrow one." Nine paragraphs go through
+`wrap(..., _prose_width(n))`. These two did not.
+
+Fixed at both print sites in `report.py` (`render_overview`). The truncation summary keeps a
+hanging indent — `  … ` then four spaces — because it sits directly under a table, and a
+continuation flush with the rows above reads as another row. Neither note is drawn by the
+dashboard (checked: `tui.py` and `render.py` mention neither), so there is no second surface to
+keep in step.
+
+`tests/test_plain_notes_are_wrapped.py` (21 tests). Teeth verified by neutering each wrap site
+separately: the footprint site reddens 8, the tail site 1. Controls that pass in both states: a
+150-column terminal keeps each note on one line, a small history still prints no footprint note,
+the threshold boundary still holds, `-n 0` still prints no truncation summary, and the demo's own
+54-cell tail still fits the 60-cell floor on one line.
+
+One existing test was updated rather than left red:
+`test_portability_round81.py::test_the_footprint_is_disclosed_on_a_large_window` asserted
+`"narrow it with -S" in text`, which a wrapped note can legitimately straddle. It now flattens the
+text first — the property is that the advice is disclosed, not where the break falls.
+
+## Round seventy-seven — the two surfaces disagreed about how to say "no node"
+
+2333 collected before, **2348** after (+15); `ruff`, `ruff format` and `mypy src/ tests/` clean.
+One red going out and it is the documented badge test (see round seventy-six for why it stays).
+
+### SP-4 (fixed) — `NODE` was the one cell of twelve where `--plain` and the dashboard differed
+
+`CLAUDE.md` states the rule: "`render.py` exists so the dashboard and `--plain` cannot drift."
+The job table is drawn by both from the same twelve `JOB_COLUMNS`. Eleven agreed:
+
+| column | `--plain` | dashboard |
+| --- | --- | --- |
+| STARTED | `or "-"` | `or "-"` |
+| ENDED | `or "-"` | `or "-"` |
+| GPU | `or "-"` | `or "-"` |
+| NAME | `or ""` | `or ""` |
+| **NODE** | **`or "-"`** | **`or ""`** |
+
+So the convention was settled everywhere else in that same dict, and the dashboard was the
+outlier. It matters because a job with no node list is a real state -- pending, or cancelled
+before it was ever allocated -- not an inapplicable column: an empty cell reads as "this column
+does not apply to this row", while `-` is this tool's marker for a value it does not have. The
+same distinction the package draws everywhere between an absence and a zero.
+
+The width computations still use `or ""` on both sides and that is right: they size the column
+and an absent value contributes no characters, while the four-wide `NODE` heading floors it, so a
+one-character `-` cannot be truncated. Measured after: a nodeless job renders `... n/a - -` and
+one with a node renders `... - midway3-0042`.
+
+`tests/test_node_absent_marker_agrees.py` (15). The marker is read off BOTH sources rather than
+restated, so the test cannot drift from the code the way the code drifted from itself. Teeth:
+reverting the dashboard cell to `or ""` reddens 3; all 12 controls pass in both states -- and the
+`--plain` side is deliberately among them, being the side that was already right.
+
+## Round seventy-six — a failed `sinfo` memoised, an unbounded `sstat`, and the quit that never exits
+
+2307 collected before, **2333** after (+26); `ruff`, `ruff format` and `mypy src/ tests/` clean.
+Five reds going in; **one red going out, and it is the documented badge test** — the four signal
+failures were a CONSEQUENCE of SP-3 and went green with it.
+
+**A correction this round made and then undid.** The badge was bumped 1969 -> 2319 to "fix" the
+documented red, which **broke `test_badge_mismatch_diagnosis.py::TestControls::
+test_the_badge_still_states_the_committed_count`** — a test that exists precisely to stop this.
+Its module docstring says it in as many words: the tree holds untracked test files, so the badge
+is *correct for the suite that ships*, the local failure is expected, and "Bumping the badge would
+**red CI** — the opposite of the fix." Reverted to 1969, byte-identical to HEAD. The badge moves
+in the same change that commits the tests, and not before.
+
+### SP-1 (fixed) — `partition_ceiling` cached a query that failed
+
+`partition_ceiling` is what keeps `--sizing` from advising a number the hardware cannot take;
+its own docstring records the case, "`--cpus-per-task=34` on a partition whose nodes have 28,
+which `sbatch` refuses outright". It is also explicit that a failure answers `(None, None)` and
+never raises, and that is right. What went unsaid is that the failure was then written into
+`_PARTITION_CEILING`, which is consulted **before** the query. Measured:
+
+| call | `sinfo` | answer | cached? |
+| --- | --- | --- | --- |
+| 1 | raises `SacctError` | `(None, None)` | **yes** |
+| 2 | works, returns `128 256000` | **`(None, None)`** | — `sinfo` never re-ran |
+
+One transient failure — no `sinfo` on PATH yet, a timeout, an EINTR — therefore disabled the
+clamp for the whole process, reintroducing the exact defect the function exists to prevent.
+
+The fix withholds only the memo, on a single `answered` flag. The return contract is untouched
+(still `(None, None)`, still never raises), and output that **answered** but would not parse
+still caches, because that is a measurement about the partition: the distinction is the query,
+not the verdict, which is the line this package already draws between a zero and an absence.
+`tests/test_partition_ceiling_cache.py` (12). Teeth: `if answered:` -> `if True:` reddens 5, and
+so does dropping `answered = False`; all 7 controls pass in both states.
+
+### SP-3 (fixed) — the live `sstat` enrichment had no budget of its own
+
+`merge_live_metrics` is built around a number it names outright: "the 18-second call this exists
+to avoid". Measured on midway3 with **60 running array tasks**, the one batched call this module
+makes — `sstat --allsteps --jobs=<60 ids>` — took **119.76s** for 2,160 rows. It contacts each
+job's `slurmstepd`, so its cost scales with how many jobs the reader has RUNNING, not with the
+window. Nothing bounded it but `DEFAULT_TIMEOUT = 300.0`, which is the *accounting database's*
+budget. `slurmpast --plain` therefore sat for two minutes before printing anything, and this is
+also what the `_load` worker in SP-2 is usually inside when the user quits.
+
+`read_live_metrics` already documents the right answer for a failure: "the caller's fallback is to
+report the field as unmeasured, which is the correct answer and not a degradation". So the query
+gets its own `LIVE_METRICS_TIMEOUT_S = 15.0` and lands on that fallback. Waiting two minutes to
+avoid printing "unmeasured" is the wrong trade.
+
+Three deliberate details. **No new environment variable** — `SLURMPAST_TIMEOUT` is documented as
+"the package's only environment variable", so it is honoured as a *ceiling* instead:
+`min(_timeout(), timeout)` inside `_run`, so lowering it lowers this too while raising it does not
+extend an enrichment. **`_timeout()` is still read first**, so a bad setting is refused before any
+spawn, as its own comment requires. **The budget goes to `_run` directly, not through `runner`**:
+all 48 injected runners in this package are one-argument callables and a test double has no wait
+to bound, so the protocol is untouched.
+
+Measured after: `_run(["sleep", "30"], timeout=2.0)` raises at 2.00s. The end-to-end `--plain` run
+is **still ~171s**, because the bulk is elsewhere and the tool already says so in its own output —
+"37,784 rows parsed, about 36.9 MiB held — a window ten times longer costs ten times that; narrow
+it with -S". This fix bounds the enrichment, not the window.
+
+### SP-2 (root cause still open; the fatal symptom is gone via SP-3) — quitting lingers
+
+`tests/test_portability_round81.py::TestASignalledDashboardRestoresTheTerminal` is **4 red, and
+not a flake**: it fails the same way run alone (170s) as in a full run. Every case dies on the
+helper's own last resort, `pytest.fail("the dashboard did not exit")`.
+
+Driven in a pty and timed, `sacct` being 0.12s and the alternate screen appearing at 0.46s:
+
+    'q' sent -> alternate screen RESTORED at 0.21s   (clean: enter 1, leave 1, no traceback)
+             -> process REAPED at ... 14.7s once, and never at all in 3 of 4 later trials
+
+`--no-logs` changes nothing, so it is not the log-resolving worker. `faulthandler` on the hung
+process names it exactly:
+
+    main thread   asyncio/runners.py close -> loop.shutdown_default_executor()
+    shutdown thr  concurrent/futures/thread.py:235 shutdown -> Thread.join
+    worker thr    textual/worker.py run_callable -> tui._load -> cli.load
+                  -> sacct.history -> sacct._query -> sacct.parse
+                  -> duration.parse_bytes -> duration.py:60 <listcomp>
+
+Textual's `run_worker(..., thread=True)` submits to asyncio's **default** executor, and
+`asyncio.Runner.close()` joins it. The load worker is mid-parse, a parse cannot be interrupted,
+so the interpreter waits — leaving an orphan burning CPU on a login node after the user has
+already got their prompt back.
+
+**Deliberately not fixed here, and SP-3 changed the picture.** Every remedy for the root cause
+touches process-exit or threading semantics rather than a line of logic: Python 3.11's
+`shutdown_default_executor()` takes no timeout (3.12 added one), the executor's own `atexit` hook
+joins its threads regardless, and Textual creates the loop inside `App.run()`, so
+`set_default_executor` is out of reach. The candidates are a daemon thread of our own for the
+load, a cooperative abandon-flag checked inside `sacct.parse`'s row loop, or `os._exit` after the
+terminal is restored — a design call, not polish.
+
+**What SP-3 did to it, measured.** Capping the live query removed the unbounded part of the wait:
+
+    before SP-3   screen restored at 0.21s | reaped at 14.7s once, NEVER in 3 of 4 trials
+    after  SP-3   screen restored at 0.21s | exited in 21.3s, 21.4s, 21.3s (bounded)
+
+So the orphan is gone and the four signal tests pass, because their budget is ~22s. **The linger
+is still ~21s**, which is a long time to hold a terminal after the user has their prompt back, and
+the join is still uninterruptible — the root cause is open, it is just no longer unbounded.
+
+## Round seventy-five — three defaults stated in prose, and a sibling's note saying they were not
+
+2298 collected before, **2307** after (+9); `ruff`, `ruff format` and `mypy src/ tests/` clean,
+and the only red is the documented badge test.
+
+`--since`, `--metric` and `--sort` each spell their default into the help text —
+`(default: now-7days)`, `(default: hang)`, `(default: cost)` — rather than interpolating
+`%(default)s`. Hardcoding is defensible (`--since`'s gloss, "'-7days' is accepted and rewritten
+for you", reads better beside a literal) but it is a **copy**, and a copy drifts silently:
+change the keyword and the sentence beside it still names the old value. Nothing checked them.
+
+**Found by doubting a sibling's note rather than the code.** nodetop has this exact check, and
+its docstring said: *"A sibling package sidesteps this by interpolating everywhere, and two
+others state only prose defaults, so this is the one package where the check has anything to
+bite on."* Half right. Measured across the family:
+
+| package | stated defaults | drift possible? |
+| --- | --- | --- |
+| rapidu | 7, all `%(default)s` | no — interpolated |
+| nodetop | 13 values + 3 prose | yes, and checked since `c03ef88` |
+| **slurmpast** | **3 values + 1 prose (`--user`, "you")** | **yes, and unchecked** |
+| slurmate | — | no `cli` module to import a parser from |
+| slurmwatch | — | its `cli` exposes no `build_parser` |
+
+So the sentence under-counted, and the two it lumped together are not comparable for a different
+reason: their parsers are not reachable, which makes the help text the only surface and a
+different probe. Corrected in nodetop as part of this round.
+
+`tests/test_stated_defaults.py` is ported from nodetop deliberately unchanged in shape — the
+same `(default: X)` regex bounded to 24 characters, the same semicolon-gloss handling, the same
+by-name prose skip list, and the same emptiness guard that fails and says to delete the file if
+the package ever moves to `%(default)s` throughout. A fix in one transfers.
+
+Teeth, three drifts, each reddening exactly the flag that moved with all 5 controls and the
+guard green:
+
+| neuter | red |
+| --- | --- |
+| `--since` default → `now-14days`, help unchanged | `[--since]` |
+| `--since` help → `(default: now-30days)`, default unchanged | `[--since]` |
+| `--metric` default → `failure`, help unchanged | `[--metric]` |
+
+The second row is the direction a copy usually drifts — someone edits the sentence — and it is
+caught the same way, because the check compares the pair rather than trusting either side.
+
+### Still open
+
+* The badge/untracked-files item, unchanged.
+
+## Round seventy-four — `--mouse` evaporated in every text mode
+
+2283 collected before, **2298** after (+15); `ruff`, `ruff format` and `mypy src/ tests/`
+clean, and the only red is the documented badge test.
+
+The neighbour of round 73, found by looking one flag over. `args.mouse` is read at exactly one
+place — `tui.run(mouse=args.mouse)` — so under `--plain`, `--json`, any section view or a named
+job it is a flag that was typed and will not be used. This block already holds three remedies
+for that class and `--mouse` had none of them:
+
+* `--log-dir` (round 81) and `-S`/`-E`/`--all-users` under `--demo` (round 73) → a **warning**;
+* `--steps` without a job id → a **`parser.error`**, and its comment states the class outright:
+  *"It used to evaporate, so a caller who forgot the id got the ordinary overview and no hint
+  that the flag they typed did nothing."*
+* the `_has_terminal()` degrade → deliberately **silent**, for a reason it also states.
+
+A warning, matching `--log-dir`: the report asked for still arrives exactly as asked, and only
+the mouse preference is moot.
+
+**The placement is the load-bearing part, and I got it wrong first.** `if not _has_terminal():
+args.plain = True` degrades to text on a pipe and must stay silent — "a note on stdout would
+corrupt the very file being written, and one on stderr would be noise in every CI log for a
+fallback that did what was wanted". My first version sat AFTER that assignment, so
+`--demo --mouse | cat` warned about a mouse the caller had never asked to drop. Measured, moved
+above the degrade, and re-measured: `--demo --mouse` piped is silent again while every explicit
+text mode warns. A control now pins that case, and it is the regression guard for the placement
+as much as for the behaviour.
+
+The components mirror `wants_text` and take the section names from `SECTION_ORDER`, so a sixth
+section reaches both or neither.
+
+Teeth: removing the block reddens **8**, all 5 controls green — including the pipe case and
+`--steps`' stricter remedy, which this round leaves alone.
+`tests/test_mouse_needs_the_dashboard.py`, 15 tests.
+
+**Also measured and NOT changed, on the same sweep:** `--plain --json` silently prefers JSON,
+and `--overview --patterns --nodes --sizing` compose additively. Neither is a dropped flag —
+`--plain` is a degrade switch that `--json` refines rather than contradicts (its own help says
+it is "automatic when stdout is not a terminal"), and the composed sections are what `--help`
+shows as an example. `--json` with two sections is already a `parser.error` naming the fix.
+
+### Still open
+
+* The badge/untracked-files item, unchanged.
+
+## Round seventy-three — `--demo` dropped a window and an audience without saying so
+
+2271 collected before, **2283** after (+12); `ruff`, `ruff format` and `mypy src/ tests/`
+clean, and the only red is the documented badge test.
+
+Round 81's `TestADroppedFlagIsReported` set the rule and the wording — a flag asked for and not
+used earns a warning on stderr, not silence and not an error — and it explicitly named `--demo`
+as a route that makes flags no-ops: *"it sets `no_logs` itself ... so `--demo --log-dir X` was
+equally silent."* It fixed `--log-dir`. Two more flags arrive by the same route and were still
+silent:
+
+* **`-S/--since` and `-E/--until`.** Both render sites read
+  `"synthetic demo data" if args.demo else humanize_window(...)`, and the query gets
+  `since=None if (args.demo or args.until)`. Measured: `--demo -S now-1days` and
+  `--demo -S now-365days` render **byte-identical** output to `--demo` alone (md5 `d4de7f5765`
+  all three).
+* **`--all-users`.** `demo.history()` yields 58 jobs belonging to **one** user, so there is
+  nobody to widen to. Also byte-identical, on `--json` as well.
+
+Now one warning, comma-joined when several apply, beside `--log-dir`'s and worded the same way
+with its own reason: `-S/--since, --all-users has no effect with --demo (a fixed tape of one
+user's jobs); ignoring`.
+
+**Compared against the parser's OWN default, not truthiness.** `--since` defaults to
+`now-7days` and is therefore always set, so a truthiness test would warn on every `--demo` run
+and say nothing about what the caller typed. The default is normalised for the comparison
+because `args.since` already is, or the check would fire on spelling alone. **The cost, recorded
+rather than hidden:** typing the default explicitly (`--demo -S now-7days`) is indistinguishable
+from not typing it, because argparse keeps no record of which happened without a sentinel
+default — and changing the default to one is a wider change than this warning is worth. A
+control asserts that case stays silent.
+
+On **stderr**, so `--json` still parses and `--plain` is byte-identical — both asserted, because
+a diagnostic on stdout would corrupt the payload this package is scripted through.
+
+Teeth: removing the block reddens **7**, all 5 controls green.
+`tests/test_demo_reports_its_dropped_flags.py`, 12 tests.
+
+**One control had to be rescoped after measuring it.** It originally asserted that a real
+(non-`--demo`) run reports `Invalid time specification` for `-S not-a-date`. Under the narrow
+`PATH` the test gives its subprocess there is no `sacct`, so the run stops earlier with "cannot
+execute sacct" — the correct message, and exactly what a CI runner sees. It now asserts the
+portable property instead: rc=2 and **no** `--demo` warning. A control that needed a live
+scheduler would have passed here only because this host is a cluster, which is the inverse of a
+runner and a defect class this family has shipped before.
+
+**Found by a sweep that came back clean otherwise.** The axis was "does `--json` stay parseable
+on the error branch, or does a diagnostic land on stdout" — checked across all five packages,
+ten failure paths, and **every stdout was either empty or valid JSON**. The `--demo` finding
+came out of a confounded reading in that sweep: `--demo -S not-a-date` returned a full report
+with rc=1, which looked like missing validation until the real path showed rc=2 and a helpful
+message. The flag was not unvalidated; it was ignored.
+
+### Still open
+
+* The badge/untracked-files item, unchanged.
+
+## Round seventy-two — a substring check that could not fail, in the test guarding the 3.10 floor
+
+2270 collected before, **2271** after (+1 net: one test split into two); `ruff`,
+`ruff format` and `mypy src/ tests/` clean, and the only red is the documented badge test.
+
+`test_the_one_backfill_there_is_is_declared` guarded the one thing that makes this package's
+tests runnable on the floor it declares — `tomllib` is 3.11+, `requires-python` is `>=3.10`, and
+the dev extra ships `tomli>=1.1; python_version < '3.11'` for it. It checked that with two
+substring assertions, and **one of them cannot fail**:
+
+    assert "import tomli as tomllib" in source     # `source` is THIS file
+
+**Measured, not argued.** Breaking one of the two real fallbacks — replacing
+`import tomli as tomllib` with `tomllib = None` inside the guard — left the class **passing, 3
+of 3**. The phrase occurs four times in this file and two of those are the test's own machinery:
+the assertion above quotes it, and `test_it_would_have_caught_the_one_that_shipped` embeds it in
+an `ast.parse` fixture string. So the substring is satisfied by the code that checks it, and it
+would go on being satisfied with every real guard gone.
+
+Replaced with an AST check. `_tomllib_guards` walks each `try:` whose body imports `tomllib` and
+reports whether any handler imports `tomli`, over `src/`, `tests/` and `tools/`. The marker
+assertion is now tied to `ADDED_IN["tomllib"]` rather than matching the literal `< '3.11'`, so
+the two numbers that must agree cannot drift apart independently.
+
+Teeth, four neuters, each reddening exactly one test with 3 of 3 controls green:
+
+| neuter | red |
+| --- | --- |
+| one real fallback broken (**the one the old version survived**) | the AST check |
+| fallback imports `json` instead of `tomli` | the AST check |
+| marker boundary bumped to `< '3.12'` | the marker check |
+| marker line deleted | the marker check |
+
+The second row is the case no substring check can reach at all: a handler that still imports
+*something* keeps every phrase in the file intact.
+
+**Found by generalising round seventy-one's own mistake.** The first draft of slurmate's
+equivalent this round asserted `"tomli" in source.replace("tomllib", "")` and survived its
+neuter for the same reason — two docstrings there say "``tomllib`` on 3.11+, ``tomli`` on older
+Pythons" and "real TOML (tomllib/tomli)". Having watched a substring check pass on a broken
+guard once, the sibling with the same shape was worth looking at.
+
+### Still open
+
+* The badge/untracked-files item, unchanged.
+
+## Round seventy-one — nine `noqa` directives claimed a violation the line does not have
+
+2262 collected before, **2270** after (+8); `ruff`, `ruff format` and `mypy src/ tests/` clean,
+and the only red is the documented badge test.
+
+Every other claim in this repo is checked by something. The **suppressions** were not, and this
+is the one axis where that showed: `conftest.py`, `test_readability.py`, `test_tui.py` and
+`test_ui_usability.py` carried **nine** `# noqa: E402` directives on imports that follow a
+`sys.path.insert`, and ruff does not flag them. `E402` IS in `select` and `per-file-ignores`
+for `tests/*` is `["ARG"]` only, so nothing was exempting them — each line simply advertised a
+violation it does not have.
+
+**All nine were BARE**, the code with no rationale after it, and that decided the treatment.
+The same sweep across the family found stale directives in `nodetop` (2) and `rapidu` (5) where
+every one carries a reviewer's note — `# noqa: S603 - fixed argv, never a shell`,
+`# noqa: BLE001  (a hang is worse than a report)`, `# noqa: F401  (used in `# type:` comments)`.
+Enabling this rule there would demand **deleting the note to satisfy the linter**, which is the
+wrong trade, so it was not enabled there. Recorded rather than done.
+
+**Measured on BOTH ends of the dev bound before removing anything.** The bound is
+`ruff>=0.15,<0.17` and CI resolves the upper end; a directive one version calls unused can be
+load-bearing on another. Installed 0.16.6 in a throwaway venv and re-ran: it agrees with the
+local 0.15.18 on all nine, and on every repo's count (nodetop 2, rapidu 5, slurmwatch 2,
+slurmate 0). The `select` comment two lines above records this spread biting once already —
+0.16 surfaced 206 findings a local 0.15 run never saw — which is why the check was worth making
+rather than assuming.
+
+`RUF100` is now in `select`, so the **gate** keeps the directives honest and nothing in
+`tests/` re-implements `ruff check`. What is pinned is that the rule stays selected, that no
+BARE directive returns, and one end-to-end check that the rule fires on a planted file.
+
+Teeth: dropping `RUF100` from `select` reddens **2** and the planted stale directive goes from
+1 finding to **0**; all five controls green.
+`tests/test_stale_suppressions_are_caught.py`, 8 tests.
+
+**One of its tests guards only half the round**, and the neuter is what established that:
+`test_no_bare_noqa_survives_in_the_tree` reddens if a bare directive comes back (the cleanup
+half) and holds with `RUF100` dropped (so for the config half it is a control). Its docstring
+says which.
+
+**And the scanner had to exclude its own file** — it quotes the directive it searches for, in
+the classifier and in a control. Third time that shape has bitten in this campaign.
+
+### Still open
+
+* The badge/untracked-files item, unchanged.
+
+## Round seventy — the last three spellings of the confidence level now derive from `Z`
+
+2253 collected before, **2262** after (+9); `ruff`, `ruff format` and `mypy src/ tests/` clean,
+and the only red is the documented badge test.
+
+Closes round sixty-nine's Still-open item, which is also the last of round sixty-eight's. That
+item deferred three sites with a reason:
+
+> `render.NODE_COLUMNS` declares a WIDTH beside the label (`Column("95% CI", 18, ...)`, and
+> `render.table_floor` records that `NODE_COLUMNS` bottoms out at 41 cells), and `report.py`
+> and `tui.py` key their row dicts BY that label, so all three must be one string. Rebuilding
+> them is a layout change, not a polish one.
+
+**The reason was about changing the label's TEXT, and deriving the same six characters changes
+no layout — measured rather than assumed.** `render.CI_COLUMN = "%s%% CI" % CONFIDENCE_PERCENT`
+is `'95% CI'`, the column is still 18 wide and right-aligned with `drop=1`, and
+`table_floor(NODE_COLUMNS)` is still **41**. The `--plain --nodes` view is byte-identical
+(md5 compared before and after). `render` already imported `MIN_SAMPLES` from `nodes`, so this
+adds no dependency direction — and `nodes` still imports nothing from `render`, which is the
+constraint that put the shared sentence in `nodes` in the first place.
+
+**Why the KEY mattered and not just the header.** `text_table` looks each row's cells up BY the
+column label, so a key that disagrees with the header does not raise — it renders the column
+**empty**. Both new behavioural tests watch exactly that, and the drift neuter below proves it:
+hardcoding `99% CI` at the three sites leaves the plain view and the dashboard with a blank CI
+column and no error anywhere.
+
+Teeth, two neuters, because the two failure modes differ:
+
+| neuter | red | which half caught it |
+| --- | --- | --- |
+| three sites hardcode `95% CI` again | 1 | the source pin only — output is byte-identical |
+| three sites hardcode `99% CI` | 4 | the table spec, BOTH surfaces' cells, and the source pin |
+
+All controls green under both. `tests/test_ci_column_label_is_derived.py` (9), and round
+sixty-nine's pin **inverted** in place: it used to assert `report.py` and `tui.py` each CONTAIN
+the literal, which is now the thing that must not be true.
+
+The dashboard test reads off the **compositor** (`screen._compositor.render_strips()`), the way
+`test_requeue_tail_disclosure` reads a panel and `test_readability` pins as a rule — reading
+`Static.renderable` returned an empty string here, because this screen keeps no `Text` of its
+own and that attribute exists in textual 0.89 and not in 8.x.
+
+### Still open
+
+* The badge/untracked-files item, unchanged.
+* Nothing else. Round sixty-eight's item is fully closed: the prose spelling derives (69), the
+  three layout-coupled ones derive (70), and the two docstrings that quote `95% CI` as a worked
+  example of a *format* are deliberately left alone.
+
+## Round sixty-nine — the level `Z` decides, spelled by hand in the sentence both front ends share
+
+2244 collected before, **2253** after (+9); `ruff`, `ruff format` and `mypy src/ tests/`
+clean, coverage over the 75 floor, and the only red is the documented badge test.
+
+Closes the half of round sixty-eight's Still-open item that could be closed without touching
+layout. That item read: *"the level is literal text in six places while `Z` decides it ...
+Raise `Z` and five sentences lie."* The six split into two kinds and they get different
+treatment, which is the whole content of this round:
+
+**Fixed — the prose.** `_note_from_row` builds the allocation note in `nodes.py`, which is
+the one place both front ends share (`render` imports this module, and the analysis modules
+may not import `render` — the function's own docstring says so). It carried a hardcoded
+`95%% CI` inside its format string. Now `CONFIDENCE_PERCENT`, which is `"%g" % round(
+CONFIDENCE_LEVEL * 100, 1)` — the same rounding as the `confidence_level` key the payload
+carries, so the prose, the payload and the label cannot disagree about what `Z` means.
+Rendering is **byte-identical** today, verified by capturing the sentence before and after
+across both of its shapes (with a workload, and with the `over N placements` clause).
+
+**Pinned, not rebuilt — the three layout-coupled spellings.** `render.NODE_COLUMNS` declares
+a WIDTH beside the label (`Column("95% CI", 18, align="right")`, and `render.table_floor`
+records that `NODE_COLUMNS` bottoms out at 41 cells), and `report.py:879` and `tui.py:2134`
+key their row dicts BY that label, so all three must be one string. Rebuilding them is a
+layout change, not a polish one. They are asserted against the derived value instead, so
+raising `Z` now fails and names all three sites.
+
+**Left alone — the two docstrings.** `duration.py:310` and `cli.py:503` quote `95% CI` as a
+worked example of a format, not as a claim about this run's arithmetic.
+
+**Teeth, and the first version of the pin was too narrow.** Two neuters, because the failure
+modes differ:
+
+| neuter | red | which half caught it |
+| --- | --- | --- |
+| sentence hardcodes `95` again | 1 | the source pin only — output is identical |
+| sentence hardcodes `99` | 2 | source pin **and** the behavioural test |
+
+The second row is why the pin changed. It first asserted `"95%% CI" not in source`, which
+stayed **silent** under the drift neuter — the case the pin exists for. It now asserts
+`re.findall(r"\d+%% CI", source) == []`, so any typed level fails. All four controls green
+under both neuters.
+
+`tests/test_ci_level_spelling_is_derived.py`, 9 tests. One of its controls is the quiet
+branch: `verdict != "worse"` returns `""` before any formatting happens, so a healthy node
+never reaches the spelling at all.
+
+### Still open
+
+* The badge/untracked-files item, unchanged.
+* **The three layout-coupled spellings are pinned, not derived.** Raising `Z` now fails
+  loudly and names them, which is the point; actually rebuilding the label from
+  `CONFIDENCE_PERCENT` means re-deriving a declared column width and the two dict keys that
+  match it, and `render.table_floor`'s 41-cell floor is asserted elsewhere. That is a layout
+  change and wants its own round.
+
+## Round sixty-eight — a confidence interval whose confidence level was not in the payload
+
+2235 collected before, **2244** after (+9); `ruff`, `ruff format` and `mypy src/ tests/`
+clean, and the only red is the documented badge test.
+
+One defect, found by running the **rendered-vs-`--json` sweep** across all four text views
+— the tactic that had been applied to two sibling packages and never to this one. Method:
+take the same `--demo` history through both surfaces, then check that every integer the
+rendered view prints is reachable from that view's own payload.
+
+**The sweep needed a correction before it said anything true.** Its first pass reported ten
+unreachable integers; nine were rounded renderings of stored floats, which the scan simply
+could not see — the payload holds `core_hours: 105.29555555555555` and the table prints
+`105`, so `105` looked absent. After crediting each float's roundings, `--overview`,
+`--patterns` and `--sizing` came back **clean** and `--nodes` was left with exactly one:
+
+    NODE                         N     RATE             95% CI VERDICT
+                                                        ^^
+
+**`--nodes --json` published `ci_low`, `ci_high`, `p_value` and `verdict`, and neither
+threshold.** So a consumer held two interval bounds with no way to learn what level they
+are an interval *of* — a 95% and a 99% interval are different claims about the same two
+numbers — and a p-value beside a verdict with no way to learn which threshold produced it,
+so it could neither re-derive the verdicts under its own alpha nor see how close a `same`
+row came to tripping. `node_table` now carries `confidence_level` and `fdr_alpha`.
+
+**`CONFIDENCE_LEVEL` is derived, not written down a second time.** The level is
+`erf(Z / sqrt(2))`, which is 0.9500042 at `Z = 1.96`, so the payload cannot disagree with
+the arithmetic that produced the interval. That matters here because the level is spelled as
+literal text in **six** places — two of them column labels (`render.py:780`,
+`report.py:879`, `tui.py:2134`, `nodes.py:899`, and two docstrings) — while `Z` is what
+actually decides the interval. `tests/test_ci_level_is_published.py` holds the label and the
+derived value together, which nothing did before.
+
+Teeth: removing both keys reddens **4** tests, all 4 controls green. The derivation test
+stays green under that neuter and says so in its own docstring — it guards against a
+hardcoded `0.95`, which is a different question from whether the keys are published.
+
+### Verified CLEAN this round — three withdrawals with numbers, do not re-run
+
+* **The `--ascii` fold.** Measured with a vacuity guard in both directions, which is the
+  half that makes it mean anything: `--overview` 3 non-ASCII characters without the flag and
+  0 with it, `--patterns` 8→0, `--nodes` 3→0, `--sizing` 16→0, the default job view 21→0,
+  `--failed` 19→0. Six views folded non-vacuously. (`--steps` emits no non-ASCII either way
+  in `--demo`, so it proves nothing — recorded rather than counted.) `site.py:265`
+  hardcodes a literal `\u2014` with no `ascii_mode` in scope, which is the exact shape of a
+  leak found in a sibling package, and here it is harmless: `render.py:1203` folds the
+  **finished text of each plain view**, and its docstring already says why that is the right
+  place ("there is exactly one place per view where the text is complete").
+* **Module-pair string literals.** All pairs across **19** modules share no prose literal at
+  all — including the pairs a previous round listed as unswept (`nodes.py`, `diagnose.py`
+  against `render.py`). The probe that found duplications in two sibling packages finds
+  nothing here.
+* **`sample_count`'s worked example.** `maxrss_sampling_note`'s docstring says an 89-second
+  job at `JobAcctGatherFrequency=30` gets "at most three samples", which reads as an
+  off-by-one against `89 // 30 == 2`. It is not: `sample_count` is `floor(e / f) + 1` and its
+  own docstring says "3 for the 89-second job that prompted this, not 2", because the sampler
+  gets one look at the start. A considered decision, documented at the site.
+
+### Still open
+
+* The badge/untracked-files item, unchanged.
+* **The level is literal text in six places while `Z` decides it.** Round sixty-eight tied
+  the `render.py` column label to the derived value; the other five spellings
+  (`report.py:879`, `tui.py:2134`, `nodes.py:899`, and the two docstrings) are still
+  hand-written. Deliberately not folded into this round: two of them are column labels whose
+  WIDTH is load-bearing (`Column("95% CI", 18, ...)`, and `render.table_floor` records that
+  `NODE_COLUMNS` bottoms out at 41 cells), so changing how they are built is a layout change,
+  not a polish one. Raise `Z` and five sentences lie.
+
+## Round sixty-seven — the requeue tail said how many workloads it hid, not what they cost
+
+2213 tests before, **2235** after (+22); `ruff`, `ruff format` and `mypy src/ tests/` clean, and
+the only red is the documented badge test.
+
+`find_requeues` caps its findings at `REPEAT_REPORT_LIMIT` (4) and appends one summary for the
+rest. That summary read `hidden` for `len()` and nothing else, so it published how MANY
+workloads the cap dropped and withheld the one quantity the rule is *ranked* by — the abandoned
+time, which each of the four findings above it prints for itself, and which the rule's own
+docstring calls the figure that makes the case ("a requeued allocation really ran, and its hours
+appear in no other total the tool prints").
+
+This is the "container read, values dead" shape: `hidden` IS read, so a zero-reader sweep would
+not have found it. Only the reads had to be classified.
+
+### The byte-identical proof
+
+Two histories differing only in the hidden tail's abandoned time, through
+`find_requeues` on the tail finding's own evidence:
+
+```
+tail site OUT   00:09:00  -> sha 71a94bf6d290  'Shown in full with a narrower --since window.'
+tail site OUT   3-00:00:00 -> sha 71a94bf6d290  'Shown in full with a narrower --since window.'
+tail site IN    00:09:00  -> sha 74b6adef9bce  'The abandoned attempts ran 00:09:00 between them. ...'
+tail site IN    3-00:00:00 -> sha 1f02eba3248a  'The abandoned attempts ran 3-00:00:00 between them. ...'
+```
+
+Nine minutes and three days were the same bytes. A reader deciding whether to spend a second,
+narrower query had nothing to decide with.
+
+### What changed
+
+`patterns.py` gains `_abandoned_time_note(burned)` — one spelling, because the figure is now
+reported twice (per workload, and for the tail) and the two must not word it differently. It
+returns `""` for a zero or missing total, because an earlier attempt can end carrying no
+`Elapsed` and "ran 00:00:00" reads as a measurement where there is none. The tail finding puts
+the figure first and the instruction second, the shape `find_repeat_failures` already uses for
+its own tail.
+
+`render.py` cannot hold this sentence: it imports `rich`, and the analysis modules may not. So
+the single spelling lives inside `patterns.py`.
+
+### Provenance, and what I verified rather than took
+
+This round was started by a subagent that hit its session limit mid-flight. Its last reported
+line was "Now I'll apply the fix" — but it had already written both the change and a 22-test
+file, which `md5sum -c` against the snapshot is what revealed. **The report and the tree
+disagreed; the tree was right.** Verified here independently: the static gates, all 22 tests,
+the byte-identical pair above (reproduced from scratch), and two neuters — the helper silenced
+reddens 12, the tail site alone reddens 11, and no control reddens under either. The one-test
+difference is the per-workload path, which the tail neuter does not touch.
+
+### Still open
+
+* The badge/untracked-files item, unchanged.
+
+## Round sixty-six — FLAGGED counts runs, and the figure that says what they cost was read by nothing
+
+2193 tests before, **2213** after (+20); `ruff`, `ruff format` and
+`mypy src/ tests/` clean, coverage **96.34%** against the 75 floor, and the only red
+is the documented badge test.
+
+One defect, found by the sweep that has just paid off twice in slurmwatch: separate the
+WRITES of every result-object field from its READS, and look for a value that is
+computed, summed or parsed and then read by nothing.
+
+**`GroupStats.wasted_gpu_hours` — declared `index.py:82`, summed `index.py:228`, read
+nowhere.** It is the GPU-hours held by the runs the overview counts under FLAGGED. It
+has been computed on every `build_groups` walk since the first commit (`11a5774`) and
+its only other appearance in the tree was a `0.0` in one test fixture
+(`test_index.py:404`).
+
+FLAGGED is a run *count*, so it cannot carry the difference, and nothing else on the row
+can either: `CPU / GPU-HOURS` is the workload's whole spend and `GroupStats.cost` — what
+the list is ranked by — is a weighted sum of the same two totals. Two histories built to
+agree on every dimension a surface showed and to differ only in the one it did not:
+
+```
+                 runs  completed  flagged  gpu_hours  core_hours   cost   wasted_gpu_hours
+cheap failures     20         16        4      290.0      2320.0   6960                2.0
+costly failures    20         16        4      290.0      2320.0   6960               90.0
+```
+
+Sixteen completed runs plus four FAILED, one card and eight cores each. In the first the
+four flagged runs died in half an hour; in the second each held its card for 22.5 hours.
+Rendered before the fix, `--plain --overview` came out **byte-identical** for both:
+
+```
+  window now-30days
+  20 jobs in 1 workload · 80.0% completed
+  ordered by compute used (1 GPU-hour = 16 CPU-hours) · "#" stands for a name's digits
+
+  #    JOB NAME               PARTITION  RUNS COMPLETED  FLAGGED CPU / GPU-HOURS LAST RUN
+  -----------------------------------------------------------------------------------------
+  1    train-#                gpu          20        16        4   2,320 / 290   2026-08-20
+```
+
+So did the per-workload object in `--overview --json`, and `severity` and the rank agreed
+too. 2 idle GPU-hours and 90 were the same output.
+
+That matters because this module already calls idle GPU-hours the central finding, and
+already reports them for the whole window: the summary above the table says "184
+GPU-hours total, 91 of them never used" (`History.idle_gpu_hours`,
+`render.idle_hours_note`). The reader's next question is *which workload* — and the answer
+was being computed per group and thrown away. On the demo history the answer is the top
+row: `node-evaluation` holds 84 of the window's 184 GPU-hours and **all 84 of them are
+flagged**.
+
+`--overview --json` is also the one hand-enumerated payload in the CLI, and it states the
+rule this violated twice in its own comments — `distinct_names` is "off the table on
+purpose ... but it is a real measurement, so it is emitted rather than lost", and the
+failed/cancelled/noop breakdown "stays here so nothing measured is lost". Every other
+payload escapes the question by going out wholesale (`history.stats`, `node_table(...)`,
+`Advice._asdict()`, `Finding._asdict()`), which is why this was the only measured field
+of `GroupStats` reaching no surface at all.
+
+### The fix, on all three surfaces
+
+* `index.py:558` — `History.idle_workload`, the workload holding the most idle GPU-hours,
+  or `None`. Picked by the **absolute** figure, so "the most" is true; a two-hour workload
+  wasting one of them must not outrank a 290-hour one wasting 90. Only then gated, on the
+  pair `idle_gpu_hours` uses (`IDLE_SHARE_WORTH_NAMING`, `IDLE_HOURS_WORTH_NAMING`), read
+  against the workload's own GPU-hours because that is the denominator the sentence
+  prints. A CPU-only history is silent by construction.
+* `render.py:1134` — `idle_workload_note`, one spelling for both front ends:
+  `flagged runs held the most GPU-hours in train-#: 90 of its 290`. Both numbers, never
+  the numerator alone — the slurmwatch lesson that started this sweep, where "idle cores
+  240" read identically at 240-of-256 and 240-of-3200. Through `hours_text`, so a sliver
+  reads `<1` rather than a rounded `0`.
+* `report.py:707` — under the table, wrapped to the terminal. Not beside the total:
+  `test_the_summary_is_brief` caps everything above the table at four lines on purpose.
+* `tui.py:1103` — on the overview summary, its own line rather than a fifth `·` clause.
+  The split in placement with one shared sentence is what `gpu_hours_equivalence` already
+  does ("the caption on one surface, a help note on the other"); what must not differ is
+  the wording, and now cannot.
+* `cli.py:1289` — `"wasted_gpu_hours"` in the `--overview --json` workloads payload.
+
+The dashboard placement took two attempts, and the suite caught the first: appended
+among the summary's `·` clauses, the new line pushed `showing %d` onto a second line and
+reddened `test_a_narrowed_table_still_reports_the_true_total`, which reads the narrowed
+count off line one. That test was right and the placement was wrong -- `_summary`'s own
+comment states the order ("the facts about the history come first, then what the view is
+currently doing to them"), so the sentence now goes below both, and the reason is written
+at the site.
+
+Two frozen guards moved with it, which is what they are for: `render.py`'s public builder
+count 48 → **49**, and its surface classification `both` 29 → **30**
+(`test_render_surface_disclosure.py`). `idle_workload_note` is deliberately on both
+surfaces.
+
+### The tests and their teeth
+
+`tests/test_idle_workload_disclosure.py`, 20 tests. Seven controls hold the *premise*
+rather than the remedy and read nothing the fix added — the two histories agree on label,
+partition, runs, completed, failed, problems, noop, cancelled, gpu_hours, core_hours,
+severity, cost and last_seen; the table row, the hours cell and the FLAGGED cell are
+still identical (no column moved); and a history whose waste is immaterial still says
+nothing on either surface. With all three reader sites disabled — the exact pre-fix state
+— **7 tests red, 13 green, and no control among them.**
+
+Each site neutered on its own, one occurrence per file, verified before running:
+
+| neuter | reddens |
+| --- | --- |
+| `report.py` never asks | 4, all plain or cross-surface |
+| `tui.py` never asks | 2, dashboard and cross-surface |
+| the JSON key removed | 2, both in the JSON class |
+| `render`'s sentence replaced | 5, plain and dashboard, JSON untouched |
+| the gate removed | 2, both "stays quiet" controls |
+| the property returns `None` | 7 |
+| `max` → `min` in the picker | 1 — the one test that plants a 100%-share sliver beside a 90-hour workload |
+
+### The enumeration behind the pick
+
+148 fields across the 8 `NamedTuple` result objects (`model.Step`, `model.Job`,
+`model.Finding`, `model.Verdict`, `index.GroupStats`, `sizing.Advice`, `site.Site`,
+`render.Column`). Five had no attribute read anywhere in `src/`. Four are benign and each
+says so where it sits:
+
+* `sizing.Advice.observed` — reached through `Advice._asdict()` on `--sizing --json`, and
+  `report.py:1021` says exactly that: "`observed` is not dead -- it stays in the --json
+  payload".
+* `model.Verdict.job` — a handle back to the job a caller already holds, not a
+  measurement.
+* `index.GroupStats.kind` — `"gpu"`/`"cpu"`, and the GPU half of the hours cell already
+  shows which a row is (`-` for CPU-only).
+* `site.Site.accounting_storage_type` — parsed at `site.py:149` and read by nothing, but
+  no figure or verdict in this tool turns on slurmdbd versus filetxt, so no reader loses
+  anything.
+
+The dict-shaped results all escape the question by being emitted whole:
+`node_table`'s `comparison`, `direction` and `p_value` have no reader by name outside
+`nodes.py`, and `goodput`'s `gpu_hours_completed`, `core_hours_total`, `noop_jobs`,
+`gpu_goodput` and `gpu_noop_fraction` have none outside `patterns.py` — all of them go out
+under `--nodes --json` and `"summary": history.stats` respectively.
+
+### Still open
+
+* **`History.gpu_concurrency` has no reader in `src/`, and a test docstring says it
+  does.** `test_concurrency_still_available_to_callers`
+  (`test_readability.py:256`) is headed "Trimmed from the display, not deleted -- it is in
+  the JSON payload", and it is not: it is a `History` property, not a `stats` key, so no
+  `--json` payload carries it. The test only asserts the property is not `None`, which is
+  this suite's named failure mode — a test that asserts less than it appears to. Its
+  helper `span_hours` feeds nothing else. Left for its own round: the fix is a decision
+  about the JSON contract, not a one-line wiring.
+* **`History.headline()`** — "One line for the footer: the number that should bother you
+  most" — is called by six tests and by no surface. Same shape, same round.
+* The badge/untracked-files item, unchanged.
+
+## Round sixty-five — the classifiers understated support this package had already been run with
+
+2184 tests before, **2193** after (+9); `ruff`, `ruff format` and `mypy src/ tests/`
+clean, coverage **96.33%** against the 75 floor, and the only red is the documented
+badge test.
+
+`requires-python = ">=3.10"` has no upper bound, so pip already installs this on 3.14.
+The classifiers stopped at 3.13 — which understates support rather than restricting
+it, and classifiers are what PyPI shows and what tooling filters on.
+
+**Not a guess for this package.** `issues.md` already records the published artefact
+being installed from PyPI onto **midway2 — CentOS 7.9, glibc 2.17, Python 3.14.6,
+Slurm 23.02, cgroup v1 — and exercised against that cluster's real accounting
+history**, twice: round thirty-one's report against 0.7.0 and round thirty-six's
+cross-cluster evaluation of 0.8.2. Neither reported an import or syntax failure; every
+defect they filed was environment-general. A `Programming Language :: Python :: 3.14`
+classifier is therefore a claim this repo's own record already supports.
+
+Two tests hold it, transferred from slurmate, which has carried the identical pair
+since the round its CHANGELOG describes ("the packages are 3.14-clean while their
+classifiers stop at [3.13] ... nothing was blocked; the metadata simply understated
+it"):
+
+* every version `requires-python` allows is declared, and
+* `test_no_removed_or_deprecated_stdlib_apis` — the thing that would actually break on
+  a newer interpreter (`distutils`, `import imp`, `utcnow`, `getdefaultlocale`,
+  `find_loader`, `pkg_resources`, `typing.ByteString`). `src/slurmpast` has none
+  today; nothing was holding it there.
+
+Both read `pyproject.toml` as **text, not through `tomllib`** — deliberately, and for
+the reason slurmate's version records: `tomllib` is 3.11+, and 3.10 is the oldest
+version these very tests assert support for, so importing it would make them
+unrunnable on the interpreter they most need to run on.
+
+**The CI matrix is deliberately not asserted.** It tops out at 3.13 because that is
+what runners offer, which is a separate policy from what the package supports — the
+same split slurmate keeps, and the reason a floor pin must not be copied between these
+repos unexamined.
+
+### How this round nearly went the wrong way
+
+It opened as "slurmate has an anomaly": its classifiers list 3.14 while its matrix
+stops at 3.13, and the two siblings agreed with their matrices. Reading slurmate's
+CHANGELOG inverted it — the 3.14 entry is deliberate, already tested, and slurmate was
+simply **ahead** of its siblings rather than out of step. The finding was in the two
+repos that looked consistent.
+
+### Still open
+
+* The badge/untracked-files item, unchanged: 10 test files here are untracked. Since
+  round sixty-four the failure says so itself.
+* slurmwatch has neither of this round's two tests and no 3.14 evidence recorded, so
+  the guard transfers there but the classifier claim does not.
+
+## Round sixty-four — the standing badge failure now says which of two opposite causes it is
+
+2174 tests before, **2184** after (+10); `ruff`, `ruff format` and `mypy src/ tests/`
+clean, coverage **96.33%** against the 75 floor, and the only red is the badge test
+itself — which is the point of this round.
+
+`test_the_test_badge_matches_the_suite` compares the README badge against a live
+`--collect-only`. Two opposite situations produce a mismatch:
+
+* **the badge is stale** — tests were added and nobody bumped it. That is the case its
+  own docstring records ("`tests-1029` sat in the README for two rounds"), and the fix
+  is to bump the badge.
+* **the tree holds test files that are not committed** — then the badge is *correct*
+  for the suite that ships, the failure is expected locally, CI is green, and bumping
+  the badge would **red CI**.
+
+The message was `"README says N tests, the suite collects M"`, which cannot tell them
+apart. This repo has been in the second state since round fifty-three, and the item has
+sat in every Still-open list since — with each round re-deriving the explanation by
+hand. Round sixty-one is the proof that the ambiguity costs something: I bumped the
+badge to the live count to turn it green, which was backwards, and only measuring
+`HEAD` caught it.
+
+It now reads:
+
+```
+README says 1969 tests, the suite collects 2174 -- 9 test file(s) here are untracked
+(tests/test_interval_spelling.py, tests/test_node_history_query_is_lazy.py,
+tests/test_parse_cost.py, ...), which is exactly the difference: the badge states the
+count of the suite that SHIPS, so it is correct for HEAD and this failure is expected
+locally while CI is green. Commit or delete those files to close it -- bumping the
+badge to 2174 would red CI.
+```
+
+Two helpers carry it, both in `test_layout.py`: `_untracked_test_files` (which returns
+`[]` on any git failure, so a tarball install falls back to the plain "bump it" wording
+rather than claiming a cause it cannot support) and `_badge_mismatch_reason`, whose
+branches are pinned directly in `tests/test_badge_mismatch_diagnosis.py` — including
+that a badge *ahead* of the suite is always "stale", since untracked files can only make
+the live count larger. **The pass/fail semantics are untouched:** a genuinely stale badge
+still fails, which is what CI relies on.
+
+### One thing measured and dropped
+
+I also meant to stop the badge test's nested `--collect-only` subprocess from leaving a
+`.pytest_cache` behind, since it does not inherit the outer `-p no:cacheprovider`.
+Measured: it leaves nothing. `--collect-only` writes no cache, so there was no defect —
+whatever created the `.pytest_cache` seen in earlier rounds, it was not this.
+
+### Still open
+
+* The badge/untracked-files item itself, unchanged and not mine to close: 9 test files
+  here are untracked, so committing or deleting them is the only thing that closes it.
+  What changed is that nobody has to work that out again.
+
+## Round sixty-three — the oldest open item had been closed, and the guard that closed it was untested
+
+2169 tests before, **2174** after (+5); all four gates clean. One pin, plus a record
+correction. No source change.
+
+### The item, and the measurement that closes it
+
+Every Still-open list from round fifty-three onward carried this, worded the same way:
+
+> The note remains all but unreachable on `--plain` for a single job id, for round
+> forty-eight's reason: `-j` loads only the records asked for, and changing that is a
+> second `sacct` query.
+
+`cli._node_history` does exactly that second query. It is wired at `cli.py:1338`,
+computed once above both the `--json` and the plain rendering, and on the `-j` branch
+it re-runs `_load` with `job_ids` cleared. Measured against this cluster rather than
+read off the code -- a bare `slurmpast <id> --plain --no-logs` for a terminated job
+with an allocation:
+
+```
+records from the bare id query:        1
+population the note is computed from:  218
+```
+
+So the item is closed. This is the **third** stale entry found in two sittings (the
+other two were slurmwatch's D19-era banked leads), which is now recorded in the loop's
+memory as a rule: re-read the code before working a banked lead, because the note
+outlives the tree.
+
+### What that measurement turned up
+
+`_node_history` opens with a guard whose only job is cost:
+
+```python
+if not any(expand_nodelist(job.node_list) for job in targets):
+    return None
+```
+
+Its own docstring prices what it avoids -- "`-S now-30days` is 9.3 s for 13,075 rows"
+-- and promises "nothing is queried unless some target job actually has an allocation
+to say something about". `TestWhetherTheNodeNoteExistsAtAll` covers the widening
+thoroughly, but **all three of its cases have an allocation**, so none can see the
+guard. Verified by neuter, not assumed: with the guard deleted all three still pass --
+they simply get a population they already wanted -- while every `slurmpast <id>` pays
+a second query it can do nothing with.
+
+`tests/test_node_history_query_is_lazy.py` counts window queries through a fake Slurm
+that answers `-j` with one row, and pins zero of them for a `NodeList=None assigned`
+job (cancelled before it started -- an ordinary shape, not a contrived one). Its
+controls take the allocated path, which the guard cannot reach, so they hold either
+way.
+
+Two fixture mistakes worth recording, both mine, both caught by running it:
+`parse` reads raw `|` and only the fake runner's *output* carries `SAFE_DELIMITER`,
+so parsing the pre-encoded text yielded zero jobs; and the note is a COMPARISON
+("against 0.0% on every other node"), so a single-node fleet produces no note at all
+and the control that asserted the note was meaningless until a clean node was added.
+
+### Still open
+
+* The badge/untracked-files item, unchanged and not mine to close: the README states
+  the count of the suite that SHIPS (1969 at `HEAD`) and eight test files here are
+  untracked. Committing or deleting them closes it.
+
+## Round sixty-two — a test that asserted an exit code the report owns
+
+2169 tests, unchanged; all four gates clean. No source change: this fixes a test of
+mine that was going to go red on someone eventually, and did.
+
+`test_portability_round81.py::TestADroppedFlagIsReported` shells out to the real tool
+and asserted:
+
+```python
+rc, err = self._stderr("--no-logs", "--log-dir", "/tmp")
+assert "--log-dir has no effect with --no-logs" in err, err
+assert "/tmp" in err
+assert rc == 0, "a dropped flag is a warning, not a failure"
+```
+
+The first two hold. The third does not belong to flag handling at all: `cli.py:1438` is
+`return 1 if worst_critical else 0`, so **the exit code carries the report's verdict**.
+On a week whose history holds a critical finding the tool exits 1 having printed a
+perfectly good report -- which is the documented design, not a defect.
+
+So the test passed for weeks and then failed, with nothing in this package having
+changed. Measured while diagnosing it: 186 jobs in the default window, `rc=1` from
+`slurmpast --no-logs` with no other flags, the full report rendered correctly above it.
+
+### Two wrong turns worth recording, because both looked like answers
+
+1. **"It's the known flake."** It is not: the same case failed **3/3 in isolation**,
+   while the round81 cases that flake are the signal/terminal-restore ones. The tell was
+   that this test's name is about a flag message, not a terminal. A different test failing
+   in the same file is not evidence of the same cause.
+2. **"The tool exits 1 on a good report -- that's the bug."** My first probe piped to
+   `head -3`, which closes the pipe, so `rc=1` could have been EPIPE from my own probe.
+   Re-run without the pipe: still 1, and the reason is the verdict above. Neither the
+   tool nor the flag handling is at fault.
+
+### The fix
+
+The claim is "a dropped flag changed nothing", so the test now says that, against the
+same invocation without the dropped flag:
+
+```python
+baseline, _ = self._stderr("--no-logs")
+assert rc == baseline, (rc, baseline)
+```
+
+Immune to the caller's job history, and still has teeth: making the warning path
+`return 3` reddens this case and leaves the class's other three green -- including
+`test_either_flag_alone_is_silent`, which is that class's own control. (The first
+attempt at that neuter inserted a line by paren-walking and produced a `SyntaxError`,
+which failed all four in 0.57s instead of the usual 9s. A neuter that does not parse
+reads as teeth and is not; check that the file parses and that the timing is plausible.)
+
+### Still open
+
+Nothing new. The badge failure remains the expected one -- the README states the count
+of the suite that SHIPS (1969 at `HEAD`), and eight test files here are untracked.
+
+## Round sixty-one — the module that exists to stop drift did not say where nine of its own builders belong
+
+2161 tests before, **2169** after (+8 here); all four gates clean. One change, plus a
+badge reverted to the value the recorded rule asks for -- see the last section.
+
+`render.py` exists so the dashboard and `--plain` cannot drift: a fact is spelled
+once and both surfaces read that spelling. Whether that holds depends on a reader
+being able to tell a *deliberate* single-surface builder from one nobody wired up
+yet, and the only place that intent can live is the docstring.
+
+Measured, import-aware, across the forty-eight public functions:
+
+| reached by | count |
+| --- | --- |
+| both surfaces | 29 |
+| `--plain` only | 5 |
+| dashboard only | 8 |
+| neither (helpers called inside `render.py`, or by tests) | 6 |
+
+Round fifty-six's entry records that each single-surface builder's docstring says
+which surface it belongs to. **It did not.** Five public functions had no docstring
+at all -- `health_dot`, `state_text`, `severity_chip`, `sort_findings`,
+`register_alignment` -- and four more were documented but silent about surface:
+`hours_pair_text`, `severity_tag`, `nothing_matches`, `search_hint`. Nine of
+forty-eight. All nine now say it, and `tests/test_render_surface_disclosure.py`
+pins all three claims: no public function is bare, every single-surface builder
+names its surface, and the 29/5/8/6 split is frozen so a builder crossing surfaces
+is a decision rather than a diff nobody saw.
+
+### A hypothesis withdrawn, and the measurement that killed it
+
+The first explanation was structural and wrong: `report.py` neither imports nor
+constructs a rich `Text`, so "returns a `Text`" looked like it *forced*
+dashboard-only. But two of the six builders touching `Text` -- `bar` and
+`resource_rows` -- are in the both-surfaces set, and `report.py:330` shows why:
+
+```python
+prefix = bar(gauge, "", width=DETAIL_BAR_WIDTH, ascii_mode=ascii_mode, flat=True).plain
+```
+
+The plain renderer reads `.plain` off a `Text` wherever sharing is wanted. So no
+builder is dashboard-only *because* of its return type, and the docstrings now say
+the split is a pairing decision -- `severity_tag`/`severity_chip`,
+`hours_pair_text`/`hours_pair`, string half and coloured half -- which a future
+caller on the other side may revisit.
+
+### The trap in the checker, recorded because a first cut shipped it
+
+A first cut counted every `ast.Name` matching a builder and reported `bar_cells` as
+called by the dashboard. It is not: `tui.py:1795` has a **local variable** of that
+name, passed to `pair_value_budget(width, bar_cells=...)`, and nothing calls the
+builder outside `render.py`. Resolving each surface by how it actually imports --
+`tui.py` does `from . import render` and calls `render.X`; `report.py` does
+`from .render import (...)` and calls bare -- reproduces 29/5/8/6. `TestControls`
+pins that behaviour against planted synthetic source, so it measures the resolver
+rather than today's call graph, and holds whatever the docstrings say.
+
+### One thing checked and found already right
+
+`nothing_matches` explains an empty table and names the key that undoes it, and it
+is dashboard-only -- so: does `--plain` have the bare-header-over-blank-space
+failure it was written to prevent? `--plain` does filter (`-p`, `--failed`), but an
+empty result there never reaches a table. `cli.py:408` raises first and names both
+the filter and its value:
+
+```
+slurmpast: no jobs for youzhi since now-7days matching --partition nosuchpartition
+slurmpast: no demo jobs match partition nosuchpartition          # cli.py:355
+```
+
+No gap; the reason is now in the docstring instead of being rediscovered.
+
+### The badge, and why bumping it was the wrong instinct
+
+`test_the_test_badge_matches_the_suite` collects the **live** suite, so it fails in
+any working tree holding untracked tests -- eight of them here. The instinct was to
+bump the badge to the live count and turn it green. That is backwards, and measuring
+`HEAD` is what showed it:
+
+| | badge | suite collects |
+| --- | --- | --- |
+| `HEAD` (what ships, what CI runs) | 1969 | **1969** |
+| working tree before this round | 2034 | 2169 |
+
+CI is green because `HEAD` agrees with itself. The working tree's 2034 agreed with
+nothing -- neither the committed suite nor the live one -- and was drift from an
+earlier round. Setting it to 2169 would have been right only if every untracked test
+file were committed in the same commit as the README; three of them
+(`test_parse_cost.py`, `test_portability_round81.py`, `test_subprocess_text_mode.py`)
+have stayed untracked for many rounds.
+
+So the badge is back to **1969**, byte-identical to `HEAD`: the README ships with the
+package and states the count of the suite that ships with it. The local failure of
+this one test is the expected cost of that and is not a defect. **Whoever commits the
+untracked tests bumps the badge in the same commit**, to whatever the tree then
+collects (2169 today).
+
+### Still open
+
+Nothing new. The known flake class is unchanged and is not a defect in this package:
+`test_portability_round81.py`'s signal/terminal-restore cases fail intermittently
+under full-suite load -- confirmed this round by md5 (the file is untouched) and an
+isolated re-run, which reddened a *different* case in the same class while the two
+that failed in the full run passed.
+
+## Round sixty — an open item that had already been closed
+
+No code changed. 2034 tests before and after; all four gates clean. This round is a
+correction to the record, and the error was mine: round fifty-nine's Still-open list
+carried an item that round **fifty-five** had already fixed.
+
+### The item, and the proof it is closed
+
+Round fifty-nine listed, as untouched:
+
+> Round forty-eight's third item: one-sided p-values chosen after seeing the
+> direction, pooled into one BH family with the opposite direction's. A statistical
+> question, not a labelling one.
+
+Round fifty-five's own entry opens by saying it "closes the **oldest** item in the
+Still-open list: round **forty-seven's second**", and quotes that item verbatim:
+
+> **One-sided p-values chosen after seeing the direction**, pooled into one BH
+> family with the opposite direction's.
+
+Word for word the same item, attributed to a different round. Verified in the code
+rather than taken from the entry:
+
+* `nodes.selected_direction_p_value` exists (`nodes.py:292`) and is documented as
+  ":func:`node_p_value`, priced for a ``direction`` that was read off the data";
+* it is **wired** — `nodes.py:520` computes each row's `p_value` through it;
+* raw `node_p_value` is reached from exactly one place, `nodes.py:313`, which is
+  inside the priced wrapper and doubles the tail. No caller gets the unpriced value.
+
+So the deferral is spent and the entry was wrong to carry it. Corrected in place
+above with a pointer here.
+
+### Two things checked while verifying it, both clean
+
+* **The per-job note and the node table cannot disagree about the statistics.**
+  `note_for_allocation` does not compute its own p-value; it calls
+  `node_table(...)` and reads the row, which is what its docstring requires ("the
+  family the correction is applied over has to be the table, not a per-node slice
+  of it"). Pricing the direction therefore reached both surfaces at once.
+* **`--metric` not reaching the per-job note is not a drift.** The note hardcodes
+  `metric="failure"` while `--metric` defaults to `hang`, but `--metric`'s help says
+  "what **--nodes** measures", and each surface names the metric it used. Different
+  commands, each self-describing.
+
+### Still open
+
+* The note remains all but unreachable on `--plain` for a single job id, for round
+  forty-eight's reason: `-j` loads only the records asked for, and changing that is a
+  second `sacct` query.
+* The badge/untracked-files item: the local suite collects 2160 against a committed
+  2034, because `test_parse_cost.py`, `test_portability_round81.py` and
+  `test_subprocess_text_mode.py` are untracked. Committing or deleting them closes
+  it; flipping the badge reds CI.
+
+## Round fifty-nine — the sizing surface the dashboard said nothing about
+
+Two fixes, both from round fifty-seven's Still-open item ("The overview, the job
+list and `--sizing` still have no end-to-end routing test"). 2021 tests before,
+**2034** here; all four gates clean.
+
+### Working the item first CORRECTED it: two of its three are not gaps
+
+Measured, not argued:
+
+* The **overview** does have an end-to-end pairing —
+  `test_ui_usability.py::test_both_surfaces_say_the_same_thing` asserts the idle
+  clause is in `render_overview(...)` **and** in the dashboard's `summary_text`.
+* The **job list** has no shared sentence to route. `report.render_list` calls
+  exactly `cores_text`, `stamp_short` and `text_table` — all formatting. There is
+  nothing for a routing test to route.
+* **`--sizing` is the real one**, and its prose lives in `sizing.py`, which as an
+  analysis module may not import `render`; both front ends import `recommend` from
+  it, so the sentences are single-sourced. The fields that carry them are
+  `Advice.basis` and `Advice.caution`.
+
+Two measurement traps on the way, both of which first read as live defects:
+
+* An exact-substring comparison reported `caution` **missing from `--sizing` for 8
+  of 10** advices. It is not: `render_sizing` wraps to `_plain_width()`. Compared
+  on the words — this file's rule since round fifty-six — everything matched.
+* `Advice.observed` really is absent from both text surfaces, and that is correct:
+  it is the DATA behind `basis` (`1.9 GiB peak across 6 runs` against `the most any
+  run used was 1.9 GiB.`), not a second sentence. `--sizing --json` is where a
+  consumer reads the field. Pinned with the reason so a later sweep does not "fix"
+  it into both surfaces and say the same thing twice.
+
+### The finding: a `capped` workload appeared on NO screen
+
+`Advice.actionable` is `verdict in ("raise", "lower") and bool(suggestion)`, and the
+banner filtered on it — so a **`capped`** verdict was dropped from the dashboard
+entirely while `--sizing` gave it a flag line, its basis, and the caution that names
+the way out. `sizing.py:524` gives `capped` its own verdict for a stated reason:
+
+> Clamping alone turned "raise to 34" into "already about right", which is a
+> different wrong answer: the workload is using 27.9 of its 28 cores and would take
+> more.
+
+So the one surface that said nothing was the default one. Measured with the demo
+history against a pinned 2-core ceiling — three workloads capped, `--sizing` naming
+all three and the banner none:
+
+    midtrain  --cpus-per-task  --sizing: flag=True  caution=True  | dashboard: flag=False caution=False
+
+`--demo` pins `{"test": (48, …)}` and the demo's busiest workload uses 7.5 cores, so
+nothing is ever capped there — which is exactly why the branch had no coverage on
+either surface. My first probe read `history()` with **no** ceiling pinned at all,
+where `partition_ceiling` returns `(None, None)` and capping cannot happen; that
+looked like "unreachable" and was a wrong measurement, not a result.
+
+The fix is in two parts because the label is a sentence both surfaces now draw, and
+this repo's rule puts those in `render.py`: `render.capped_label()` owns
+`at this partition's ceiling`, `report` routes through it, and the banner includes
+capped items using it. The clamped `suggestion` is deliberately **not** rendered as
+`--cpus-per-task=2` on either surface — that reads as advice to shrink, which is the
+"different wrong answer" the verdict exists to avoid. `sizing.sbatch_lines` already
+filtered on `actionable`, so no pasteable line was ever emitted for one.
+
+Teeth, four neuters: dropping `caution` from the banner and dropping it from
+`--sizing` each redden only `test_the_caution_is_on_both` (so the pin guards both
+surfaces, not one); restoring the actionable-only filter reddens only
+`test_the_ceiling_line_is_on_both` with 8 controls passing; and re-spelling the label
+in `tui.py` reddens only `test_control_the_label_has_one_home`, which is what makes
+that control load-bearing.
+
+### Corrections to older records
+
+* **Round fifty-eight's Open item is CLOSED as unreachable.** It recorded
+  `format_rate_range(0.9996, 1.0)` reading `"100.0 – 100.0%"` as "the same defect one
+  helper over". Nothing can produce that pair: the ends come from
+  `nodes.wilson_interval(bad, trials)`, whose lower bound enters [99.95%, 100%) only
+  at **n ≳ 10,000 placements on one node** (n=5000 gives `99.9 – 100.0%`), and the
+  heaviest single node for a heavy user over 90 days on this cluster is **715
+  placements** out of 15,022 rows. Do not re-open without a placement count two
+  orders of magnitude larger.
+* The badge item's figures were stale in every round that carried them forward. The
+  local suite now collects **2147** against a committed **2034**; the three untracked
+  files are unchanged, and so is the conclusion (committing or deleting them closes
+  it; flipping the badge reds CI).
+
+### Still open
+
+* The note remains all but unreachable on `--plain` for a single job id, for round
+  forty-eight's reason: `-j` loads only the records asked for, and changing that is a
+  second `sacct` query.
+* ~~Round forty-eight's third item: one-sided p-values chosen after seeing the
+  direction.~~ **Stale when this list was written — round fifty-five closed it.**
+  See round sixty.
+* The badge/untracked-files item above.
+
+## Round fifty-eight — `format_percent` named a boundary it had not reached, and here the boundary is a claim
+
+One fix, in `duration.py`. 1995 tests before, **2021** here; all four gates clean.
+Found by the rule this module states about itself twice and this function did not
+follow: `format_bytes` says "the unit is chosen for the value as PRINTED, not as
+stored" and keeps `_ROUNDS_UP_AT` to enforce it, and round fifty-two fixed
+`format_duration` for exactly this (59.95s printing "60.0s"). `%.1f` flips to
+`100.0` at 99.95 and to `0.0` anywhere below 0.05.
+
+### Why a percentage boundary is worse than a byte one
+
+`1024.0 MiB` is a ladder failure a reader can still act on. Both ends of a
+percentage are read as statements about whether anything happened, and three
+callers put them next to a word that makes the claim explicit:
+
+    report.py:533   format_percent(stats["completion_rate"]) + " completed"
+    tui.py:1053     the same line on the dashboard
+    render.py:1393  format_percent(job.walltime_used)
+
+Measured rather than argued:
+
+    2000 jobs, 1 failure  -> rate 0.999500 -> "100.0% completed"
+    5000 jobs, 1 failure  -> rate 0.999800 -> "100.0% completed"
+   13051 jobs, 1 failure  -> rate 0.999923 -> "100.0% completed"
+
+2000 is where it starts, and 13,051 is the real parent-job count a 30-day window
+holds on this cluster — so this is the ordinary scale, not a corner. The tool whose
+job is to say what failed was telling the reader nothing had.
+
+The low end is the function's own docstring one step in. It already refuses `0%` for
+a missing reading ("printing ``0%`` for a failed read is indistinguishable from a
+real measurement of zero") and then printed `0.0%` for a real 0.0077% — one failure
+in 13,051 — so that one string meant "none" AND "some, but under a tenth". And
+`walltime_used` at 99.96% printed "100.0%" for a job that did not hit the wall,
+which is the distinction a TIMEOUT diagnosis turns on.
+
+### The fix, and why a bound rather than more precision
+
+An interior value now gets a BOUND: `<0.1%` and `>99.9%`. Printing `0.1%` for
+0.0077% would invent a factor of 13. The spelling is not new to this family —
+`rapidu.fmt` returns `<0.01x` and `nodetop.core.duration` returns `<1m` for the same
+"nonzero but below the resolution" case — so this is consistency, not a new
+convention. `>99.9%` is six characters, which is exactly the `MEM%` column width.
+
+**The exact boundaries still print as boundaries.** 0.0 is `0.0%` and 1.0 is
+`100.0%`, because those are true, and two tests already pinned them
+(`test_duration.py:140`, `:191`). Only the strictly interior band moves. Above 100%
+is untouched — MEM% legitimately reads `102.6%` for a job that exceeded its request
+— and so is anything negative. No existing test changed: the interior band was
+covered by nothing, which is how it survived.
+
+Teeth: with both branches removed, 10 tests redden (nine formatter cases and the
+end-to-end "100.0% completed" line) while all fifteen controls and the vacuity guard
+pass in both states — including `test_control_a_genuinely_all_completed_window_still
+_says_so`, so the fix demonstrably did not swallow the true case.
+
+### Open — the same defect one helper over, NOT fixed here
+
+`format_rate_range(0.9996, 1.0)` reads `"100.0 – 100.0%"`: an interval of
+[99.96%, 100%] presented as a degenerate one. It builds its own `"%.1f – %.1f%%"` and
+does not call `format_percent`, so this round could not reach it and deliberately did
+not extend into it — a range shows both ends, so it needs its own decision about
+whether `">99.9 – 100.0%"` reads better than widening the precision, and `ci_range`'s
+spelling is pinned in three places. Recorded rather than pinned:
+`test_percent_boundary.py` asserts only that the shared helper still answers, with a
+comment saying why the wrong string is not written into an assertion.
+
+### Numbers a reader might be depending on
+
+`--json` is unaffected (it carries fractions, not formatted strings). On the text
+surfaces, a completion rate in [99.95%, 100%) now reads `>99.9%` instead of
+`100.0%`, and a nonzero share below 0.05% reads `<0.1%` instead of `0.0%`.
+
+## Round fifty-seven — the exclude block's quiet branch, and a control that measured the runner's TMPDIR
+
+Two fixes, both in the test suite: nothing shipped in `src/` changed. 1993 tests
+before, **1995** here; all four gates clean. Round fifty-six's own record named the
+lead ("end-to-end routing tests existed for two screens of six"), and working it
+first produced a **correction to that framing**, which is recorded here because the
+wrong version of it would have bought three redundant assertions.
+
+### The cross-surface hunt came up clean, and that is the result
+
+Both surfaces were driven at every screen — overview, job list, workload, job,
+patterns, nodes — and their prose compared two ways: line-keyed on words (the
+round fifty-six rule), and again wrap-insensitively on 6-word shingles, since the
+dashboard wraps to its panel and `--plain` to `_plain_width()` and a line-keyed
+diff reads a different line break as a different sentence.
+
+**No drift was found.** Every apparent difference resolved to one of three things
+that are not drift, each already reasoned about in the code:
+
+* Chrome. The dashboard's title row and its key-binding footer; `--plain`'s caption.
+* The overview caption. `ordered by compute used (1 GPU-hour = 16 CPU-hours) · "#"
+  stands for a name's digits` is `--plain`-only on that screen, and the two facts
+  are under `?` on the dashboard — phrased for the medium, which is why a shingle
+  match does not find them and why looking only at the overview screen suggests a
+  gap that is not there. `report.py:619` states the arrangement outright.
+* The sort. `--plain` always names the ordering; the dashboard names it only when
+  it is not the default, and `tui.py:1008` gives the reason ("a bare 'everything'
+  is noise, and so is 'by resource use' on the default ordering"). `report.py:622`
+  cites the dashboard's behaviour as the correct one.
+
+Also checked and clean: the four public no-arg builders that neither front end
+calls (`mem_text`, `exit_pair_text`, `requeue_summary`, `register_alignment`) are
+each called from inside `render.py` by `job_sections`, so both surfaces do reach
+them — not dead code. And the job list's missing `NODE` column is `fit_columns`
+doing its job: `Column(label="NODE", drop=4)` appears at width 120 and above, and
+both surfaces drop in the same declared order.
+
+### The finding: only the FLAGGED half of the exclude block was drawn end to end
+
+`tests/test_tui.py::TestTheDashboardDrawsTheSharedSentences` covers the nodes
+screen when a node IS worse — disclaimer, correction note, workload control — and
+it has real teeth: with `render.nodes_exclude_disclaimer()` left called but its
+output replaced by `""` at `tui.py:2119`, that test reddens.
+
+Its `else` was not covered. `render.nodes_nothing_to_exclude()` — "no node is
+worse than the rest; nothing to exclude." — was asserted on `--plain` only
+(`test_audit.py:612`), and it is the branch a **healthy** cluster takes every
+time. Neutered the same way at `tui.py:2134`, four tests were consulted and three
+were content:
+
+    test_the_plain_renderer_emits_the_shared_sentences_verbatim   passed
+    test_no_sentence_is_written_out_in_both_front_ends            passed
+    TestTheDashboardDrawsTheSharedSentences                       passed
+    test_the_dashboard_draws_the_quiet_half_of_the_exclude_block  FAILED  (new)
+
+So a healthy fleet's verdict could have stopped reaching the dashboard with the
+suite green. The reader told nothing is wrong is exactly the one who cannot tell a
+clean verdict from a panel that failed to draw.
+
+The route is pinned with it. On a uniform fleet that branch is reached only under
+the **failure** metric and the nodes view opens on `hang`, so the test presses `m`
+— and asserts the sentence is *absent* before that press, so the key cannot become
+unnecessary and leave the assertion passing off the other branch. A second, cheaper
+pin came with the harness: `patterns_empty()` on a history of **zero** jobs, where
+every upstream count is 0, rather than on the demo's healthy subset the existing
+test uses.
+
+### The second fix: a control whose verdict depended on `$TMPDIR`
+
+`TestTheInferredLogHedgeIsOneSentenceInOneHue::
+test_the_other_half_of_the_same_branch_was_already_shared` compares
+`render.log_miss_detail(job)` across both surfaces. That sentence **embeds an
+absolute path**, and pytest builds `tmp_path` under `TMPDIR`, so the runner chooses
+its length. Under a ~100-character temp root the sentence reached 150 characters,
+the hardcoded 120-cell panel dropped its tail, and the control failed — while
+`--plain`, which wraps rather than clips, still passed. Measured both ways:
+
+    TMPDIR=/project/.../scratchpad/gate_slurmpast   1 failed
+    TMPDIR unset (/tmp)                             1 passed
+
+Clipping is correct — the docstring itself grants each surface its own prose width
+— so the defect is the assertion, which was measuring the temp directory. `_dashboard`
+now takes a `width`, and the call passes `max(120, len(detail) + 20)`. With the
+parameter reverted the split above returns exactly; with it in place both roots
+pass. No `src/` behaviour is involved, and this is the kind of failure that reaches
+a contributor as a mystery rather than as a bug.
+
+### Numbers a reader might be depending on
+
+None moved. Both fixes are tests; `src/` is byte-identical to round fifty-six, which
+was verified by md5 rather than asserted.
+
+## Round fifty-six — the log-line `if` was shared, the `elif` above it was written twice
+
+Two fixes, both in the seam `render.py` exists to close, found by asking the
+question the other way round: not "which sentences did we move to `render`?" but
+"which prose in `report.py` or `tui.py` is still written out there?". 1986 tests
+before, **1993** here; all four gates clean.
+
+### The coverage that was already there, measured
+
+`render.py` has 47 public builders after this round. Walking the call graph of both
+front ends over all of them gives this: **28 are called by both surfaces**; **13 by
+exactly one** — `ascii_fold`, `severity_tag`, `hours_pair_text`, `text_table`,
+`wrap_or_clip` on the plain side, `clip`, `health_dot`, `severity_chip`,
+`state_text`, `sort_findings`, `search_hint`, `nothing_matches`, `hours_pair` on the
+dashboard's, each single-surface by design and each docstring saying which
+(`ascii_fold`'s at length: "Deliberately NOT applied to the dashboard") — and **6
+by neither**, of which five are internal to `render` (`bar_cells`,
+`exit_pair_text`, `mem_text`, `requeue_summary`, `register_alignment`) and
+`table_floor` is read only by tests and comments.
+
+End-to-end routing tests existed for **two screens of six**:
+
+* `test_audit.py::TestTheTwoSurfacesCannotDriftApart::
+  test_the_plain_renderer_emits_the_shared_sentences_verbatim` — nodes, patterns.
+* `test_tui.py::TestTheDashboardDrawsTheSharedSentences` — nodes, patterns.
+
+The job screen, the overview, the job list and `--sizing` had no such test. What
+covered them instead was the source sweep, `test_no_sentence_is_written_out_in_both_
+front_ends`, and that is where the hole was.
+
+### 1. The hedge on a log matched by timing was maintained in two files
+
+`report.py:392` and `tui.py:1859`, before this round:
+
+```python
+# report.render_job
+note = "(matched by timing, not by name — verify before trusting it)"
+...
+out.append("  %s %s  %s" % (style("log", "grey"), log_path, style(note, "grey")))
+
+# tui.JobScreen.render_body
+body.append(
+    "       matched by timing, not by name — verify before trusting it\n",
+    style=theme.HEALTH_COLOR["warn"],
+)
+```
+
+One sentence, two files, no test on either copy — and it is the **`if` half of a
+two-branch decision whose `elif` was fixed and tested three rounds' worth of work
+ago**. `render.log_miss_detail` has owned the "no log found" line since round
+thirty-three, with a cross-surface test *and* a control
+(`test_portability.py:4401`). The branch immediately above it kept two copies. The
+comment on the fixed branch even says "the same one `--plain` prints --
+`render.log_miss_detail` holds the rule for both", eight lines under a line that
+did not.
+
+**It is the ordinary case, not a corner.** Over `sacct -u youzhi -S now-30days` on
+midway3 — 13,051 parent jobs — **469 resolve their log by timing rather than by
+name**, because the scripts that wrote them number their output (`report/<N>-train.out`)
+instead of naming the job. Every one of those 469 post-mortems draws this line.
+
+**The visible half of the drift is the hue.** `logs.find_log_by_time` states the
+stake in its own docstring — *"it is still an inference either way, so callers must
+label it as one: a wrong log invents a cause, which is worse than no log"* — and
+the dashboard drew the line in `HEALTH_COLOR["warn"]` accordingly. `--plain` drew
+it `grey`: the hue this module uses for bookkeeping, and the hue of the word `log`
+two cells to its left. The one sentence on the screen warning that the traceback
+below it may belong to a different job was the quietest thing on it, on the surface
+that gets pasted into tickets.
+
+Both surfaces, same job, same window, after the fix — job `53074942`, whose log
+`/home/youzhi/ArgonneAI/report/a4_pcanchor.out` carries neither its id nor its name:
+
+```
+$ COLUMNS=140 slurmpast 53074942 --plain -S now-30days
+  log /home/youzhi/ArgonneAI/report/a4_pcanchor.out  (matched by timing, not by name — verify before trusting it)
+
+$ COLUMNS=80 slurmpast 53074942 --plain -S now-30days
+  log /home/youzhi/ArgonneAI/report/a4_pcanchor.out
+      matched by timing, not by name — verify before trusting it
+```
+
+```
+# tui.JobScreen at the same id, through Textual's run_test(size=(140, 50))
+DASH 31|    log  /home/youzhi/ArgonneAI/report/a4_pcanchor.out
+DASH 32|         matched by timing, not by name — verify before trusting it
+```
+
+The fix is `render.log_inferred_note()` (`render.py:195`), called from
+`report.py:404` and `tui.py:1864`, and `--plain` now says it in the hue this module
+already spells the dashboard's warn as. The parentheses stay where the note rides
+on the path's line and come off where it gets a line of its own — that is layout,
+it is a distinction `report` was already making (`note.strip("()")`), and it is
+what keeps the aside legible with colour off. The only layout the dashboard has is
+the second one, and there the two surfaces are now byte-identical.
+
+### 2. The sweep that forbids exactly this could not see it
+
+`test_audit.py:505`, before:
+
+```python
+value = node.value.strip()
+if len(value) >= 25 and " " in value and "\n" not in value:
+    found.setdefault(value, []).append(node.lineno)
+```
+
+Three separate reasons that pair got through. It keyed on the **literal, byte for
+byte**, so `(matched by timing…)` and `matched by timing…` were two unrelated
+strings; it **skipped anything holding a newline**, which the dashboard's copy did;
+and its floor was **characters, not words**, which admits `"    %-17s %s %s   %s"`
+and excludes `"nothing to flag."`.
+
+The key is now the words — lowercased, punctuation and padding and line breaks
+discarded — past a floor of three of them. Below three the matches are `Column`
+keys (`WALL TIME`, `PEAK MEM`, `JOB NAME`), which legitimately appear in both front
+ends because they *are* the lookup into a spec `render` owns, and Slurm directives
+(`#SBATCH --exclude=`), which are what the reader types rather than something this
+package phrases.
+
+Turning it on named two more copies, both now routed rather than exempted:
+
+* `"nothing to flag."` — the whole findings block when `diagnose` returned none,
+  written out at `report.py:444` and `tui.py:1879` before this round (`report.py:464`,
+  `tui.py:1884` now). Now `render.NOTHING_TO_FLAG`.
+* `"ABOVE THE LIMIT"` — built by `render.job_sections` into the `peak (MaxRSS)`
+  value and then **searched for** by `report.render_job` and `tui.JobScreen` with
+  `"ABOVE THE LIMIT" in value`, to paint that row in the alarm hue. Three literals
+  in three files, and the one keeping the red on the row that says a job blew its
+  own memory ceiling. Nothing would have failed if `render` had rephrased its own
+  note; the row would simply have stopped being red on both surfaces at once,
+  silently. Now `render.OVER_LIMIT_MARK`.
+
+### The tests, and the controls
+
+`tests/test_audit.py:617`, `TestTheInferredLogHedgeIsOneSentenceInOneHue`, plus two
+new controls on the sweep in `TestTheTwoSurfacesCannotDriftApart`. Both surfaces are
+driven against one job whose log is reachable *only* by mtime — the fixture asserts
+`inferred is True` rather than assuming it, because a fixture that hands back a
+name match tests nothing.
+
+Failing before and passing after, verified by restoring the two hand-written copies
+and nothing else (3 failed, 7 passed):
+
+* `test_no_sentence_is_written_out_in_both_front_ends` — `duplicated between
+  report.py and tui.py: 'matched by timing not by name verify before trusting it'
+  (report.py:[404], tui.py:[1864])`.
+* `test_the_plain_hedge_is_in_the_warning_hue` — `'\x1b[90m' == '\x1b[33m'` fails.
+* `test_the_hedge_stays_shared_when_it_gets_its_own_line` — the same, at the width
+  that pushes the note onto its own line, so the fix is not width-dependent.
+
+Restoring only the two companion copies reds the same sweep with `duplicated
+between report.py and tui.py: 'above the limit' (report.py:[297], tui.py:[1813]);
+'nothing to flag' (report.py:[462], tui.py:[1884])`.
+
+**The expectation is not read out of the code under test.** "The warning hue" comes
+from the *overview's* idle clause: `report.render_overview` styles
+`render.idle_hours_note` one way and `tui.OverviewScreen` styles that same sentence
+`theme.HEALTH_COLOR["warn"]`, a pairing this codebase already makes and already
+tests (`test_ui_usability.py:1101`). The test reads the ANSI code off that rendered
+clause and requires the hedge to carry it. A test that had asked `report` which
+colour it passed would have passed in both states — this suite's recorded failure
+mode, three instances of it in rounds five, forty-seven and forty-eight.
+
+Controls, all green in both states:
+
+* `test_the_other_half_of_the_same_branch_was_already_shared` — the control on the
+  harness itself. `render.log_miss_detail` is the `elif` three lines below the
+  hedge, single-sourced since round thirty-three, and driving both surfaces at one
+  job shows it agreeing. If this one ever reddens the finding is the harness, not
+  the hedge.
+* `test_the_label_beside_it_is_still_bookkeeping` — the control against
+  over-correcting. `log` and the path are chrome; painting the whole line the
+  warning hue would say the *path* is suspect rather than the match. Pinned via the
+  label plus its reset, so the needle cannot pin the colour it is asserting about.
+* `test_the_sweep_still_catches_a_copy_it_used_to_miss` — the non-vacuity control,
+  fed the exact pair of spellings that sat in the two front ends rather than
+  whatever the package holds today. Under the old byte-for-byte key it reds with
+  the two spellings printed side by side, while
+  `test_no_sentence_is_written_out_in_both_front_ends` sat **green over the
+  duplicate**: that is the blindness, demonstrated rather than asserted.
+* `test_the_sweep_ignores_a_column_key_both_specs_look_up` — the other side of it.
+  Widening the sweep must not make it fire on the `Column` labels, so lowering
+  `_MIN_WORDS` has to break a test rather than a screen.
+* `test_both_surfaces_print_the_shared_hedge` — green before the fix too, and worth
+  saying why: the two copies **happened to agree** on the words. The defect was the
+  two copies, not a disagreement that had already occurred, and this is the guard
+  that the next edit to one of them cannot be the disagreement.
+
+### What a user reading old output should know
+
+Nothing that was printed was false. The hedge said the same thing on both surfaces;
+`--plain` said it in the hue it uses for a footnote. If you have been reading
+post-mortems in `--plain` on a cluster whose scripts do not put the job id in the
+log filename, the line telling you the log below might not be this job's was
+styled as chrome — it is now styled as the warning it is, and it is one string in
+one place.
+
+### Examined and found clean — not changed
+
+* **The overview's count sentence.** `report.py:508` builds
+  `"%d job%s in %d workload%s · %s completed"` in one `%`-format; `tui.py:1045-1053`
+  builds the same words in four styled `text.append` calls. Not routed through
+  `render`, and it cannot be without giving up the per-segment styling the dashboard
+  needs. The two agree today on every word, every plural guard and every source
+  figure, each file's comment points at the other, and no segment reaches three
+  words — so the sweep does not see it either. Left as it is, and named here so the
+  next round does not have to re-derive it.
+* **`--sizing` versus the workload screen's "next run" banner.** Both draw
+  `sizing.recommend`, and they present it differently on purpose: a flag/verdict
+  table in `--plain`, a paste-ready `--mem=72G` on the dashboard, which
+  `tui.py:1552`'s comment records as a deliberate change. Basis and caution now
+  reach both. Not a drift.
+* **The job-list qualifiers** (`"%d of them never computed"`, `"%d cancelled"`,
+  `"%d unterminated, excluded"`), the excluded-record counts, the footprint note and
+  the unclassified note. All single-surface: `render_list` is a bare table by design
+  and `--plain` carries these on the overview instead. One stale comment,
+  `tui.py:1064`, says "the exclusion count is on the workload screen" — the
+  dashboard's workload screen shows `group.excluded` only, not the three-way
+  breakdown. Wording, not behaviour; left alone.
+* **`tui.py:1815`'s third value branch**, `elif "not recorded" in value: FAINT`.
+  `report` has no equivalent because it has no faint. Two words, below the sweep's
+  floor, and a per-surface styling choice rather than a sentence.
+
+### Still open
+
+* The note is all but unreachable on `--plain` for a single job id, for round
+  forty-eight's reason: `-j` loads only the records asked for and changing that is a
+  second `sacct` query. Untouched here. (Round forty-nine's fix means the note *is*
+  drawn when the window is given — `slurmpast 53363721_35 --plain --no-logs -S
+  now-90days` prints `midway3-0250 failed 32 of 33 placements there (97.0%, 95% CI
+  84.7 – 99.5%) against 1.0% …` — so what is open is the bare `slurmpast <id>` case.)
+* The local suite collects 2120 against a badge of 1993 because
+  `test_parse_cost.py`, `test_portability_round81.py` and
+  `test_subprocess_text_mode.py` are untracked (127 tests).
+  `test_layout.py::TestTheReadmeAndItsAssetsAgree::test_the_test_badge_matches_the_suite`
+  fails locally and passes on CI; committing or deleting those three files closes
+  it, flipping the badge would red CI. Unchanged from round fifty-three's note.
+* **The overview, the job list and `--sizing` still have no end-to-end routing
+  test.** The job screen has one now. What guards the other three is the source
+  sweep, which is stronger than it was but is still a sweep — it can prove no
+  sentence is written twice, not that what reaches each screen is the shared one.
+
+## Round fifty-five — the direction was read off the data, and the p-value never paid for it
+
+One fix, and it closes the **oldest** item in the Still-open list: round
+forty-seven's second, carried unchanged through rounds forty-eight to fifty-four,
+each of which recorded it and declined it as "a statistical question, not a
+labelling one". 1980 tests before, **1986** here; all four gates clean.
+
+### The item, and why the argument for it had gone stale
+
+Round forty-seven wrote it down with its own reason for leaving it:
+
+> **One-sided p-values chosen after seeing the direction**, pooled into one BH
+> family with the opposite direction's. Each row's `p` is effectively a two-sided
+> p halved. The docstring records a null simulation putting the realised rate at
+> 2.4–2.8% against a 5% target, so the slack absorbs it; noted because the
+> argument for it is empirical rather than structural, and nothing re-measures it.
+
+That is an honest deferral and it names its own weak point. "Nothing re-measures
+it" turned out to be the whole of the defect, because **the simulation it leans on
+measured half the family.** `nodes.py:513` picks the direction from the row's own
+rate:
+
+```python
+            direction = "worse" if rate > comparison else "better"
+```
+
+and the docstring's 2.7% / 2.8% / 2.4% came from `tests/test_nodes.py`'s
+`_null_tables`, which counted `suggest_exclude(...)` — the `worse` rows only. A
+`better` verdict is a claim off the same table, corrected in the same `_bh_reject`
+pass, printed in the same column and read by the same person. Counting one half and
+quoting the number against `FDR_ALPHA` compares a half-family rate to a
+whole-family promise, and the missing half is the same size as the one that was
+counted. So the slack that "absorbs it" was measurement error.
+
+### 1. What it costs, on a null
+
+Re-measured with `_null_tables`' own construction — every node sharing one true
+rate, jobs built directly, `workload="w"` — but counting a table as flagged when it
+reaches **any** verdict rather than only when it offers one to `--exclude`. 4,000
+tables a cell:
+
+```
+per node   rate    nodes    tail in the won direction    priced for the direction
+30         0.20    10        4.8%                         2.5%
+30         0.20    20        4.5%                         2.4%
+30         0.20    40        4.7%                         1.2%
+30         0.35    20        5.5%                         2.7%
+50         0.35    20        6.5%                         3.2%
+100        0.35    20        7.8%                         3.7%
+100        0.50    20        8.0%                         3.8%
+200        0.50    20        8.2%                         4.4%
+```
+
+The `worse`-only column reproduced the docstring: 3.5% / 2.7% / 2.7% at 10 / 20 /
+40 nodes against its 2.7% / 2.8% / 2.4%, so the harness agrees with the one round
+forty-seven ran. Whole-family, the same three cells are 4.8% / 4.5% / 4.7% — under
+the 5% target, and **that is the only block where it is.** Give a node more
+evidence than 30 placements, or a rate nearer 0.5 where Fisher's 2x2 is least
+discrete, and it converges on 8.2% — twice the target, which is exactly what a
+one-sided test at nominal 5% run in a direction picked from the data is worth.
+
+So the deferral's premise was right about the mechanism ("effectively a two-sided
+p halved") and wrong about the consequence: the slack does not absorb it, it hides
+it at one particular sample size. FDR_ALPHA's own comment calls the family "the
+table", so this is the code drifting from a rule it states about itself.
+
+Priced, the same grid runs 1.2% – 4.4%, inside the promise across all eight cells
+and rising toward it rather than collapsing away from it — the sign of a bound that
+is being spent rather than over-paid.
+
+The power cost, measured the same way on the docstring's own case (one node at 0.55
+against 0.20 elsewhere, 20 nodes, 1,500 tables): 55% / 82% / 98% at 20 / 30 / 50
+placements a node, against 65% / 87% / 99% unpriced. The unpriced figures reproduce
+the docstring's 63% / 87% / 98%. The loss is 10 points at 20 placements, 5 at 30
+and half a point at 50 — concentrated where the evidence is thin, which is where
+this module already says it wants to hold back.
+
+### 2. What it changes on real data
+
+The owner's own history, one `Sacct().history(user="youzhi", since="now-90days")`
+fetch: 15,025 records parsed, 15,019 usable, 1,258 workload folds. Both surfaces
+rendered twice off that **one** fetch rather than by two CLI runs, because the
+cluster is live and a first attempt at the diff drifted by a placement mid-capture
+(`15027` → `15028`, and `midway3-0168` from 2/38 to 2/39) — noise that has nothing
+to do with the fix.
+
+**The workload-controlled views — the default, and what this module is for — are
+byte-identical.** No node stops or starts being named, on either metric:
+
+```
+=== hang_controlled       IDENTICAL
+=== failure_controlled    IDENTICAL
+```
+
+That is not luck, and the reason is worth recording because it bounds who ever saw
+this: held to one workload, this window tests 34 nodes at a median of 20 placements
+and a maximum of 80 (`--metric failure`: 104 rows, median 15, max 65). Not one row
+in either reaches 100. That is squarely inside the protected block of the table
+above — the fix lands in the regime where the unpriced test was already passing.
+
+`--all-workloads`, the view the CLI's own `--help` calls "(confounded)", is the
+other regime: 308 rows, 26 of them past 100 placements and the busiest at 713.
+Three verdicts are withdrawn there, and nothing is added:
+
+```
+=== --all-workloads --metric hang
+-   midway3-0602            13/161     8.1%        4.8 - 13.3% worse
++   midway3-0602            13/161     8.1%        4.8 - 13.3% inconclusive
+-   midway3-0386             3/448     0.7%         0.2 - 2.0% better
++   midway3-0386             3/448     0.7%         0.2 - 2.0% inconclusive
+-     #SBATCH --exclude=midway3-[0056,0116,0250,0385,0600-0602]
++     #SBATCH --exclude=midway3-[0056,0116,0250,0385,0600-0601]
+-   20 intervals clear the baseline on their own - but about one in twenty ...
++   22 intervals clear the baseline on their own - but about one in twenty ...
+
+=== --all-workloads --metric failure
+-   midway3-0235             2/183     1.1%         0.3 - 3.9% better
++   midway3-0235             2/183     1.1%         0.3 - 3.9% inconclusive
+-   18 intervals clear the baseline on their own - but about one in twenty ...
++   19 intervals clear the baseline on their own - but about one in twenty ...
+```
+
+**`midway3-0602` comes off an `--exclude` line a user pastes into a submission
+script**, and its p moved 0.000973 → 0.001947 against a BH step it had cleared by a
+factor of two. `midway3-0386` (0.000696 → 0.001393) and `midway3-0235` (0.002558 →
+0.005116) lose `better`. Those are the changes the owner sees, and they are the
+whole of them. The two withdrawn rows in the `hang` view then show up in
+`held_back` (20 → 22, and 18 → 19 for `failure`) — round forty-eight's machinery
+picking them up unprompted, so a row now reading `inconclusive` beside an interval
+clear of the baseline is still explained on the screen rather than looking like a
+contradiction.
+
+### The fix
+
+`src/slurmpast/nodes.py:292` — `selected_direction_p_value`, called at
+`nodes.py:520` in `node_table`, replacing the raw `node_p_value` on the line under
+the `direction = "worse" if rate > comparison else "better"` that creates the debt.
+It returns `min(1.0, 2.0 * node_p_value(...))`.
+
+Three choices inside that, each of which could have gone the other way:
+
+* **Doubling, not a two-sided Fisher tail.** Both are defensible and the null sweep
+  was what decided it: for the lopsided 2x2 tables this module actually sees — 3 of
+  448, 2 of 183 — the two-sided tail is the *smaller* of the two and so the weaker
+  guarantee. Doubling is also the entire arithmetic, which is worth something for a
+  number that decides what goes on an `--exclude` line.
+* **`node_p_value` is left alone.** It stays the plain one-sided tail. It is
+  cross-checked against `scipy.stats.fisher_exact` over 5,986 comparisons (round
+  thirty-three, max difference 7.7e-13) and against a hand-computed 10/510, and a
+  caller that names its direction in advance owes nothing. The charge belongs at
+  the one site that picks a direction it did not commit to in advance.
+* **The verdict still needs the Wilson interval too.** Unchanged — BH bounds how
+  often the table invents a node, the interval keeps the verdict consistent with
+  the CI printed beside it, and intersecting with the priced BH cannot add false
+  rejections, so the bound survives it.
+
+The module docstring now carries the whole-family sweep, the corrected power
+figures, and — because "nothing re-measures it" is how this stayed open for seven
+rounds — which regime a real table falls in and therefore which screens move.
+
+### The test, and the control
+
+`tests/test_nodes.py:1495`, `TestTheDirectionIsPricedBecauseTheDataChoseIt`.
+
+Two teeth, both failing before and passing after (verified by reverting only
+`nodes.py:520` to `node_p_value` and leaving everything else in place: 2 failed, 4
+passed):
+
+* `test_the_row_carries_twice_the_tail_the_data_picked` — 1 failure in 10
+  placements beside 0 in 500. The one-sided tail there is exactly 10/510, so the
+  row must carry 20/510. Neutered: `0.0196078 != 0.0392157`.
+* `test_a_better_verdict_that_only_restated_the_bad_node_is_withdrawn` — one node
+  failing 6 of 10 beside two that went 0 for 20. All three rows are one fact: every
+  failure in the leave-one-out rate the clean nodes are measured against is the
+  first node's, so "these two are better than the fleet" is "that one is worse"
+  said twice more. Unpriced, both clean rows cleared BH's loosest step at 0.0373
+  and were published as `better`. Neutered: `0.0373662 != 0.0747324`.
+
+Both expectations are hand-computed hypergeometrics written out as arithmetic, not
+read back from the function under test — 10/510, and
+`(30*29*28*27*26*25)/(50*49*48*47*46*45)` for the single-term tail of 0 marked in a
+20-draw from 50 placements holding 6. This suite's recorded failure mode is a test
+that pins the buggy value (rounds five, forty-seven, forty-eight found three), and
+a test that had asked the code what the tail was would have passed in both states.
+
+Four controls, all passing in both states:
+
+* `test_the_node_the_evidence_is_actually_about_keeps_its_verdict` — the important
+  one, and deliberately in the *same table* as the second tooth: `node000` is
+  `worse` either way and stays the whole of `suggest_exclude`. The fix withdraws
+  the rows that were handing one node's failures back as two other nodes' virtue.
+  It does not withdraw the node.
+* `test_the_tail_itself_is_untouched_and_still_one_sided` — pins *where* the charge
+  lives. Folding the factor of two into `node_p_value` would make every other test
+  in the class pass while breaking the scipy cross-check and the hand-computed
+  10/510.
+* `test_a_certainty_stays_a_certainty` — 19 of 36 hangs against 12 of 218 on
+  identical work, the signal this module exists for, is 2.5e-11 and eleven orders
+  of magnitude clear of the line; and the `min(1.0, ...)` cap keeps the priced
+  value a p-value.
+* `test_the_whole_family_and_not_just_the_exclude_line_stays_flat` — closes the
+  measurement gap itself. `_null_tables` grew a `verdict` argument; the default is
+  the old `suggest_exclude` count, so the three existing null tests are unchanged,
+  and `verdict="any"` is what `FDR_ALPHA` is actually a promise about.
+
+### What a user reading old output should know
+
+A `--nodes` table published before this round used a p-value worth about half what
+it claimed for every row that reached a verdict. On the workload-controlled screens
+that changes nothing at this cluster's sample sizes — verified byte-for-byte above.
+On `--all-workloads` it means a table with 25-plus rows past 100 placements was
+offering some verdict on roughly 8% of null tables rather than 5%, and three
+verdicts in the owner's own 90-day window do not survive the correction, one of
+them a node that was on the exclude line.
+
+### Still open
+
+**Round forty-seven's Still-open list is now empty.** Its first item — the note's
+denominator called "your N jobs" — was settled by round forty-eight, which moved
+the noun to `placements` and wrote the docstring for why; its second is this round.
+What remains open is inherited from later rounds:
+
+* The note is all but unreachable on `--plain` for a single job id, for round
+  forty-eight's reason: `-j` loads only the records asked for and changing that is
+  a second `sacct` query. Untouched here.
+* The local suite still collects 2113 against a badge of 1986 because
+  `test_parse_cost.py`, `test_portability_round81.py` and
+  `test_subprocess_text_mode.py` are untracked (127 tests). `test_layout.py::
+  TestTheReadmeAndItsAssetsAgree::test_the_test_badge_matches_the_suite` fails
+  locally and passes on CI; committing or deleting those three files closes it,
+  flipping the badge would red CI. Unchanged from round fifty-three's note.
+
+## Round fifty-four — the note named one job for a finding pooled across 154
+
+One fix, closing the second of round **forty-eight**'s Still-open items. 1974 tests
+before, **1980** here; all four gates clean.
+
+### Round forty-eight could not reproduce it. It reproduces.
+
+That round recorded the symptom and declined:
+
+> **The note labels the stratum with the raw job name, the nodes screen with the
+> folded one.** ... Both *match* on the fold, so the counts agree, and no
+> misattribution is reachable on this history: all 403 jobs in that fold carry the
+> one raw name. Recorded rather than fixed because it could not be reproduced as a
+> wrong count, only as two labels.
+
+The fold it looked at was degenerate. Swept across the whole 90-day history
+(15,025 usable jobs, 1,258 folds), **92 folds hold more than one raw name**:
+
+```
+  fold            distinct raw names   jobs
+  exp-n#                     154        157
+  caai-p#a                    96        127
+  exp-a#-n#                   87         87
+  caai-p#b                    64         77
+  caai-p#c                    36         46
+```
+
+`cli._node_note` and the dashboard both build `Workload(job.name, job.user)` — one
+job's RAW name — while `Workload.matches` normalises before comparing, so
+`node_table` pools the whole fold. Measured directly: for a job named `exp-n89`,
+`matches` selected **157 jobs spanning 154 distinct names**, and the sentence
+labelled that finding "for exp-n89". The count was never wrong. The attribution
+was, and a reader would fairly take the finding to be about their `exp-n89` run.
+
+### The rule was already written down
+
+`patterns.fold_erased_the_name` describes itself as "only a *display* rule ...
+callers use this to decide whether the key is fit to be read aloud", and
+`dominant_workload` applies it — which is why the nodes screen says "only exp-n#
+counted". The note applied no display rule at all. `_stratum_label` now does, in
+`note_for_allocation` and `note_for_node`, so both front ends get it from the one
+place they already share.
+
+Label only: the `workload` handed to `node_table` is untouched, and a control runs
+the table with the raw name and with the fold and asserts identical `trials`,
+`hits`, rows and verdicts — the premise `dominant_workload` states for its own
+substitution, checked rather than trusted.
+
+### What I got wrong first, and the test that caught it
+
+The first version folded unconditionally, and broke two of `test_nodes.py`'s
+assertions by turning `caai-p10b_scan` into `caai-p#b_scan`. Those tests were
+right to object: that fold pools a single name, so folding traded a true, specific
+label for a true, vaguer one — a pattern the reader never typed. **1,166 of the
+1,258 folds are that shape**, so it is the common case, not the exception. The
+label now folds only where the stratum genuinely spans more than one name, and a
+control pins the single-name-with-digits case that exposed it.
+
+The all-digit fallback is unchanged and also pinned: `20260821` folds to `#`,
+which names nothing, so the raw name stays — the same fallback `dominant_workload`
+reaches for with `newest_name`.
+
+### Still open
+
+* Round forty-eight's third item is untouched: **one-sided p-values chosen after
+  seeing the direction**, pooled into one BH family with the opposite direction's.
+  That is a statistical question, not a labelling one.
+* The note remains all but unreachable on `--plain` for a single job id, for the
+  reason round forty-eight gave: `-j` loads only the records asked for, and
+  changing that is a second `sacct` query.
+
+## Round fifty-three — one interval, three spellings, and the third option round forty-eight missed
+
+One fix, and it closes the oldest item in the Still-open list -- round **forty-eight**'s,
+not round fifty's. 1969 tests before, **1974** here; all four gates clean.
+
+### The item, and why it sat open
+
+Round forty-eight recorded it exactly:
+
+> **The interval in the note is hyphenated where the table's is an en dash.**
+> `nodes.py:728` writes `95% CI 84.7-99.5%` by hand while `render.ci_range` — which
+> exists *because* "a hyphen and an en dash stood in the same cell depending on which
+> one you were looking at" — renders the same two numbers as `84.7 – 99.5%`.
+
+It then declined, and the reasoning is worth quoting because it is where the round went
+wrong: *"the choices are to duplicate the format (re-creating exactly the drift `ci_range`
+prevents) or to move the sentence out, which is the four-file change described above."*
+
+Both options are bad, and the framing is a false binary. There is a third: **put the rule
+where both callers can reach it.** `nodes` may not import `render` -- that is the
+architectural rule, and it is why the note had its own spelling -- but `duration` imports
+nothing outside the standard library, `render` **already** imports from it, and `nodes` may
+import it too. So `duration.format_rate_range` now owns the format, `render.ci_range`
+delegates to it, and the note calls it. One home, two callers, no architecture violation,
+and no four-file change.
+
+### Rendered, on both surfaces and in both modes
+
+```
+                 normal                          --ascii
+  note    95% CI 84.7 – 99.5%             95% CI 84.7 - 99.5%
+  table          24.6 – 57.7%                    24.6 - 57.7%
+```
+
+The en dash is safe in the note for the same reason it is safe in the table:
+`render.ascii_fold` maps it to a hyphen, and `report._fold` applies that **once per view
+over the finished text** -- "the flag has to reach the sentences as well as the glyphs",
+as its own docstring puts it. Verified by rendering job 53363721_35 both ways rather than
+by reading the fold path.
+
+Three existing tests pinned the old hyphen incidentally -- round forty-seven's
+`test_only_the_noun_moved` control, `test_the_denominator_is_not_presented_as_the_readers_job_count`,
+and round fifty-one's `test_control_b_every_figure_the_sentence_already_carried_is_unchanged`.
+Each one's subject is a different claim (no figure moved, the denominator's noun, the
+figures unchanged) and none was about the separator, so all three keep their subject with
+the new spelling. A control in the new file asserts every figure is still present, read off
+`node_table` rather than off the sentence.
+
+One control is architectural rather than behavioural: it parses `duration.py` and asserts
+it imports nothing outside the standard library. That property is the entire reason this
+fix is legal, and if `duration` ever grows a `rich` import the fix silently becomes a
+violation -- so it is pinned rather than trusted.
+
+### Note on the README badge
+
+The badge is **1974**, the count of the tree that ships. The working tree here collects
+2101 because three test files from earlier rounds (`test_parse_cost.py`,
+`test_portability_round81.py`, `test_subprocess_text_mode.py`) are untracked, so
+`test_the_test_badge_matches_the_suite` fails locally and passes on CI. That is the correct
+way round -- the README is published with the package -- but it means a local full-suite run
+shows one failure that CI will not. Committing or deleting those three files is what closes
+the gap; flipping the badge to 2101 would red CI instead.
+
+### Still open
+
+* The remaining round forty-eight items are unchanged: the stratum label (raw job name in
+  the note, folded name on the nodes screen) and the one-sided p-values pooled into one BH
+  family. Neither is cosmetic and neither is touched here.
+
 ## Round fifty-two — `format_duration` named a boundary in the unit below it
 
 One fix, found by comparing this tool's formatters against the four sibling
@@ -2827,7 +5291,8 @@ severity"), so the precedent for leaving the sentence alone exists; the decision
 the maintainer's.
 
 **B. `patterns.py:361` — "Stop resubmitting" is said to workloads that were
-submitted once.** Every element of a job array is its own record with its own
+submitted once.** *(FIXED in round eighty-one — the wording only; the counts and the
+grouping are unchanged.)* Every element of a job array is its own record with its own
 `JobID`, and `group_key` folds them into one workload, so array fan-out counts as
 repetition. On the real history:
 
@@ -2855,7 +5320,8 @@ master-id count — available, `job_id.split("_")[0]` — threaded into the evid
 say the true thing instead.
 
 **C. `patterns.py:113` — `newest_name`'s docstring describes a tie-break
-`build_groups` does not have.** It says a group's members are ordered "start,
+`build_groups` does not have.** *(FIXED in round eighty-one — the docstring was the
+wrong half, as this entry said.)* It says a group's members are ordered "start,
 falling back to submit — with `numeric_job_id` breaking the tie";
 `index.py:198` is `members.sort(key=lambda j: _stamp(j), reverse=True)`, with no
 second key. Ties are the ordinary case for an array, whose tasks share a Submit.

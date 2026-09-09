@@ -17,9 +17,9 @@ import pytest
 
 pytest.importorskip("textual")
 
-from slurmpast import render, tui  # noqa: E402
-from slurmpast.demo import history  # noqa: E402
-from slurmpast.index import History, sort_label  # noqa: E402
+from slurmpast import render, tui
+from slurmpast.demo import history
+from slurmpast.index import History, sort_label
 
 
 def make_app(jobs, **kw):

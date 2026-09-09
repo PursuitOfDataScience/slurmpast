@@ -554,6 +554,48 @@ class History:
             return (idle, total)
         return None
 
+    @property
+    def idle_workload(self) -> tuple[GroupStats, float] | None:
+        """The workload whose flagged runs held the most GPU-hours, when material.
+
+        The overview's FLAGGED column counts *runs*, and a run count says nothing
+        about what the runs cost: twenty runs at four flagged is the same cell
+        whether those four died in their first minute or each held a card for
+        forty hours. ``GroupStats.wasted_gpu_hours`` is the second figure --
+        summed on every ``build_groups`` walk since the first commit and, until
+        this, read by nothing -- so both cases rendered byte for byte the same on
+        every surface, in the table, in ``--overview --json`` and in ``cost``,
+        which is what the list is ranked by. Two histories differing only in that
+        dimension (2 idle GPU-hours against 90, everything else held equal) came
+        out identical.
+
+        Which matters because idle GPU-hours are what this module already calls
+        the central finding: :attr:`idle_gpu_hours` reports them for the whole
+        window, and the reader's next question -- *which workload* -- was
+        computed per group and thrown away.
+
+        Picked by the ABSOLUTE figure, so "the most" is true, and only then
+        gated: without that, a two-hour workload wasting one of them outranks a
+        900-hour one wasting eighty, and the sentence would name the wrong
+        workload while claiming to name the worst.
+
+        The gate is the pair :attr:`idle_gpu_hours` uses, read against the
+        workload's own GPU-hours because that is the denominator the sentence
+        prints. None means "do not mention it" -- the same restraint, for the
+        same reason: a headline that fires at every magnitude is noise. A
+        CPU-only history is silent by construction, every group's figure being
+        zero.
+        """
+        if not self.groups:
+            return None
+        worst = max(self.groups, key=lambda g: g.wasted_gpu_hours)
+        wasted, total = worst.wasted_gpu_hours, worst.gpu_hours
+        if not wasted or not total:
+            return None
+        if wasted / total >= IDLE_SHARE_WORTH_NAMING or wasted >= IDLE_HOURS_WORTH_NAMING:
+            return (worst, wasted)
+        return None
+
     def tail_summary(self, shown: int | None, ordered=None) -> str:
         """What sits below the fold, so truncation is never silent.
 

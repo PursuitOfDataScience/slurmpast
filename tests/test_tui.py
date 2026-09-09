@@ -10,7 +10,7 @@ import pytest
 
 pytest.importorskip("textual")
 
-from slurmpast import theme, tui  # noqa: E402
+from slurmpast import theme, tui
 
 
 def make_app(jobs, **kwargs):

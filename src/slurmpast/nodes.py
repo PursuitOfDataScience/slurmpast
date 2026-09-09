@@ -30,16 +30,52 @@ that it is *flat*: raising ``Z`` to 2.576 instead only slows the growth, from
 13.5% / 21.3% / 33.8% across the same three table sizes -- a wider interval
 treats the symptom, and the cause is the number of tests.
 
+Those three figures counted only the ``worse`` half, because they were measured
+off ``--exclude``. The family is both halves -- a ``better`` verdict is a claim
+from the same table, corrected in the same pass -- and the direction each row is
+tested in is *read off that row's own rate*. A tail taken in the winning direction
+prices one look when two were available, so the row's p-value came out about half
+what the selection was worth, and the table's real rate of offering an innocent
+node some verdict ran at roughly twice the ``worse``-only figure. Re-measured on
+the same null, as the share of tables reaching **any** verdict:
+
+    per node   rate    nodes    tail in the       priced for the
+                                won direction     direction (now)
+    30         0.20    10        4.8%              2.5%
+    30         0.20    20        4.5%              2.4%
+    30         0.20    40        4.7%              1.2%
+    30         0.35    20        5.5%              2.7%
+    50         0.35    20        6.5%              3.2%
+    100        0.35    20        7.8%              3.7%
+    100        0.50    20        8.0%              3.8%
+    200        0.50    20        8.2%              4.4%
+
+The left column is the promise in FDR_ALPHA and holds only in the top block, where
+Fisher's discreteness at 30 placements is doing the work rather than the
+correction; give each node more evidence than that and it converges on twice the
+target. So the direction costs a factor of two, applied where it is chosen --
+:func:`selected_direction_p_value`.
+
+Which regime a real table is in is worth knowing, because it says who sees this.
+Held to one workload -- the default, and the whole point of this module -- a
+90-day window here tests 34 nodes at a median of 20 placements and a maximum of
+80, squarely in the protected block: the workload-controlled screens do not move
+by a character. It is ``--all-workloads``, the confounded view, that pools 15,019
+runs across 1,258 folds onto 308 rows with 26 of them past 100 placements and the
+busiest at 713 -- and that is the view where pricing the direction withdrew three
+verdicts, one of them off an ``--exclude`` line.
+
 The cost is power against one truly bad node (0.55 against 0.20 elsewhere, 20
-nodes): 63% at 20 placements per node, 87% at 30, 98% at 50. It is concentrated
-where evidence is thin, which is where this module already says it wants to hold
-back.
+nodes): 55% at 20 placements per node, 82% at 30, 98% at 50, against 65% / 87% /
+99% for the unpriced tail. It is concentrated where evidence is thin, which is
+where this module already says it wants to hold back.
 """
 
 import math
 import re
 
 from .diagnose import looks_like_noop
+from .duration import format_rate_range
 from .patterns import fold_erased_the_name, newest_name, normalize_name, usable
 
 MIN_SAMPLES = 10
@@ -62,6 +98,22 @@ Z = 1.96  # 95%, and the interval the table displays stays a plain 95% interval
 # the user reads every row at once and pastes whatever tripped into --exclude, so
 # the family is the table.
 FDR_ALPHA = 0.05
+
+# The confidence level `Z` is the two-sided critical value for, DERIVED rather than
+# written down a second time: erf(Z / sqrt(2)) is 0.9500042 at Z = 1.96. Every
+# surface spells the level as the literal text "95% CI" -- six places do, two of
+# them column labels -- while `Z` is what actually decides the interval. Deriving
+# it here means the payload cannot disagree with the arithmetic, whatever the
+# labels say.
+CONFIDENCE_LEVEL = math.erf(Z / math.sqrt(2.0))
+
+# The level as every surface SPELLS it -- "95" -- taken from the derived value
+# rather than typed again. Same rounding as the `confidence_level` key the payload
+# carries, so the prose, the payload and the column label cannot disagree about
+# what `Z` means. The three layout-coupled spellings (the `NODE_COLUMNS` label and
+# the two dict keys that must match it) are pinned against this rather than
+# rebuilt, because their WIDTH is declared beside them.
+CONFIDENCE_PERCENT = "%g" % round(CONFIDENCE_LEVEL * 100, 1)
 
 # The first bracketed range in a name, with whatever precedes and follows it.
 # The prefix is deliberately unconstrained: a character class enumerating what a
@@ -251,6 +303,30 @@ def node_p_value(bad, trials, other_bad, other_trials, direction="worse"):
         if term <= 1e-18 * tail and ((step > 0 and k >= mode) or (step < 0 and k <= mode)):
             break
     return min(1.0, max(0.0, tail))
+
+
+def selected_direction_p_value(bad, trials, other_bad, other_trials, direction):
+    """:func:`node_p_value`, priced for a ``direction`` that was read off the data.
+
+    ``node_table`` does not decide in advance which way it suspects a node; it
+    compares the node's rate against the rest of the fleet and *then* tests the
+    tail it already knows the data fell in. That is two looks, and a one-sided
+    tail charges for one. The correction is the factor between them: a row that
+    would need p <= t to be believed had two chances to reach t, so 2p is the
+    p-value that means what a p-value is supposed to mean here.
+
+    Not folded into :func:`node_p_value`, which stays the plain one-sided tail --
+    it is checked against a hand-computed hypergeometric and against
+    ``scipy.stats.fisher_exact`` over 5,986 comparisons, and the caller that
+    names its direction up front owes nothing. The charge belongs at the site
+    that picks the direction, which is the only place the debt is incurred.
+
+    Doubling rather than a two-sided Fisher tail: for these lopsided 2x2 tables
+    the two disagree, and the two-sided tail is the smaller and so the weaker
+    guarantee. Doubling is also the whole of the arithmetic, which matters for a
+    number that decides what goes on an ``--exclude`` line.
+    """
+    return min(1.0, 2.0 * node_p_value(bad, trials, other_bad, other_trials, direction))
 
 
 def _bh_reject(pvalues, alpha=FDR_ALPHA):
@@ -451,7 +527,13 @@ def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
             direction, p_value = "", 1.0
         else:
             direction = "worse" if rate > comparison else "better"
-            p_value = node_p_value(bad, trials, other_hits, other_trials, direction)
+            # Priced, not raw: the direction on the line above came out of `rate`
+            # and `comparison`, so the tail below it is the one the data already
+            # chose. See `selected_direction_p_value` and the module docstring's
+            # second null table -- unpriced, this family ran at up to 8.2% against
+            # the 5% FDR_ALPHA promises, and the excess is exactly the factor of
+            # two a free choice of direction is worth.
+            p_value = selected_direction_p_value(bad, trials, other_hits, other_trials, direction)
         rows.append(
             {
                 "node": node,
@@ -522,6 +604,16 @@ def node_table(jobs, workload=None, metric="failure", min_samples=MIN_SAMPLES):
         # interactive" form is for screens; see Workload.
         "workload": workload.name if workload else None,
         "workload_user": workload.user if workload else None,
+        # The two thresholds the rendered table states and the payload did not.
+        # The column header says `95% CI` and the verdict paragraph says the
+        # correction is "after correcting for N nodes tested"; a consumer holding
+        # `ci_low`/`ci_high` had no way to learn what level they are an interval
+        # OF -- a 95% and a 99% interval are different claims about the same two
+        # numbers -- and one holding `p_value` beside `verdict` could not tell
+        # which threshold produced the verdict, so it could neither re-derive the
+        # verdicts under its own alpha nor see how close a `same` row came.
+        "confidence_level": round(CONFIDENCE_LEVEL, 2),
+        "fdr_alpha": FDR_ALPHA,
         "tested_nodes": len(rows),
         "held_back": held_back,
         "skipped_nodes": sum(1 for n, t in totals.items() if t < min_samples),
@@ -711,10 +803,54 @@ def note_for_allocation(jobs, nodelist, workload=None):
     # its placement is the problem, not a list of eight intervals.
     for row in table["rows"]:
         if row["node"] in wanted:
-            note = _note_from_row(row, workload, table["trials"] - row["trials"])
+            note = _note_from_row(
+                row, _stratum_label(workload, jobs), table["trials"] - row["trials"]
+            )
             if note:
                 return note
     return ""
+
+
+def _stratum_label(workload, jobs):
+    """The stratum's label, folded -- the display rule this module already applies.
+
+    ``Workload.matches`` normalises before comparing, so the stratum IS the fold
+    whatever label rides on it, and :func:`dominant_workload` prints that fold,
+    substituting a real name only where the fold erased it
+    (:func:`patterns.fold_erased_the_name`, whose docstring calls itself "only a
+    *display* rule ... callers use this to decide whether the key is fit to be read
+    aloud"). The note never applied it: `cli._node_note` and the dashboard both
+    build ``Workload(job.name, job.user)``, so the sentence carried ONE job's raw
+    name over a finding pooled across the whole fold.
+
+    Measured on this cluster's 90-day history: 92 of 1,258 folds hold more than one
+    raw name, and the largest, ``exp-n#``, spans **154 distinct names across 157
+    jobs** -- so "for exp-n89" named one 157th of what the sentence's own figures
+    cover, while the nodes screen beside it said "only exp-n# counted". Round
+    forty-eight recorded the two labels and could not reproduce a wrong count; the
+    count was never wrong, the attribution was.
+
+    Label only. The `workload` handed to :func:`node_table` is untouched, so which
+    jobs are pooled cannot change -- the same reason `dominant_workload` gives for
+    its own substitution.
+    """
+    if not workload:
+        return workload
+    signature = normalize_name(workload)
+    # A fold with no letters left names nothing a reader can match to a job, so the
+    # raw name is the better label there -- the same fallback, in the same order.
+    if not signature or fold_erased_the_name(signature):
+        return workload
+    # Only where the fold actually pooled more than one name. Folding a stratum
+    # that holds a single name trades a true, specific label for a true, vaguer
+    # one: `caai-p10b_scan` is what the reader submitted and `caai-p#b_scan` is
+    # a pattern they never typed. 1,166 of this history's 1,258 folds are that
+    # shape, so the specific label is the common case, not the exception.
+    matcher = as_workload(workload)
+    names = {job.name for job in usable(jobs) if matcher.matches(job)}
+    if len(names) <= 1:
+        return workload
+    return signature
 
 
 def _note_from_row(row, workload=None, other_trials=None):
@@ -786,15 +922,15 @@ def _note_from_row(row, workload=None, other_trials=None):
     if other_trials is not None and other_trials < row["trials"]:
         against += " over %d placements" % other_trials
     return (
-        "%s failed %d of %d placements there (%.1f%%, 95%% CI %.1f-%.1f%%) against "
+        "%s failed %d of %d placements there (%.1f%%, %s%% CI %s) against "
         "%s on every other node%s."
         % (
             row["node"],
             row["bad"],
             row["trials"],
             100 * row["rate"],
-            100 * row["ci_low"],
-            100 * row["ci_high"],
+            CONFIDENCE_PERCENT,
+            format_rate_range(row["ci_low"], row["ci_high"]),
             against,
             (" for %s" % workload) if workload else "",
         )
@@ -812,5 +948,7 @@ def note_for_node(jobs, node, workload=None):
     table = node_table(jobs, workload=workload, metric="failure")
     for row in table["rows"]:
         if row["node"] == node:
-            return _note_from_row(row, workload, table["trials"] - row["trials"])
+            return _note_from_row(
+                row, _stratum_label(workload, jobs), table["trials"] - row["trials"]
+            )
     return ""

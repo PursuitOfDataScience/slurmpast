@@ -22,7 +22,6 @@ import asyncio
 import contextlib
 import os
 import signal
-import sys
 from collections.abc import Generator
 from typing import Any, ClassVar, cast
 
@@ -1076,6 +1075,7 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
                 style=theme.HEALTH_COLOR["warn"],
             )
 
+        # Which workload those idle hours are in. The clause above is the whole
         # Last: the facts about the history come first, then what the view is
         # currently doing to them.
         # `shown != total_groups`, not `shown and shown != total_groups`. Zero is
@@ -1084,6 +1084,28 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
         if shown != total_groups:
             text.append("  ·  ", style=theme.FAINT)
             text.append("showing %d" % shown, style=theme.ACCENT)
+
+        # Which workload those idle hours are in. The clause above is the whole
+        # window; FLAGGED counts runs and cannot say what they cost, so the one
+        # figure that answers "which one" is `GroupStats.wasted_gpu_hours` --
+        # summed on every walk and, before this, read by nothing. `--plain` prints
+        # the same sentence under the table, from `render`, so the two cannot word
+        # it differently.
+        #
+        # Its own line rather than another `·` clause, and BELOW the clauses
+        # above rather than among them: this row already carries four, the
+        # sentence names a site-controlled workload label so its length is
+        # unbounded, and inserting it mid-row pushed `showing %d` onto a second
+        # line -- which `test_a_narrowed_table_still_reports_the_true_total` reads
+        # off line one, and which contradicts the ordering rule stated directly
+        # above (the facts, then what the view is doing to them).
+        worst = history.idle_workload
+        if worst is not None:
+            text.append("\n")
+            text.append(
+                render.idle_workload_note(worst[0].label, worst[1], worst[0].gpu_hours),
+                style=theme.HEALTH_COLOR["warn"],
+            )
 
         if self.search_text:
             text.append("\nsearch: ", style=theme.FAINT)
@@ -1361,7 +1383,20 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
                     style=theme.HEALTH_COLOR["crit"] if over_limit else theme.DIM,
                 ),
                 "GPU": Text(str(job.gpu_count or "-"), style=theme.GPU_COLOR),
-                "NODE": Text(job.node_list or "", style=theme.FAINT),
+                # `"-"`, matching `report.py`'s job table. This was the ONE cell
+                # of the twelve where the two surfaces disagreed about how to say
+                # "absent": the plain report writes `job.node_list or "-"` while
+                # this wrote `or ""`. STARTED, ENDED and GPU all use `-` on both
+                # sides, and NAME uses `""` on both, so the convention was settled
+                # everywhere except here -- and `render.py` exists precisely so
+                # "the dashboard and `--plain` cannot drift" (CLAUDE.md).
+                #
+                # An empty cell reads as a column that does not apply to this row;
+                # `-` is this tool's marker for a value it does not have. A job
+                # with no node list is a real state (pending, or cancelled before
+                # it was ever allocated), so the reader is told that rather than
+                # shown a blank.
+                "NODE": Text(job.node_list or "-", style=theme.FAINT),
             }
             table.add_row(*(cells[label] for label, _ in layout), key=str(index))
         if not drawn and cursor and cursor < len(jobs):
@@ -1553,7 +1588,19 @@ class WorkloadScreen(JobListScreen):
         # "--time=09:45:00  --mem=72G" and point at `slurmpast --sizing for why` --
         # a bare number with no basis, and for the reason a different command in a
         # different program. The reason belongs where the number is.
-        advice = [a for a in recommend(self._group.jobs) if a.actionable]
+        # `capped` as well as actionable. `Advice.actionable` is
+        # `verdict in ("raise", "lower")`, so a saturated workload -- one whose
+        # target exceeds what a node in this partition HAS, and which is already
+        # asking for all of it -- was filtered out here and appeared on no screen
+        # at all, while `--sizing` gave it a flag line, its basis and the caution
+        # that names the way out ("a larger request here cannot be scheduled --
+        # this workload needs a bigger partition"). `sizing` gives `capped` its own
+        # verdict precisely because it is "Not 'already about right': the workload
+        # wants more and cannot have it here", and the dashboard was the surface
+        # that said nothing. Measured with the demo history against a pinned
+        # 2-core ceiling: three workloads capped, `--sizing` naming all three and
+        # this banner none.
+        advice = [a for a in recommend(self._group.jobs) if a.actionable or a.verdict == "capped"]
         # 10 cells of "next run  " plus the 22-cell flag column: what the basis has
         # to start after when it shares the line.
         basis_column = 32
@@ -1563,7 +1610,18 @@ class WorkloadScreen(JobListScreen):
         for index, item in enumerate(advice):
             banner.append("\n" if banner.plain else "")
             banner.append("next run  " if index == 0 else "          ", style=theme.FAINT)
-            banner.append("%-22s" % ("%s=%s" % (item.flag, item.suggestion)), style=theme.ACCENT)
+            # A capped item has a `suggestion` (the clamped ceiling) and must NOT
+            # print it as `--cpus-per-task=2`: that reads as advice to lower the
+            # request, which is the "different wrong answer" the verdict exists to
+            # avoid. The label comes from `render` so this and `--sizing` cannot
+            # word it differently.
+            if item.verdict == "capped":
+                banner.append("%-22s" % item.flag, style=theme.ACCENT)
+                banner.append(render.capped_label() + "  ", style=theme.HEALTH_COLOR["warn"])
+            else:
+                banner.append(
+                    "%-22s" % ("%s=%s" % (item.flag, item.suggestion)), style=theme.ACCENT
+                )
             # Every line of it, not just the first. `[:1]` silently cut the basis
             # mid-sentence -- "the rest is room to" -- which reads as the app having
             # broken rather than as a sentence that did not fit. Wrapped to the
@@ -1810,7 +1868,7 @@ class JobScreen(ScreenChrome, Screen[Any]):
                 # red-green colour blindness; printing every value in one ink
                 # threw that away and left the eye nothing to group by.
                 style = colour
-                if "ABOVE THE LIMIT" in value:
+                if render.OVER_LIMIT_MARK in value:
                     style = theme.HEALTH_COLOR["crit"]
                 elif "not recorded" in value:
                     style = theme.FAINT
@@ -1855,8 +1913,13 @@ class JobScreen(ScreenChrome, Screen[Any]):
             if inferred:
                 # Matched by when it was written, not by its name. Say so: a wrong
                 # log invents a cause, which is worse than no log at all.
+                #
+                # From `render`, like the miss line in the `elif` below: this branch
+                # kept a copy of the sentence and `report.render_job` kept another,
+                # so one piece of prose was maintained in two files while the branch
+                # beside it was single-sourced.
                 body.append(
-                    "       matched by timing, not by name — verify before trusting it\n",
+                    "       %s\n" % render.log_inferred_note(),
                     style=theme.HEALTH_COLOR["warn"],
                 )
         elif not self.sp.no_logs:
@@ -1876,7 +1939,7 @@ class JobScreen(ScreenChrome, Screen[Any]):
         body.append("\n")
         findings = render.sort_findings(verdict.findings)
         if not findings:
-            body.append("  nothing to flag.\n", style=theme.HEALTH_COLOR["ok"])
+            body.append("  %s\n" % render.NOTHING_TO_FLAG, style=theme.HEALTH_COLOR["ok"])
         for finding in findings:
             _finding_lines(self, body, finding)
 
@@ -2080,7 +2143,9 @@ class NodesScreen(ScreenChrome, CentredContent, Screen[Any]):
                 "RATE": Text(
                     "%.1f%%" % (100 * row["rate"]), style=theme.HEALTH_COLOR.get(grade, theme.DIM)
                 ),
-                "95% CI": Text(render.ci_range(row["ci_low"], row["ci_high"]), style=theme.FAINT),
+                render.CI_COLUMN: Text(
+                    render.ci_range(row["ci_low"], row["ci_high"]), style=theme.FAINT
+                ),
                 "VERDICT": Text(row["verdict"], style=theme.HEALTH_COLOR.get(grade, theme.FAINT)),
             }
             table.add_row(*(cells[label] for label, _ in self._layout))
@@ -2547,13 +2612,24 @@ def _guard_startup_window() -> Generator[None, None, None]:
     previous: list[tuple[signal.Signals, signal._HANDLER]] = []
 
     def _restore_and_die(signum: int, _frame: object) -> None:
-        stream = (
-            sys.stdout if sys.stdout.isatty() else (sys.stderr if sys.stderr.isatty() else None)
-        )
-        if stream is not None:
-            with contextlib.suppress(OSError, ValueError):
-                stream.write(_TERMINAL_RESET)
-                stream.flush()
+        # Written to the file DESCRIPTOR, not through `sys.stdout`. The window this
+        # guard covers opens the instant Textual emits the alternate-screen
+        # sequence -- and Textual replaces `sys.stdout` and `sys.stderr` with
+        # capture objects at about the same moment, whose `write` queues into the
+        # app instead of reaching the terminal and whose `isatty()` still answers
+        # True. So the stream version picked the capture, wrote the restore into
+        # it, and `os._exit` a microsecond later dropped the queue: the process
+        # reported 143 while the screen it claimed to have restored was still the
+        # dead dashboard. Reproduced deterministically with a stand-in capture,
+        # and seen as 1 run in 5 of the real pty test, which is the shape of a
+        # race between the redirect and the signal. A descriptor cannot be
+        # redirected, so this cannot lose.
+        for target in (1, 2):
+            if not os.isatty(target):
+                continue
+            with contextlib.suppress(OSError):
+                os.write(target, _TERMINAL_RESET.encode())
+            break
         os._exit(128 + signum)
 
     for signum in (signal.SIGTERM, signal.SIGHUP):

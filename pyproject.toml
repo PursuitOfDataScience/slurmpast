@@ -22,6 +22,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Scientific/Engineering",
   "Topic :: System :: Distributed Computing",
   "Topic :: System :: Monitoring",
@@ -126,7 +127,15 @@ target-version = "py310"
 # clean locally: 0.15 and 0.16 disagree about the default set, and 0.16 surfaced
 # 206 findings the local run never saw. An explicit list makes the gate mean the
 # same thing on every machine.
-select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "C4", "T20"]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "ARG", "C4", "T20", "RUF100"]
+# RUF100 (unused `noqa`) is the gate holding the SUPPRESSIONS honest, and it was the
+# only claim in this repo that nothing checked. Nine directives had gone stale: three
+# files plus `conftest.py` carried `# noqa: E402` on imports that ruff does not flag,
+# so each line advertised a violation it does not have. Measured on BOTH ends of the
+# dev bound before removing them -- 0.15.18 and 0.16.6 agree on all nine, which is the
+# check this repo learned to make the hard way (the comment above records 0.15 and 0.16
+# disagreeing about the default set). With the rule selected the gate keeps them from
+# accumulating again, so no test re-implements it.
 # UP031 (%-format -> f-string) fires on 206 sites. Ruff auto-converts 113 of them
 # with all tests still passing, so the migration is safe -- but it also introduces
 # 28 line-length violations and leaves 93 sites for hand conversion. That is a
@@ -150,6 +159,16 @@ ignore = ["UP031"]
 
 [tool.ruff.format]
 quote-style = "double"
+# `issues.md` is an audit log, and its fenced blocks QUOTE code as it was at the
+# time of a finding -- with column-aligned trailing comments naming the site
+# (`# sacct.py:854`) and `...` elisions between the two lines that matter. ruff
+# 0.16 began formatting Python inside Markdown, which normalises those comments to
+# two spaces: it rewrites quoted history to look like current code and destroys
+# the alignment that makes the excerpt readable. The dev bound is
+# `ruff>=0.15,<0.17`, so CI resolves 0.16.x while a pinned 0.15 here does not
+# format Markdown at all -- the check passed locally and failed on CI from the
+# same tree. Documentation is not source; every .py file is still formatted.
+exclude = ["*.md"]
 
 [tool.mypy]
 python_version = "3.10"

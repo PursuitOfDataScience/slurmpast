@@ -772,26 +772,149 @@ class TestTheReadmeAndItsAssetsAgree:
     def test_the_test_badge_matches_the_suite(self):
         """`tests-1029` sat in the README for two rounds after the count moved."""
         import re
-        import subprocess
-        import sys
 
         root = self._root()
         claimed = re.search(r"tests-(\d+)-brightgreen", (root / "README.md").read_text())
         assert claimed, "the badge should still be there"
-        out = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "--collect-only"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-        ).stdout
-        collected = re.search(r"(\d+) tests collected", out) or re.search(r"(\d+)/(\d+)", out)
-        if not collected:  # pytest phrasing varies by version; skip rather than lie
+        collected_n, basis = _committed_collect_count(root)
+        if collected_n is None:  # pytest phrasing varies by version; skip rather than lie
             import pytest
 
             pytest.skip("could not read a collected count from this pytest")
-        assert int(claimed.group(1)) == int(collected.group(1)), (
-            "README says %s tests, the suite collects %s" % (claimed.group(1), collected.group(1))
+        claimed_n = int(claimed.group(1))
+        assert claimed_n == collected_n, (
+            f"README says {claimed_n} tests, {basis} collects {collected_n} -- "
+            + _badge_mismatch_reason(claimed_n, collected_n, _untracked_test_files(root))
         )
+
+
+def _untracked_test_files(root):
+    """Test files present but not committed, or ``[]`` when git cannot say.
+
+    Read rather than assumed, because it decides which of two opposite messages
+    :meth:`test_the_test_badge_matches_the_suite` prints. Returns ``[]`` on any
+    git failure (a tarball install, no git binary) so the caller falls back to
+    the plain "bump it" wording rather than claiming a cause it cannot support.
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "--", "tests/"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return sorted(ln.strip() for ln in out.stdout.splitlines() if ln.strip().endswith(".py"))
+
+
+def _collect_count(cwd, src_first=None):
+    """``N`` from a ``--collect-only`` run in ``cwd``, or ``None`` if unreadable."""
+    import os
+    import re
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    if src_first is not None:
+        # An exported tree is not the installed package: put its own `src` first
+        # so the collect imports the code that ships WITH it, not this checkout's.
+        prior = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = os.pathsep.join([str(src_first), prior] if prior else [str(src_first)])
+    try:
+        out = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "--collect-only", "-p", "no:cacheprovider"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=600,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.search(r"(\d+) tests collected", out) or re.search(r"(\d+)/(\d+)", out)
+    return int(found.group(1)) if found else None
+
+
+def _committed_collect_count(root):
+    """``(count, basis)`` for the suite that SHIPS -- what HEAD collects.
+
+    A live collect is the wrong surface to compare the badge against. The badge
+    documents the PUBLISHED package, and a working tree mid-round holds test
+    files that are not committed *and* edits adding tests to files that are, so
+    the live count describes a suite nobody can install. Comparing against it
+    made this test fail on every round that left the tree dirty -- carried in
+    ``issues.md`` as open since round fifty-three, with a whole module
+    (``test_badge_mismatch_diagnosis.py``) written to explain the failure rather
+    than remove it. Measured on this checkout: HEAD collects 1969 with a badge
+    reading 1969, the same tree live collects 2526, and dropping only the 27
+    untracked files still gives 1985 -- which is why "ignore what is untracked"
+    is not the fix either.
+
+    Falls back to the working tree when git cannot answer (a tarball install, no
+    git binary). That fallback is why :func:`_badge_mismatch_reason` keeps its
+    untracked branch: it is the one remaining path where untracked files explain
+    a mismatch.
+    """
+    import os
+    import subprocess
+    import tempfile
+
+    def _live():
+        return _collect_count(root), "the working tree"
+
+    try:
+        archive = subprocess.run(
+            ["git", "archive", "HEAD"], cwd=root, capture_output=True, timeout=120
+        )
+    except (OSError, subprocess.SubprocessError):
+        return _live()
+    if archive.returncode != 0 or not archive.stdout:
+        return _live()
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            unpack = subprocess.run(
+                ["tar", "-x", "-C", tmp], input=archive.stdout, capture_output=True, timeout=120
+            )
+        except (OSError, subprocess.SubprocessError):
+            return _live()
+        if unpack.returncode != 0:
+            return _live()
+        return _collect_count(tmp, os.path.join(tmp, "src")), "HEAD"
+
+
+def _badge_mismatch_reason(claimed, collected, untracked):
+    """Why the badge and the live collect disagree, as a sentence.
+
+    The count alone cannot tell the two causes apart, and they want opposite
+    actions:
+
+    * the badge is stale -- somebody added tests and did not bump it. This is the
+      case the docstring below records (``tests-1029`` sat for two rounds), and
+      the fix is to bump the badge.
+    * the working tree holds test files that are not committed. Then the badge is
+      RIGHT for the suite that ships, this failure is expected locally, and CI is
+      green -- bumping the badge would RED CI, which is the opposite of the fix.
+
+    Empty string when the counts agree, so the caller can use it unconditionally.
+    """
+    if claimed == collected:
+        return ""
+    if untracked and collected > claimed:
+        shown = ", ".join(untracked[:3]) + (", ..." if len(untracked) > 3 else "")
+        return (
+            f"{len(untracked)} test file(s) here are untracked ({shown}), which is "
+            f"exactly the difference: the badge states the count of the suite that "
+            f"SHIPS, so it is correct for HEAD and this failure is expected locally "
+            f"while CI is green. Commit or delete those files to close it -- bumping "
+            f"the badge to {collected} would red CI."
+        )
+    return f"the badge is stale; bump it to {collected}"
 
 
 class TestEverySentenceWrapsIncludingTheEmptyOnes:

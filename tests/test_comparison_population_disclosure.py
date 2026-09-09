@@ -105,7 +105,7 @@ def test_control_b_every_figure_the_sentence_already_carried_is_unchanged():
     assert (row["bad"], row["trials"]) == (10, 10)
     note = _note_from_row(row, None, table["trials"] - row["trials"])
     assert note.startswith("nodeA failed 10 of 10 placements there (100.0%,")
-    assert "95% CI 72.2-100.0%" in note, note
+    assert "95% CI 72.2 – 100.0%" in note, note  # en dash: duration.format_rate_range
 
 
 def test_control_c_a_caller_without_the_table_keeps_the_old_wording():
