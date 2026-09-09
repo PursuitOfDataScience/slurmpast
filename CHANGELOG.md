@@ -9,10 +9,14 @@ project adheres to [Semantic Versioning](https://semver.org).
 that were withdrawn or deliberately left open. This file is the *release* log: what
 changed for a user between one version and the next.
 
-## [Unreleased]
+## [0.8.3] — 2026-09-09
 
-Covers the working tree since 0.8.3. Every entry below shipped with a regression
-test and a control verified in both states.
+Polish and bugfix work only — no API changes, so a patch release. Note that this
+release is wider than the entries below: `_version.py` was already set to 0.8.3 by
+the rounds thirty-eight to fifty-two commit, which was never tagged and never
+reached PyPI (0.8.2 is the published version), so 0.8.3 ships those rounds too.
+`issues.md` is the record for that earlier half — this file starts here. Every
+entry below shipped with a regression test and a control verified in both states.
 
 ### Fixed
 

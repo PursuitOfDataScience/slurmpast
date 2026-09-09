@@ -1,5 +1,53 @@
 # slurmpast — audit and resolution
 
+> **Release 0.8.3, 2026-09-09.** Thirty-two rounds (fifty-three through
+> eighty-four), released together because `_version.py` was bumped to 0.8.3 by the
+> rounds thirty-eight to fifty-two commit and never tagged — 0.8.2 was the published
+> version until today, so 0.8.3 ships both halves. 1969 tests at HEAD going in,
+> **2526** here; all four gates clean (`ruff check .`, `ruff format --check .`,
+> `mypy src/ tests/`, `pytest --cov-fail-under=75` at 96.5%).
+>
+> **The eight-round red is gone, and not by being silenced.** Every one of the last
+> eight rounds ended with "one red going out and it is the documented badge test".
+> Round eighty-four found the cause: `test_the_test_badge_matches_the_suite`
+> compared the README badge — which documents the PUBLISHED package — against a
+> collect of the WORKING tree, and those differ for the whole life of a round. So it
+> failed on every round that left the tree dirty, and round seventy-six's response
+> had been to add a module explaining the failure rather than to correct the
+> measurement. It now collects HEAD. Measured before fixing, because the obvious fix
+> was wrong: HEAD collected 1969 against a badge reading 1969 (self-consistent all
+> along, CI green for the right reason), the live tree collected 2526, and dropping
+> only the 27 untracked test files gave 1985 — not 1969 — because uncommitted work
+> also adds tests to files already tracked. "Ignore what is untracked" would have
+> been wrong by sixteen.
+>
+> The badge moved to 2526 in the same commit that committed the tests, which is the
+> rule two earlier helpers broke (1969 → 2319, then 1969 → 2526, both reverted).
+> This release is the first time that rule has been exercised end to end rather than
+> undone.
+>
+> **This release also adds the repo's first CHANGELOG**, and the division of labour
+> between the two files is deliberate: `issues.md` stays the audit log, one entry per
+> round including findings withdrawn or left open, and `CHANGELOG.md` is the release
+> log — what changed for a user between one version and the next.
+>
+> What a user gets that they did not have at 0.8.2: a dashboard that actually
+> restores the terminal when it is signalled during startup, instead of reporting
+> that it had while Textual's capture objects swallowed the sequence; a bar that does
+> not draw solid where its own label says 98%; repeat-failure advice that does not
+> say "stop resubmitting" to a workload submitted once, or "deterministic" to one
+> that succeeded; `format_rate_range(0.9996, 1.0)` no longer reading
+> `100.0 – 100.0%`; and two `--plain` notes wrapped like every other paragraph.
+>
+> Still open and unchanged: quitting the dashboard can leave the process running for
+> ~21 seconds (SP-2). Three candidate remedies are recorded; all three change
+> process-exit or threading semantics and want a decision rather than a quiet patch.
+>
+> Convention note for the record: this release was committed straight to `main` with
+> no PR and published on the maintainer's explicit instruction, overriding this
+> repo's "do not commit to `main` directly" and "publishing a release — ask even
+> then". No GitHub issue was filed for the round.
+
 > **Release 0.7.0, 2026-08-22.** Eleven rounds (twenty-two through thirty-two),
 > ten defects, all found by running the tool against a real cluster's accounting
 > database and log tree rather than against fixtures. 1503 tests at 0.6.0,
