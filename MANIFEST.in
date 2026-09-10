@@ -32,4 +32,3 @@ graft assets
 graft .github
 include LICENSE
 include README.md
-include issues.md
