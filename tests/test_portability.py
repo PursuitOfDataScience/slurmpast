@@ -135,10 +135,18 @@ class TestDelimiter:
         sacct = Sacct(runner=runner, probe=" ".join(_FIELDS))
         jobs = sacct.history(user="u")
         assert [j.job_id for j in jobs] == ["12"]
-        assert len(calls) == 2, "should retry exactly once, without the option"
+        # Counted by SHAPE, not by total. A window query is now a cheap
+        # `-X --format=JobID` listing followed by the read (see
+        # `Sacct._query_partitioned`), so "how many calls" no longer answers
+        # "how many retries" -- and the retry is what this test is about. The
+        # option is offered once, refused once, and never offered again.
+        offered = [c for c in calls if any(a.startswith("--delimiter") for a in c)]
+        assert len(offered) == 1, offered
+        assert len(calls) == 3, calls
         # And it remembers, rather than paying for the failure on every query.
+        before = len(calls)
         sacct.history(user="u")
-        assert len(calls) == 3
+        assert not [c for c in calls[before:] if any(a.startswith("--delimiter") for a in c)]
 
     def test_a_real_error_is_not_retried_as_an_option_problem(self):
         calls = []

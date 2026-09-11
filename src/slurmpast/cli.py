@@ -177,6 +177,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-dir", action="append", default=[], help="extra directory to search for job logs"
     )
     parser.add_argument("--no-logs", action="store_true", help="do not read job logs")
+    # A finished job's accounting record cannot change, so it is kept and reused;
+    # see `slurmpast.cache` for what makes that safe. This is the off switch, for
+    # a reader who would rather spend the seconds than keep the file. The
+    # environment variable does the same thing for every run.
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="re-read every job from sacct instead of reusing finished ones "
+        "(same as SLURMPAST_NO_CACHE=1)",
+    )
     # Names its scope, as `--metric`, `--all-workloads`, `-n` and `--sort` all do:
     # this one reaches exactly one view, and read as an unscoped "per-step
     # accounting" it invites `--plain --steps` over a list, where it is accepted
@@ -1097,7 +1107,7 @@ def _main(argv=None) -> int:
             )
 
     style = report.Style(enabled=False if args.no_color else None)
-    sacct = Sacct()
+    sacct = Sacct(cache=not args.no_cache)
 
     # A dashboard needs a terminal on both ends, and without this the most
     # ordinary thing anyone does with a report -- redirect it to a file -- hung

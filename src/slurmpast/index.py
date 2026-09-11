@@ -461,6 +461,7 @@ class History:
         self.stats = goodput(jobs)
         self._by_id = {job.job_id: job for job in self.jobs}
         self._patterns: list | None = None
+        self._group_patterns: dict = {}
 
     def __len__(self) -> int:
         return len(self.jobs)
@@ -495,10 +496,26 @@ class History:
         return self._patterns
 
     def group_patterns(self, group: GroupStats) -> list:
-        """Findings scoped to one workload."""
+        """Findings scoped to one workload, computed once per workload.
+
+        Cached for the same reason `patterns` is not: the dashboard reads this
+        from `WorkloadScreen.extra_summary`, which runs again on every filter
+        change and every search keystroke over the SAME group -- so the detectors
+        walked the same jobs on each one, 385 ms of it on the largest workload of
+        a 29,624-job history.
+
+        Keyed by `GroupStats.key`, which `build_groups` makes unique within a
+        History -- and holding the group itself alongside the answer, so a group
+        built somewhere else that happens to share a key gets its own findings
+        rather than this History's.
+        """
+        cached = self._group_patterns.get(group.key)
+        if cached is not None and cached[0] is group:
+            return cached[1]
         found = list(find_repeat_failures(group.jobs, limit=3))
         found.extend(find_memory_search(group.jobs))
         found.extend(find_requeues(group.jobs, limit=3))
+        self._group_patterns[group.key] = (group, found)
         return found
 
     @property

@@ -35,10 +35,19 @@ def parse_duration(text):
     The MM:SS.mmm form is the trap: read as HH:MM it turns 0.539 seconds of CPU
     into 30 minutes, which inverts the diagnosis of a hung job entirely.
     """
-    if text is None:
+    if text is None or text == "":
+        # The two absent forms, taken without building a string or lowering one.
+        # This is the hottest parser in the package -- 445,815 calls parsing a
+        # single seven-day history -- so the cheap exits come first. NOT
+        # `if not text`: a numeric 0 is falsy and is a duration of zero, which
+        # this has always returned as 0.0 and must keep returning as 0.0.
         return None
-    s = str(text).strip()
-    if s.lower() in _NOT_A_DURATION:
+    s = text.strip() if type(text) is str else str(text).strip()
+    # Every sentinel in `_NOT_A_DURATION` starts with a letter or `*`, and every
+    # real duration starts with a digit, so a leading digit answers the question
+    # without allocating a lowered copy of the string. Same trick, same reason,
+    # as the sentinel test in `sacct.parse`.
+    if not s[:1].isdigit() and s.lower() in _NOT_A_DURATION:
         return None
 
     days = 0
@@ -57,7 +66,7 @@ def parse_duration(text):
     except ValueError:
         return None
 
-    if any(not math.isfinite(n) for n in nums):
+    if not all(map(math.isfinite, nums)):
         # "NaN" and "inf" are floats Python is happy to build and this module must
         # not return: a None is a missing measurement and everything downstream is
         # written for it, while a NaN is a number that poisons whatever it touches.
@@ -95,10 +104,12 @@ def parse_bytes(text):
     job-level total must multiply the ``c`` form by the core count themselves;
     this function only decodes the magnitude.
     """
-    if text is None:
-        return None
-    s = str(text).strip().rstrip("nc")
-    if not s or s.lower() in ("unknown", "none", "n/a", ""):
+    if text is None or text == "":
+        return None  # not `if not text`: a numeric 0 is zero bytes, not absent
+    s = (text if type(text) is str else str(text)).strip().rstrip("nc")
+    # As in `parse_duration`: a leading digit rules out every sentinel, and this
+    # runs 624,987 times on one seven-day history.
+    if not s or (not s[0].isdigit() and s.lower() in ("unknown", "none", "n/a")):
         return None
     mult = 1
     if s[-1:].lower() in _UNITS:

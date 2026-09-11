@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import os
 import signal
+import time
 from collections.abc import Generator
 from typing import Any, ClassVar, cast
 
@@ -510,6 +511,27 @@ def _rows_already_drawn(screen, layout, key) -> bool:
     return False
 
 
+def _resize_changed_anything(screen) -> bool:
+    """Whether this ``on_resize`` is a real resize.
+
+    Textual sends `Resize` when a screen is first laid out, so `on_mount`'s
+    build was immediately followed by a second one at the SAME size -- and while
+    `_rows_already_drawn` stops the rows being drawn twice, everything around
+    them still ran twice: the filter, the sort, the summary's per-job counts.
+    On a 29,617-job list that second pass was 122 ms of the 391 ms `a` took, for
+    a layout that could not have changed.
+
+    Recorded on the screen rather than compared against the table, because two
+    of the three callers here rebuild their columns from `self.size.width` and
+    that is the input this is guarding.
+    """
+    size = screen.size
+    if getattr(screen, "_sized_at", None) == size:
+        return False
+    screen._sized_at = size
+    return True
+
+
 def _content_width(layout, padding: int = 2) -> int:
     """Cells a table of ``layout`` occupies: columns, DataTable's cell padding, a
     scrollbar. This is what the centring container is sized to."""
@@ -541,6 +563,86 @@ class CentredContent:
         screen_width = self.size.width  # type: ignore[attr-defined]
         wanted = _content_width(layout)
         content.styles.width = min(wanted, screen_width) if screen_width else wanted
+
+
+def _breathe():
+    """Hand the GIL back, so a keypress is answered while a worker is thinking.
+
+    Python's thread switch interval is 5 ms, which is enough while a worker is
+    short and not while it is long: at `assign_logs`'s original 16.7 s an arrow
+    key took between 0.85 s and 5.4 s to redraw. The pass is 1.2 s now and this
+    keeps what is left of it out of the way -- see `logs.PACE_EVERY` for how often
+    it is called and what that costs.
+
+    `sleep(0)` is NOT enough: CPython treats it as a no-op yield that the same
+    thread usually wins straight back. A millisecond is the smallest interval that
+    reliably lets the UI thread run, and 59 of them over a whole history is 59 ms.
+    """
+    time.sleep(0.001)
+
+
+class FastDataTable(DataTable):
+    """A DataTable that does not re-measure cells whose column width is fixed.
+
+    Textual's ``_update_dimensions`` walks every new row and calls ``measure()``
+    on every cell in it, to grow each column's ``content_width``. That figure is
+    read back in exactly one place -- ``Column.get_render_width``, as
+    ``self.content_width if self.auto_width else self.width`` -- and every column
+    in this app is added with an explicit ``width=`` by :func:`_sync_columns`. So
+    on these tables the entire pass computes a number nothing will read.
+
+    It is not a small number of cells. Measured on a real seven-day history of
+    29,624 jobs, pressing ``a`` for the flat job list:
+
+        add_row x29,617                 0.70 s
+        _update_dimensions              4.12 s   <- 355,404 measure() calls
+        _update_dimensions, skipped     0.15 s
+
+    and the same pass ran again on every filter change and every search
+    keystroke, which is why typing one letter into the search box on that screen
+    cost 9.6 s.
+
+    The skip is expressed as ``super()._update_dimensions(())`` rather than as a
+    reimplementation, because the tail of that method is load-bearing -- it sets
+    ``virtual_size``, which is what the scrollbar and the scroll extent come from.
+    Handing it an empty row set runs the tail and skips only the loop.
+
+    Conditions, checked rather than assumed, because being wrong here means
+    columns silently sized to nothing:
+
+    * every column has a fixed width (``auto_width`` false),
+    * no row carries a label -- ``_label_column`` IS auto-width, and a labelled
+      row is the one case where the loop's result is read,
+    * no row is of auto height, which the loop is also what measures,
+    * ``fixed_cell_sizes`` has not been turned off by the caller.
+
+    The last two are noticed in :meth:`add_row` rather than looked for in the
+    loop being skipped, because looking for them there is the O(rows) walk this
+    exists to avoid. No screen in this package passes either, so in practice the
+    switch never flips -- it is here so that a screen which starts to cannot get
+    a silently wrong layout for it.
+    """
+
+    #: Set False to get stock Textual behaviour back on one table.
+    fixed_cell_sizes: bool = True
+
+    def add_row(self, *cells, height=1, key=None, label=None):
+        if height is None or label is not None:
+            # An auto-height row has to be rendered to find out how tall it is,
+            # and a labelled row grows `_label_column`, which is auto-width.
+            # Both are what the skipped loop does. One row of either kind and
+            # this table goes back to stock behaviour for good.
+            self.fixed_cell_sizes = False
+        return super().add_row(*cells, height=height, key=key, label=label)
+
+    def _update_dimensions(self, new_rows) -> None:
+        if (
+            self.fixed_cell_sizes
+            and not self._labelled_row_exists
+            and not any(column.auto_width for column in self.columns.values())
+        ):
+            new_rows = ()
+        super()._update_dimensions(new_rows)
 
 
 def _digit_bindings(action: str):
@@ -613,8 +715,40 @@ def _steer_table(screen, table_id: str, key: str) -> bool:
         step = max(1, table.size.height - 2)
         table.move_cursor(row=table.cursor_row + (step if key == "pagedown" else -step))
     else:
+        if key == "end":
+            # `end` means the LAST row, and on a screen still streaming its rows
+            # in the table's idea of the last one is wherever the fill has got
+            # to. Finish it, so the key lands where the reader expects.
+            ensure = getattr(screen, "ensure_all_rows", None)
+            if ensure is not None:
+                ensure()
         table.move_cursor(row=0 if key == "home" else table.row_count - 1)
     return True
+
+
+#: How long the search box waits for the next keystroke before re-filtering.
+#: Rebuilding the flat job list is 100-311 ms at 29,617 jobs -- `DataTable.clear`
+#: alone is 139 ms of it, and that is Textual's, not ours -- so typing "test" was
+#: four of those back to back. One rebuild when the typing stops is what every
+#: other search box does, and 150 ms is short enough that it still reads as
+#: immediate. Enter commits without waiting, and escape cancels without waiting,
+#: so nothing that ends a search is delayed by this.
+_SEARCH_SETTLE = 0.15
+
+
+def _debounce_search(screen, value: str) -> None:
+    """Apply ``value`` to ``screen.search_text`` once the keystrokes stop."""
+    _cancel_search_debounce(screen)
+    screen._search_timer = screen.set_timer(
+        _SEARCH_SETTLE, lambda: setattr(screen, "search_text", value)
+    )
+
+
+def _cancel_search_debounce(screen) -> None:
+    timer = getattr(screen, "_search_timer", None)
+    if timer is not None:
+        timer.stop()
+        screen._search_timer = None
 
 
 def _dismiss_search(screen, table_id: str) -> bool:
@@ -628,6 +762,9 @@ def _dismiss_search(screen, table_id: str) -> bool:
     """
     if not screen.query_one("#search", Input).has_focus:
         return False
+    # Before the reset, or a debounce still in flight would put the cancelled
+    # query straight back a moment later.
+    _cancel_search_debounce(screen)
     screen.query_one("#searchbar").remove_class("visible")
     screen.query_one("#search", Input).value = ""
     screen.search_text = ""
@@ -891,7 +1028,7 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
             yield Static(id="summary")
             with Horizontal(id="searchbar"):
                 yield SearchBar(GROUP_SEARCH_FIELDS)
-            yield DataTable(
+            yield FastDataTable(
                 id="groups",
                 cursor_type="row",
                 zebra_stripes=False,
@@ -904,6 +1041,10 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
 
     def on_mount(self) -> None:
         self.refresh_rows()
+        # The size this build used, so the `Resize` Textual sends right after a
+        # screen is laid out does not rebuild it at the same size. See
+        # `_resize_changed_anything`.
+        self._sized_at = self.size
         self.query_one("#groups", DataTable).focus()
 
     def on_resize(self) -> None:
@@ -911,8 +1052,11 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
 
         The row set is unchanged, so the selection is carried across it -- a
         relayout that silently returned you to row 1 would be its own annoyance.
+
+        A resize that did not change the size is not a relayout; see
+        :func:`_resize_changed_anything`.
         """
-        if self.is_mounted:
+        if self.is_mounted and _resize_changed_anything(self):
             self.refresh_rows(keep_cursor=True)
 
     # -- data ------------------------------------------------------------
@@ -1216,9 +1360,11 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
             self.refresh_rows()
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        self.search_text = event.value
+        _debounce_search(self, event.value)
 
     def on_input_submitted(self, _event: Input.Submitted) -> None:
+        _cancel_search_debounce(self)
+        self.search_text = self.query_one("#search", Input).value
         self.query_one("#searchbar").remove_class("visible")
         self.query_one("#groups", DataTable).focus()
 
@@ -1227,6 +1373,36 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
 
 
 _JOB_COLUMNS = render.JOB_COLUMNS
+
+#: Rows :meth:`JobListScreen.refresh_rows` draws before it returns. Comfortably
+#: more than any terminal shows, so what the reader is looking at is there
+#: immediately; the rest follows from a timer. See `JobListScreen._draw_rows`.
+_FIRST_ROWS = 200
+
+#: A slice of the background fill is bounded by TIME, not by a row count: a row
+#: costs ~120 us the first time it is drawn and ~60 us once its cells are cached,
+#: so any fixed count is either a stall on the cold pass or a crawl on the warm
+#: one. A first attempt used 2,500 rows and blocked the event loop for 519 ms.
+#:
+#: The budget and the interval together are a DUTY CYCLE, and that is the number
+#: that decides how the app feels. 25 ms every 5 ms is four fifths of the idle
+#: time, which fills 29,617 rows in about three seconds and -- measured in a real
+#: pty -- made an arrow key during those three seconds take **110 ms, worst 350
+#: ms**. 8 ms every 24 ms is a third of it: the fill takes longer and nothing else
+#: waits on it, because everything that needs the whole table calls
+#: `ensure_all_rows` instead of hoping.
+_FILL_BUDGET = 0.008
+_FILL_EVERY = 0.024
+#: Rows between clock reads. Small enough that one granule cannot overrun the
+#: budget, large enough that the clock is not the cost.
+_FILL_STEP = 100
+
+#: How long after a keypress the fill stays out of the way entirely. Typing and
+#: holding an arrow key are exactly when the reader is watching the screen, and
+#: exactly when rows arriving below the fold are worth nothing to them. The fill
+#: is not cancelled, only deferred -- it resumes the moment the keyboard goes
+#: quiet, which is when the rows are wanted and nobody is waiting.
+_FILL_YIELD_AFTER_KEY = 0.15
 
 # A copy is a paste-ready artefact, so it carries every column regardless of how
 # narrow the terminal was when the rows were drawn, and uses the same labels.
@@ -1244,6 +1420,82 @@ _JOB_CLIPBOARD_HEADER = (
     "GPU",
     "NODE",
 )
+
+
+def _noop(app, job) -> bool:
+    """:func:`~slurmpast.diagnose.looks_like_noop`, remembered for this history.
+
+    It walks the job's steps through `Job.total_cpu`, and the job list asks it
+    about every matching job twice over -- once for the row's colour and once for
+    the summary's count -- on every filter change, every search keystroke and
+    every resize. The answer cannot change while a history is loaded.
+    """
+    cache = app.noop_jobs
+    answer = cache.get(job.job_id)
+    if answer is None:
+        answer = cache[job.job_id] = looks_like_noop(job)
+    return answer
+
+
+def _job_cells(job, noop) -> dict[str, Text]:
+    """One job's row, by column label, with the row number left out.
+
+    Split out of ``JobListScreen.refresh_rows`` and cached by job id on the app
+    (:attr:`SlurmpastApp.job_cells`) because that method runs again on every
+    filter change, every search keystroke and every resize, over the SAME jobs.
+    None of these values can change while a history is loaded -- a `Job` is a
+    NamedTuple and the styles come from the theme -- so recomputing them was
+    pure repetition, and not a cheap one: on a 29,617-job flat list the derived
+    properties alone (`total_cpu` and `cpu_utilization`, both of which walk the
+    job's steps, plus `gpu_count` and `looks_like_noop`) were 5.0 s of the
+    12.3 s a profiled search keystroke took.
+
+    The `#` column is deliberately absent: it numbers the ROW, so it changes
+    when a filter changes even though the job did not. `refresh_rows` splices it
+    in at whatever position the layout gives it.
+    """
+    grade = theme.STATE_HEALTH.get(job.base_state, "none")
+    if noop:
+        grade = "crit"
+    util = job.cpu_utilization
+    # MaxRSS above the ceiling is not a working set (it sums shared pages
+    # across the process tree), so it is flagged rather than read as 103%.
+    over_limit = bool(job.mem_limit_bytes and job.max_rss and job.max_rss > job.mem_limit_bytes)
+    return {
+        "JOBID": Text(job.job_id, style=theme.INK),
+        "NAME": Text(job.name or "", style=theme.DIM),
+        "STATE": Text(job.base_state, style=theme.HEALTH_COLOR.get(grade, theme.DIM)),
+        "STARTED": Text(render.stamp_short(job.start) or "-", style=theme.ACCENT),
+        "ENDED": Text(render.stamp_short(job.end) or "-", style=theme.FAINT),
+        "WALL TIME": Text(format_duration(job.elapsed), style=theme.DIM),
+        "CPU TIME": Text(format_duration(job.total_cpu), style=theme.CPU_COLOR),
+        "CPUS BUSY": Text(
+            render.cores_text(job),
+            style=theme.HEALTH_COLOR["crit"]
+            if (util is not None and util < 0.02)
+            else theme.CPU_COLOR,
+        ),
+        "PEAK MEM": Text(format_bytes(job.max_rss), style=theme.MEM_COLOR),
+        "MEM%": Text(
+            format_percent(job.mem_utilization),
+            style=theme.HEALTH_COLOR["crit"] if over_limit else theme.DIM,
+        ),
+        "GPU": Text(str(job.gpu_count or "-"), style=theme.GPU_COLOR),
+        # `"-"`, matching `report.py`'s job table. This was the ONE cell
+        # of the twelve where the two surfaces disagreed about how to say
+        # "absent": the plain report writes `job.node_list or "-"` while
+        # this wrote `or ""`. STARTED, ENDED and GPU all use `-` on both
+        # sides, and NAME uses `""` on both, so the convention was settled
+        # everywhere except here -- and `render.py` exists precisely so
+        # "the dashboard and `--plain` cannot drift" (CLAUDE.md).
+        #
+        # An empty cell reads as a column that does not apply to this row;
+        # `-` is this tool's marker for a value it does not have. A job
+        # with no node list is a real state (pending, or cancelled before
+        # it was ever allocated), so the reader is told that rather than
+        # shown a blank.
+        "NODE": Text(job.node_list or "-", style=theme.FAINT),
+    }
 
 
 def _job_clipboard_cells(job) -> list[str]:
@@ -1291,6 +1543,14 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
         self._all = list(jobs)
         self._rows: list = []
         self._layout: list[tuple[str, int]] = []
+        # Rows of `_rows` already in the table, and the timer putting the rest
+        # there. See `_draw_rows`.
+        self._filled = 0
+        self._fill_timer: Any = None
+        self._fill_labels: list[str] = []
+        self._fill_marker_at: int | None = None
+        # When the reader last touched the keyboard; see `_FILL_YIELD_AFTER_KEY`.
+        self._last_key = 0.0
         self._title = title
         self.summary_text = Text()
         self.filter_mode = initial_filter
@@ -1302,7 +1562,7 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
             yield Static(id="summary")
             with Horizontal(id="searchbar"):
                 yield SearchBar()
-            yield DataTable(
+            yield FastDataTable(
                 id="jobs",
                 cursor_type="row",
                 cell_padding=1,
@@ -1312,6 +1572,10 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
 
     def on_mount(self) -> None:
         self.refresh_rows()
+        # The size this build used, so the `Resize` Textual sends right after a
+        # screen is laid out does not rebuild it at the same size. See
+        # `_resize_changed_anything`.
+        self._sized_at = self.size
         self.query_one("#jobs", DataTable).focus()
 
     def on_resize(self) -> None:
@@ -1319,8 +1583,11 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
 
         The row set is unchanged, so the selection is carried across it -- a
         relayout that silently returned you to row 1 would be its own annoyance.
+
+        A resize that did not change the size is not a relayout; see
+        :func:`_resize_changed_anything`.
         """
-        if self.is_mounted:
+        if self.is_mounted and _resize_changed_anything(self):
             self.refresh_rows(keep_cursor=True)
 
     def refresh_rows(self, keep_cursor: bool = False) -> None:
@@ -1346,59 +1613,23 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
         # because it reports counts a caller may have just changed.
         drawn = _rows_already_drawn(self, layout, tuple(j.job_id for j in jobs))
         if not drawn:
+            self._stop_filling()
             table.clear()
-        for index, job in enumerate([] if drawn else jobs, start=1):
-            grade = theme.STATE_HEALTH.get(job.base_state, "none")
-            if looks_like_noop(job):
-                grade = "crit"
-            util = job.cpu_utilization
-            # Row number only. A health dot on every row duplicated the STATE
-            # column beside it, and a filled circle leading each line was read as
-            # "all the entries are selected". The overview keeps its dot: group
-            # severity has no column of its own there.
-            marker = Text("%-2d" % index, style=theme.FAINT)
-            # MaxRSS above the ceiling is not a working set (it sums shared pages
-            # across the process tree), so it is flagged rather than read as 103%.
-            over_limit = bool(
-                job.mem_limit_bytes and job.max_rss and job.max_rss > job.mem_limit_bytes
-            )
-            cells = {
-                "#": marker,
-                "JOBID": Text(job.job_id, style=theme.INK),
-                "NAME": Text(job.name or "", style=theme.DIM),
-                "STATE": Text(job.base_state, style=theme.HEALTH_COLOR.get(grade, theme.DIM)),
-                "STARTED": Text(render.stamp_short(job.start) or "-", style=theme.ACCENT),
-                "ENDED": Text(render.stamp_short(job.end) or "-", style=theme.FAINT),
-                "WALL TIME": Text(format_duration(job.elapsed), style=theme.DIM),
-                "CPU TIME": Text(format_duration(job.total_cpu), style=theme.CPU_COLOR),
-                "CPUS BUSY": Text(
-                    render.cores_text(job),
-                    style=theme.HEALTH_COLOR["crit"]
-                    if (util is not None and util < 0.02)
-                    else theme.CPU_COLOR,
-                ),
-                "PEAK MEM": Text(format_bytes(job.max_rss), style=theme.MEM_COLOR),
-                "MEM%": Text(
-                    format_percent(job.mem_utilization),
-                    style=theme.HEALTH_COLOR["crit"] if over_limit else theme.DIM,
-                ),
-                "GPU": Text(str(job.gpu_count or "-"), style=theme.GPU_COLOR),
-                # `"-"`, matching `report.py`'s job table. This was the ONE cell
-                # of the twelve where the two surfaces disagreed about how to say
-                # "absent": the plain report writes `job.node_list or "-"` while
-                # this wrote `or ""`. STARTED, ENDED and GPU all use `-` on both
-                # sides, and NAME uses `""` on both, so the convention was settled
-                # everywhere except here -- and `render.py` exists precisely so
-                # "the dashboard and `--plain` cannot drift" (CLAUDE.md).
-                #
-                # An empty cell reads as a column that does not apply to this row;
-                # `-` is this tool's marker for a value it does not have. A job
-                # with no node list is a real state (pending, or cancelled before
-                # it was ever allocated), so the reader is told that rather than
-                # shown a blank.
-                "NODE": Text(job.node_list or "-", style=theme.FAINT),
-            }
-            table.add_row(*(cells[label] for label, _ in layout), key=str(index))
+            labels = [label for label, _ in layout]
+            # The row number is the one cell that depends on the row rather than
+            # the job, so it is spliced in at whatever position the layout gives
+            # it rather than assumed to lead. The placeholder keeps the per-row
+            # lookup a flat list comprehension.
+            marker_at = labels.index("#") if "#" in labels else None
+            if marker_at is not None:
+                labels[marker_at] = "JOBID"
+            self._fill_labels = labels
+            self._fill_marker_at = marker_at
+            self._filled = 0
+            # A screenful now, the rest between keystrokes. See `_draw_rows`.
+            self._draw_rows(max(_FIRST_ROWS, cursor + 1))
+            if self._filled < len(jobs):
+                self._fill_timer = self.set_interval(_FILL_EVERY, self._fill_slice)
         if not drawn and cursor and cursor < len(jobs):
             table.move_cursor(row=cursor)
 
@@ -1433,7 +1664,7 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
         # "of them" ties the count to the job count beside it. A bare "3 never
         # computed" next to a GPU-hours figure elsewhere read as hours.
         qualifier(
-            sum(1 for j in jobs if looks_like_noop(j)),
+            sum(1 for j in jobs if _noop(self.sp, j)),
             "%d of them never computed",
             theme.HEALTH_COLOR["warn"],
         )
@@ -1471,6 +1702,78 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
             parts.append(dict(FILTERS).get(self.filter_mode, self.filter_mode))
         self.sub_title = "  ·  ".join(parts)
 
+    def _draw_rows(self, stop: int) -> None:
+        """Draw rows up to ``stop`` into the table, continuing where it left off.
+
+        The flat job list is 29,617 rows on a real seven-day history and the
+        terminal shows about forty of them. Drawing all of them before handing
+        the screen back cost 5.0 s for ``a`` and 1.7 s for every search
+        keystroke -- a freeze, during which nothing on screen moves.
+
+        So the first screenful is drawn here and the rest arrives in slices from
+        :meth:`_fill_slice` between keystrokes. Nothing is dropped and nothing is
+        paged: the table still ends up holding every row, so `end`, a digit jump
+        and the scrollbar all mean what they meant. What changed is only when the
+        rows land -- and anything that needs the whole table before then says so
+        by calling :meth:`ensure_all_rows`.
+
+        Cells come from `SlurmpastApp.job_cells`, so a filter keystroke over jobs
+        already drawn once pays for the DataTable and nothing else.
+        """
+        jobs = self._rows
+        stop = min(stop, len(jobs))
+        start = self._filled
+        if start >= stop:
+            return
+        table = self.query_one("#jobs", DataTable)
+        cache = self.sp.job_cells
+        add_row = table.add_row
+        labels = self._fill_labels
+        marker_at = self._fill_marker_at
+        marker_style = theme.FAINT
+        for index in range(start, stop):
+            job = jobs[index]
+            cells = cache.get(job.job_id)
+            if cells is None:
+                cells = cache[job.job_id] = _job_cells(job, _noop(self.sp, job))
+            row = [cells[label] for label in labels]
+            if marker_at is not None:
+                row[marker_at] = Text("%-2d" % (index + 1), style=marker_style)
+            add_row(*row, key=str(index + 1))
+        self._filled = stop
+
+    def _fill_slice(self) -> None:
+        now = time.perf_counter()
+        if now - self._last_key < _FILL_YIELD_AFTER_KEY:
+            # Somebody is navigating. See `_FILL_YIELD_AFTER_KEY`.
+            return
+        deadline = now + _FILL_BUDGET
+        total = len(self._rows)
+        while self._filled < total:
+            self._draw_rows(self._filled + _FILL_STEP)
+            if time.perf_counter() >= deadline:
+                break
+        if self._filled >= total:
+            self._stop_filling()
+
+    def _stop_filling(self) -> None:
+        if self._fill_timer is not None:
+            self._fill_timer.stop()
+            self._fill_timer = None
+
+    def ensure_all_rows(self) -> None:
+        """Finish the background fill now.
+
+        For the two things that ask the TABLE rather than ``self._rows`` where
+        the end is: `end`, and a digit jump past what has been drawn.
+        """
+        self._stop_filling()
+        self._draw_rows(len(self._rows))
+
+    def on_unmount(self) -> None:
+        self._stop_filling()
+        _cancel_search_debounce(self)
+
     def _selected(self):
         table = self.query_one("#jobs", DataTable)
         if not self._rows or not (0 <= table.cursor_row < len(self._rows)):
@@ -1504,9 +1807,16 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
     def action_digit(self, digit: str) -> None:
         row = self._jump.push(digit, len(self._rows))
         if row is not None:
+            # The target may be past what the background fill has reached; the
+            # jump is bounded by `len(self._rows)`, so draw up to it first.
+            self._draw_rows(row)
             self.query_one("#jobs", DataTable).move_cursor(row=row - 1)
 
     def on_key(self, event: events.Key) -> None:
+        # Stamped before anything else, so a slice already queued behind this key
+        # sees it. Screen-level, so it catches the arrows the DataTable acts on as
+        # well as the keys handled here.
+        self._last_key = time.perf_counter()
         self._jump.on_key_pressed(event.key)
         handled = (event.key == "escape" and _dismiss_search(self, "#jobs")) or _steer_table(
             self, "#jobs", event.key
@@ -1532,9 +1842,11 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
             self.refresh_rows()
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        self.search_text = event.value
+        _debounce_search(self, event.value)
 
     def on_input_submitted(self, _event: Input.Submitted) -> None:
+        _cancel_search_debounce(self)
+        self.search_text = self.query_one("#search", Input).value
         self.query_one("#searchbar").remove_class("visible")
         self.query_one("#jobs", DataTable).focus()
 
@@ -1711,8 +2023,12 @@ class JobScreen(ScreenChrome, Screen[Any]):
         Without this, resizing the terminal left the prose wrapped to the width it
         had when the screen was opened -- the same staleness every table screen
         here avoids with its own ``on_resize``.
+
+        A resize that did not change the size re-wraps to the width it already
+        had; see :func:`_resize_changed_anything`.
         """
-        self.render_body()
+        if _resize_changed_anything(self):
+            self.render_body()
 
     def clipboard_row(self) -> str:
         """The whole post-mortem, rendered plain -- the paste-ready artefact."""
@@ -1984,7 +2300,8 @@ class PatternsScreen(ScreenChrome, Screen[Any]):
 
     def on_resize(self) -> None:
         """Re-wrap for the width there now is. See JobScreen.on_resize."""
-        self.render_body()
+        if _resize_changed_anything(self):
+            self.render_body()
 
     def render_body(self) -> None:
         history: History | None = self.sp.history
@@ -2042,16 +2359,20 @@ class NodesScreen(ScreenChrome, CentredContent, Screen[Any]):
         yield _header()
         with Vertical(id="content"):
             yield Static(id="summary")
-            yield DataTable(id="nodes", cursor_type="row")
+            yield FastDataTable(id="nodes", cursor_type="row")
             yield Static(id="exclude")
         yield Footer()
 
     def on_mount(self) -> None:
         self.refresh_rows()
+        # The size this build used, so the `Resize` Textual sends right after a
+        # screen is laid out does not rebuild it at the same size. See
+        # `_resize_changed_anything`.
+        self._sized_at = self.size
         self.query_one("#nodes", DataTable).focus()
 
     def on_resize(self) -> None:
-        if self.is_mounted:
+        if self.is_mounted and _resize_changed_anything(self):
             self.refresh_rows()
 
     def refresh_rows(self) -> None:
@@ -2276,6 +2597,17 @@ class SlurmpastApp(App[Any]):
         # background worker; until it lands, log lookups fall back to the per-job
         # search. See :func:`slurmpast.logs.assign_logs`.
         self._log_map: dict | None = None
+        # {job_id: {column label: Text}} for the loaded history. Filled on demand
+        # by `_job_cells`, dropped whenever the history is replaced. Shared across
+        # screens on purpose: the flat job list and every workload screen draw the
+        # same jobs, so the second one to open pays nothing for the cells.
+        self.job_cells: dict[str, dict[str, Text]] = {}
+        # {job_id: bool} for `diagnose.looks_like_noop`, which the job list's
+        # summary counts over every matching job on every filter change and every
+        # search keystroke -- 110 ms of a profiled 478 ms keystroke on a
+        # 29,617-job list, re-deriving an answer that cannot change while a
+        # history is loaded. Dropped with `job_cells`, for the same reason.
+        self.noop_jobs: dict[str, bool] = {}
 
         # The window was fixed at launch by -S, so answering "what about last
         # month?" meant quitting and re-running. `w` cycles it in place.
@@ -2366,20 +2698,45 @@ class SlurmpastApp(App[Any]):
         self._previous = None
         self.history = history
         self._log_map = None
+        # A reload brings new Job objects, and a cell drawn from an old one would
+        # report a state the job has since left.
+        self.job_cells = {}
+        self.noop_jobs = {}
         if not self.no_logs:
             # Off the UI thread: 1.7s over 6,600 jobs, which is invisible here and
             # a visible stall if it happens on the keypress that opens a job.
             self.run_worker(self._resolve_logs, thread=True, name="logs")
+        # Same trade, one panel over. `History.patterns` is deliberately lazy --
+        # "paying for it at load time would slow the first paint for a panel the
+        # user may never open" -- and that reasoning holds for `--plain` and for
+        # a library caller. Here the first paint has already happened, so the
+        # cost lands on `p` instead: measured at 505 ms of frozen dashboard on a
+        # 29,624-job history, on the keypress. Warmed in a worker after the
+        # overview is up, it costs the reader nothing either way. The property
+        # caches, so `p` finds it done.
+        self.run_worker(self._warm_patterns, thread=True, name="patterns")
         screen = self.screen
         if isinstance(screen, OverviewScreen):
             screen.refresh_rows()
+
+    def _warm_patterns(self) -> None:
+        history = self.history
+        if history is None:
+            return
+        try:
+            history.patterns  # noqa: B018 -- the property caches; that is the point
+        except Exception:
+            # Same rule as the log worker below: a warm-up that fails must leave
+            # the dashboard exactly as it would have been without one. `p` then
+            # computes them itself, and reports its own failure if there is one.
+            return
 
     def _resolve_logs(self) -> None:
         history = self.history
         if history is None:
             return
         try:
-            resolved = assign_logs(history.usable_jobs, extra_dirs=self.log_dirs)
+            resolved = assign_logs(history.usable_jobs, extra_dirs=self.log_dirs, pace=_breathe)
         except Exception:
             # `except OSError` did not deliver the guarantee this comment makes: any
             # other exception escaped the worker and, per `exit_on_error=True`, took

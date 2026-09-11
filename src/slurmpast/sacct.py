@@ -54,13 +54,17 @@ to be right on a cluster nobody here has seen.
 
 from __future__ import annotations
 
+import functools
 import getpass
+import itertools
 import math
 import os
 import re
 import subprocess
 import threading
+from typing import Any
 
+from . import cache
 from .duration import mem_scope, parse_bytes, parse_duration, parse_mem_limit
 from .model import Job, Step
 
@@ -148,6 +152,13 @@ _OPTIONAL = frozenset(
 # by field and by release.
 _UNSET = frozenset(["", "unknown", "none", "n/a", "unlimited", "(null)", "partition_limit"])
 
+#: First characters any member of `_UNSET` can begin with, either case. A value
+#: starting with anything else cannot be a sentinel, which answers the question
+#: without allocating a lowered copy of the string -- see `get` inside `parse`,
+#: where the leading-digit test already does the same job for the numeric fields
+#: and left 2.2M `str.lower()` calls on the text ones.
+_UNSET_LEAD = frozenset("unpUNP(")
+
 # Fields whose value a *person* chose, where those same words are ordinary text
 # rather than sacct speaking for itself. `Reason` really does read "none" on every
 # clean job, `Timelimit` really does read "UNLIMITED", `End` really does read
@@ -179,6 +190,68 @@ SAFE_DELIMITER = "\x1f"
 # query takes 2.26 s here, so this is not a performance bound -- it is there so an
 # unreachable slurmdbd reports a timeout instead of hanging the dashboard forever.
 DEFAULT_TIMEOUT = 300.0
+
+# --- Splitting one window query across several sacct processes -------------
+#
+# A window query costs almost nothing in the database and almost everything in
+# `sacct` itself formatting the rows. Measured on midway3 (Slurm 20.11.8) over
+# one user's last seven days -- 29,624 jobs, 89,163 rows, the 80 fields this
+# module asks for:
+#
+#     --format=JobID                        5.82 s      <- the database read
+#     --format=<40 fields>                 11.14 s
+#     --format=<80 fields>                 14.49 s      <- what slurmpast asked
+#     --format=<80 fields> -X               1.52 s      <- allocations only
+#
+# So ~6 s is the fetch and ~9 s is one process laying out 7.1 million cells,
+# single-threaded, on a login node with dozens of idle cores. The fix is to run
+# several sacct processes at once. Splitting the *window* does not work: sacct
+# filters step rows by the window too, so a job that spans a boundary comes back
+# with only the steps that ran inside each half, and its MaxRSS is then read off
+# a fragment (verified: 27 of 31,336 job/chunk pairs came back short).
+#
+# Splitting by job id does work, because `-j` returns a job's whole record. So
+# the ids are fetched first with `-X --format=JobID` -- the cheap query above,
+# 0.41 s for 29,627 ids and 0.07 s for 1,571 -- and the full read is partitioned
+# across them. Every other filter is passed through to both halves unchanged, so
+# what comes back is what the single query would have returned:
+#
+#     ids in the single query but not the partitioned one     0
+#     ids in the partitioned query but not the single one     1   (a job that
+#                                                                  started between
+#                                                                  the two)
+#
+#     probe + 8 parallel `-j` reads          3.15 s   (vs 14.49 s)
+#
+#: Below this, the window query is already quick and one extra round trip is the
+#: larger cost. 1,571 jobs -- a day here -- reads in 0.90 s undivided.
+PARALLEL_MIN_JOBS = 400
+
+#: Processes at once. Eight saturates the win (four gave 8.3 s where eight gave
+#: 4.8 s on the window-split experiment) without turning a login node into a
+#: fork bomb, and slurmdbd serialises enough that more buys little.
+PARALLEL_MAX_WORKERS = 8
+
+#: Ids per `-j`, and therefore MORE chunks than there are workers -- deliberately.
+#: Parsing is Python and holds the GIL, so if every chunk returns at the same
+#: moment the eight parses queue up behind each other and none of them overlaps a
+#: query. Smaller chunks stagger the returns, so a thread is parsing chunk 9 while
+#: another is still waiting on chunk 17. Measured over the same 22,359-job window,
+#: end to end including the id listing:
+#:
+#:      8 chunks   5.46 s        48 chunks   4.27 s
+#:     16 chunks   4.98 s        64 chunks   4.56 s
+#:     32 chunks   4.94 s       128 chunks   4.98 s
+#:
+#: -- the far side is process-spawn overhead, so this sits at the bottom of the
+#: curve rather than as low as it will go. It also keeps the id list, which is a
+#: SINGLE argv entry, at a few KiB: Linux caps one entry at MAX_ARG_STRLEN
+#: (128 KiB), which a history of this size would otherwise reach.
+PARALLEL_IDS_PER_QUERY = 500
+
+#: Never split so finely that the per-process overhead dominates. A window just
+#: over PARALLEL_MIN_JOBS is three chunks, not thirty.
+PARALLEL_MIN_IDS_PER_QUERY = 150
 
 #: Budget for the LIVE (`sstat`) query specifically, which is an enrichment and
 #: not the data. `DEFAULT_TIMEOUT` is for the accounting database; `sstat` is a
@@ -762,12 +835,15 @@ def parse(text, fields=None, delimiter="|", stats=None):
         value = row[pos].strip()
         if not value:
             return ""
-        # A leading digit rules the sentinels out without lowering the string:
-        # every member of `_UNSET` starts with a letter or `(`. That matters
-        # because this branch runs once per non-empty field -- 3.2M `str.lower()`
-        # calls over a 30-day window -- and a large share of 85 sacct fields are
-        # numbers (`ElapsedRaw`, `ReqCPUS`, `Priority`, `UID`, byte counts).
-        if not free_text and not value[0].isdigit() and value.lower() in _UNSET:
+        # The first character rules the sentinels out without lowering the string.
+        # A leading digit did that for the numeric fields -- a large share of 85
+        # sacct fields are numbers (`ElapsedRaw`, `ReqCPUS`, `Priority`, `UID`,
+        # byte counts) -- and left every text one still being lowered: 2.2M
+        # `str.lower()` calls over a seven-day window, for job names, partitions,
+        # node lists and states that cannot be a sentinel because no sentinel
+        # begins with their first letter. `_UNSET_LEAD` is the whole test now, and
+        # it is a superset check, so `value.lower() in _UNSET` still decides.
+        if not free_text and value[0] in _UNSET_LEAD and value.lower() in _UNSET:
             return ""
         seen = shared.get(value)
         if seen is not None:
@@ -1211,18 +1287,94 @@ def queryable_job_id(value: str) -> str:
     return match.group(1) if match else value
 
 
+def _in_parallel(work, workers):
+    """Run ``work`` across at most ``workers`` daemon threads; results in order.
+
+    ``concurrent.futures.ThreadPoolExecutor`` is the obvious tool and is the
+    wrong one here, for one reason: its threads are non-daemon and joined at
+    interpreter exit, so a Ctrl-C during the query would wait for every ``sacct``
+    still in flight -- up to the 300 s accounting budget. :func:`main` treats
+    Ctrl-C as an ordinary way to stop this tool, and says why: "its query timeout
+    is 300 s by design (an accounting database can genuinely take minutes) ...
+    Five minutes of silence is exactly when a user reaches for Ctrl-C." A query
+    that cannot be interrupted takes that away, and would take it away precisely
+    when the reader most wants it.
+
+    ``Thread.join`` IS interruptible, and a daemon thread does not hold up
+    interpreter exit, so a Ctrl-C here leaves the same orphaned ``sacct`` a
+    single-process query always did -- several of them rather than one.
+
+    The first exception raised by any item is re-raised here, and the remaining
+    items are not started.
+    """
+    results: list = [None] * len(work)
+    errors: list[BaseException] = []
+    turn = itertools.count()  # `next` on a count is atomic, so this needs no lock
+
+    def run():
+        for at in turn:
+            if at >= len(work) or errors:
+                return
+            try:
+                results[at] = work[at]()
+            except BaseException as exc:  # re-raised in the caller
+                errors.append(exc)
+                return
+
+    threads = [
+        threading.Thread(target=run, daemon=True, name="slurmpast-sacct-%d" % n)
+        for n in range(min(workers, len(work)))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[0]
+    return results
+
+
 class Sacct:
     """Queries sacct, adapting the request to what the local Slurm accepts."""
 
-    def __init__(self, runner=None, probe=None, delimiter=None):
+    def __init__(self, runner=None, probe=None, delimiter=None, parallel=True, cache=True):
         self._run = runner or _run
         self._probe = probe
         self._supported = None
         self._delimiter = delimiter
+        # Whether a finished job may be read back from disk instead of from
+        # sacct -- see :mod:`slurmpast.cache`. Off for a caller with an injected
+        # runner, set below: those records did not come from this cluster's
+        # accounting database and must not be filed as though they had.
+        self._cache = cache
+        self._store_cache: Any = None
+        # Whether a window query may be split across several sacct processes --
+        # see PARALLEL_MIN_JOBS. Off makes `history` issue the one query it always
+        # did, which is what the parser tests want and what a caller measuring the
+        # scheduler rather than this tool wants.
+        self._parallel = parallel
         # Filled by the last query. Read by `--json` so a cluster whose sacct
         # emits rows this parser refuses says so, instead of the rows simply not
         # being there.
         self.stats: dict = {}
+
+    def _store(self):
+        """The record cache, or None when it is off for this instance.
+
+        Never for an injected ``runner``: a test double or a library caller
+        feeding canned text is not this cluster's accounting database, and a
+        record from one filed under the other is the one way this could hand back
+        a job that does not exist. Never when the reader has switched it off.
+        """
+        if not self._cache or self._run is not _run or not cache.enabled():
+            return None
+        if self._store_cache is None:
+            fields = self.fields
+            # Scoped by cluster and account, so two clusters' records cannot meet
+            # -- `Cluster` is in the field list precisely because a record does
+            # not mean the same thing on another one.
+            self._store_cache = cache.Store(("sacct", current_user()), fields)
+        return self._store_cache
 
     @property
     def fields(self):
@@ -1234,8 +1386,14 @@ class Sacct:
             self._supported = resolve_fields(available)
         return self._supported
 
-    def _query(self, extra):
-        fields = self.fields
+    def _fetch(self, extra, fields):
+        """Raw sacct output for one query, negotiating ``--delimiter`` once.
+
+        Split out of :meth:`_query` so the id listing and the partitioned reads go
+        through the same option handling -- and so the delimiter is settled by the
+        listing, before any thread starts, rather than negotiated concurrently by
+        several of them.
+        """
         # `-D` because without it sacct reports only a job's *latest* incarnation,
         # so a job requeued on NODE_FAIL, on preemption, or by `scontrol requeue`
         # loses every attempt but the last -- including the time those attempts
@@ -1258,11 +1416,182 @@ class Sacct:
                 self._delimiter = "|"
             else:
                 self._delimiter = SAFE_DELIMITER
-                return parse(text, fields=fields, delimiter=SAFE_DELIMITER, stats=self.stats)
+                return text
         args = base + list(extra)
         if self._delimiter != "|":
             args = base + ["--delimiter=" + self._delimiter] + list(extra)
-        return parse(self._run(args), fields=fields, delimiter=self._delimiter, stats=self.stats)
+        return self._run(args)
+
+    def _query(self, extra):
+        fields = self.fields
+        text = self._fetch(extra, fields)
+        return parse(text, fields=fields, delimiter=self._delimiter, stats=self.stats)
+
+    def _window_listing(self, extra):
+        """``[(job id, fingerprint)]`` for the window, in sacct's own order.
+
+        ``-X`` drops the step rows, which is what makes this cheap: the same
+        seven-day window costs 0.45 s here against 14.49 s for the full read.
+
+        The fingerprint is every ``(State, End)`` sacct currently reports for that
+        id, in order -- ``-D`` lists one row per incarnation, so a job requeued
+        after it finished has a different one. It costs two more columns on the
+        cheapest query this makes, and it is what lets :mod:`slurmpast.cache`
+        reuse a stored record without believing a clock: see that module.
+
+        The id is returned as sacct printed it, because that is what the record
+        will be keyed by. Turning it into something ``-j`` accepts is
+        :func:`queryable_job_id`'s job and happens at the point of asking --
+        ``-j '49046820_[1-20%10]'`` is a fatal error in the very sacct that just
+        printed that string.
+        """
+        listing = self._fetch(["-X", *extra], ["JobID", "State", "End"])
+        delimiter = self._delimiter or "|"
+        order = []
+        marks: dict[str, list] = {}
+        for line in listing.splitlines():
+            row = line.split(delimiter)
+            raw = row[0].strip() if row else ""
+            if not raw or not _looks_like_job_id(raw):
+                continue
+            if raw not in marks:
+                marks[raw] = []
+                order.append(raw)
+            marks[raw].append(
+                (
+                    _canonical_state(row[1].strip()) if len(row) > 1 else "",
+                    row[2].strip() if len(row) > 2 else "",
+                )
+            )
+        return [(raw, tuple(marks[raw])) for raw in order]
+
+    def _query_partitioned(self, extra):
+        """The window read by several sacct processes at once, or ``None``.
+
+        ``None`` is "this is not worth splitting, or splitting is off" and the
+        caller runs the ordinary single query -- which is also the path that
+        reports an error, so nothing here has to produce a good message.
+
+        Every filter the caller asked for is passed to the partitioned reads as
+        well as to the listing. It is redundant -- ``-j`` already names the exact
+        jobs -- and it is what makes the result identical rather than merely
+        equivalent: sacct applies ``-S``/``-E``/``--state`` to STEP rows too, so
+        dropping them here would hand back steps the single query filters out.
+        """
+        if not self._parallel:
+            return None
+        fields = self.fields
+        try:
+            listing = self._window_listing(extra)
+        except SacctError:
+            # An sacct with no `-X`, or a query this site refuses. Either way the
+            # single query below is the one that reports it, and it says something
+            # a reader can act on -- so this stays silent and stops trying, rather
+            # than paying for the same refusal on every reload.
+            self._parallel = False
+            return None
+        if len(listing) < PARALLEL_MIN_JOBS:
+            return None
+        # Whatever the cache still describes correctly is not read again. `known`
+        # keeps the listing's order so the result does not depend on what happened
+        # to be cached; `wanted` is what is left to ask sacct for.
+        store = self._store()
+        known = {}
+        wanted = []
+        seen = set()
+        for raw, fingerprint in listing:
+            if store is not None:
+                hit = store.get(raw, fingerprint)
+                if hit is not None:
+                    known[raw] = hit
+                    continue
+            queryable = queryable_job_id(raw)
+            if queryable not in seen:
+                seen.add(queryable)
+                wanted.append(queryable)
+        if not wanted:
+            # Everything was already known. The listing was still made, so this is
+            # as current as an uncached read of the same instant.
+            self.stats["dropped_rows"] = {"shifted": 0}
+            return [known[raw] for raw, _ in listing if raw in known]
+        ids = wanted
+        size = min(
+            PARALLEL_IDS_PER_QUERY,
+            max(PARALLEL_MIN_IDS_PER_QUERY, -(-len(ids) // PARALLEL_MAX_WORKERS)),
+        )
+        groups = [ids[at : at + size] for at in range(0, len(ids), size)]
+        if len(groups) < 2 and not known:
+            # One group and nothing cached is the single query with extra steps.
+            # `and not known` is load-bearing: once the cache is warm `wanted` is
+            # just the handful of jobs still running, which is ONE group -- and
+            # bailing there threw away 22,354 valid records and re-read the whole
+            # window, turning a 1.5 s warm start into 16 s.
+            return None
+        # One stats dict per group, merged below: `parse` writes into whatever it
+        # is given, and several threads sharing one would race.
+        collected: list[dict] = [{} for _ in groups]
+        delimiter = self._delimiter
+        # Query in parallel, parse one at a time. The queries are subprocesses and
+        # overlap properly; the parse is Python and holds the GIL, so eight of them
+        # running at once do not go eight times faster -- they take turns badly.
+        # Measured over the same window: 4.38 s / 4.76 s unserialised against
+        # 4.00 s / 3.99 s with this lock, and only one parse's intermediates are
+        # alive at a time. A thread waiting here releases the GIL, so the one that
+        # holds it runs at full speed while the others sit in sacct.
+        parsing = threading.Lock()
+
+        def read(at, group):
+            text = self._fetch(["-j", ",".join(group), *extra], fields)
+            with parsing:
+                return parse(text, fields=fields, delimiter=delimiter, stats=collected[at])
+
+        try:
+            batches = _in_parallel(
+                [functools.partial(read, at, group) for at, group in enumerate(groups)],
+                PARALLEL_MAX_WORKERS,
+            )
+        except SacctError:
+            # A site that refuses a long `-j` list, or a scheduler that fell over
+            # between the listing and the read. Fall back for this query AND every
+            # later one on this instance, so a dashboard reloading in a loop does
+            # not pay for the discovery each time.
+            self._parallel = False
+            return None
+        shifted = sum((each.get("dropped_rows") or {}).get("shifted", 0) for each in collected)
+        self.stats["dropped_rows"] = {"shifted": shifted}
+        fetched = [job for batch in batches for job in batch]
+        # Built ONCE. An earlier version rebuilt it inside the loop below, which
+        # is O(jobs squared) and turned a warm 1.5 s read into 16 s.
+        marks = dict(listing)
+        if store is not None:
+            for job in fetched:
+                fingerprint = marks.get(job.job_id)
+                # Only a job the LISTING named: an array element expanded out of a
+                # master query was never described by the listing, so there is no
+                # fingerprint to validate it against next time. `Store.put` refuses
+                # anything that is not finished, which is what those are.
+                if fingerprint is not None:
+                    store.put(job, fingerprint)
+            store.save()
+        if not known:
+            return fetched
+        # Back into the listing's order, with anything sacct volunteered that the
+        # listing did not name (an expanded pending array) kept on the end.
+        by_id = {}
+        extra_jobs = []
+        for job in fetched:
+            if job.job_id in marks:
+                by_id[job.job_id] = job
+            else:
+                extra_jobs.append(job)
+        out = []
+        for raw, _fingerprint in listing:
+            job = known.get(raw) or by_id.pop(raw, None)
+            if job is not None:
+                out.append(job)
+        out.extend(by_id.values())
+        out.extend(extra_jobs)
+        return out
 
     def jobs(self, job_ids):
         ids = [str(j) for j in job_ids if str(j).strip()]
@@ -1301,7 +1630,11 @@ class Sacct:
             extra += ["-E", until]
         if partition:
             extra += ["-r", partition]
-        return self._query(extra)
+        # Split across several sacct processes when the window is big enough to
+        # pay for the extra round trip; `None` means it was not, or could not be.
+        # See PARALLEL_MIN_JOBS for what this costs and what it buys.
+        partitioned = self._query_partitioned(extra)
+        return self._query(extra) if partitioned is None else partitioned
 
 
 #: What `sstat` is asked for, in this order.  Deliberately short: every field is

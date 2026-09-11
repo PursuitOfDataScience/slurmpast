@@ -17,6 +17,19 @@ def make_app(jobs, **kwargs):
     return tui.SlurmpastApp(lambda: list(jobs), window="test window", **kwargs)
 
 
+async def settle_search(pilot):
+    """Wait out the search box's debounce.
+
+    `tui._debounce_search` re-filters once the keystrokes STOP rather than on
+    each one: rebuilding the flat job list is 100-311 ms at 29,617 jobs -- 139 ms
+    of that is `DataTable.clear`, which is Textual's own -- so typing "test" was
+    four of those back to back. Only the tests that type need this; enter commits
+    and escape cancels without waiting, which is the point of both.
+    """
+    await pilot.pause(tui._SEARCH_SETTLE * 2)
+    await pilot.pause()
+
+
 @pytest.fixture
 def history_jobs(repeat_timeouts, oom_series, healthy_job):
     return list(repeat_timeouts) + list(oom_series) + [healthy_job]
@@ -292,7 +305,7 @@ class TestEscapeCancelsSearch:
             await pilot.pause()
             for char in "cot":
                 await pilot.press(char)
-            await pilot.pause()
+            await settle_search(pilot)
             assert app.screen.query_one(table, DataTable).row_count < before
             await pilot.press("escape")
             await pilot.pause()
@@ -325,7 +338,7 @@ class TestEscapeCancelsSearch:
             await pilot.pause()
             for char in "cot":
                 await pilot.press(char)
-            await pilot.pause()
+            await settle_search(pilot)
             narrowed = app.screen.query_one("#groups", DataTable).row_count
             await pilot.press("enter")
             await pilot.pause()
@@ -715,7 +728,7 @@ class TestNavigatingWhileSearching:
             await pilot.pause()
             for char in "cot":
                 await pilot.press(char)
-            await pilot.pause()
+            await settle_search(pilot)
             assert app.screen.search_text == "cot"
             assert app.screen.query_one("#groups", DataTable).row_count < before
 

@@ -134,7 +134,13 @@ class TestControls:
 
     def test_an_allocated_job_does_pay_the_window_query(self, monkeypatch, capsys) -> None:
         _code, _out, calls = _plain(monkeypatch, capsys, ALLOCATED_JOB)
-        assert len(calls) == 1, calls
+        # One widening, not one call. A window query is a cheap
+        # `-X --format=JobID,State,End` listing plus the read that follows it
+        # (see `Sacct._query_partitioned`), so the read is what to count -- the
+        # point of the guard is that the widening happens at all, and
+        # `calls == []` in the class above is what says it did not.
+        reads = [c for c in calls if not any(a.startswith("--format=JobID,State,End") for a in c)]
+        assert len(reads) == 1, calls
 
     def test_and_gets_the_note_the_widening_exists_for(self, monkeypatch, capsys) -> None:
         _code, out, _calls = _plain(monkeypatch, capsys, ALLOCATED_JOB)

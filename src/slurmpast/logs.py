@@ -36,6 +36,7 @@ is an inference, and callers are told so -- a wrong log attached to a post-morte
 is worse than no log, because it invents a cause.
 """
 
+import functools
 import os
 import re
 import shlex
@@ -263,30 +264,86 @@ def searched_roots(job, extra_dirs=None):
     return roots
 
 
+#: How many distinct (work directory, --log-dir set, cwd) combinations to keep
+#: the derived directory lists for. A history has a handful of work directories,
+#: not thousands, so this never evicts in practice.
+_DIR_CACHE = 256
+
+
+@functools.lru_cache(maxsize=_DIR_CACHE)
+def _searched_dirs(roots):
+    """Each of ``roots`` crossed with :data:`_SUBDIRS`, normalised, in order.
+
+    Cached because it is a pure derivation of the root strings and it was being
+    rebuilt once per job. Over a 29,617-job history that was 6.8 million
+    ``os.path.normpath`` calls to compute the same fourteen strings.
+
+    Directory NAMES only. The cache the :class:`Scan` docstring rules out is one
+    over directory *contents* -- "a long-lived dashboard that cached directory
+    contents once would stop seeing logs written after it started". This holds
+    nothing a later write could change, and the working directory arrives as one
+    of ``roots``, so a ``chdir`` is a different key rather than a stale answer.
+    """
+    seen = set()
+    out = []
+    for root in roots:
+        for sub in _SUBDIRS:
+            base = os.path.normpath(os.path.join(root, sub) if sub else root)
+            if base not in seen:
+                seen.add(base)
+                out.append(base)
+    return tuple(out)
+
+
+def _candidate_dirs(job, extra_dirs=None):
+    return _searched_dirs(tuple(searched_roots(job, extra_dirs)))
+
+
+def _candidate_names(job):
+    """The conventional filenames this job's log could carry, in priority order.
+
+    Pattern-major, identifier-minor -- the order :func:`candidate_paths` has
+    always produced, kept here so the two cannot drift.
+    """
+    jid = base_job_id(job.job_id)
+    array_base = jid.split("_")[0]
+    idents = (jid,) if array_base == jid else (jid, array_base)
+    return tuple(pattern.format(jid=ident) for pattern in _PATTERNS for ident in idents)
+
+
+def _candidate_parts(job, extra_dirs=None):
+    """``(directory, name)`` for every conventional candidate, in priority order.
+
+    Split out of :func:`candidate_paths` because the caller that matters --
+    :func:`find_log` behind a :class:`Scan` -- asks the directory listing about a
+    NAME, and joining the two only to split them straight back apart was 6.9M
+    ``os.path.join`` and 4.9M ``os.path.split`` calls over one history.
+    """
+    names = _candidate_names(job)
+    for base in _candidate_dirs(job, extra_dirs):
+        for name in names:
+            yield base, name
+
+
 def candidate_paths(job, extra_dirs=None):
     """Paths worth checking for this job's log, in priority order.
 
     What Slurm recorded comes first and is not a guess; the conventional names
     follow for the clusters that record nothing.
     """
-    jid = base_job_id(job.job_id)
-    array_base = jid.split("_")[0]
-    roots = searched_roots(job, extra_dirs)
-
     seen = set()
     out = []
     for path in recorded_paths(job):
         seen.add(path)
         out.append(path)
-    for root in roots:
-        for sub in _SUBDIRS:
-            base = os.path.join(root, sub) if sub else root
-            for pattern in _PATTERNS:
-                for ident in (jid, array_base):
-                    path = os.path.normpath(os.path.join(base, pattern.format(jid=ident)))
-                    if path not in seen:
-                        seen.add(path)
-                        out.append(path)
+    for base, name in _candidate_parts(job, extra_dirs):
+        # `base` is already normalised and `name` holds no separator, so `join`
+        # alone yields a normal path -- the `normpath` this used to wrap it in
+        # was 6.8M calls that could not change an answer.
+        path = os.path.join(base, name)
+        if path not in seen:
+            seen.add(path)
+            out.append(path)
     return out
 
 
@@ -354,14 +411,40 @@ def probe_path(path):
     return "special"
 
 
-def find_log(job, extra_dirs=None, exists=os.path.isfile):
-    """First existing candidate path, or None. Matched by name, so it is certain."""
-    for path in candidate_paths(job, extra_dirs=extra_dirs):
+def find_log(job, extra_dirs=None, exists=os.path.isfile, scan=None):
+    """First existing candidate path, or None. Matched by name, so it is certain.
+
+    ``scan`` is an optimisation and nothing else: given one, a conventional name
+    that the directory listing does not hold is ruled out without building a path
+    at all. Every conventional spelling ends in ``.out`` or ``.err``, which is
+    exactly the set :meth:`Scan.entries` keeps, so the listing settles absence
+    here for the reason :meth:`Scan.exists` already gives. A name the listing DOES
+    hold still goes through ``exists``, so a dangling symlink is still refused.
+
+    Without a ``scan`` the loop is what it always was, one ``exists`` per
+    candidate path.
+    """
+    for path in recorded_paths(job):
         try:
             if exists(path):
                 return path
         except OSError:
             continue
+    candidates = _candidate_names(job)
+    for base in _candidate_dirs(job, extra_dirs=extra_dirs):
+        # The listing fetched once per DIRECTORY, not once per candidate: there
+        # are twelve conventional spellings behind each one, so asking the scan
+        # inside the inner loop was 4.9M method calls over one history.
+        here = scan.names(base) if scan is not None else None
+        for name in candidates:
+            if here is not None and name not in here:
+                continue
+            path = os.path.join(base, name)
+            try:
+                if exists(path):
+                    return path
+            except OSError:
+                continue
     return None
 
 
@@ -378,9 +461,21 @@ def _log_dirs(job, extra_dirs=None):
     attached to a training post-mortem. A directory named with ``--log-dir`` is
     trusted, because the user just said that is where the logs are.
     """
+    return _scanned_dirs(tuple(extra_dirs or ()), job.work_dir or "", os.getcwd())
+
+
+@functools.lru_cache(maxsize=_DIR_CACHE)
+def _scanned_dirs(extra, work_dir, cwd):
+    """:func:`_log_dirs` for one (--log-dir set, work directory, cwd).
+
+    Cached for the reason :func:`_searched_dirs` is, and it is the same saving:
+    this was 116,006 calls over one 29,617-job history, each re-deriving the same
+    fifteen strings. Keyed on all three because all three are inputs -- a
+    ``chdir`` between two jobs changes the answer and must change the key.
+    """
     seen = set()
     out = []
-    for directory in extra_dirs or ():
+    for directory in extra:
         if not directory:
             continue
         directory = os.path.normpath(directory)
@@ -388,9 +483,9 @@ def _log_dirs(job, extra_dirs=None):
             seen.add(directory)
             out.append((directory, True))
     roots = []
-    if job.work_dir:
-        roots.append(job.work_dir)
-    roots.append(os.getcwd())
+    if work_dir:
+        roots.append(work_dir)
+    roots.append(cwd)
     for root in roots:
         for sub in _SUBDIRS:
             base = os.path.normpath(os.path.join(root, sub) if sub else root)
@@ -398,7 +493,7 @@ def _log_dirs(job, extra_dirs=None):
                 continue
             seen.add(base)
             out.append((base, bool(sub)))
-    return out
+    return tuple(out)
 
 
 class Scan:
@@ -430,6 +525,14 @@ class Scan:
                 found = []
             self._entries[directory] = found
         return self._entries[directory]
+
+    def names(self, directory):
+        """:meth:`entries` as a set. The public spelling of :meth:`_names_in`.
+
+        `find_log` asks this directly, so that ruling a conventional filename out
+        costs one set lookup instead of a path built and split apart again.
+        """
+        return self._names_in(directory)
 
     def _names_in(self, directory):
         """:meth:`entries` as a set, cached alongside it.
@@ -552,6 +655,26 @@ def job_identifiers(job):
     return out
 
 
+def _carries_ident(name, ident):
+    r"""Whether ``name`` holds ``ident`` delimited by non-digits.
+
+    Exactly what ``re.search(r"(?<!\d)" + re.escape(ident) + r"(?!\d)", name)``
+    answers, without the regex. The pattern is built from the JOB ID, so it is a
+    different pattern for every job -- 29,617 of them on one history, which walks
+    straight through `re`'s 512-entry cache and recompiles: 49,019 compilations,
+    5.2 s of a 15.0 s profiled pass. A literal needs no engine.
+    """
+    width = len(ident)
+    at = name.find(ident)
+    while at != -1:
+        if (at == 0 or not name[at - 1].isdigit()) and not name[
+            at + width : at + width + 1
+        ].isdigit():
+            return True
+        at = name.find(ident, at + 1)
+    return False
+
+
 def find_log_by_id(job, extra_dirs=None, scan=None):
     """A log whose *name* carries this job's id, whatever the rest of the name is.
 
@@ -571,12 +694,14 @@ def find_log_by_id(job, extra_dirs=None, scan=None):
         # A plain job id is a digit run, so the prebuilt index answers it outright.
         # An array element's own spelling (``60_4``) is not, so that falls back to a
         # scan of the names -- rare enough to be worth the difference.
-        pattern = None if ident.isdigit() else re.compile(r"(?<!\d)%s(?!\d)" % re.escape(ident))
+        plain = ident.isdigit()
         for directory, _trusted in _log_dirs(job, extra_dirs):
-            if pattern is None:
+            if plain:
                 names = scan.by_digits(directory).get(ident, ())
             else:
-                names = [e for e in scan.entries(directory) if pattern.search(e)]
+                names = [e for e in scan.entries(directory) if _carries_ident(e, ident)]
+            if not names:
+                continue
             for entry in sorted(names, key=_suffix_key):
                 path = os.path.normpath(os.path.join(directory, entry))
                 if scan.is_file(path):
@@ -590,6 +715,34 @@ _MTIME_SLACK_BEFORE = 60
 _MTIME_SLACK_AFTER = 600
 
 
+def _job_marks(job):
+    """What :func:`_relates_to_job` tests a name against, derived once per job.
+
+    Split out because the test runs once per FILE in every untrusted directory --
+    9.2 million times over one 29,617-job history against a 900-file tree -- and
+    it was rebuilding the identifier list inside that loop.
+
+    The name is returned already lowered, and empty when it is too short to be
+    evidence: two characters would match almost anything, and a real job name is
+    longer.
+    """
+    name = (job.name or "").strip().lower()
+    return job_identifiers(job), (name if len(name) >= 3 else "")
+
+
+def _relates(entry, idents, name):
+    """:func:`_relates_to_job` against marks already derived. See :func:`_job_marks`."""
+    # Five characters lowered rather than the whole filename: this is the test
+    # that runs first and answers most often, and `entry.lower()` allocated a
+    # copy of every name in the directory for every job.
+    if entry[:5].lower() == "slurm":
+        return True
+    for ident in idents:
+        if _carries_ident(entry, ident):
+            return True
+    return bool(name) and name in entry.lower()
+
+
 def _relates_to_job(entry, job):
     """Whether a name in an *untrusted* directory has anything to do with this job.
 
@@ -598,15 +751,8 @@ def _relates_to_job(entry, job):
     a name carrying the job's name is the ``%x`` convention; anything else in a home
     directory is a stranger that happened to be written at the right moment.
     """
-    lower = entry.lower()
-    if lower.startswith("slurm"):
-        return True
-    for ident in job_identifiers(job):
-        if re.search(r"(?<!\d)%s(?!\d)" % re.escape(ident), entry):
-            return True
-    name = (job.name or "").strip().lower()
-    # Two characters would match almost anything; a real job name is longer.
-    return bool(name) and len(name) >= 3 and name in lower
+    idents, name = _job_marks(job)
+    return _relates(entry, idents, name)
 
 
 def time_candidates(job, extra_dirs=None, scan=None):
@@ -630,11 +776,16 @@ def time_candidates(job, extra_dirs=None, scan=None):
     scan = scan or Scan()
     found = []
     seen = set()
+    idents, job_name = _job_marks(job)
     for directory, trusted in _log_dirs(job, extra_dirs):
+        # `directory` comes back normalised from `_log_dirs` and `entry` is a bare
+        # name, so the prefix plus the name IS the joined path -- and `os.path.join`
+        # was 9.2M calls, 12.2 s of a 52.9 s profiled pass, for a concatenation.
+        prefix = directory if directory.endswith(os.sep) else directory + os.sep
         for entry in scan.entries(directory):
-            if not trusted and not _relates_to_job(entry, job):
+            if not trusted and not _relates(entry, idents, job_name):
                 continue
-            path = os.path.normpath(os.path.join(directory, entry))
+            path = prefix + entry
             if path in seen:
                 continue
             seen.add(path)
@@ -727,13 +878,28 @@ def find_log_by_name(job, extra_dirs=None, scan=None):
     the six fixed spellings or any file carrying the job id).
     """
     scan = scan or Scan()
-    return find_log(job, extra_dirs=extra_dirs, exists=scan.exists) or find_log_by_id(
+    return find_log(job, extra_dirs=extra_dirs, exists=scan.exists, scan=scan) or find_log_by_id(
         job, extra_dirs=extra_dirs, scan=scan
     )
 
 
-def assign_logs(jobs, extra_dirs=None):
+#: Jobs between two calls to ``assign_logs``'s ``pace`` hook. 500 is ~20 ms of
+#: work at the measured 1.2 s for 29,617 jobs -- under the ~50 ms at which a
+#: keypress starts to feel late -- and 59 pauses over that history, which is
+#: 59 ms of added wall clock for a pass that runs in the background anyway.
+PACE_EVERY = 500
+
+
+def assign_logs(jobs, extra_dirs=None, pace=None):
     """Resolve logs for many jobs at once. ``{job_id: (path, inferred)}``.
+
+    ``pace`` is called every :data:`PACE_EVERY` jobs and is how the dashboard
+    stays answerable while this runs. It has to: this is Python, so it holds the
+    GIL, and the dashboard starts it in a worker thread the moment a history
+    lands. At 16.7 s (before the shortcuts above) that made every arrow key take
+    between 0.85 s and 5.4 s; at 1.2 s it was still worth 180 ms spikes. A hook
+    rather than a sleep of its own, because a library caller resolving logs in the
+    foreground wants neither -- ``None`` is exactly the behaviour this always had.
 
     Timing has to be resolved across jobs, not one at a time. Measured on a real
     history: 51 of 296 timing matches pointed at a file that another job also
@@ -755,7 +921,9 @@ def assign_logs(jobs, extra_dirs=None):
     scan = Scan()
     resolved = {}
     pending = []
-    for job in jobs:
+    for at, job in enumerate(jobs):
+        if pace is not None and at and not at % PACE_EVERY:
+            pace()
         path = find_log_by_name(job, extra_dirs=extra_dirs, scan=scan)
         if path:
             resolved[job.job_id] = (path, False)
@@ -763,7 +931,9 @@ def assign_logs(jobs, extra_dirs=None):
             pending.append(job)
 
     ranked = []
-    for job in pending:
+    for at, job in enumerate(pending):
+        if pace is not None and at and not at % PACE_EVERY:
+            pace()
         for key, path in time_candidates(job, extra_dirs=extra_dirs, scan=scan):
             ranked.append((key, str(job.job_id), path))
     # Sorting by the candidate key puts the strongest claim on any file first, so

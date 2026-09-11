@@ -288,3 +288,43 @@ class TestTheUnitLadderNeverPrintsAFigureOfTenTwentyFour:
         assert format_bytes(4 * 1024**3) == "4.0 GiB"
         assert format_bytes(33935225257984) == "30.9 TiB"  # the real disk-read peak
         assert format_bytes(None) == "n/a"
+
+
+class TestAbsentIsNotTheSameAsZero:
+    """The trap in taking the cheap exit from these two parsers first.
+
+    Both are on the hot path -- 445,815 and 624,987 calls parsing one seven-day
+    history -- so both now answer `None` and `""` before building a string. The
+    obvious spelling of that, `if not text`, is wrong: `0` is falsy and is a
+    measurement of zero, which these have always returned as such. Getting it
+    wrong turns "this job used no CPU" into "nobody measured", which is the very
+    distinction the sentinel table at the top of the module exists to keep.
+    """
+
+    @pytest.mark.parametrize("absent", [None, ""])
+    def test_absent_is_none(self, absent):
+        assert parse_duration(absent) is None
+        assert parse_bytes(absent) is None
+
+    @pytest.mark.parametrize("zero", [0, 0.0, "0"])
+    def test_zero_is_zero(self, zero):
+        assert parse_duration(zero) == 0.0
+        assert parse_bytes(zero) == 0
+
+    def test_a_sentinel_is_still_absent(self):
+        """CONTROL — the leading-digit shortcut must not let a sentinel through.
+
+        The lowered comparison is now skipped when the value starts with a digit,
+        on the grounds that no sentinel does. These are the ones sacct writes.
+        """
+        for word in ("UNLIMITED", "unlimited", "Unknown", "None", "n/a", "*", "partition_limit"):
+            assert parse_duration(word) is None, word
+        for word in ("Unknown", "unknown", "None", "none", "n/a"):
+            assert parse_bytes(word) is None, word
+
+    def test_a_real_value_still_parses(self):
+        """CONTROL — the exits above are exits, not a new refusal."""
+        assert parse_duration("01:52:49") == 6769.0
+        assert parse_duration("30:30.919") == pytest.approx(1830.919)
+        assert parse_bytes("53741792K") == 53741792 * 1024
+        assert parse_bytes("40Gn") == 40 * 1024**3

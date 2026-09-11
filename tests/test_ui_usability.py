@@ -1308,7 +1308,10 @@ class TestATableThatMatchedNothingSaysSo:
             await pilot.pause()
             for ch in "zzz":
                 await pilot.press(ch)
-                await pilot.pause()
+            # The search box re-filters once the typing stops; see
+            # `tui._debounce_search` and `test_tui.settle_search`.
+            await pilot.pause(tui._SEARCH_SETTLE * 2)
+            await pilot.pause()
             assert app.screen._rows == []
             assert app.screen.query_one("#jobs", DataTable).display is False
             text = app.screen.summary_text.plain
