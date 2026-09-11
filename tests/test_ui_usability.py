@@ -1457,14 +1457,27 @@ class TestATableIsNotBuiltTwiceToOpenItOnce:
             builds.clear()
             await pilot.press("a")
             await pilot.pause()
+            # Deterministically, not whenever the background fill happens to get
+            # there: rows arrive in slices now, and `pilot.pause` waiting for CPU
+            # idle is not a promise that every slice has run. Without this the
+            # count depends on how fast the runner is, which is how this failed on
+            # the oldest-Textual job and passed everywhere else.
+            app.screen.ensure_all_rows()
             rows = app.screen.query_one("#jobs", DataTable).row_count
         assert rows == len(jobs), rows
-        # No layout is built twice, and the work done is one build per distinct
-        # layout -- never the same table over again.
+        # No layout is built twice, and no row is added twice.
         assert len(builds) == len(set(builds)), builds
-        assert seen["n"] == rows * len(builds), (
+        # AT MOST one pass per build. It used to be exactly that. With the
+        # deferred fill a build that is superseded before it finishes stops where
+        # it is -- on Textual 0.86 the app lays a screen out twice, and the first
+        # layout's fill is cancelled partway, so 400 rows across 2 builds cost 600
+        # add_row calls rather than 800. Less work for the same table is the point
+        # of the fill; more work than one pass per build is the bug this class is
+        # about, and that is what is asserted.
+        assert seen["n"] <= rows * len(builds), (
             "%d add_row calls for %d rows across %d build(s)" % (seen["n"], rows, len(builds))
         )
+        assert seen["n"] >= rows, "%d add_row calls cannot have filled %d rows" % (seen["n"], rows)
 
     @pytest.mark.asyncio
     async def test_the_overview_adds_each_row_once(self, monkeypatch):
@@ -1491,6 +1504,9 @@ class TestATableIsNotBuiltTwiceToOpenItOnce:
             await pilot.pause()
             await pilot.press("a")
             await pilot.pause()
+            # Finish the fill before counting, or the slices still to come are
+            # attributed to the refreshes below. See the sibling test.
+            app.screen.ensure_all_rows()
             seen["n"] = 0
             app.screen.refresh_rows(keep_cursor=True)
             app.screen.refresh_rows(keep_cursor=True)

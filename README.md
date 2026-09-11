@@ -8,7 +8,7 @@
   <a href="https://pypi.org/project/slurmpast/"><img src="https://img.shields.io/pypi/v/slurmpast.svg" alt="PyPI"></a>
   <a href="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/tests-2526-brightgreen.svg" alt="2526 tests">
+  <img src="https://img.shields.io/badge/tests-2643-brightgreen.svg" alt="2643 tests">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
 </p>
 
