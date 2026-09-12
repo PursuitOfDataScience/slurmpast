@@ -39,6 +39,40 @@ def _pinned_site(monkeypatch):
     reset_cache()
 
 
+@pytest.fixture(autouse=True)
+def _no_key_acceleration(request):
+    """Hold-to-accelerate is off unless a test asks for it.
+
+    `tui._HeldKey` cannot tell a held key from a test pressing "down" two hundred
+    times in a loop, and a loop that runs for longer than `_ACCEL_AFTER` gets a
+    stride nobody wrote the test for -- intermittently, since whether it crosses
+    the threshold depends on how loaded the runner is. Two tests here broke on
+    exactly that and a dozen more were one slow afternoon away from it.
+
+    A test that wants the ramp declares the `key_acceleration` fixture.
+    """
+    try:
+        from slurmpast import tui
+    except Exception:  # textual is not installed; there is no dashboard to slow
+        yield
+        return
+    if "key_acceleration" in request.fixturenames:
+        yield
+        return
+    saved = tui._ACCEL_AFTER
+    tui._ACCEL_AFTER = float("inf")
+    try:
+        yield
+    finally:
+        tui._ACCEL_AFTER = saved
+
+
+@pytest.fixture
+def key_acceleration():
+    """Ask for the real ramp. Read by :func:`_no_key_acceleration`, above."""
+    return True
+
+
 def _row(**kw):
     """Build one sacct row by FIELD NAME, never by position.
 

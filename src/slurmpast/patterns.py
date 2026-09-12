@@ -58,6 +58,14 @@ REQUEUE_FRACTION = 0.10
 MEM_WALK_STEPS = 8
 # How many repeat-failure groups to print before summarising the rest.
 REPEAT_REPORT_LIMIT = 4
+# The same cap for the memory detectors, which did not have one. On a real
+# seven-day history `find_memory_search` emitted NINETEEN findings, and because
+# the advice for the commonest shape does not vary with the workload, the same
+# three lines of it were printed nineteen times -- 96 of the report's 213 lines
+# saying one thing. `find_repeat_failures` states the rule this broke: "an
+# uncapped list is the failure mode where volume replaces judgement -- so the
+# tail is counted and named rather than printed in full."
+MEMORY_REPORT_LIMIT = 4
 
 
 _DIGIT_RUN = re.compile(r"\d+")
@@ -380,31 +388,28 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
                 "Raise --time above that limit; a timeout's Elapsed only bounds runtime from below."
             )
         elif dominant == "OUT_OF_MEMORY":
-            # Names the finding rather than the code. The detector emits two titles
-            # now -- "Memory request is being hand-searched" and "The same memory
-            # request keeps being OOM-killed" -- and "the memory-search check" is
-            # neither of them on screen, so a reader following the pointer was
-            # looking for a heading that is not there.
-            action = (
-                "See the memory finding for this workload — the next increment is probably "
-                "not the fix."
-            )
+            # Points at a heading the reader can actually see. Naming the CODE
+            # ("the memory-search check") sent them looking for something that is
+            # not on screen; the two titles the memory detector emits are
+            # "--mem is being guessed at" and "Same --mem, OOM-killed again".
+            action = "See the --mem finding below; the next increment is probably not the fix."
         else:
             unit = "tasks" if one_array else "runs"
             if one_array:
                 # There is nothing to stop: the array was submitted once.
                 action = (
-                    "One array submission, not repeated ones: reproduce a single task "
-                    "interactively rather than resubmitting the array."
+                    "One array submission, not repeated ones. Reproduce a single task "
+                    "interactively."
                 )
             elif finished_well:
                 action = "Reproduce interactively."
             else:
                 action = "Stop resubmitting; the failure is deterministic. Reproduce interactively."
             if finished_well:
-                action += (
-                    " %d of %d %s completed, so the failure is not deterministic — compare a "
-                    "failed one against a completed one." % (len(finished_well), len(members), unit)
+                action += " Not deterministic: %d of %d %s completed, so compare the two." % (
+                    len(finished_well),
+                    len(members),
+                    unit,
                 )
 
         findings.append(
@@ -414,7 +419,7 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
                 Finding(
                     CRITICAL if fraction > 0.8 else WARNING,
                     "repeat-failure",
-                    "This work has failed repeatedly in the same way",
+                    "Failing the same way, run after run",
                     evidence,
                     action,
                 ),
@@ -430,11 +435,10 @@ def find_repeat_failures(jobs, min_runs=REPEAT_MIN, limit=REPEAT_REPORT_LIMIT):
             Finding(
                 INFO,
                 "repeat-failure-more",
-                "%d further group%s show%s the same repeat-failure pattern"
-                % (len(hidden), "" if len(hidden) == 1 else "s", "s" if len(hidden) == 1 else ""),
-                "Together they account for %d more failed runs. Shown in full with a "
-                "narrower --since window, or per job with `slurmpast <jobid>`."
-                % sum(row[1] for row in hidden),
+                "%d more workload%s failing the same way"
+                % (len(hidden), "" if len(hidden) == 1 else "s"),
+                "%d further failed runs between them. Narrow --since to see them, or "
+                "`slurmpast <jobid>` for one." % sum(row[1] for row in hidden),
                 "",
             )
         )
@@ -560,21 +564,18 @@ def find_requeues(jobs, min_runs=REQUEUE_MIN, fraction=REQUEUE_FRACTION, limit=R
 
         if dominant == "NODE_FAIL":
             action = (
-                "NODE_FAIL is the node, not the job. `slurmpast --nodes` attributes it, "
-                "and a workload this exposed is worth pinning away from the nodes it keeps "
-                "landing on."
+                "The node, not the job. `slurmpast --nodes` attributes it — a workload "
+                "this exposed is worth pinning away from those nodes."
             )
         elif dominant in ("PREEMPTED", "CANCELLED"):
             action = (
-                "Preemption is a queue policy, not a fault: check whether this account has a "
-                "higher-priority QOS, and make the work checkpoint so a requeue resumes "
-                "rather than restarts."
+                "Queue policy, not a fault. Ask for a higher-priority QOS, and checkpoint "
+                "so a requeue resumes rather than restarts."
             )
         else:
             action = (
-                "Requeue restarts the job from the beginning unless it checkpoints, so this "
-                "time is spent twice. `slurmpast --nodes` says whether particular nodes are "
-                "behind it."
+                "Without a checkpoint a requeue starts over, so this time is spent twice. "
+                "`slurmpast --nodes` says if certain nodes are behind it."
             )
 
         findings.append(
@@ -626,8 +627,17 @@ def find_requeues(jobs, min_runs=REQUEUE_MIN, fraction=REQUEUE_FRACTION, limit=R
     return kept
 
 
-def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
-    """Hand-bisection of --mem, visible as a non-monotone walk across OOMs."""
+def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM, limit=MEMORY_REPORT_LIMIT):
+    """Hand-bisection of --mem, visible as a non-monotone walk across OOMs.
+
+    Worst first, then capped, for the reason :func:`find_repeat_failures` gives
+    for doing the same: an uncapped list is where volume replaces judgement. This
+    one had no cap, and it is the detector that needed one most -- nineteen
+    workloads on one seven-day history, and the advice for the commonest shape is
+    the same sentence whichever workload it is about, so the report repeated it
+    nineteen times. Ranked on OOM kills, which is the count the evidence leads
+    with.
+    """
     groups = {}
     for job in usable(jobs):
         groups.setdefault(group_key(job), []).append(job)
@@ -686,57 +696,74 @@ def find_memory_search(jobs, min_oom=BISECTION_MIN_OOM):
                 walk,
             )
         else:
-            evidence = (
-                "%d OOM kills for %s, every one of them at --mem %s: the request has not moved."
-                % (len(ooms), workload_label(key[0], members), format_bytes(requests[0]))
+            evidence = "%d OOM kills for %s, all at --mem %s." % (
+                len(ooms),
+                workload_label(key[0], members),
+                format_bytes(requests[0]),
             )
         if contradiction is not None:
-            evidence += " Job %s then COMPLETED at %s — a value that had already OOM'd." % (
+            evidence += " Job %s later COMPLETED at the same %s." % (
                 contradiction.job_id,
                 format_bytes(contradiction.mem_limit_bytes),
             )
 
         if contradiction is not None:
             action = (
-                "--mem is not the deciding variable: the same request both failed and "
-                "succeeded. Something else changed (worker count, batch size, input shard). "
-                "Find that before tuning memory again."
+                "Memory is not the cause — the same request both failed and succeeded. "
+                "Find what else changed: workers, batch size, input shard."
             )
         elif not searching:
             # "Stop stepping" below is advice about a search, and there was none.
             action = (
-                "Nothing has been tried yet: every one of these asked for the same %s. "
-                "Measure the working set once and request that plus a margin, rather than "
-                "resubmitting the request that is already failing." % format_bytes(requests[0])
+                "Nothing has changed yet — every run asked for %s. Measure the peak once, "
+                "then request that plus a margin." % format_bytes(requests[0])
             )
         elif not monotone:
             action = (
-                "The search is not converging — it moves both directions. Measure the real "
-                "working set once instead of bisecting, then request that plus a margin."
+                "The search moves both ways, so it is not converging. Measure the peak "
+                "once instead of guessing, then add a margin."
             )
         else:
             biggest = max(requests)
             action = (
-                "Stop stepping. Jump well past the largest failed request (%s) to bound the "
-                "requirement, then tighten once from a measurement." % format_bytes(biggest)
+                "Stop stepping. Jump well past the largest failure (%s) to bound it, then "
+                "tighten from a measurement." % format_bytes(biggest)
             )
 
         findings.append(
-            Finding(
-                CRITICAL if contradiction is not None else WARNING,
-                # Two codes for the two shapes, as `timeout-hang` and `timeout-real`
-                # already do for the rule above: a consumer of `--json` should be
-                # able to tell "they are bisecting" from "they have changed
-                # nothing", because the two call for different things.
-                "memory-search" if searching else "memory-unchanged",
-                "Memory request is being hand-searched"
-                if searching
-                else "The same memory request keeps being OOM-killed",
-                evidence,
-                action,
+            (
+                len(ooms),
+                Finding(
+                    CRITICAL if contradiction is not None else WARNING,
+                    # Two codes for the two shapes, as `timeout-hang` and
+                    # `timeout-real` already do for the rule above: a consumer of
+                    # `--json` should be able to tell "they are bisecting" from
+                    # "they have changed nothing", because the two call for
+                    # different things.
+                    "memory-search" if searching else "memory-unchanged",
+                    "--mem is being guessed at" if searching else "Same --mem, OOM-killed again",
+                    evidence,
+                    action,
+                ),
             )
         )
-    return findings
+
+    findings.sort(key=lambda row: -row[0])
+    kept = [row[1] for row in findings[:limit]]
+    hidden = findings[limit:]
+    if hidden:
+        kept.append(
+            Finding(
+                INFO,
+                "memory-more",
+                "%d more workload%s hitting the same memory wall"
+                % (len(hidden), "" if len(hidden) == 1 else "s"),
+                "%d further OOM kills between them. `slurmpast <jobid>` for one of them."
+                % sum(row[0] for row in hidden),
+                "",
+            )
+        )
+    return kept
 
 
 def find_noop_allocations(jobs, top=10):

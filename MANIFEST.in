@@ -32,3 +32,8 @@ graft assets
 graft .github
 include LICENSE
 include README.md
+# The release log. A reader who downloads the sdist to check a portability claim
+# on their own cluster -- which is how this package's claims actually get
+# checked -- should be able to see what changed between the version they have
+# and the one they are looking at, without a network round trip to GitHub.
+include CHANGELOG.md

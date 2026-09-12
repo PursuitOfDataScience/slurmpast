@@ -189,19 +189,10 @@ def maxrss_caveat(known_site=None):
     current = known_site if known_site is not None else site()
     from_cgroup = current.rss_from_cgroup
     if from_cgroup is None:
-        return (
-            "MaxRSS may over-report multi-process jobs depending on this cluster's "
-            "JobAcctGatherType, so treat it as an upper bound"
-        )
+        return "MaxRSS may over-report here, depending on this cluster, so it is an upper bound"
     if from_cgroup:
-        return (
-            "MaxRSS comes from the cgroup peak here (%s), so it is the step's real "
-            "high-water mark rather than a sum over processes" % current.jobacct_gather_type
-        )
-    return (
-        "MaxRSS sums RSS across the process tree under %s, double-counting shared "
-        "pages, so treat it as an upper bound" % current.jobacct_gather_type
-    )
+        return "MaxRSS is the cgroup's own peak here, so it is the real high-water mark"
+    return "MaxRSS double-counts shared pages here, so it is an upper bound"
 
 
 # Below this many samples the peak is a coin flip rather than a measurement. The
@@ -260,16 +251,14 @@ def maxrss_sampling_note(elapsed_seconds, known_site=None):
     if samples is None or samples > SPARSE_SAMPLE_COUNT:
         return ""
     # No article before the figures: "a 89s job" and "an 89s job" are both wrong
-    # for some interval, and the numbers read fine without one.
-    return (
-        "the sampler runs every %ds and the job ran %ds, so at most %d sample%s \u2014 "
-        "a spike between polls is not recorded"
-        % (
-            current.sampling_seconds,
-            int(float(elapsed_seconds)),
-            samples,
-            "" if samples == 1 else "s",
-        )
+    # for some interval, and the numbers read fine without one. What a thin
+    # sample MEANS is the caller's sentence, not this one's: both callers say it,
+    # and saying it here too put "a spike can be missed" inside a clause that
+    # then went on to say the same thing again.
+    return "at most %d sample%s in %ds" % (
+        samples,
+        "" if samples == 1 else "s",
+        int(float(elapsed_seconds)),
     )
 
 
@@ -400,21 +389,18 @@ def cpu_caveat(known_site=None):
     from_cgroup = cpu_total_is_complete(current)
     if from_cgroup is None:
         return (
-            "TotalCPU may miss work done in processes reparented out of the step's "
-            "tree, depending on this cluster's JobAcctGatherType, so treat it as a "
-            "lower bound"
+            "TotalCPU may miss detached workers here, depending on this cluster, "
+            "so it is a lower bound"
         )
     if from_cgroup:
-        return (
-            "TotalCPU is gathered from the cgroup here (%s), which a reparented "
-            "process stays in, so detached worker pools are counted" % current.jobacct_gather_type
-        )
-    return (
-        "TotalCPU is summed over the step's process tree under %s, so work in "
-        "processes reparented away from it — PSOCK/multisession worker pools, "
-        "nohup/setsid children, detached daemons — is not counted; treat it as a "
-        "lower bound" % current.jobacct_gather_type
-    )
+        return "TotalCPU is gathered from the cgroup here, so detached workers are counted"
+    # One clause. This rides inside a per-job finding, where it was three
+    # wrapped lines of a four-line paragraph and buried the measurement it was
+    # qualifying. The gather type stays -- it is what makes this a claim about
+    # THIS cluster rather than a universal disclaimer -- and so do "reparented"
+    # and "lower bound", which are the words that carry the meaning. Three
+    # examples of a reparented process become one.
+    return "TotalCPU misses detached worker pools here, so it is a lower bound"
 
 
 def gpu_utilization_note(known_site=None):

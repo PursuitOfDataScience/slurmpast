@@ -71,7 +71,12 @@ CHEAP_FAILURES: list[Job] = _workload(64800, 1800)
 COSTLY_FAILURES: list[Job] = _workload(45000, 81000)
 
 #: The sentence the fix puts on both surfaces, for the costly history.
-EXPECTED = "flagged runs held the most GPU-hours in train-#: 90 of its 290"
+#: Reworded after being reported as unreadable three times. "flagged runs held
+#: the most GPU-hours in office-asr: 0.2 of its 0.9" reads as "the most WITHIN
+#: office-asr" when it means "office-asr is the workload with the most", "its"
+#: has no visible antecedent, and the pair carries no unit. Subject, verb, then
+#: the figures with their unit.
+EXPECTED = "train-# wasted the most GPU time: 90 of its 290 GPU-hours went to flagged runs"
 
 
 def _history(jobs: list[Job]) -> History:
@@ -105,10 +110,15 @@ def _table_row(text: str) -> str:
 
 
 def _summary_sentence(text: str) -> str:
-    """The clause under test, cut out of whichever surface drew it."""
+    """The clause under test, cut out of whichever surface drew it.
+
+    Bounded by the workload label and the sentence's last word rather than by a
+    figure, so a reworded middle does not need this helper rewritten again.
+    """
     squashed = _squash(text)
-    start = squashed.index("flagged runs held")
-    return squashed[start : squashed.index(" 290", start) + len(" 290")]
+    start = squashed.index("train-# wasted")
+    end = squashed.index("flagged runs", start) + len("flagged runs")
+    return squashed[start:end]
 
 
 def _make_app(jobs: list[Job]) -> tui.SlurmpastApp:

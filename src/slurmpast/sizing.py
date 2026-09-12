@@ -387,10 +387,7 @@ def memory_advice(jobs) -> Advice:
             % (len(ooms), "" if len(ooms) == 1 else "s", format_bytes(floor) if floor else "n/a"),
             suggestion="%dG" % target if target and verdict != "keep" else "",
             basis=basis,
-            caution=(
-                "If the same request both failed and succeeded, --mem is not the "
-                "deciding variable — look for what else changed."
-            ),
+            caution="If it also succeeded at this size, memory is not the cause.",
         )
 
     if untrustworthy and (
@@ -428,26 +425,30 @@ def memory_advice(jobs) -> Advice:
 
     verdict = _memory_verdict(target, current)
 
-    caution = maxrss_caveat() + "."
-    # The sampler's blind spot, on the surface whose whole output is "ask for
-    # less". `maxrss_caveat` words the direction MaxRSS overstates; a peak taken
-    # from one or two samples of a short run can also sit far *under* the truth,
-    # and acting on that here under-provisions a job that then OOMs. Worded from
-    # the shortest contributing run, because that is the one whose sample count
-    # is thinnest and it is the peak's provenance that is in question.
+    # ONE direction, not both. `maxrss_caveat` words the way MaxRSS overstates;
+    # a peak taken from one or two samples of a short run sits far *under* the
+    # truth instead, and acting on that here under-provisions a job that then
+    # OOMs. Printing both left the reader a sentence that said the figure was an
+    # upper bound and then that it was a floor -- three clauses that cancel out,
+    # on the one surface whose whole output is "ask for less". So the thin-sample
+    # case wins where it applies, because it is the direction that can break the
+    # advice, and the over-report caveat carries the rest.
+    #
+    # Worded from the shortest contributing run: that is the one whose sample
+    # count is thinnest, and it is the peak's provenance that is in question.
     shortest = min((j.elapsed for j in usable if j.elapsed is not None), default=None)
     sampling = maxrss_sampling_note(shortest)
     if sampling:
-        caution += "  The shortest of these runs is thinly sampled, so the peak may be a "
-        caution += "floor rather than a ceiling: %s. Confirm before lowering." % sampling
+        caution = "Thinly sampled (%s), so the peak may be low." % sampling
+    else:
+        caution = maxrss_caveat() + "."
     if untrustworthy:
-        caution += "  %d run%s excluded: MaxRSS above the limit there, which cannot be a " % (
+        caution += "  %d run%s excluded: MaxRSS above the limit." % (
             len(untrustworthy),
             "" if len(untrustworthy) == 1 else "s",
         )
-        caution += "working set."
     if any((j.node_count or 1) > 1 for j in usable):
-        caution += "  Per node, which is what --mem sets; the allocation total is larger."
+        caution += "  Per node; the allocation total is larger."
 
     return Advice(
         flag="--mem",
@@ -569,9 +570,8 @@ def cpu_advice(jobs) -> Advice:
     if saturated:
         clauses.insert(
             0,
-            "Saturated at this partition's ceiling of %d cores per node, so a larger "
-            "request here cannot be scheduled — this workload needs a partition with "
-            "more cores per node." % ceiling,
+            "At this partition's ceiling of %d cores per node — a larger request needs "
+            "a partition with more cores per node." % ceiling,
         )
     caution = "  ".join(c for c in clauses if c)
 

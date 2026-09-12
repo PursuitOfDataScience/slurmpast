@@ -590,7 +590,8 @@ class TestExcludedRecordsAreNamed:
 
         h = History(demo(), window="now-30days → now")
         text = render_overview(h, style=Style(enabled=False))
-        assert "window now-30days → now" in text
+        # The label alone; "window" in front of it was the tool's own vocabulary.
+        assert "now-30days → now" in text
 
 
 class TestBarLooksLikeAGauge:
@@ -742,7 +743,7 @@ class TestWorkloadBannerSurvivesRefresh:
             await pilot.pause()
             extra = app.screen.extra_summary()
             assert extra is not None
-            assert "failed repeatedly" in extra.plain
+            assert "Failing the same way" in extra.plain
 
     @pytest.mark.asyncio
     async def test_banner_still_there_after_filtering(self):
@@ -753,7 +754,7 @@ class TestWorkloadBannerSurvivesRefresh:
             await pilot.pause()
             await pilot.press("f")  # this used to wipe it
             await pilot.pause()
-            assert "failed repeatedly" in app.screen.summary_text.plain
+            assert "Failing the same way" in app.screen.summary_text.plain
 
     @pytest.mark.asyncio
     async def test_a_clean_workload_gets_no_failure_banner(self):
@@ -769,7 +770,7 @@ class TestWorkloadBannerSurvivesRefresh:
             await pilot.pause()
             extra = app.screen.extra_summary()
             text = "" if extra is None else extra.plain
-            assert "failed repeatedly" not in text
+            assert "Failing the same way" not in text
 
     @pytest.mark.asyncio
     async def test_flat_job_list_has_no_banner_hook_content(self):

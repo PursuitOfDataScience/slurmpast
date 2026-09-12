@@ -118,7 +118,7 @@ class TestMemorySearch:
         """
         finding = find(find_memory_search(oom_series), "memory-search")
         assert "COMPLETED at" in finding.evidence
-        assert "not the deciding variable" in finding.action
+        assert "Memory is not the cause" in finding.action
 
     def test_walk_is_shown(self, oom_series):
         finding = find(find_memory_search(oom_series), "memory-search")
@@ -254,7 +254,7 @@ class TestReportVolume:
         findings = find_repeat_failures(self._many_groups(repeat_timeouts))
         tail = [f for f in findings if f.code == "repeat-failure-more"]
         assert len(tail) == 1
-        assert "3 further groups" in tail[0].title
+        assert "3 more workloads failing the same way" in tail[0].title
 
     def test_no_tail_note_when_under_the_cap(self, repeat_timeouts):
         findings = find_repeat_failures(self._many_groups(repeat_timeouts, count=2))
@@ -352,7 +352,7 @@ class TestMemorySearchUsesTheRealLimit:
             0
         ]
         assert "COMPLETED at" in finding.evidence
-        assert "not the deciding variable" in finding.action
+        assert "Memory is not the cause" in finding.action
 
 
 class TestOneWorkloadIsOnePersonsWork:
@@ -428,7 +428,7 @@ class TestAlreadyOomdMeansAlready:
 
     def test_a_success_after_an_oom_at_the_same_value_still_is(self):
         findings = find_memory_search(self._history(completed_first=False))
-        assert "already OOM'd" in findings[0].evidence, findings[0].evidence
+        assert "later COMPLETED at the same" in findings[0].evidence, findings[0].evidence
 
 
 class TestTheRepeatFailureActionNamesTheSplitToo:
@@ -587,8 +587,8 @@ class TestAWalkThatDoesNotWalkIsNotASearch:
     def test_an_unchanged_request_is_reported_as_what_it_is(self):
         finding = find(find_memory_search(self._unchanged()), "memory-unchanged")
         assert finding is not None, codes(find_memory_search(self._unchanged()))
-        assert finding.title == "The same memory request keeps being OOM-killed"
-        assert "the request has not moved" in finding.evidence
+        assert finding.title == "Same --mem, OOM-killed again"
+        assert "all at --mem" in finding.evidence
         assert "walking" not in finding.evidence
         # And "->" would be a walk it never took.
         assert "->" not in finding.evidence
@@ -597,14 +597,14 @@ class TestAWalkThatDoesNotWalkIsNotASearch:
         """The action has to match too: "Stop stepping" is advice about a search."""
         finding = find(find_memory_search(self._unchanged()), "memory-unchanged")
         assert "Stop stepping" not in finding.action
-        assert "Nothing has been tried yet" in finding.action
+        assert "Nothing has changed yet" in finding.action
         assert "8.0 GiB" in finding.action
 
     def test_a_real_search_still_reads_as_one(self):
         """The control. Six distinct values is a bisection and keeps its wording."""
         finding = find(find_memory_search(self._searched()), "memory-search")
         assert finding is not None
-        assert finding.title == "Memory request is being hand-searched"
+        assert finding.title == "--mem is being guessed at"
         assert "--mem walking" in finding.evidence
         assert "17.0 GiB" in finding.evidence and "18.0 GiB" in finding.evidence
 

@@ -1371,7 +1371,7 @@ class TestAnArrowIsOnlyDrawnWhenItPointsAtSomething:
 
         jobs = self._many_failing_groups(repeat_timeouts)
         text = render_patterns(History(jobs), style=Style(enabled=False))
-        assert "3 further groups" in text, text
+        assert "3 more workloads failing the same way" in text, text
         assert not self._bare_arrows(text), self._bare_arrows(text)
 
     def test_both_surfaces_agree_on_the_actionless_finding(self):

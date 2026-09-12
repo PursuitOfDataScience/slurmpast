@@ -1356,3 +1356,111 @@ class TestFitColumnsHoldsItsContractOnAnySpec:
                 seen["floor overrun"] += 1
         for branch, count in seen.items():
             assert count > 100, (branch, count, seen)
+
+
+def _widths(columns):
+    return {c.label: c.width for c in columns}
+
+
+class TestTheRowNumberColumnFitsTheRowsItNumbers:
+    """A "#" fixed at 3 numbered row 1000 as "100", and 1001 as "100" as well.
+
+    Reported from the flat job list: rows 991 to 999 counted up correctly and
+    then the column started over, so ten consecutive rows carried the same
+    number before it ticked to "101". It is not decoration -- `tui._RowJump`
+    lets a reader type a row number to jump to it -- so a row that reads 100 and
+    answers to 1004 is a trap, and a clipped identifier that still looks like an
+    identifier is worse than a wider table or no column at all.
+    """
+
+    def test_a_short_list_is_left_as_it_was(self):
+        """CONTROL — `--plain` shows 25 rows by default and 3 is right for it."""
+        from slurmpast.render import JOB_COLUMNS, ROW_NUMBER_FLOOR, numbered_for
+
+        assert _widths(numbered_for(JOB_COLUMNS, 25))["#"] == ROW_NUMBER_FLOOR
+
+    @pytest.mark.parametrize("rows,want", [(999, 3), (1000, 4), (9999, 4), (29617, 5)])
+    def test_it_widens_to_the_longest_number_it_will_draw(self, rows, want):
+        from slurmpast.render import JOB_COLUMNS, numbered_for
+
+        assert _widths(numbered_for(JOB_COLUMNS, rows))["#"] == want
+
+    def test_nothing_else_moves(self):
+        from slurmpast.render import JOB_COLUMNS, numbered_for
+
+        widened = numbered_for(JOB_COLUMNS, 29617)
+        assert [c.label for c in widened] == [c.label for c in JOB_COLUMNS]
+        for before, after in zip(JOB_COLUMNS, widened, strict=True):
+            if before.label != "#":
+                assert before == after
+
+    def test_an_empty_list_still_has_a_column(self):
+        from slurmpast.render import JOB_COLUMNS, ROW_NUMBER_FLOOR, numbered_for
+
+        assert _widths(numbered_for(JOB_COLUMNS, 0))["#"] == ROW_NUMBER_FLOOR
+
+    def test_the_overview_gets_it_too(self):
+        """`--all-users` on a busy cluster reaches four figures of workloads."""
+        from slurmpast.render import OVERVIEW_COLUMNS, numbered_for
+
+        assert _widths(numbered_for(OVERVIEW_COLUMNS, 12000))["#"] == 5
+
+    def test_a_wide_terminal_shows_the_wider_column(self):
+        from slurmpast.render import JOB_COLUMNS, fit_columns, numbered_for
+
+        layout = dict(fit_columns(numbered_for(JOB_COLUMNS, 29617), 140))
+        assert layout["#"] == 5
+
+    def test_a_narrow_terminal_drops_the_column_rather_than_a_digit(self):
+        """The note this replaced chose the other way: it held "#" at 3 so the
+        never-dropped columns would fit 80 cells, and paid for it with a number
+        that was wrong. `#` goes LAST in the drop order now -- so on a terminal
+        that cannot hold a truthful row number there is no row number, and the
+        table still fits."""
+        from slurmpast.render import JOB_COLUMNS, fit_columns, numbered_for
+
+        layout = dict(fit_columns(numbered_for(JOB_COLUMNS, 29617), 80))
+        assert "#" not in layout
+        assert sum(layout.values()) + 2 * len(layout) <= 80
+
+    def test_and_keeps_it_at_eighty_cells_when_it_costs_nothing_extra(self):
+        """CONTROL, and the reason the drop is on the WIDENING and not the column.
+
+        At the floor "#" costs no more than it always did, so making it droppable
+        there would take the row number away from every 80-column terminal to
+        solve a problem those readers do not have."""
+        from slurmpast.render import JOB_COLUMNS, fit_columns, numbered_for
+
+        assert dict(fit_columns(numbered_for(JOB_COLUMNS, 25), 80))["#"] == 3
+        assert dict(fit_columns(numbered_for(JOB_COLUMNS, 999), 78))["#"] == 3
+
+    def test_every_number_the_plain_job_table_prints_is_its_own(self):
+        """End to end, on the surface the report was made from."""
+        from slurmpast import report
+
+        jobs = [_numbered_job(i) for i in range(1, 1006)]
+        text = report.render_list(jobs, limit=len(jobs), style=report.Style(enabled=False))
+        seen = [
+            line.split()[0]
+            for line in text.splitlines()
+            if line[:6].strip().isdigit() and len(line.split()) > 2
+        ]
+        assert len(seen) == len(jobs), (len(seen), len(jobs))
+        assert seen == [str(n) for n in range(1, len(jobs) + 1)]
+
+
+def _numbered_job(index):
+    from slurmpast.model import Job
+
+    return Job(
+        job_id="%d" % (900000 + index),
+        name="w",
+        user="u",
+        partition="test",
+        state="COMPLETED",
+        submit="2026-01-01T00:00:00",
+        start="2026-01-01T00:00:00",
+        end="2026-01-01T00:10:00",
+        elapsed=600.0,
+        node_list="midway3-0001",
+    )

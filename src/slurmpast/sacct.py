@@ -1472,11 +1472,33 @@ class Sacct:
         caller runs the ordinary single query -- which is also the path that
         reports an error, so nothing here has to produce a good message.
 
-        Every filter the caller asked for is passed to the partitioned reads as
-        well as to the listing. It is redundant -- ``-j`` already names the exact
-        jobs -- and it is what makes the result identical rather than merely
-        equivalent: sacct applies ``-S``/``-E``/``--state`` to STEP rows too, so
-        dropping them here would hand back steps the single query filters out.
+        The listing selects WHICH jobs; the reads then fetch each of those jobs
+        **whole**, with no window filter of their own. That is a reversal, and it
+        is load-bearing in two ways.
+
+        The filters used to be passed to the reads as well, to make the result
+        byte-identical to the single query. It is not identical any more, and the
+        difference is a bug being fixed rather than introduced: sacct applies
+        ``-S``/``-E``/``--state`` to STEP rows too, so a job that started before
+        the window comes back with only the steps that ran inside it. Job
+        57477255 on midway3 -- 41 hours, six work steps -- was returned with
+        three, summing to **0.4 CPU-seconds against its real 21,383**, and
+        `looks_like_noop` therefore called it idle and charged its 41.42
+        GPU-hours to "never computed". That single job was the whole of one
+        account's "41 of 116 GPU-hours never used" headline. A post-mortem of a
+        job should see the job.
+
+        It is also what makes :mod:`slurmpast.cache` sound. A record keyed by job
+        id has to MEAN the same thing whichever window found it, and while the
+        reads were windowed it did not: a record captured yesterday under
+        ``now-7days`` held steps that today's ``now-7days`` excludes, so the same
+        command answered differently depending on what was cached. Fetching the
+        job whole removes the window from the record entirely.
+
+        The job SET is unaffected -- verified against the live scheduler: the ids
+        the listing names and the ids a single windowed query returns are the
+        same, and dropping the filters adds 223 step rows across 5 long-running
+        jobs and not one extra job.
         """
         if not self._parallel:
             return None
@@ -1541,7 +1563,8 @@ class Sacct:
         parsing = threading.Lock()
 
         def read(at, group):
-            text = self._fetch(["-j", ",".join(group), *extra], fields)
+            # `-j` only: no window, no `--state`, no `-r`. See the docstring.
+            text = self._fetch(["-j", ",".join(group)], fields)
             with parsing:
                 return parse(text, fields=fields, delimiter=delimiter, stats=collected[at])
 

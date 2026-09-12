@@ -85,7 +85,11 @@ class TestEveryPublicBuilderIsDocumented:
 
     def test_the_count_is_what_the_docs_claim(self):
         # Guards against the check above passing because it found nothing to check.
-        assert len(_public_functions()) == 49
+        # 49 -> 50: `hours_divisible` was added, the pair formatter that fixed
+        # `<1 of its <1`. 50 -> 52: `loading_bar` and `sweep_hue`, the gradient
+        # sweep the dashboard shows while it waits. 52 -> 53: `numbered_for`,
+        # which sizes the "#" column to the rows it is about to number.
+        assert len(_public_functions()) == 53
 
 
 class TestSingleSurfaceBuildersNameTheirSurface:
@@ -107,7 +111,21 @@ class TestSingleSurfaceBuildersNameTheirSurface:
         sizes = {k: len(v) for k, v in _classify().items()}
         # 29 -> 30 both: `idle_workload_note` was added and wired to BOTH surfaces
         # deliberately, which is what this test asks a change to declare.
-        assert sizes == {"both": 30, "report_only": 5, "tui_only": 8, "neither": 6}
+        # 6 -> 7 neither: `hours_divisible` is reached only through
+        # `idle_workload_note`, which is itself on both surfaces -- so the pair
+        # formatter belongs to neither directly, and that IS the declaration.
+        #
+        # 8 -> 9 tui_only and 7 -> 8 neither: `loading_bar` is drawn by the
+        # dashboard's loading state and by nothing in `--plain`, which has no
+        # loading state to draw; `sweep_hue` is reached only through it. A
+        # single-surface builder on purpose -- the one animation in the tool
+        # cannot be on a surface that gets piped into a file.
+        #
+        # 30 -> 31 both: `numbered_for`, and BOTH is the declaration that matters
+        # for it. A row number the dashboard gets right and `--plain` gets wrong
+        # is the same defect twice, so the width rule lives here and both callers
+        # read it -- which is what `render.py` is for.
+        assert sizes == {"both": 31, "report_only": 5, "tui_only": 9, "neither": 8}
 
 
 class TestControls:

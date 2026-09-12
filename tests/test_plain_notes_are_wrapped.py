@@ -30,6 +30,7 @@ import pytest
 
 from slurmpast import report
 from slurmpast.demo import history as demo_history
+from slurmpast.duration import format_bytes
 from slurmpast.index import History
 
 PLAIN = report.Style()
@@ -38,8 +39,14 @@ PLAIN = report.Style()
 #: `_plain_width` stops shrinking.
 WIDTHS = [60, 70, 80, 90, 100, 120]
 
-#: A row count above `_FOOTPRINT_NOTE_ROWS`, from the measured history.
-BIG_ROWS = 40_994
+#: A row count above `_FOOTPRINT_NOTE_ROWS`.
+#:
+#: Was 40,994 -- the measured history -- back when the threshold was 20,000. The
+#: threshold is 500,000 now, because at ~1 KB a row the old one fired at 20 MB
+#: and told every reader of an ordinary week the tool's own resident size. This
+#: is a window that genuinely runs into the gigabytes, which is what the note was
+#: written for.
+BIG_ROWS = 1_200_000
 
 
 def _history(rows: int = BIG_ROWS) -> History:
@@ -63,10 +70,22 @@ def _lines(width: int, rows: int = BIG_ROWS, limit: int = 2) -> list[str]:
 
 
 #: The footprint note in full, so "wrapped" can be told from "truncated".
-FOOTPRINT = (
-    "40,994 rows parsed, about 40.0 MiB held — a window ten times longer "
-    "costs ten times that; narrow it with -S"
+#:
+#: It used to be 109 cells, which overran every width tested. Cut to 59 as part
+#: of the verbosity pass -- it still names the knob, which is the only reason to
+#: print it at all, and it now breaks only at `PLAIN_MIN_WIDTH`. The widths below
+#: moved with it; the property did not.
+#: DERIVED from the fixture, not transcribed. Hardcoding it meant the constant
+#: and the row count could disagree -- which they did, the moment BIG_ROWS moved.
+FOOTPRINT = "%s rows, about %s held; narrow the window with -S" % (
+    f"{BIG_ROWS:,}",
+    format_bytes(BIG_ROWS * report._BYTES_PER_ROW),
 )
+
+#: Widths at which the note is wide enough to need a break. Measured, not
+#: assumed: at 59 cells plus its two-space leader it wraps at 60 and fits from
+#: 70 up. `test_every_line_fits` covers the widths absent from this list.
+WRAPPING_WIDTHS = [60]
 
 
 #: The tail summary a real 14-day history produced: 63 cells with its leader.
@@ -109,12 +128,15 @@ class TestNoNoteOverrunsTheTerminal:
 
     @pytest.mark.parametrize("width", [60, 90, 100])
     def test_the_footprint_note_is_wrapped_not_truncated(self, width: int) -> None:
-        # Wrapping may put the break anywhere; nothing may be lost to it.
+        # Wrapping may put the break anywhere; nothing may be lost to it. Asserted
+        # at every width, including the ones where it now fits on one line --
+        # "nothing is lost" has to hold either way.
         assert FOOTPRINT in _flat(_lines(width)), _flat(_lines(width))
 
-    @pytest.mark.parametrize("width", [60, 90, 100])
+    @pytest.mark.parametrize("width", WRAPPING_WIDTHS)
     def test_the_footprint_note_really_did_have_to_break(self, width: int) -> None:
         # Vacuity guard: if it fitted on one line, the test above proves nothing.
+        # Only the widths where it genuinely breaks -- see WRAPPING_WIDTHS.
         assert not [ln for ln in _lines(width) if FOOTPRINT in ln], width
 
     def test_the_tail_summary_wraps_with_a_hanging_indent(self) -> None:
@@ -157,12 +179,12 @@ class TestControls:
         # The note is deliberately conditional: on an ordinary window it is a
         # line in the way.
         lines = _lines(90, rows=174)
-        assert not [ln for ln in lines if "rows parsed" in ln], lines
+        assert not [ln for ln in lines if "MiB held" in ln], lines
 
     def test_the_threshold_itself_still_prints_the_note(self) -> None:
-        assert [ln for ln in _lines(120, rows=report._FOOTPRINT_NOTE_ROWS) if "rows parsed" in ln]
+        assert [ln for ln in _lines(120, rows=report._FOOTPRINT_NOTE_ROWS) if "MiB held" in ln]
         assert not [
-            ln for ln in _lines(120, rows=report._FOOTPRINT_NOTE_ROWS - 1) if "rows parsed" in ln
+            ln for ln in _lines(120, rows=report._FOOTPRINT_NOTE_ROWS - 1) if "MiB held" in ln
         ]
 
     def test_no_limit_still_prints_no_tail_summary(self) -> None:
@@ -171,10 +193,20 @@ class TestControls:
         assert h.tail_summary(None) == ""
 
     def test_the_other_notes_are_untouched(self) -> None:
+        """The notes beside the footprint one still render.
+
+        This used to assert `"window" in joined`, which passed on the word
+        "window" INSIDE the footprint note itself ("a window ten times longer
+        costs ten times that") -- `_history()` sets no window, so there was never
+        a window label here to find. A control that can only be satisfied by the
+        thing under test is not a control, so it now names notes that exist
+        independently of it.
+        """
         lines = _lines(100)
         joined = "\n".join(lines)
-        assert "window" in joined
         assert "ordered by compute used" in joined
+        assert "58 jobs in 8 workloads" in joined
+        assert "56.9% completed" in joined
 
     def test_the_table_still_renders_its_columns(self) -> None:
         joined = "\n".join(_lines(120, limit=8))

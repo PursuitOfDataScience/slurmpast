@@ -1195,11 +1195,11 @@ class TestEveryCountIsSpelledForItsNumber:
                 jid += 1
                 jobs.append(self._job(jid, "FAILED", name=name))
         titles = " ".join(f.title for f in find_repeat_failures(jobs))
-        assert "1 further group shows" in titles, titles
-        assert "1 further groups" not in titles
-        # Control: two hidden groups keep the plural, and the verb agrees.
+        assert "1 more workload failing" in titles, titles
+        assert "1 more workloads" not in titles
+        # Control: two hidden groups keep the plural.
         jobs += [self._job(jid + n, "FAILED", name="zeta") for n in range(1, 6)]
-        assert "2 further groups show" in " ".join(f.title for f in find_repeat_failures(jobs))
+        assert "2 more workloads failing" in " ".join(f.title for f in find_repeat_failures(jobs))
 
     def test_one_computing_timeout_is_not_were_cut_off(self):
         from slurmpast.sizing import walltime_advice

@@ -126,7 +126,7 @@ def _slack_sampling_warning(job):
     note = maxrss_sampling_note(job.elapsed)
     if not note:
         return ""
-    return "  Thinly sampled, so the peak may be a floor: %s." % note
+    return "  Thinly sampled (%s), so the peak may be a floor." % note
 
 
 def diagnose(job, log_text=None, node_note=None):
@@ -153,9 +153,8 @@ def diagnose(job, log_text=None, node_note=None):
             )
         elif job.live is False:
             action = (
-                "squeue has never heard of it, so the job is long gone and the record was "
-                "never closed. The elapsed above is an artefact. Excluded from aggregate "
-                "totals."
+                "squeue has never heard of it: long gone, record never closed. The "
+                "elapsed is an artefact. Excluded from totals."
             )
         else:
             action = "Confirm against squeue. Excluded from aggregate totals."
@@ -234,8 +233,8 @@ def _walltime_rules(job, add):
                         format_duration(used),
                         format_percent(job.cpu_utilization),
                     ),
-                    "Raise --time well above the limit that cut it off: Elapsed is "
-                    "truncated at the limit, so it bounds the true runtime only from below.",
+                    "Raise --time well above it: Elapsed is truncated at the limit, so "
+                    "it only bounds the true runtime from below.",
                 )
             )
         return
@@ -265,13 +264,13 @@ def _memory_rules(job, add):
     limit = job.mem_limit_bytes
 
     if state == "OUT_OF_MEMORY":
-        detail = "Killed by the cgroup OOM handler (this state is event-driven, so it is reliable)."
+        detail = "OOM-killed by the cgroup."
         if rss is not None and limit is not None and rss > limit:
             from .site import maxrss_caveat
 
             detail += (
-                " Note MaxRSS reports %s against a %s per-node limit — above the hard limit, "
-                "which is impossible for a working set: %s. Do not size --mem from it."
+                " MaxRSS reads %s over a %s limit — impossible for a working set, so do not "
+                "size --mem from it: %s."
                 % (format_bytes(rss), format_bytes(limit), maxrss_caveat())
             )
         elif rss is not None and limit is not None:
@@ -283,21 +282,19 @@ def _memory_rules(job, add):
             from .site import maxrss_sampling_note
 
             detail += (
-                " MaxRSS sampled only %s of that %s limit, but the kill is proof the peak "
-                "reached it: treat the sample as a floor, not the footprint, and do not "
-                "size --mem from it." % (format_bytes(rss), format_bytes(limit))
+                " MaxRSS sampled %s of the %s limit, but the peak reached it — that "
+                "sample is a floor, not the footprint." % (format_bytes(rss), format_bytes(limit))
             )
             note = maxrss_sampling_note(job.elapsed)
             if note:
-                detail += " Sampling is why — %s." % note
+                detail += " (%s)" % note
         add(
             Finding(
                 CRITICAL,
                 "host-oom",
                 "Host memory exhausted",
                 detail,
-                "Raise --mem, or cut what multiplies per-worker footprint — workers, "
-                "prefetch depth, cache size.",
+                "Raise --mem, or cut workers, prefetch depth, cache size.",
             )
         )
         return
@@ -459,9 +456,8 @@ def _cpu_rules(job, add):
                         format_bytes(job.io_bytes or 0),
                         format_bytes(job.io_rate or 0),
                     ),
-                    "Treat this as the I/O problem below, not as a hang: stage the input "
-                    "somewhere faster, or overlap the transfer with compute so the "
-                    "allocation is not idle while it waits.",
+                    "Not a hang, an I/O problem: stage the input somewhere faster, or "
+                    "overlap the transfer with compute.",
                 )
             )
             return
@@ -503,9 +499,8 @@ def _cpu_rules(job, add):
                     held,
                     outcome,
                 ),
-                "Find the blocking call — or the work, if it ran in a detached pool this "
-                "cluster cannot attribute. If this allocation is a deliberate reservation, "
-                "mark it so and this rule will stay quiet.",
+                "Find the blocking call — or the work, if a detached pool ran it where "
+                "this cluster cannot see it.",
             )
         )
         return
@@ -549,8 +544,8 @@ def _cpu_rules(job, add):
                 "Most allocated cores were idle",
                 "Utilization %s of %d cores%s, i.e. about %.1f cores of real work. %s."
                 % (format_percent(util), cores, shape, effective, cpu_caveat()),
-                "Try --cpus-per-task=%d, unless those cores feed dataloader workers, "
-                "or the work runs in a detached worker pool this cluster cannot attribute."
+                "Try --cpus-per-task=%d — unless the cores feed dataloader workers, or "
+                "a detached worker pool this cluster cannot attribute."
                 % max(1, int(busy_per_task + 0.999)),
             )
         )
@@ -651,21 +646,18 @@ def _exit_rules(job, log_text, add):
             if canceller == "0":
                 title = "Cancelled by root, not by you"
                 detail = (
-                    "sacct records this as CANCELLED by 0 — root — while the job belongs to "
-                    "uid %s. An administrator or the scheduler ended it, so how far it got "
-                    "says nothing about whether the job was healthy." % job.uid
+                    "CANCELLED by root, not by uid %s — an admin or the scheduler ended it, "
+                    "so how far it got says nothing about its health." % job.uid
                 )
                 action = (
-                    "Nothing in the script chose this. Look for a maintenance window, a "
-                    "policy or QOS limit, or a dependency that could never be satisfied "
-                    "before resubmitting it unchanged."
+                    "Check for a maintenance window, a QOS limit, or an unsatisfiable "
+                    "dependency before resubmitting."
                 )
             else:
                 title = "Cancelled by another user, not by you"
                 detail = (
-                    "sacct records this as CANCELLED by %s while the job belongs to uid %s, "
-                    "so somebody else ran the scancel — an account, reservation or allocation "
-                    "you share." % (canceller, job.uid)
+                    "CANCELLED by %s, not by uid %s — somebody you share an account or "
+                    "reservation with ran the scancel." % (canceller, job.uid)
                 )
                 action = "Find out who holds uid %s before resubmitting." % canceller
             add(Finding(INFO, "cancelled-by-other", title, detail, action))
@@ -675,8 +667,8 @@ def _exit_rules(job, log_text, add):
                     INFO,
                     "cancelled",
                     "Cancelled, not failed",
-                    "A deliberate kill and an abandoned run are identical in accounting, so this "
-                    "is excluded from failure statistics.",
+                    "Excluded from failure stats: a deliberate kill and an abandoned run "
+                    "are identical in accounting.",
                     "",
                 )
             )
@@ -692,9 +684,8 @@ def _exit_rules(job, log_text, add):
                 WARNING,
                 "node-failed",
                 "The node failed under this job",
-                "Slurm ended this as NODE_FAIL, so the job did not choose to stop and its "
-                "last accounting sample may never have been taken — a CPU or memory total "
-                "near zero here is missing data, not a measurement.",
+                "NODE_FAIL: the node died, not the job. A near-zero CPU or memory total "
+                "here is missing data, not a measurement.",
                 _NODE_FAULT_REMEDY,
             )
         )
@@ -705,9 +696,8 @@ def _exit_rules(job, log_text, add):
                 WARNING,
                 "boot-failed",
                 "The node never came up for this job",
-                "Slurm ended this as BOOT_FAIL, so the allocation was made and the node "
-                "failed to boot into it. Nothing in the record is a measurement of your "
-                "work, because none of it ran.",
+                "BOOT_FAIL: the allocation was made and the node failed to boot into it. "
+                "None of your work ran, so nothing here measures it.",
                 _NODE_FAULT_REMEDY,
             )
         )
@@ -723,9 +713,8 @@ def _exit_rules(job, log_text, add):
                 CRITICAL,
                 "deadline",
                 "Killed at its --deadline, not its time limit",
-                "Slurm ended this as DEADLINE: the wall-clock moment given by --deadline "
-                "arrived, which is a different limit from --time and is not extended by "
-                "raising it.",
+                "DEADLINE: the --deadline moment arrived. That is a different limit from "
+                "--time, and raising --time does not extend it.",
                 "Move or drop --deadline, or submit earlier. A longer --time changes nothing here.",
             )
         )
@@ -782,12 +771,10 @@ def _exit_rules(job, log_text, add):
                 CRITICAL,
                 "sigkill" if killer == 9 else "signal-kill",
                 "Killed by %s" % _signal_name(killer),
-                "Exit signal %d, and nothing in the accounting record accounts for it: the "
-                "state is %s, not OUT_OF_MEMORY, TIMEOUT, CANCELLED, PREEMPTED or NODE_FAIL, "
-                "each of which would name its own killer." % (killer, state or "unrecorded"),
-                "Look for a wrapper or watchdog killing it — a queue system layered over "
-                "Slurm, a `timeout` in the batch script, or the node's own OOM killer "
-                "reaping a process Slurm was not accounting for.",
+                "Exit signal %d, and the state (%s) does not account for it — no Slurm "
+                "limit names this killer." % (killer, state or "unrecorded"),
+                "Look for a wrapper or watchdog: a queue layered over Slurm, a `timeout` "
+                "in the script, or the node's own OOM killer.",
             )
         )
 
@@ -1054,9 +1041,8 @@ def _gpu_rules(job, add):
                     "GPUs were held but barely used",
                     "%d GPU(s) held for %s at %s average utilization, as recorded by Slurm."
                     % (job.gpu_count, format_duration(job.elapsed), format_percent(measured)),
-                    "This is a measurement, not an inference. Either the work is not on the "
-                    "device or the device is waiting on input — check the dataloader before "
-                    "asking for more cards.",
+                    "Measured, not inferred: the work is off the device, or waiting on "
+                    "input. Check the dataloader before asking for more cards.",
                 )
             )
         elif measured < GPU_UNDERUSED:
@@ -1201,9 +1187,8 @@ def _parallel_rules(job, add):
                 # keeps the evidence and the number it is evidence for measured
                 # over the same tasks, as the `straggler` finding above already
                 # does with its percentage.
-                "One task held %.1fx the mean of its peers inside a single step, across "
-                "%d tasks. The job's memory ceiling has to cover the largest task, "
-                "not the mean." % (imbalance, job.task_count),
+                "One task held %.1fx its peers' mean, across %d tasks — the ceiling has "
+                "to cover the largest, not the mean." % (imbalance, job.task_count),
                 "",
             )
         )
@@ -1224,10 +1209,9 @@ def _paging_rules(job, add):
             WARNING,
             "paging",
             "The job was paging",
-            "%s major page faults recorded. Memory pressure forced the kernel to "
-            "fetch pages from disk, which is orders of magnitude slower than RAM "
-            "and does not show up as a failure." % f"{int(pages):,}",
-            "Raise --mem, or cut the working set. A job that pages can finish and "
-            "still have run many times slower than it needed to.",
+            "%s major page faults — the kernel fetched pages from disk, orders of "
+            "magnitude slower than RAM and never visible as a failure." % f"{int(pages):,}",
+            "Raise --mem, or cut the working set: a paging job finishes, just far "
+            "slower than it needed to.",
         )
     )

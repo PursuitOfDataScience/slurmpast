@@ -135,12 +135,22 @@ class TestItSplits:
         assert first.max_rss == 64 * 1024
 
 
-class TestItCarriesTheQuery:
-    """Every filter reaches BOTH halves.
+class TestTheFiltersSelectJobsAndDoNotClipThem:
+    """Every filter reaches the LISTING. None of them reaches the reads.
 
-    Passing them to the reads is redundant -- `-j` already names the exact jobs
-    -- and it is what makes the result identical rather than merely equivalent,
-    because sacct applies `-S`/`-E`/`--state` to step rows as well.
+    This reverses what these tests asserted when they were written, and the
+    reversal is the fix. Passing the window to the reads made the result
+    byte-identical to a single query -- including its bug: sacct applies
+    `-S`/`-E`/`--state` to STEP rows too, so a job that began before the window
+    came back with only the steps inside it. Job 57477255 on midway3 was
+    returned with 3 of its steps, summing to 0.4 CPU-seconds against a real
+    21,383, and was therefore called idle and charged 41.42 GPU-hours to "never
+    computed" -- the whole of one account's headline figure.
+
+    It is also what `slurmpast.cache` needs: a record keyed by job id has to mean
+    the same thing whichever window found it.
+
+    So the listing decides WHICH jobs, and each is then read whole.
     """
 
     def _calls(self, **kwargs):
@@ -161,16 +171,58 @@ class TestItCarriesTheQuery:
             ),
         ],
     )
-    def test_the_filter_is_on_the_listing_and_on_every_read(self, kwargs, flag, value):
+    def test_the_filter_is_on_the_listing(self, kwargs, flag, value):
         cluster = self._calls(**kwargs)
-        for call in cluster.listings + cluster.reads:
+        assert cluster.listings, "no listing was made"
+        for call in cluster.listings:
             assert flag in call, call
             assert call[call.index(flag) + 1] == value, call
 
-    def test_allusers_reaches_both_halves(self):
+    @pytest.mark.parametrize(
+        ("kwargs", "flag"),
+        [
+            ({"user": "alice", "since": "now-7days"}, "-u"),
+            ({"user": "u", "since": "now-3days"}, "-S"),
+            ({"user": "u", "since": "now-7days", "partition": "amd"}, "-r"),
+            (
+                {"user": "u", "since": "now-7days", "states": ["TIMEOUT"], "until": "now"},
+                "--state",
+            ),
+        ],
+    )
+    def test_and_not_on_any_read(self, kwargs, flag):
+        """A read names ids and nothing else, so it cannot clip a job's steps."""
+        cluster = self._calls(**kwargs)
+        assert cluster.reads, "no read was made"
+        for call in cluster.reads:
+            assert flag not in call, call
+            assert "-j" in call, call
+
+    def test_allusers_reaches_the_listing_only(self):
         cluster = self._calls(all_users=True, since="now-7days")
-        for call in cluster.listings + cluster.reads:
+        assert cluster.listings and cluster.reads
+        for call in cluster.listings:
             assert "--allusers" in call, call
+        for call in cluster.reads:
+            assert "--allusers" not in call, call
+
+    def test_a_job_read_whole_keeps_steps_the_window_would_have_clipped(self):
+        """The bug this reversal fixes, in one fixture.
+
+        The fake below returns a step row only when the read carries no window,
+        which is exactly how sacct behaves for a job that started earlier.
+        """
+        rows = _jobs(sacct.PARALLEL_MIN_JOBS + 10)
+        cluster = _Cluster(rows)
+        cluster.rows["1000.batch"] = row(
+            JobID="1000.batch", JobName="batch", State="COMPLETED", TotalCPU="01:00:00"
+        )
+        jobs = Sacct(runner=cluster, probe=" ".join(sacct._FIELDS)).history(
+            user="u", since="now-7days"
+        )
+        first = next(j for j in jobs if j.job_id == "1000")
+        assert [s.step_id for s in first.steps] == ["1000.batch"]
+        assert first.total_cpu == 3600.0
 
 
 class TestWhenItDoesNot:

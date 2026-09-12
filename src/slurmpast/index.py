@@ -54,6 +54,22 @@ GPU_CORE_EQUIVALENT = 16.0
 IDLE_SHARE_WORTH_NAMING = 0.10
 IDLE_HOURS_WORTH_NAMING = 100.0
 
+# A floor under the SHARE gate, because a share has no scale of its own.
+#
+# `IDLE_SHARE_WORTH_NAMING` was the only gate a small workload had to clear, and
+# 10% of nothing is nothing: on a real account the summary named a workload that
+# wasted **0.18 of its 0.86 GPU-hours** -- eleven minutes -- while the same
+# window held a 114.7 GPU-hour workload it did not mention. Eleven minutes is
+# not money, and a headline about it is the noise the paragraph above exists to
+# prevent.
+#
+# One GPU-hour, so the figure is always at least an hour of a card. This does
+# NOT reopen `test_the_sliver_alone_is_named_because_nothing_outweighs_it`,
+# which pins that a small workload may be named when nothing outweighs it: its
+# sliver is 2 GPU-hours and still clears this. What it removes is the case where
+# the printed pair rounds to minutes.
+IDLE_HOURS_WORTH_A_HEADLINE = 1.0
+
 
 class GroupStats(NamedTuple):
     """One workload rolled up. The unit the overview is built from."""
@@ -608,6 +624,10 @@ class History:
         worst = max(self.groups, key=lambda g: g.wasted_gpu_hours)
         wasted, total = worst.wasted_gpu_hours, worst.gpu_hours
         if not wasted or not total:
+            return None
+        if wasted < IDLE_HOURS_WORTH_A_HEADLINE:
+            # Below an hour of a card there is nothing to act on, whatever the
+            # share. See IDLE_HOURS_WORTH_A_HEADLINE.
             return None
         if wasted / total >= IDLE_SHARE_WORTH_NAMING or wasted >= IDLE_HOURS_WORTH_NAMING:
             return (worst, wasted)

@@ -134,7 +134,7 @@ class TestAnArrayIsNotToldToStopResubmitting:
 class TestDeterminismIsNotClaimedOverASuccess:
     def test_a_workload_with_completions_is_not_called_deterministic(self) -> None:
         action = _finding(_jobs(*ONE_ARRAY)).action
-        assert "is not deterministic" in action, action
+        assert "Not deterministic" in action, action
         assert "the failure is deterministic." not in action, action
 
     def test_it_names_how_many_completed(self) -> None:
@@ -205,7 +205,7 @@ class TestControls:
     def test_an_oom_group_keeps_its_own_action(self) -> None:
         ids = [str(400 + i) for i in range(8)]
         action = _finding(_jobs(ids, ["OUT_OF_MEMORY"] * 8)).action
-        assert "memory finding" in action, action
+        assert "--mem finding" in action, action
 
     def test_array_siblings_still_count_as_evidence(self) -> None:
         # The invariant the earlier round pinned deliberately: an array's tasks are

@@ -5,26 +5,202 @@ All notable changes to slurmpast are documented here, newest first.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
-`issues.md` is the *audit* log — one entry per review round, including findings
-that were withdrawn or deliberately left open. This file is the *release* log: what
-changed for a user between one version and the next.
+This is the *release* log: what changed for a user between one version and the
+next. The per-round *audit* log, `issues.md`, was dropped from the repo and the
+sdist in 0.8.3; entries below that still cite it are pointing at that history,
+which lives in the git log and in the issues on GitHub.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-09-12
+
+Held-down arrow keys now cover ground, the dashboard answers a keypress in about
+a third of the CPU it used to, and the sentences it prints are shorter. One
+display bug is fixed. Nothing in the analysis changed: the same jobs are read,
+grouped, diagnosed and sized the same way, and every number is the number it was.
+
+### Added
+
+- **Hold an arrow key and the cursor starts covering ground.** A remote
+  control's fast-forward: the first three seconds are exactly as they were —
+  one row per key, because reading down a list a row at a time is what the key
+  is for — and past that the stride jumps to 8 rows and doubles every second to
+  a 64-row ceiling. Measured in a real pty at a 30 Hz key repeat, rows covered
+  per second of holding: **30, 30, 30, then 240, 480, 832, and ~1,900 from the
+  sixth second on**. Held from the top, the cursor reaches the last of 28,741
+  rows in **21 seconds** — against the sixteen minutes a row at a time would
+  take. Releasing the key, or pressing
+  the other arrow, drops straight back to one row, which is how you stop after
+  overshooting. It works on the overview, inside a workload, on the flat job
+  list and on the nodes screen, in both directions.
+
+  Two things had to be right for it to hold. The run-break gap is half a second,
+  because a key at the top of the ramp scrolls a whole viewport and that frame
+  costs ~250 ms — at 0.2 s the accelerator defeated itself, going fast, causing
+  frames longer than the gap, and resetting. What stops a slow tapper inheriting
+  a held key's speed instead is a minimum rate: a key repeat is never below
+  10 Hz and a person pressing deliberately manages three or four a second, and
+  the verdict is taken once when the run crosses three seconds and latched, so
+  neither the frames acceleration causes nor a minute of patient tapping can
+  flip it.
+
+- **A gradient sweep while the history loads**, in place of a static
+  `loading…`. `--ascii` gets the same motion in one-cell characters.
+
+### Fixed
+
+- **Row numbers past 999 were wrong, and the column is an identifier.** The `#`
+  column was a fixed three cells, so row 1000 drew as `100` and row 1001 as
+  `100` as well: **ten consecutive rows carried the same number** before the
+  display ticked over to `101`. Reported from the flat job list, where rows 991
+  to 999 counted up correctly and then the column started over. It is not
+  decoration — typing a row number jumps to that row — so a row that reads `100`
+  and answers to `1004` is a trap, and a clipped identifier that still looks like
+  an identifier is worse than a wider table or no column at all.
+
+  The width now follows the rows it is numbering, in one place (`render.py`) that
+  both the dashboard and `--plain` read, so the two cannot disagree about it. The
+  note this replaces reasoned the other way — that a fourth cell would push the
+  never-dropped columns one past a canonical 80-column terminal — and so chose a
+  wrong number over a dropped column. The **widening** is what goes last in the
+  drop order now, not the column: at its floor of three it costs nothing extra
+  and 80-column terminals keep it exactly as they had it, and only a terminal too
+  narrow to hold a truthful row number loses it.
+
 ### Changed
 
-Performance only. Nothing on screen moves, no flag changes meaning, and every
+- **Holding an arrow key no longer runs into the background fill.** Textual
+  keys all three of its `DataTable` render caches on an internal counter that
+  `add_row` bumps, so one slice of the background row fill makes the *next* frame
+  re-render every cell on screen — 598 of them, **~250 ms against the ~12 ms a
+  warm frame costs**. The fill's 150 ms deferral was shorter than that, so a cold
+  frame was itself what made the keyboard look idle: the reader was still holding
+  the key and the next press was already queued. It sustained itself for as long
+  as the key was held — 84 keys in 8 s with **one of them taking 2.4 s**. The
+  deferral is now 300 ms, longer than a cold frame by construction, and paired
+  with a check that a whole tick passed with no key on it.
+
+- **A held key no longer strangles itself on the rows it asks for.** Drawing
+  rows is not free and the cost is not the rows: `add_row` invalidates all three
+  of `DataTable`'s render caches, so drawing even one makes the next frame
+  re-render the whole viewport — and that cold frame gets *more* expensive the
+  more rows the table holds. Topping the drawn margin up on every key meant every
+  frame was cold, and in a real pty the frames reached **0.5 s at row 16,000**,
+  which is longer than the run-break gap: the ramp broke its own run on a frame
+  it had asked for, rebuilt from one row per key over three seconds, and did it
+  again. Measured, the cursor cycled between 1,700 rows a second and 200 and
+  never reached the end of the list. Rows are now drawn in one block when the
+  margin runs out rather than a few at a time, and the run forgives the one gap
+  that block opens — the whole 28,741-row list in **21 seconds**, at a steady
+  stride, instead of forever.
+
+- **And no longer stops dead at the end of what has been drawn.** `DataTable`
+  clamps its cursor to the rows the fill has reached, and the fill stands aside
+  while a key is held, so the two rules cancelled: on the 29,617-row list the
+  cursor **froze at the fill boundary and forty further presses moved it no rows
+  at all**, with no way out but letting go. Three screenfuls are now kept drawn
+  ahead of the cursor and re-extended on each key, which after the first block
+  costs one row per press. `ctrl+end` finishes the fill first, so it means the
+  last job rather than the last drawn row.
+
+- **A keypress costs about a third of the CPU it did.** Two findings, both in
+  Textual's own drawing. Its `DataTable` puts the cursor's position in the key of
+  both caches behind a rendered line, so moving the cursor one row invalidates
+  every line on screen and — once the table is scrolling, which it is past the
+  first screenful — re-renders the whole viewport for a move that can change two
+  rows; rows the cursor is not on are now drawn as though it were nowhere, which
+  is what they look like. And the scrollbar repainted all 39 of its lines on
+  every key, while what it can actually draw is far coarser: eighth-block glyphs
+  give a 45-line bar 360 thumb positions, so over 29,617 rows it changes once
+  every 82 rows and 81 keys in 82 redrew the identical picture. Together, per
+  arrow key on the flat job list at a 50-line terminal:
+
+  | | before | after |
+  |---|---|---|
+  | line renders | 30.3 | **1.6** |
+  | cell renders | 393.9 | **21.3** |
+  | scrollbar lines redrawn | 39.2 | **0.9** |
+  | CPU | 21.6 ms | **12.3 ms** |
+
+  For scale, a bare Textual `DataTable` with the same thirteen columns and the
+  same 29,617 rows costs **20.6 ms** a key. Both changes are pinned by diffing
+  the drawn screen, cell by cell, against what stock Textual draws — which is
+  what caught the first cut of the cursor one, where the sentinel coordinate was
+  `(-1, -1)` and Textual gives a row it cannot place that same index, so the
+  header came out in the cursor's colour.
+
+- **Shorter sentences, everywhere they are read.** Every user-facing string of
+  135 characters or more was cut — the host-OOM finding, `NODE_FAIL`,
+  `BOOT_FAIL`, `DEADLINE`, the signal kill, both cancelled-by arms, paging, idle
+  GPUs, the I/O and no-op allocations, task imbalance, the stale record, three
+  cross-run pattern actions, the partition ceiling, the node-failure and
+  log-miss lines, and the four notes under `?`. The host-OOM finding a reader
+  actually quoted went from 313 characters to 198:
+
+  ```
+  before  Killed by the cgroup OOM handler (this state is event-driven, so it is
+          reliable). MaxRSS sampled only 1.2 GiB of that 50.0 GiB limit, but the
+          kill is proof the peak reached it: treat the sample as a floor, not the
+          footprint, and do not size --mem from it.
+       →  Raise --mem, or cut what multiplies per-worker footprint — workers,
+          prefetch depth, cache size.
+
+  after   OOM-killed by the cgroup. MaxRSS sampled 1.2 GiB of the 50.0 GiB limit,
+          but the peak reached it — that sample is a floor, not the footprint.
+       →  Raise --mem, or cut workers, prefetch depth, cache size.
+  ```
+
+  Where a test pinned wording that carried a fact — the state name in the
+  evidence, "not readable by you", the partition remedy, the node count — the
+  fact was kept and the sentence cut around it. Several such tests were rewritten
+  as property checks, which is stronger than the substring match they replaced
+  and is what had made those paragraphs unshortenable.
+
+- **The `--mem` caution said the figure was an upper bound and then that it was a
+  floor.** Three clauses that cancel each other out, on the one view whose whole
+  output is "ask for less":
+
+  ```
+  before  ! MaxRSS double-counts shared pages here, so it is an upper bound.
+            Thinly sampled (at most 1 sample in 5s — a spike can be missed), so
+            the peak may be a floor. Confirm before lowering.
+
+  after   ! Thinly sampled (at most 1 sample in 5s), so the peak may be low.
+  ```
+
+  One direction now, and it is the one that can break the advice: a peak taken
+  from one or two samples of a short run sits *under* the truth, and acting on
+  that under-provisions a job that then gets OOM-killed. Where sampling is not
+  thin, the over-report caveat is the only direction in question and it is what
+  is printed.
+
+### Known issues
+
+- **Quitting can still hold the process open, but for about a fifth as long.**
+  0.8.3 recorded ~21 seconds: the load runs on a thread Python joins at exit and
+  an in-flight parse cannot be interrupted. The caching and parallel-read work
+  shortened the thing being waited on rather than the waiting, so measured in a
+  real pty on the 29,617-job history it is now **0.5 s** quitting once the data
+  is on screen and **5.2 s** quitting cold, mid-parse, with `SLURMPAST_NO_CACHE=1`.
+  The remedies are unchanged and still want a decision rather than a quiet patch:
+  all three change process-exit or threading semantics.
+
+### Changed — the performance work
+
+No flag changes meaning here, and none of this changed a word on screen: every
 text surface (`--plain`, `--overview`, `--patterns`, `--nodes`, `--sizing`, and
-each of their `--json` forms) was verified byte-identical to the previous release
-over a fixed window before and after. Measured on midway3 (Slurm 20.11.8) against
+each of their `--json` forms) was verified byte-identical across these changes,
+over one fixed window, before and after. The wording above is the only reason
+0.9.0's output differs from 0.8.3's. Measured on midway3 (Slurm 20.11.8) against
 one user's last seven days — **29,624 jobs, 89,163 sacct rows**:
 
 | | before | after |
 |---|---|---|
-| `slurmpast --plain`, first run | 20.7 s | **5.5 s** |
-| `slurmpast --plain`, every run after | 20.7 s | **2.1 s** |
+| `slurmpast --plain`, first run | 20.7 s | **5.5–8 s** |
+| `slurmpast --plain`, every run after | 20.7 s | **2.1–2.8 s** |
 | the sacct query inside it | 14.5 s | **3.1 s** |
-| peak RSS | 250 MB | **137 MB** |
+| peak RSS, first run | 250 MB | **140 MB** |
+| peak RSS, every run after | 250 MB | **185 MB** |
 | `a`, the flat job list | 9.7 s frozen | **0.20 s** to a drawn screen |
 | typing a word into that list's search | one rebuild per character | **one, when you stop** |
 | `p`, the patterns panel | 0.51 s frozen | **0.01 s** |
@@ -32,6 +208,12 @@ one user's last seven days — **29,624 jobs, 89,163 sacct rows**:
 | an arrow key, inside a workload | 850–5400 ms | **6 ms** |
 | an arrow key, flat job list, mid-fill | — | **5 ms** (was 110) |
 | `assign_logs` over the history | 16.7 s | **1.2 s** |
+
+The two ranges are a spread over repeated runs on a live login node, not noise in
+the measurement: the first run is mostly `sacct`, so it moves with how busy the
+accounting database is. A warm run costs more memory than a cold one because the
+records it did not have to re-read are resident — that is the trade, and 185 MB
+is still well under the 250 MB it took to not have them.
 
 - **A finished job's record is kept and reused.** A job that has ended cannot
   change, so re-reading 29,624 of them out of `sacct` on every run was the single
@@ -52,6 +234,10 @@ one user's last seven days — **29,624 jobs, 89,163 sacct rows**:
   rather than as something to salvage. A cache that cannot be written — full
   quota, read-only home — costs the reader nothing but the seconds they were
   already spending.
+
+  The file is keyed by the package version, so **the first run after any upgrade
+  is a cold one** and the cache refills itself as it goes. That is deliberate: a
+  record parsed by one version is not a record this one can vouch for.
 
   `--no-cache` turns it off for one run and `SLURMPAST_NO_CACHE=1` for every run.
   An injected `runner=` never caches at all: canned text is not the cluster's

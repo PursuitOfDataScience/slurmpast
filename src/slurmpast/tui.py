@@ -31,8 +31,10 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.reactive import reactive
+from textual.coordinate import Coordinate
+from textual.reactive import Reactive, reactive
 from textual.screen import ModalScreen, Screen
+from textual.scrollbar import ScrollBar
 from textual.widgets import DataTable, Footer, Header, Input, Static
 
 from . import render, theme
@@ -216,6 +218,44 @@ class ScreenChrome:
     while `HelpScreen` carried two rows explaining the nodes screen's own keys.
     Paired with ``_SCREEN_BINDINGS``: one list, one action, five screens.
     """
+
+    #: The table a held arrow key steers on this screen, if it has one. Set by
+    #: every screen whose main widget is a `DataTable`; left None by the two that
+    #: scroll text (`JobScreen`, `PatternsScreen`), which have no cursor to carry.
+    TABLE_ID: ClassVar[str | None] = None
+
+    @property
+    def held(self) -> _HeldKey:
+        """The ramp a held arrow key has built up here. See :class:`_HeldKey`.
+
+        On the mixin rather than on one screen because the reader does not know
+        which screen they are on -- the overview is 485 rows on a real history and
+        the nodes table is one row per node, and a key that flies on the job list
+        and crawls on those two is worse than one that never flew. It was written
+        on `JobListScreen` first and that is exactly how it read.
+
+        Built on first use: `ScreenChrome` has no ``__init__`` of its own, and
+        giving it one would put it in the MRO of five screens ahead of `Screen`.
+        """
+        ramp = getattr(self, "_held_key", None)
+        if ramp is None:
+            ramp = self._held_key = _HeldKey()
+        return ramp
+
+    def carry_the_cursor(self, key: str, rows: int) -> None:
+        """Move the cursor the EXTRA rows a held key has earned. See `_HeldKey`.
+
+        The one row the key itself is worth is left to whoever would have moved
+        it -- `DataTable`'s own binding, or `_steer_table` when the search box has
+        focus -- so this stays out of the way of both and does not have to know
+        which acted. Adding to their move rather than replacing it also makes the
+        order the two run in irrelevant.
+        """
+        if rows <= 0 or self.TABLE_ID is None:
+            return
+        table = self.query_one("#" + self.TABLE_ID, DataTable)  # type: ignore[attr-defined]
+        step = rows if key == "down" else -rows
+        table.move_cursor(row=max(0, table.cursor_row + step))
 
     @property
     def sp(self) -> SlurmpastApp:
@@ -581,6 +621,71 @@ def _breathe():
     time.sleep(0.001)
 
 
+class SteadyScrollBar(ScrollBar):
+    """A scrollbar that repaints when the BAR moves, not when the offset does.
+
+    ``ScrollBar.position`` is a repainting reactive holding the scroll offset in
+    rows, so one arrow key repaints the whole bar. What the bar can actually draw
+    is far coarser: `ScrollBarRender.render_bar` reduces everything it puts on
+    screen to ``start = int(position * 8)`` after scaling the offset onto the
+    bar's own length, and the eighth-block glyphs give a 45-line bar 360 distinct
+    thumb positions. Over 29,617 rows that is one visible change every 82 rows --
+    so 81 keys in 82 repainted 45 lines to draw the identical picture.
+
+    Measured on the flat job list at a 50-line terminal, holding the down arrow:
+    39.2 scrollbar lines re-rendered per key, 2.8 ms of the 18.0 ms a keypress
+    cost. Skipping the ones that cannot change is 15% of the key back.
+
+    The offset itself stays exact. Quantising `position` in `validate_position`
+    -- the hook that already rounds it to an eighth -- would have been shorter,
+    but `_on_mouse_capture` anchors a drag at ``self.position``, and rounding
+    there jumps the view by up to a bar-eighth (82 rows here) the moment the
+    thumb is grabbed. So the value is left alone and only the repaint is
+    conditional.
+    """
+
+    #: Redeclared to turn OFF the automatic repaint. `watch_position` below does
+    #: it instead, when there is something new to draw.
+    position: Reactive[float] = Reactive(0.0, repaint=False)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._drawn: tuple | None = None
+
+    def _drawn_state(self, position: float):
+        """What `render_bar` will draw, or None when it cannot be predicted.
+
+        Mirrors that method's arithmetic exactly, including its guard: with no
+        window size, no virtual size, or a virtual size equal to the bar, it
+        draws a full-length bar and the position does not enter into it.
+
+        None means "repaint anyway". Every other return is a tuple, so a None
+        never compares equal to a state and a scrollbar this cannot predict is
+        left with stock behaviour rather than with a stale picture.
+        """
+        size = self.size.height if self.vertical else self.size.width
+        virtual = self.window_virtual_size
+        window = self.window_size if self.window_size < virtual else 0
+        if not (window and size and virtual and size != virtual):
+            return None
+        span = virtual - window
+        if span <= 0:
+            return None
+        thumb = max(1.0, window / (virtual / size))
+        # `render_bar`: position_ratio = position / (virtual - window); then
+        # position = (size - thumb) * position_ratio; then start = int(position
+        # * 8). `end` is `start` plus a constant while the sizes hold, and the
+        # sizes are in the tuple, so `start` is the whole of what can change.
+        start = int((size - thumb) * (position / span) * 8)
+        return (size, virtual, window, self.thickness, start)
+
+    def watch_position(self, position: float) -> None:
+        drawn = self._drawn_state(position)
+        if drawn is None or drawn != self._drawn:
+            self._drawn = drawn
+            self.refresh()
+
+
 class FastDataTable(DataTable):
     """A DataTable that does not re-measure cells whose column width is fixed.
 
@@ -643,6 +748,87 @@ class FastDataTable(DataTable):
         ):
             new_rows = ()
         super()._update_dimensions(new_rows)
+
+    @property
+    def vertical_scrollbar(self) -> ScrollBar:
+        """`SteadyScrollBar` instead of the stock one. See that class.
+
+        Textual builds the scrollbar lazily in a property with no hook for the
+        class to build, so the four lines it takes are mirrored here -- and
+        guarded, because they are the one part of this file that reads Textual's
+        internals rather than its API. Where the names it needs are not there,
+        the stock scrollbar comes back: slower, never wrong.
+        """
+        if not hasattr(self, "_vertical_scrollbar") or not hasattr(self.app, "_start_widget"):
+            return super().vertical_scrollbar
+        if self._vertical_scrollbar is not None:
+            return self._vertical_scrollbar
+        self._vertical_scrollbar = bar = SteadyScrollBar(
+            vertical=True, name="vertical", thickness=self.scrollbar_size_vertical
+        )
+        bar.display = False
+        self.app._start_widget(self, bar)
+        return bar
+
+    #: Where the cursor is pretended to be while a row it does not touch is
+    #: drawn: a coordinate no cell can hold, so `_should_highlight` says no for
+    #: every cursor type.
+    #:
+    #: NOT ``-1``. Textual gives a row it cannot place -- the header above all
+    #: for one -- ``row_index = -1``, so a cursor parked there matches the header
+    #: and draws it in the cursor's own colour. Caught by diffing the whole drawn
+    #: screen against stock Textual's, which is what `test_dashboard_latency`
+    #: now does on every navigation key.
+    _CURSOR_NOWHERE = Coordinate(-2, -2)
+
+    def _render_line(self, y: int, x1: int, x2: int, base_style):
+        """Draw one line, keyed on the cursor only for the row the cursor is on.
+
+        Textual caches a rendered line twice -- ``_line_cache`` holds the
+        finished `Strip`, ``_row_render_cache`` the segments behind it -- and
+        **both keys contain ``cursor_coordinate``**. So moving the cursor one row
+        changes the key of every line on screen, and a table re-renders its whole
+        viewport on each arrow key even though two rows are all that can look
+        different. With a ``row`` cursor the other lines do not read the cursor at
+        all: the only thing it decides is whether `_should_highlight` says yes for
+        that row.
+
+        Measured on a real seven-day history, 29,617 rows in the flat job list at
+        a 50-line terminal, holding the down arrow:
+
+            re-rendered per key, stock     50 lines, 300 cells
+            re-rendered per key, here       2 lines
+            cost per key                   40.8 ms -> 2.6 ms
+
+        which is the difference between a cursor that keeps up with the key
+        repeat rate and one that falls seconds behind it.
+
+        The cursor is moved with `set_reactive`, which is Textual's own documented
+        way to set a reactive without firing its watchers -- firing them here
+        would recurse straight back into a refresh. It is restored in a `finally`
+        so an exception mid-render cannot leave the table believing its cursor is
+        off the top of the screen.
+
+        Skipped, rather than made conditional inside the render, whenever the
+        assumption does not hold: a ``column`` cursor highlights a cell in *every*
+        row, so normalising the coordinate away would erase it.
+        """
+        if self.cursor_type == "column":
+            return super()._render_line(y, x1, x2, base_style)
+        cursor = self.cursor_coordinate
+        if cursor.row < 0:
+            return super()._render_line(y, x1, x2, base_style)
+        try:
+            row_key, _offset = self._get_offsets(y)
+        except LookupError:
+            return super()._render_line(y, x1, x2, base_style)
+        if self._row_locations.get(row_key) == cursor.row:
+            return super()._render_line(y, x1, x2, base_style)
+        self.set_reactive(DataTable.cursor_coordinate, self._CURSOR_NOWHERE)
+        try:
+            return super()._render_line(y, x1, x2, base_style)
+        finally:
+            self.set_reactive(DataTable.cursor_coordinate, cursor)
 
 
 def _digit_bindings(action: str):
@@ -841,28 +1027,21 @@ _HELP_KEYS = (
 )
 
 _HELP_NOTES = (
-    "A row on the overview is one workload: every run whose job name matches once "
-    'digits are folded to "#", so cot-exp1 and cot-exp2 share a row. Its counts and '
-    "hour totals cover all of those runs. Open a row to see the real job names.",
-    "FLAGGED counts runs this tool marks for a look: they failed, or they held the "
-    "allocation without computing. One number, because those two overlap — open the "
-    "row to see which. It says what was flagged, not that it was your mistake; a "
-    "failure can be expected. COMPLETED plus FLAGGED can be less than RUNS: a "
-    "cancelled run is neither, since a deliberate kill and an abandoned one are "
-    "identical in accounting.",
+    "A row on the overview is one workload: runs whose names match once digits fold "
+    'to "#", so cot-exp1 and cot-exp2 share a row. Open it for the real names.',
+    "FLAGGED means worth a look: the run failed, or it held the allocation without "
+    "computing. Open the row to see which. COMPLETED plus FLAGGED can fall short of "
+    "RUNS — a cancelled run is neither.",
     # The rate is not decoration: the CPU / GPU-HOURS column pair is on screen
     # here, so a row with fewer CPU-hours ranked above one with more looks
     # arbitrary without it. `--plain` has always printed it in the caption above
     # the same table, and `report.py` asserted in a comment that "the dashboard
     # puts the same two facts under `?`" -- the digit fold was, the rate never
     # was. Read from `render`, so the two surfaces cannot quote different rates.
-    "Groups are ranked by resources burned, not run count: a 5-run group that cost "
-    "400 GPU-hours outranks 400 two-second probes. Weighted at %s."
-    % render.gpu_hours_equivalence(),
-    "Selecting text: just drag. Mouse capture is off by default, so your terminal "
-    "handles selection exactly as it does elsewhere. Press M to hand the mouse to "
-    "the app instead (enables clicking and wheel scrolling, disables drag-select), "
-    "or start --mouse.",
+    "Ranked by resources burned, not run count: 5 runs costing 400 GPU-hours "
+    "outrank 400 two-second probes. Weighted at %s." % render.gpu_hours_equivalence(),
+    "Drag to select text — your terminal handles it, as everywhere else. M hands "
+    "the mouse to the app instead: clicking and the wheel work, drag-select stops.",
 )
 
 
@@ -982,6 +1161,8 @@ _OVERVIEW_COLUMNS = render.OVERVIEW_COLUMNS
 class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
     """Workload groups, ranked. The landing screen."""
 
+    TABLE_ID = "groups"
+
     BINDINGS: ClassVar = [
         *_SCREEN_BINDINGS,
         Binding("q", "app.quit", "Quit"),
@@ -1021,6 +1202,10 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
         self._layout: list[tuple[str, int]] = []
         # Retained so tests and callers read what was composed, never the widget.
         self.summary_text = Text()
+        # The loading sweep: which cell the highlight is on, and the timer moving
+        # it. Both live only while there is no history. See `_tick_loading`.
+        self._loading_frame = 0
+        self._loading_timer: Any = None
 
     def compose(self) -> ComposeResult:
         yield _header()
@@ -1076,7 +1261,7 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
         names = [g.label for g in history.groups] if history is not None else []
         layout = _sync_columns(
             table,
-            spec,
+            render.numbered_for(spec, len(names)),
             self._layout,
             content={"JOB NAME": max(map(len, names), default=0)},
             available=self.size.width,
@@ -1084,8 +1269,10 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
         self._layout = layout
         self.fit_content(layout)
         if history is None:
-            summary.update(Text("loading…", style=theme.DIM))
+            summary.update(self._loading_text())
+            self._start_loading_animation()
             return
+        self._stop_loading_animation()
 
         groups = sort_groups(
             filter_groups(history.groups, self.filter_mode, self.search_text), self.sort_mode
@@ -1258,6 +1445,47 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
 
     # -- actions ---------------------------------------------------------
 
+    def _loading_text(self) -> Text:
+        """The sweep, plus the word, on one line.
+
+        Stored on `summary_text` like every other thing this screen composes --
+        "retained so tests and callers read what was composed, never the widget",
+        and the loading state was the one that left it empty.
+        """
+        out = render.loading_bar(self._loading_frame, ascii_mode=self.sp.ascii_mode)
+        out.append("  reading sacct", style=theme.DIM)
+        self.summary_text = out
+        return out
+
+    def _start_loading_animation(self) -> None:
+        if self._loading_timer is None:
+            self._loading_timer = self.set_interval(_LOADING_FPS_INTERVAL, self._tick_loading)
+
+    def _stop_loading_animation(self) -> None:
+        if self._loading_timer is not None:
+            self._loading_timer.stop()
+            self._loading_timer = None
+
+    def _tick_loading(self) -> None:
+        """Advance one cell, or stop if the history has landed.
+
+        Stopping here as well as in `refresh_rows` because the load can fail --
+        `_loaded` exits the app on that path without another refresh -- and a
+        timer left running on a screen nobody is looking at is exactly the kind
+        of idle work the rest of this file spent the day removing.
+        """
+        if self.sp.history is not None:
+            self._stop_loading_animation()
+            return
+        self._loading_frame += 1
+        with contextlib.suppress(Exception):
+            # The screen may be mid-teardown; a dropped frame is not worth a
+            # traceback in a tool whose job is explaining other people's.
+            self.query_one("#summary", Static).update(self._loading_text())
+
+    def on_unmount(self) -> None:
+        self._stop_loading_animation()
+
     def _selected(self) -> GroupStats | None:
         table = self.query_one("#groups", DataTable)
         if not self._rows or table.cursor_row < 0:
@@ -1313,6 +1541,7 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
             self.query_one("#groups", DataTable).move_cursor(row=row - 1)
 
     def on_key(self, event: events.Key) -> None:
+        self.carry_the_cursor(event.key, self.held.stride(event.key, time.perf_counter()) - 1)
         self._jump.on_key_pressed(event.key)
         handled = (event.key == "escape" and _dismiss_search(self, "#groups")) or _steer_table(
             self, "#groups", event.key
@@ -1374,6 +1603,12 @@ class OverviewScreen(ScreenChrome, CentredContent, Screen[Any]):
 
 _JOB_COLUMNS = render.JOB_COLUMNS
 
+#: How often the loading sweep advances one cell. 12 fps: fast enough to read as
+#: motion, and one frame is ~30 us of Text building, so it cannot be the reason
+#: anything else is late. The timer only exists while `history is None` -- see
+#: `OverviewScreen._tick_loading` -- which is 2.3 s warm and 7 s cold.
+_LOADING_FPS_INTERVAL = 0.08
+
 #: Rows :meth:`JobListScreen.refresh_rows` draws before it returns. Comfortably
 #: more than any terminal shows, so what the reader is looking at is there
 #: immediately; the rest follows from a timer. See `JobListScreen._draw_rows`.
@@ -1402,7 +1637,191 @@ _FILL_STEP = 100
 #: exactly when rows arriving below the fold are worth nothing to them. The fill
 #: is not cancelled, only deferred -- it resumes the moment the keyboard goes
 #: quiet, which is when the rows are wanted and nobody is waiting.
-_FILL_YIELD_AFTER_KEY = 0.15
+#:
+#: A DEADLINE ALONE IS NOT ENOUGH, and the reason is a feedback loop worth
+#: stating. `add_row` bumps `DataTable._update_count`, which is part of the key
+#: of all three of its render caches -- cell, row and line -- so one fill slice
+#: makes the NEXT frame re-render every cell on screen. Measured on the flat job
+#: list at a 50-line terminal: 13 columns x 46 rows, 598 cells, ~170 ms against
+#: the ~12 ms a warm frame costs. That frame is longer than this deadline, so it
+#: hands the next tick a keyboard that looks idle, which draws more rows, which
+#: makes another cold frame. Holding the down arrow through the fill measured 84
+#: keys in 8 s with one of them taking 2.4 s.
+#:
+#: So the deadline has to be LONGER THAN A COLD FRAME, or a cold frame is itself
+#: what makes the keyboard look idle: the reader is still holding the key, the
+#: next press is already in the queue, and the app has simply not got to it. At
+#: 0.15 s that loop sustained itself for as long as the key was held. It is
+#: paired with `_keys_since_slice` as well -- a slice also needs a tick with no
+#: key on it -- because the two fail in different ways and neither is free.
+_FILL_YIELD_AFTER_KEY = 0.3
+
+#: Screenfuls of rows kept drawn AHEAD of the cursor, extended on every key.
+#:
+#: Without this the two rules above fight each other on a held arrow key.
+#: `DataTable` clamps its cursor to `row_count`, which is what the fill has
+#: reached -- not what ``self._rows`` holds -- and the fill stands aside for
+#: `_FILL_YIELD_AFTER_KEY` after every key. A key repeating every 33 ms is never
+#: 150 ms old, so the fill never resumes and the cursor walks to the last drawn
+#: row and STOPS there, for as long as the key is held. Measured in a real pty on
+#: 29,617 jobs: the cursor froze at row 200 and the reader's only way out was to
+#: let go of the key.
+#:
+#: Three screenfuls rather than one so `pagedown` has somewhere to land.
+#:
+#: A LOW-WATER MARK, not a target: while the margin holds, a key draws nothing.
+#: That distinction is what keeps a held key from strangling itself. `add_row`
+#: bumps `DataTable._update_count`, which invalidates all three of its render
+#: caches, so drawing even one row makes the next frame re-render the whole
+#: viewport -- and that cold frame gets more expensive the more rows the table
+#: holds, because `_y_offsets` is rebuilt over all of them. Topping the margin up
+#: on every key meant every frame was cold, and measured in a real pty the frames
+#: reached 0.5 s at row 16,000, which is longer than `_ACCEL_GAP`: the ramp broke
+#: its own run and could never rebuild it. The cursor covered 15,857 rows in 14
+#: seconds and then 700 in the next sixteen.
+_CURSOR_HEADROOM = 3
+
+#: How far ahead a top-up draws once the margin above runs out, in screenfuls.
+#:
+#: Generous, because the cost of a top-up is dominated by the cold frame after it
+#: rather than by the rows: one draw of 1,000 rows is ~120 ms of drawing and ONE
+#: cold frame, where ten draws of 100 are the same drawing and ten cold frames.
+#: At the top of the ramp -- 64 rows a key, 30 keys a second -- this is about a
+#: second of travel per top-up.
+_CURSOR_TOPUP = 20
+
+#: The keys that move the cursor further down the table, and so the ones that can
+#: run into the end of what has been drawn.
+_DOWNWARD_KEYS = frozenset(["down", "pagedown"])
+
+#: The keys a reader holds down, and so the ones that accelerate. See `_HeldKey`.
+_ACCELERATING_KEYS = frozenset(["down", "up"])
+
+#: How long an arrow key has to be held before the cursor starts covering
+#: ground. Below this nothing changes at all: one press, or a short burst of
+#: them, still moves exactly one row per key.
+_ACCEL_AFTER = 3.0
+
+#: The gap that ends a run of one held key.
+#:
+#: Generous, because the thing most likely to open a gap is the app itself: a key
+#: at the top of the ramp scrolls a whole viewport, and that frame costs ~250 ms
+#: against the ~12 ms a one-row frame costs. At 0.2 s the accelerator defeated
+#: itself -- it went fast, the frames it caused went over the gap, and the run
+#: reset to one row per key. What stops a slow tapper inheriting a held key's
+#: speed instead is `_ACCEL_MIN_RATE`, which is a better test for it anyway.
+_ACCEL_GAP = 0.5
+
+#: Keys per second a run has to average before it is allowed to accelerate.
+#:
+#: A held key repeats at 25-33 Hz on every common setting and never below 10; a
+#: reader pressing the arrow deliberately manages three or four a second at most.
+#: So this separates "held" from "pressed a lot", which `_ACCEL_GAP` on its own
+#: cannot -- and it has to, now that the gap is half a second.
+#:
+#: Tested once, when the run first crosses `_ACCEL_AFTER`, and latched -- both
+#: ways -- for the rest of it. Re-testing continuously fails in both directions:
+#: the slower frames that accelerating CAUSES would pull a held key back under
+#: the bar and drop it to one row per key, and a tapper who kept going long
+#: enough would eventually clear any test written against a count.
+_ACCEL_MIN_RATE = 10.0
+
+#: Rows per key the moment the threshold is crossed -- the step that is meant to
+#: be felt, not eased into. At a 30 Hz repeat it is 240 rows a second.
+_ACCEL_FIRST = 8
+
+#: ...and it doubles every this many seconds after that.
+_ACCEL_DOUBLE = 1.0
+
+#: Where the ramp stops: 1,920 rows a second at 30 Hz, which crosses a
+#: 29,617-row history in about fifteen seconds. Past this the rows are a blur and
+#: a longer stride buys nothing but overshoot on the way back.
+_ACCEL_MAX = 64
+
+
+class _HeldKey:
+    """How far one arrow key moves, given how long it has been held.
+
+    A remote control's fast-forward, and asked for in those words: tap it and it
+    steps one row; hold it and after a moment it starts covering ground. On a
+    29,617-row history the alternative is `pagedown` held for a minute, or a
+    digit jump to a row number nobody knows.
+
+    Nothing changes for the first `_ACCEL_AFTER` seconds, which is the whole
+    point of the threshold: reading down a list a row at a time is what the key
+    is for, and a ramp that started immediately would take that away. Past it the
+    stride jumps straight to `_ACCEL_FIRST` and doubles from there to
+    `_ACCEL_MAX`.
+
+    A run ends the moment the key changes or the gap between presses exceeds
+    `_ACCEL_GAP`, so the speed a reader has built up is never inherited by the
+    next thing they press -- including the arrow in the other direction, which is
+    how somebody stops after overshooting.
+
+    Kept clockless -- the caller passes the time -- so the ramp can be tested at
+    every point on it without a running app or a sleeping test.
+    """
+
+    def __init__(self) -> None:
+        self._key = ""
+        self._started = 0.0
+        self._last = 0.0
+        self._count = 0
+        self._verdict: bool | None = None
+        self._excused = False
+
+    def excuse_the_next_gap(self) -> None:
+        """Forgive one gap the app opened itself. Consumed by the next key.
+
+        A held key that scrolls fast enough eventually needs rows drawn, and at
+        the far end of a big table that costs about half a second -- longer than
+        `_ACCEL_GAP`. So the run broke on a frame it had asked for, rebuilt from
+        one row per key over the next three seconds, and did it again: measured in
+        a real pty on the 29,617-row list, the cursor cycled between 1,700 rows a
+        second and 200 and never finished the list.
+
+        Only the caller knows a gap was self-inflicted -- a slow frame and a
+        reader letting go look identical from here -- so only the caller can say
+        so, and it says so about one gap at a time.
+        """
+        self._excused = True
+
+    def stride(self, key: str, now: float) -> int:
+        """Rows this press should move. Always 1 until the key has been held."""
+        if key not in _ACCELERATING_KEYS:
+            self._key = ""
+            self._excused = False
+            return 1
+        excused = self._excused
+        self._excused = False
+        if key != self._key or (now - self._last > _ACCEL_GAP and not excused):
+            self._key = key
+            self._started = now
+            self._count = 0
+            self._verdict = None
+        self._last = now
+        self._count += 1
+        held = now - self._started
+        if held < _ACCEL_AFTER:
+            return 1
+        if self._verdict is None:
+            self._verdict = self._count >= held * _ACCEL_MIN_RATE
+        if not self._verdict:
+            return 1
+        # Capped before the shift, not after: the exponent comes from wall clock
+        # and a key held for a minute would otherwise build a 2**57 that `min`
+        # then throws away.
+        doublings = min(int((held - _ACCEL_AFTER) / _ACCEL_DOUBLE), 16)
+        return min(_ACCEL_MAX, _ACCEL_FIRST << doublings)
+
+
+#: Keys that mean the last row of the WHOLE list. Drawing ahead is not enough for
+#: these: `DataTable.action_scroll_bottom` reads `row_count`, so it lands on
+#: whatever the fill had reached rather than on the last job, and the fill is
+#: exactly what a held key has been keeping out of the way. `end` is not one of
+#: them -- under a row cursor Textual spends it on the rightmost COLUMN, and the
+#: `end` that does mean the last row is steered by `_steer_table`.
+_WHOLE_LIST_KEYS = frozenset(["ctrl+end"])
 
 # A copy is a paste-ready artefact, so it carries every column regardless of how
 # narrow the terminal was when the rows were drawn, and uses the same labels.
@@ -1518,6 +1937,8 @@ def _job_clipboard_cells(job) -> list[str]:
 class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
     """A list of jobs -- inside one workload, or flat across everything."""
 
+    TABLE_ID = "jobs"
+
     BINDINGS: ClassVar = [
         *_SCREEN_BINDINGS,
         Binding("q", "app.pop_screen", "Back"),
@@ -1551,6 +1972,8 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
         self._fill_marker_at: int | None = None
         # When the reader last touched the keyboard; see `_FILL_YIELD_AFTER_KEY`.
         self._last_key = 0.0
+        #: Keys seen since the fill last looked. See `_FILL_YIELD_AFTER_KEY`.
+        self._keys_since_slice = 0
         self._title = title
         self.summary_text = Text()
         self.filter_mode = initial_filter
@@ -1596,7 +2019,7 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
         jobs = filter_jobs(self._all, self.filter_mode, self.search_text)
         layout = _sync_columns(
             table,
-            _JOB_COLUMNS,
+            render.numbered_for(_JOB_COLUMNS, len(jobs)),
             self._layout,
             content={
                 "NAME": max((len(j.name or "") for j in jobs), default=0),
@@ -1744,8 +2167,10 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
 
     def _fill_slice(self) -> None:
         now = time.perf_counter()
-        if now - self._last_key < _FILL_YIELD_AFTER_KEY:
-            # Somebody is navigating. See `_FILL_YIELD_AFTER_KEY`.
+        if self._keys_since_slice or now - self._last_key < _FILL_YIELD_AFTER_KEY:
+            # Somebody is navigating. See `_FILL_YIELD_AFTER_KEY` for why this
+            # takes a whole quiet tick and not just a deadline.
+            self._keys_since_slice = 0
             return
         deadline = now + _FILL_BUDGET
         total = len(self._rows)
@@ -1812,11 +2237,48 @@ class JobListScreen(ScreenChrome, CentredContent, Screen[Any]):
             self._draw_rows(row)
             self.query_one("#jobs", DataTable).move_cursor(row=row - 1)
 
+    def _draw_ahead_of_cursor(self, stride: int = 1) -> None:
+        """Keep `_CURSOR_HEADROOM` screenfuls drawn below the cursor. See that.
+
+        Called for every downward key rather than only when the cursor is at the
+        end, because "is it at the end" is the question this is here to stop the
+        reader from ever reaching -- and because the margin is what makes the
+        answer cheap: once it exists, one key extends it by one row.
+
+        ``stride`` is how far this one key is about to move (see `_HeldKey`), and
+        it is added rather than assumed to be 1: at the top of the ramp a single
+        press covers `_ACCEL_MAX` rows, which is more than a screenful.
+
+        Draws nothing at all while the margin holds. See `_CURSOR_HEADROOM` for
+        why that matters more than it looks like it should.
+        """
+        if self._filled >= len(self._rows):
+            return
+        table = self.query_one("#jobs", DataTable)
+        height = max(1, table.size.height)
+        reach = table.cursor_row + stride
+        if self._filled - reach > height * _CURSOR_HEADROOM:
+            return
+        self._draw_rows(reach + height * _CURSOR_TOPUP)
+        # The frame after this one re-renders the whole viewport and is the
+        # longest thing a held key ever waits for. See `_HeldKey.excuse_the_next_gap`.
+        self.held.excuse_the_next_gap()
+        if self._filled >= len(self._rows):
+            self._stop_filling()
+
     def on_key(self, event: events.Key) -> None:
         # Stamped before anything else, so a slice already queued behind this key
         # sees it. Screen-level, so it catches the arrows the DataTable acts on as
         # well as the keys handled here.
-        self._last_key = time.perf_counter()
+        now = time.perf_counter()
+        stride = self.held.stride(event.key, now)
+        self._last_key = now
+        self._keys_since_slice += 1
+        if event.key in _DOWNWARD_KEYS:
+            self._draw_ahead_of_cursor(stride)
+        elif event.key in _WHOLE_LIST_KEYS:
+            self.ensure_all_rows()
+        self.carry_the_cursor(event.key, stride - 1)
         self._jump.on_key_pressed(event.key)
         handled = (event.key == "escape" and _dismiss_search(self, "#jobs")) or _steer_table(
             self, "#jobs", event.key
@@ -2332,6 +2794,8 @@ class PatternsScreen(ScreenChrome, Screen[Any]):
 class NodesScreen(ScreenChrome, CentredContent, Screen[Any]):
     """Per-node reliability, workload-controlled."""
 
+    TABLE_ID = "nodes"
+
     BINDINGS: ClassVar = [
         Binding("q", "app.pop_screen", "Back"),
         Binding("escape", "app.pop_screen", "Back", show=False),
@@ -2344,6 +2808,10 @@ class NodesScreen(ScreenChrome, CentredContent, Screen[Any]):
 
     metric: reactive[str] = reactive("hang")
     controlled: reactive[bool] = reactive(True)
+
+    def on_key(self, event: events.Key) -> None:
+        """Only the ramp: every other key here is a binding. See `_HeldKey`."""
+        self.carry_the_cursor(event.key, self.held.stride(event.key, time.perf_counter()) - 1)
 
     def __init__(self) -> None:
         super().__init__()

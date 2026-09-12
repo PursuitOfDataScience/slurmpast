@@ -542,15 +542,15 @@ class TestTheParserSharesRepeatedStrings:
         # the advice can legitimately straddle a line break. What must hold is
         # that it is disclosed, not where the break falls.
         flat = " ".join(text.split())
-        assert "rows parsed" in flat
-        assert "narrow it with -S" in flat
+        assert "rows, about" in flat
+        assert "narrow the window with -S" in flat
 
     def test_an_ordinary_window_says_nothing_about_memory(self):
         from slurmpast import report as reportmod
 
         history = History(sacctmod.parse(self._rows(20), delimiter="|"), window="last 7 days")
         text = reportmod.render_overview(history, limit=1)
-        assert "rows parsed" not in text
+        assert "MiB held" not in text
 
 
 # --------------------------------------------------------------------------

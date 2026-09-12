@@ -173,7 +173,9 @@ def log_miss_detail(job) -> str:
         # No StdOut/StdErr (below Slurm 24.05), no `-o` in a recorded SubmitLine
         # (below 21.08), no path in a --comment. Nothing a post-mortem can reach
         # knows where the output went, and slurmctld has long forgotten the job.
-        return "none found — --log-dir points at one"
+        # "none found — --log-dir points at one" read as a fragment: it names a
+        # flag and leaves the reader to guess the verb. Say what to do with it.
+        return "none found — point --log-dir at one"
     path = expected[0]
     state = probe_path(path)
     if state == "discarded":
@@ -182,8 +184,8 @@ def log_miss_detail(job) -> str:
         # something had gone wrong with a decision the submitter made on purpose.
         # 152 of 2,675 records on pythia over three days.
         return (
-            "discarded — this job sent its output to %s, so there is none to read. "
-            "Re-run with --output=<path> to keep it." % path
+            "discarded — this job sent its output to %s. Re-run with "
+            "--output=<path> to keep it." % path
         )
     if state == "special":
         return (
@@ -196,13 +198,13 @@ def log_miss_detail(job) -> str:
         # The owner is on the record, so say who to ask.
         whose = ("%s's" % job.user) if job.user else "its owner's"
         return (
-            "none readable at %s — it may well be there, but %s directory is not "
-            "readable by you; ask them, or point --log-dir at a copy" % (path, whose)
+            "not readable at %s — %s directory is not readable by you; ask them, or "
+            "point --log-dir at a copy" % (path, whose)
         )
     if state == "unknown":
         return (
-            "could not be checked at %s — the filesystem refused the question; "
-            "--log-dir points somewhere reachable" % path
+            "could not be checked at %s — the filesystem refused; point --log-dir "
+            "somewhere reachable" % path
         )
     return "none at %s — moved or deleted; --log-dir points at it" % path
 
@@ -358,6 +360,57 @@ class Column(NamedTuple):
     # Read by the plain-text renderer only. Textual's DataTable takes alignment
     # from each cell's own Rich justify, so the dashboard ignores this field.
     align: str = "left"
+
+
+#: Narrowest the row-number column is ever drawn. It is widened past this to
+#: fit the rows on screen -- see :func:`numbered_for` -- never narrowed below it.
+ROW_NUMBER_FLOOR = 3
+
+#: Where a WIDENED "#" sits in the drop order: last, after every other droppable
+#: column. At its floor it is not droppable at all.
+#:
+#: The distinction is the whole of it. Widened it no longer fits everywhere -- at
+#: 29,617 rows the never-dropped columns cost 82 cells against a canonical
+#: 80-column terminal -- and the choice there is between a table two cells too
+#: wide, a row number that is wrong, and no row number. The third is the only one
+#: that is not a defect: `_draw_rows` and the plain row builders already handle
+#: the column being absent, and a reader on an 80-column terminal has lost the
+#: five columns before it anyway.
+#:
+#: But at the floor it costs nothing extra, so making it droppable there would
+#: take the column away from every 80-column terminal to solve a problem those
+#: readers do not have. It is the EXTRA WIDTH that is expendable, not the column.
+ROW_NUMBER_DROP = 9
+
+
+def numbered_for(columns, rows: int):
+    """``columns``, with the "#" column wide enough to number ``rows`` of them.
+
+    The width was a fixed 3. That is right for the 25 rows ``--plain`` shows by
+    default and silently wrong for the 29,617 the dashboard holds: row 1000 was
+    drawn as "100", row 1001 as "100" as well, and ten consecutive rows carried
+    the same number before the display ticked over to "101". Reported from the
+    flat job list, where rows 991 to 999 counted up correctly and then the column
+    started over.
+
+    A clipped identifier that still LOOKS like an identifier is the worst of the
+    available outcomes -- worse than a wider table, worse than no column at all --
+    and it IS an identifier here: `tui._RowJump` lets a reader type a row number
+    to jump to it, so a row that reads 100 and answers to 1004 is a trap.
+
+    Widening costs the table two cells at 29,617 rows. `fit_columns` pays for
+    them out of the drop order, which is what the drop order is for; the note
+    this replaces reasoned the other way -- that 4 would push the never-dropped
+    columns one cell past a canonical 80-column terminal -- and so chose a wrong
+    number over a dropped column.
+    """
+    want = max(ROW_NUMBER_FLOOR, len(str(max(int(rows), 1))))
+    return tuple(
+        column._replace(width=want, drop=ROW_NUMBER_DROP)
+        if column.label == "#" and want > column.width
+        else column
+        for column in columns
+    )
 
 
 def fit_columns(
@@ -710,7 +763,7 @@ def hours_pair(group) -> Text:
 # Annotated as variable-length: a bare literal infers a fixed-arity tuple type,
 # and both front ends drop a column from it when the history has no GPU work.
 OVERVIEW_COLUMNS: tuple[Column, ...] = (
-    Column("#", 4),
+    Column("#", 4),  # a floor; see `numbered_for`
     Column("JOB NAME", 22, flex=True, grow_to=44),
     Column("PARTITION", 9, drop=2),
     Column("RUNS", 5, align="right"),
@@ -739,14 +792,10 @@ OVERVIEW_COLUMNS: tuple[Column, ...] = (
 # * Peak memory was missing outright, which is the number most post-mortems
 #   start from.
 JOB_COLUMNS: tuple[Column, ...] = (
-    # 3, not 4, and the one cell matters in the dashboard: at the 2-cell padding
-    # Textual's DataTable is given, the columns that are never dropped cost 81 at
-    # width 4 -- one over a canonical 80-column terminal, so the table could not fit
-    # the narrowest width it has to work at. (The plain renderer pads by 1 and fit
-    # either way.) 3 numbers 999 rows against a default `-n 25`; beyond that the
-    # index clips rather than widening the table, and JOBID is the identifier that
-    # matters anyway.
-    Column("#", 3),
+    # The FLOOR, not the width: `numbered_for` widens it to fit the rows it is
+    # about to number. 3 is where it starts because that is what `--plain`'s
+    # default `-n 25` needs, and anything wider there is a gap.
+    Column("#", ROW_NUMBER_FLOOR),
     Column("JOBID", 10),
     Column("NAME", 8, flex=True, grow_to=20, drop=3),
     # Wide enough for OUT_OF_MEMORY in full. Clipping the one state a reader most
@@ -919,9 +968,9 @@ def nodes_empty_reason(table, metric: str, workload: str | None, widen: str = "-
             # builds one by hand need only carry the keys its case reaches.
             touched = table.get("tested_nodes", 0) + table.get("skipped_nodes", 0)
             return (
-                "Every decided run of %s failed, on all %d node%s it touched — no node is "
-                "an outlier because none succeeded. This is a workload failure, not a node "
-                "failure." % (workload or "this workload", touched, "" if touched == 1 else "s")
+                "Every decided run of %s failed, on all %d node%s it touched — none "
+                "succeeded, so no node is an outlier. A workload failure, not a node failure."
+                % (workload or "this workload", touched, "" if touched == 1 else "s")
             )
         # "%d seen, all below it" reads as a plural claim, and one node below the
         # threshold is the ordinary way to reach this branch on a short window.
@@ -1042,9 +1091,8 @@ def nodes_exclude_disclaimer() -> str:
 def nodes_excluded_tail_note(count: int) -> str:
     """What the capped ``--exclude`` line left off, when it left anything off."""
     return (
-        "%d further node%s scored worse too, left off the line: excluding this many "
-        "trades away more of the partition than a paste-ready suggestion should."
-        % (count, "" if count == 1 else "s")
+        "%d further node%s scored worse, left off the line: excluding this many trades "
+        "away too much of the partition." % (count, "" if count == 1 else "s")
     )
 
 
@@ -1160,6 +1208,27 @@ def idle_hours_note(idle_hours: float, total_hours: float) -> str:
     return ", %.0f of %s never used" % (idle_hours, pronoun)
 
 
+def hours_divisible(value) -> str:
+    """An hour count for a PAIR the reader has to divide, not for a column cell.
+
+    :func:`hours_text` is the column formatter, and its rounding is justified by
+    comparison *down* a column where every row shares the scale: `-` for none,
+    `<1` for a sliver, whole hours otherwise. Used for two numbers inside one
+    sentence it destroys the comparison the sentence is made of -- 0.179 wasted
+    of 0.863 total both clamp to `<1`, and `<1 of its <1` carries no quantity,
+    no ratio and nothing to act on. 1.4 of 1.9 collapsed the same way, to
+    `1 of its 1`, which does not even look wrong.
+
+    So a decimal below ten, where the integer would round away the difference,
+    and whole hours above it, where it cannot. `90 of its 290` is unchanged.
+    """
+    if not value:
+        return "0"
+    if value < 10:
+        return "%.1f" % value
+    return f"{value:,.0f}"
+
+
 def idle_workload_note(label: str, wasted_hours: float, total_hours: float) -> str:
     """``flagged runs held the most GPU-hours in att-speed-#: 91 of its 503``.
 
@@ -1175,19 +1244,28 @@ def idle_workload_note(label: str, wasted_hours: float, total_hours: float) -> s
     on its own hides which one it is. The unit is named once, in the first clause,
     so the pair after the colon does not repeat it.
 
-    Formatted through :func:`hours_text`, so these hours round exactly as the
-    CPU / GPU-HOURS column beside them does and a sliver reads ``<1`` rather than
-    a rounded ``0`` -- a workload that held cards for twenty idle minutes did not
-    waste zero.
+    Formatted through :func:`hours_divisible`, NOT through the column formatter. Both
+    figures went through :func:`hours_text` and on a CPU-heavy account both are
+    routinely under an hour, so both clamped to ``<1`` and the sentence read
+    ``<1 of its <1`` -- reported from a real run, and the exact opposite of the
+    property the paragraph above argues for.
 
     Here rather than in either front end for the reason this module exists: the
     plain report prints it under the table and the dashboard on its summary line,
     and what must not differ is the sentence.
     """
-    return "flagged runs held the most GPU-hours in %s: %s of its %s" % (
+    # Subject, verb, then the figures WITH their unit. The old spelling --
+    # "flagged runs held the most GPU-hours in office-asr: 0.2 of its 0.9" --
+    # was reported as unreadable three times, and every part of that is fair:
+    # "the most ... in X" reads as "the most within X" when it means "X is the
+    # workload with the most"; "its" has no visible antecedent; and the pair
+    # carries no unit, because the unit was named once in a clause so far away
+    # and so oddly built that it never landed. Naming the unit twice costs eight
+    # cells and is the difference between a sentence and a puzzle.
+    return "%s wasted the most GPU time: %s of its %s GPU-hours went to flagged runs" % (
         label,
-        hours_text(wasted_hours),
-        hours_text(total_hours),
+        hours_divisible(wasted_hours),
+        hours_divisible(total_hours),
     )
 
 
@@ -1206,6 +1284,96 @@ _ASCII_FOLD = {
     "\u00d7": "x",  # multiplication sign, as in `patterns._mem_walk`'s "6.0 GiB x2"
 }
 _ASCII_TABLE = str.maketrans(_ASCII_FOLD)
+
+
+#: Hues the loading sweep runs through, in order, wrapping back to the first.
+#:
+#: The four resource identities the rest of the app already uses -- cyan, violet,
+#: rose, coral -- rather than an invented palette, so the one animation in the
+#: tool is still speaking the same vocabulary as every bar and column beside it.
+_SWEEP_HUES = (theme.CPU_COLOR, theme.GPU_COLOR, theme.MEM_COLOR, theme.ACCENT)
+
+#: The surface the bar sits on, which unlit cells fade toward.
+_SWEEP_BACKDROP = "#1e1c1b"
+
+#: Cells behind the highlight that are still lit, i.e. the length of the comet's
+#: tail. About a third of the default width, which reads as a sweep rather than
+#: as a single moving block.
+_SWEEP_TAIL = 10
+
+#: How much hue an unlit cell keeps. Enough that the gradient is legible while
+#: nothing is moving over it, dim enough that the shine still reads as a shine.
+_SWEEP_REST = 0.34
+
+#: How far the shine lifts a cell toward white at the head. Past about a half the
+#: hue washes out and the bar reads as a grey comet.
+_SWEEP_SHINE = 0.3
+
+LOADING_WIDTH = 28
+
+
+def _hex_to_rgb(value: str) -> tuple[int, int, int]:
+    value = value.lstrip("#")
+    return (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
+
+
+def _blend(one: str, two: str, amount: float) -> str:
+    """``one`` shaded toward ``two`` by ``amount`` in 0..1, as ``#rrggbb``."""
+    a, b = _hex_to_rgb(one), _hex_to_rgb(two)
+    amount = 0.0 if amount < 0.0 else 1.0 if amount > 1.0 else amount
+    return "#%02x%02x%02x" % tuple(int(round(a[i] + (b[i] - a[i]) * amount)) for i in range(3))
+
+
+def sweep_hue(position: float) -> str:
+    """The gradient colour at ``position`` in 0..1 along :data:`_SWEEP_HUES`.
+
+    Wraps, so the first and last cells of a full-width bar meet without a seam.
+    """
+    span = len(_SWEEP_HUES)
+    scaled = (position % 1.0) * span
+    index = int(scaled)
+    return _blend(_SWEEP_HUES[index], _SWEEP_HUES[(index + 1) % span], scaled - index)
+
+
+def loading_bar(frame: int, width: int = LOADING_WIDTH, ascii_mode: bool = False) -> Text:
+    """A gradient sweep for the one place this tool has to say "wait".
+
+    The dashboard paints in 0.38 s and the history lands in 2.3 s warm or 7 s
+    cold, so there is a real gap with nothing in it, and it used to hold the word
+    ``loading…`` in grey. A static word cannot distinguish "working" from "hung",
+    which is the one question a reader has during that gap -- and this is a tool
+    whose whole premise is not confusing a hang with work.
+
+    The bar is a gradient at rest and a shine travels along it. Both halves
+    matter: the hue says where you are along the bar, and the shine says it is
+    still moving. A first cut lit ONLY the comet and left the rest of the track
+    grey, which meant the gradient was invisible except in the eight cells under
+    the head -- captured from a real pty, most of the tail came out as
+    ``38;5;16``, i.e. black.
+
+    ``ascii_mode`` swaps the blocks for ``#``/``-``: `--ascii` promises one cell
+    per cell, and it also keeps the motion legible without colour at all, which
+    a solid bar of one glyph would not.
+    """
+    head = frame % width
+    out = Text()
+    for cell in range(width):
+        hue = sweep_hue(cell / float(width))
+        # Distance BEHIND the head, wrapping -- so the tail trails the direction
+        # of travel instead of straddling it.
+        behind = (head - cell) % width
+        glow = 1.0 - behind / float(_SWEEP_TAIL) if behind < _SWEEP_TAIL else 0.0
+        glow *= glow  # eased, so the head is a point and not a ramp
+        if ascii_mode:
+            out.append("#" if glow > 0.12 else "-", style=hue if glow > 0.12 else theme.FAINT)
+            continue
+        # Resting gradient, then lifted toward a highlight by the shine. Never
+        # to flat black and never to flat white: both ends of that range lose
+        # the hue, which is the half of this that carries meaning.
+        resting = _blend(_SWEEP_BACKDROP, hue, _SWEEP_REST)
+        shining = _blend(hue, "#ffffff", _SWEEP_SHINE)
+        out.append("█", style=_blend(resting, shining, glow))
+    return out
 
 
 def ascii_fold(text: str) -> str:

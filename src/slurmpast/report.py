@@ -67,6 +67,7 @@ from .render import (
     nodes_nothing_to_exclude,
     nodes_title,
     nodes_workload_control,
+    numbered_for,
     pair_rows,
     pair_value_budget,
     pair_value_lines,
@@ -82,10 +83,16 @@ from .sizing import MIN_RUNS, recommend, sbatch_lines
 
 #: Parsed rows after which the window's memory footprint is worth a line.
 #:
-#: A job plus its steps is typically four rows, so this is a few thousand jobs --
-#: comfortably past any ordinary week and comfortably short of the windows that
-#: run into gigabytes.
-_FOOTPRINT_NOTE_ROWS = 20_000
+#: 20,000 was chosen as "comfortably short of the windows that run into
+#: gigabytes", and at the measured ~1 KB a row that is 20 MB -- so the note fired
+#: on any ordinary week and told the reader the tool's own resident size. An
+#: 89,151-row week printed "about 87.1 MiB held" above the table, which is the
+#: program talking about itself before it has said anything about the jobs.
+#:
+#: Raised to where that reasoning actually pointed: half a gigabyte. Nothing
+#: about the warning changes -- memory still grows with the window and `-S` is
+#: still the knob -- it now appears when there is something to warn about.
+_FOOTPRINT_NOTE_ROWS = 500_000
 
 #: Bytes retained per parsed row, measured over 43,660 real rows (13,321 jobs and
 #: 30,339 steps) after the parser began sharing one object per distinct string:
@@ -521,15 +528,17 @@ def render_overview(history: History, style=None, limit=25, sort="cost", ascii_m
     if history.window:
         # The window is the commonest explanation for "why are runs missing?",
         # so it belongs on screen rather than in the reader's memory.
-        out.append("  window %s" % style(history.window, "bold"))
+        # Not "window last 7 days": the label says what it is, and the noun was
+        # the tool naming its own concept before naming the reader's.
+        out.append("  %s" % style(history.window, "bold"))
     # Both counts on one line: "233 jobs rolled up into 41 workloads" is one fact.
     # Both halves pluralised. Only `workload%s` was, so a one-job history read
     # "1 jobs in 1 workload" -- the two counts sit in one sentence and disagreed
     # about their own grammar. `TestSingularPlural` names this exact case and has
     # been green throughout, because it presses `a` first and then reads the JOB
     # LIST screen's sentence, which is a different one and was always right.
-    line = "  %d job%s in %d workload%s · %s completed" % (
-        stats["jobs"],
+    line = "  %s job%s in %d workload%s · %s completed" % (
+        f"{stats['jobs']:,}",
         "" if stats["jobs"] == 1 else "s",
         len(history.groups),
         "" if len(history.groups) == 1 else "s",
@@ -592,13 +601,14 @@ def render_overview(history: History, style=None, limit=25, sort="cost", ascii_m
         # the terminal was, so on the 90- and 100-column terminals people actually
         # use it hard-broke mid-sentence -- the exact fault `_prose_width` exists to
         # stop, in the one note that was not using it.
-        sentence = (
-            "%s rows parsed, about %s held — a window ten times longer "
-            "costs ten times that; narrow it with -S"
-            % (
-                f"{rows:,}",
-                format_bytes(rows * _BYTES_PER_ROW),
-            )
+        # One clause, not three. The knob is still named -- that is the whole
+        # point of saying anything -- but the arithmetic lesson ("ten times
+        # longer costs ten times that") is something the reader can work out
+        # from the figure, and it pushed the note onto a second wrapped line on
+        # every run.
+        sentence = "%s rows, about %s held; narrow the window with -S" % (
+            f"{rows:,}",
+            format_bytes(rows * _BYTES_PER_ROW),
         )
         out.extend(style("  " + line, "grey") for line in wrap(sentence, _prose_width(2)))
     if stats.get("unclassified"):
@@ -640,6 +650,12 @@ def render_overview(history: History, style=None, limit=25, sort="cost", ascii_m
             claim = "ordered by compute used"
         else:
             claim = "ordered by %s" % sort_label(sort)
+        # The exchange rate stays. Cutting it was tried as part of the verbosity
+        # pass and put back: it is the one clause here that explains something
+        # VISIBLE -- why a row with fewer CPU-hours outranks one with more -- and
+        # `--plain` has no `?` screen to move it to. Brevity that makes the table
+        # look arbitrary is not brevity. `TestTheExchangeRateIsOnBothSurfaces`
+        # also requires it here, and that property is right.
         notes.append("%s (%s)" % (claim, gpu_hours_equivalence()))
     elif sort != SORTS[0][0]:
         notes.append("ordered by %s" % sort_label(sort))
@@ -671,7 +687,8 @@ def render_overview(history: History, style=None, limit=25, sort="cost", ascii_m
             out.extend(style("  " + note, "grey") for note in notes)
     out.append("")
     layout = _plain_layout(
-        spec, content={"JOB NAME": max((len(g.label) for g in shown), default=0)}
+        numbered_for(spec, len(shown)),
+        content={"JOB NAME": max((len(g.label) for g in shown), default=0)},
     )
     rows = []
     for index, group in enumerate(shown, start=1):
@@ -742,7 +759,7 @@ def render_list(jobs, style=None, limit=40, ascii_mode=False):
     style = style or Style()
     shown = list(jobs)[:limit]
     layout = _plain_layout(
-        JOB_COLUMNS,
+        numbered_for(JOB_COLUMNS, len(shown)),
         content={
             "NAME": max((len(j.name or "") for j in shown), default=0),
             "NODE": max((len(j.node_list or "") for j in shown), default=0),

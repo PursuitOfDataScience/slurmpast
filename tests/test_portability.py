@@ -624,7 +624,9 @@ class TestPerTaskCpus:
 
         job = self._job(cpus=90, ntasks=15, total_cpu=self._FOURTEEN_PERCENT)
         finding = next(f for f in diagnose(job).findings if f.code == "cpu-overrequest")
-        assert "--cpus-per-task=1," in finding.action
+        # Bounded on the space, not on a comma: the clause separator is an em
+        # dash now. The point is the figure is the per-task 1 and not the 90.
+        assert "--cpus-per-task=1 " in finding.action, finding.action
         # The total is still shown -- it is what was allocated -- but it is labelled.
         assert "of 90 cores across 15 tasks" in finding.evidence
 
@@ -634,12 +636,19 @@ class TestSiteConfiguration:
 
     def test_cgroup_gather_means_maxrss_is_a_real_high_water_mark(self):
         text = maxrss_caveat(Site(jobacct_gather_type="jobacct_gather/cgroup"))
-        assert "cgroup peak" in text
+        # The PROPERTY, not the phrasing: a cgroup cluster is told the figure is
+        # real, and is not handed the over-reporting warning it has not earned.
+        assert "high-water mark" in text, text
+        assert "upper bound" not in text, text
         assert "sums RSS" not in text
 
     def test_linux_gather_keeps_the_warning_that_was_earned_here(self):
         text = maxrss_caveat(Site(jobacct_gather_type="jobacct_gather/linux"))
-        assert "sums RSS across the process tree" in text
+        # The direction of the error is the load-bearing part, and that the
+        # sentence is a claim about THIS cluster -- asserted by the two arms
+        # differing, which is stronger than either naming the gather plugin.
+        assert "upper bound" in text, text
+        assert text != maxrss_caveat(Site(jobacct_gather_type="jobacct_gather/cgroup"))
 
     def test_an_unreachable_scheduler_hedges_rather_than_asserting(self):
         text = maxrss_caveat(Site())
@@ -725,7 +734,9 @@ class TestSiteConfiguration:
         assert found.tracks_gpu_utilization is False
         assert found.rss_from_cgroup is False
         assert found.sampling_seconds == 30
-        assert "jobacct_gather/linux" in maxrss_caveat(found)
+        # What this test is for: the key was READ. It used to probe that through
+        # the caveat's prose, which coupled a parser test to a wording.
+        assert found.jobacct_gather_type == "jobacct_gather/linux"
 
 
 class TestPackageSurface:
@@ -1543,7 +1554,8 @@ AccountingStorageTRES   = cpu,mem,node,billing,gres/gpu,gres/gpuutil,gres/gpumem
 
     def test_the_cgroup_wording_replaces_the_process_tree_warning(self, job):
         assert job.max_rss < job.mem_limit_bytes
-        assert "cgroup peak" in maxrss_caveat()
+        assert "high-water mark" in maxrss_caveat(), maxrss_caveat()
+        assert "upper bound" not in maxrss_caveat(), maxrss_caveat()
         assert "sums RSS" not in maxrss_caveat()
 
     def test_the_whole_detail_screen_renders(self, job):
@@ -4058,7 +4070,9 @@ class TestTheCpuFigureCarriesItsOwnLimits:
     def test_the_finding_says_the_figure_is_a_lower_bound(self, monkeypatch):
         finding = self._finding(monkeypatch, "jobacct_gather/linux")
         assert "lower bound" in finding.evidence, finding.evidence
-        assert "reparented" in finding.evidence
+        # And it is cluster-worded: the cgroup arm says the opposite.
+        cgroup = self._finding(monkeypatch, "jobacct_gather/cgroup")
+        assert "lower bound" not in cgroup.evidence, cgroup.evidence
 
     def test_the_action_names_the_second_reading(self, monkeypatch):
         """The bare `Try --cpus-per-task=1` is what gets acted on, so the hedge has
@@ -4819,14 +4833,14 @@ class TestTheMemorySlackCaveatIsWordedFromTheCluster:
 
     def test_a_cgroup_cluster_is_not_told_the_figure_over_reports(self, monkeypatch):
         finding = self._finding(monkeypatch, "jobacct_gather/cgroup")
-        assert "cgroup peak" in finding.action, finding.action
+        assert "high-water mark" in finding.action, finding.action
+        assert "upper bound" not in finding.action, finding.action
         assert "over-report" not in finding.action, finding.action
 
     def test_a_linux_gathering_cluster_still_gets_the_warning(self, monkeypatch):
         """The control. The caveat is a *cluster* property, not a sentence that
         was simply deleted -- under the process-tree gatherer it still holds."""
         finding = self._finding(monkeypatch, "jobacct_gather/linux")
-        assert "sums RSS" in finding.action, finding.action
         assert "upper bound" in finding.action, finding.action
 
     def test_the_advice_flag_survives_the_rewording(self, monkeypatch):
@@ -5013,7 +5027,10 @@ class TestAnOomJobIsNotToldItsSampledPeakIsAnUpperBound:
 
     def test_the_finding_explains_that_sampling_is_the_mechanism(self, monkeypatch):
         finding = self._finding(monkeypatch)
-        assert "every 30s" in finding.evidence, finding.evidence
+        # The interval itself left the sentence with the verbosity pass: "at most
+        # 3 samples in 89s" is what makes the figure untrustworthy, and the
+        # interval is derivable from it. `--json`'s `site` block still carries it.
+        assert "3 samples in 89s" in finding.evidence, finding.evidence
         assert "at most 3 samples" in finding.evidence, finding.evidence
 
     def test_a_long_oom_job_gets_the_floor_without_the_sampling_clause(self, monkeypatch):
@@ -5079,15 +5096,21 @@ class TestTheSamplerIntervalIsReadFromTheCluster:
         cg = Site(jobacct_gather_type="jobacct_gather/cgroup", jobacct_gather_frequency="30")
         assert "at most 3 samples" in maxrss_sampling_note(89, cg)
 
-    def test_the_note_folds_under_ascii(self):
-        """It carries an em dash, and `--ascii` promises one cell for one cell."""
+    def test_the_note_is_one_cell_for_one_cell_under_ascii(self):
+        """`--ascii` promises one cell for one cell, and this note reaches a screen.
+
+        It used to end "-- a spike can be missed", and this test was about folding
+        that em dash. The clause went when the sentence was cut: both callers went
+        on to say what a thin sample means, so the note said it a third time. What
+        `--ascii` needs of it survives the cut and is what is asserted now.
+        """
         from slurmpast.render import ascii_fold
         from slurmpast.site import maxrss_sampling_note
 
         note = maxrss_sampling_note(89, Site(jobacct_gather_frequency="30"))
-        assert "—" in note
-        folded = ascii_fold(note)
-        assert "—" not in folded and len(folded) == len(note)
+        assert note
+        assert ascii_fold(note) == note
+        assert note.isascii()
 
 
 class TestShrinkAdviceAdmitsASparseSampler:
@@ -5191,8 +5214,11 @@ class TestShrinkAdviceAdmitsASparseSampler:
         self._pin(monkeypatch)
         advice = memory_advice(self._jobs())
         assert advice.verdict == "lower", advice.verdict
-        assert "may be a floor" in advice.caution, advice.caution
-        assert "Confirm before lowering" in advice.caution, advice.caution
+        assert "peak may be low" in advice.caution, advice.caution
+        # ONE direction. Saying the figure is an upper bound and then that it is
+        # a floor, in the same breath, on the surface whose whole output is "ask
+        # for less", is three clauses that cancel each other out.
+        assert "upper bound" not in advice.caution, advice.caution
 
     def test_sizing_words_it_from_the_shortest_run(self, monkeypatch):
         """The peak's provenance is what is in question, and the thinnest sample
@@ -5202,14 +5228,17 @@ class TestShrinkAdviceAdmitsASparseSampler:
 
         self._pin(monkeypatch)
         jobs = list(self._jobs(elapsed="7200")) + list(self._jobs(elapsed="20", runs=1))
-        assert "may be a floor" in memory_advice(jobs).caution
+        assert "peak may be low" in memory_advice(jobs).caution
 
     def test_sizing_leaves_a_well_sampled_group_alone(self, monkeypatch):
         from slurmpast.sizing import memory_advice
 
         self._pin(monkeypatch)
         advice = memory_advice(self._jobs(elapsed="7200"))
-        assert "floor" not in advice.caution, advice.caution
+        assert "peak may be low" not in advice.caution, advice.caution
+        # CONTROL for the control: a well-sampled group is not left with nothing,
+        # it is left with the over-report caveat the thin-sample case displaces.
+        assert "upper bound" in advice.caution or "high-water" in advice.caution, advice.caution
 
 
 class TestTheClipboardFallbackIsPrivate:

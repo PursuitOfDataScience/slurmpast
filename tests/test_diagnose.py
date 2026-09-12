@@ -1,6 +1,7 @@
 import pytest
 
 from slurmpast.diagnose import diagnose, looks_like_noop
+from slurmpast.duration import format_bytes
 from slurmpast.model import CRITICAL, INFO
 
 
@@ -75,12 +76,21 @@ class TestMemory:
         assert "host-oom" in codes(diagnose(oom_job))
 
     def test_oom_evidence_calls_out_maxrss_above_limit(self, oom_job):
-        """MaxRSS 51.25 GiB vs a 40 GiB limit -- the metric is not a footprint."""
+        """MaxRSS 51.25 GiB vs a 40 GiB limit -- the metric is not a footprint.
+
+        A property rather than a phrase: both figures have to be on screen, and
+        the sentence has to say the pair is impossible. Pinning the wording made
+        the finding unshortenable without a red suite, which is how it grew to
+        the four-line paragraph a reader was asked to wade through.
+        """
         evidence = find(diagnose(oom_job), "host-oom").evidence
-        assert "above the hard limit" in evidence
+        assert format_bytes(oom_job.max_rss) in evidence
+        assert format_bytes(oom_job.mem_limit_bytes) in evidence
+        assert "impossible" in evidence
 
     def test_oom_action_does_not_tell_you_to_trust_maxrss(self, oom_job):
-        assert "Do not size --mem from it" in find(diagnose(oom_job), "host-oom").evidence
+        evidence = find(diagnose(oom_job), "host-oom").evidence
+        assert "do not size --mem from it" in evidence.lower(), evidence
 
     def test_rss_above_limit_without_oom_is_its_own_finding(self, healthy_job):
         # The limit must be lowered where the tool actually reads it: AllocTRES.
