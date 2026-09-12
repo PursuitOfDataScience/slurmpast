@@ -121,6 +121,19 @@ jobs:
       # The demo is meant to look the same everywhere. It pins its own synthetic
       # site config for exactly that reason, so this output must match what a
       # login node prints.
+      #
+      # This used to grep for "jobacct_gather/linux", which the caveats named in
+      # full until 0.9.0 shortened them. The plugin name was only ever a proxy
+      # for "the demo used its pinned site and not the runner's". Both halves of
+      # that are asserted directly now, which is what the proxy stood for and is
+      # stronger than it was: the linux wording present, AND the wording an
+      # unknown site produces absent -- a bare runner has no scontrol, so
+      # forgetting to pin would show up as the second one.
       - name: The demo does not vary with the host cluster
         run: |
-          slurmpast --demo --sizing --no-color | grep -q "jobacct_gather/linux"
+          out=$(slurmpast --demo --sizing --no-color)
+          echo "$out" | grep -q "double-counts shared pages here" \
+            || { echo "the demo did not use its pinned jobacct_gather/linux site"; exit 1; }
+          echo "$out" | grep -q "depending on this cluster" \
+            && { echo "the demo fell back to the runner's unknown site"; exit 1; }
+          true
