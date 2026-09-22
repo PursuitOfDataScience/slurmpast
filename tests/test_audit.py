@@ -974,7 +974,7 @@ class TestTheReadmeMatchesTheDependencyPin:
         pin = re.search(r'"textual>=([\d.]+),<(\d+)"', (root / "pyproject.toml").read_text())
         assert pin, "textual pin not found in pyproject.toml"
         readme = (root / "README.md").read_text()
-        assert "Textual %s–" % pin.group(1) in readme, (
+        assert "Textual %s-" % pin.group(1) in readme, (
             "README's Textual floor disagrees with pyproject's %s" % pin.group(1)
         )
         oldest = (root / ".github" / "workflows" / "ci.yml").read_text()
