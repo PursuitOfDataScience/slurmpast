@@ -734,7 +734,7 @@ class TestTheNodeTableGoesThroughTheSharedSpec:
 class TestTheReadmeAndItsAssetsAgree:
     """The README's lead image was a 404 for the first several releases: it pointed
     at `assets/demo.gif`, and no `.gif` was ever committed. Nothing noticed, because
-    nothing checked — a broken image renders as a small grey box that reads like a
+    nothing checked: a broken image renders as a small grey box that reads like a
     slow network.
     """
 
@@ -775,7 +775,12 @@ class TestTheReadmeAndItsAssetsAgree:
 
         root = self._root()
         claimed = re.search(r"tests-(\d+)-brightgreen", (root / "README.md").read_text())
-        assert claimed, "the badge should still be there"
+        if claimed is None:
+            # The static badges were dropped from the README, so there is no count to
+            # hold true. The guard stays armed for the day one is quoted again.
+            import pytest
+
+            pytest.skip("the README quotes no test count")
         collected_n, basis = _committed_collect_count(root)
         if collected_n is None:  # pytest phrasing varies by version; skip rather than lie
             import pytest
@@ -1155,14 +1160,14 @@ class TestEverySentenceWrapsIncludingTheEmptyOnes:
 
 
 class TestASharedSentenceKeepsWhatIsSurfaceSpecific:
-    """`render` exists so the two front ends cannot drift — but pooling a sentence
+    """`render` exists so the two front ends cannot drift, but pooling a sentence
     can also average away the one part of it that is *supposed* to differ.
 
     `nodes_empty_reason` did: the plain report told the reader "A wider --since
     window is what fixes this" and the dashboard told them "(w)", and sharing the
     sentence collapsed both into a bare "A wider window is what fixes this." That
     is the only actionable clause in it, and this codebase's whole line on advice
-    is to name the thing the reader actually types — `format_duration`'s
+    is to name the thing the reader actually types: `format_duration`'s
     `HH:MM:SS`, `format_mem_flag`'s `52G`, the paste-ready `#SBATCH --exclude=`.
 
     So the wording is shared and the keystroke is passed in. Nothing caught the
@@ -1374,7 +1379,7 @@ class TestTheRowNumberColumnFitsTheRowsItNumbers:
     """
 
     def test_a_short_list_is_left_as_it_was(self):
-        """CONTROL — `--plain` shows 25 rows by default and 3 is right for it."""
+        """CONTROL: `--plain` shows 25 rows by default and 3 is right for it."""
         from slurmpast.render import JOB_COLUMNS, ROW_NUMBER_FLOOR, numbered_for
 
         assert _widths(numbered_for(JOB_COLUMNS, 25))["#"] == ROW_NUMBER_FLOOR

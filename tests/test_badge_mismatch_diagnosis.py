@@ -4,12 +4,12 @@
 `--collect-only`. Two very different things produce a mismatch, and they want
 opposite actions:
 
-* the badge is stale — somebody added tests and did not bump it. That is the case
+* the badge is stale: somebody added tests and did not bump it. That is the case
   the test's own docstring records ("`tests-1029` sat in the README for two
   rounds"), and the fix is to bump the badge.
 * the working tree holds test files that are not committed. Then the badge is
   *correct* for the suite that ships, the failure is expected locally, and CI is
-  green. Bumping the badge would **red CI** — the opposite of the fix.
+  green. Bumping the badge would **red CI**, the opposite of the fix.
 
 The message used to be `"README says N tests, the suite collects M"`, which cannot
 tell them apart. This repo has been in the second state for many rounds, and
@@ -122,12 +122,20 @@ class TestTheUntrackedProbe:
 
 
 class TestControls:
-    """These read neither helper, so they hold with the diagnosis in or out."""
+    """These read neither helper, so they hold with the diagnosis in or out.
+
+    The README no longer carries a test-count badge (the static badges were dropped),
+    so the two badge controls skip rather than assert a claim nobody makes. The
+    diagnosis itself stays tested above, ready for the day a count is quoted again.
+    """
 
     def test_the_readme_still_carries_a_test_badge(self) -> None:
         import re
 
-        assert re.search(r"tests-(\d+)-brightgreen", (ROOT / "README.md").read_text())
+        import pytest
+
+        if not re.search(r"tests-(\d+)-brightgreen", (ROOT / "README.md").read_text()):
+            pytest.skip("the README quotes no test count")
 
     def test_the_badge_still_states_the_committed_count(self) -> None:
         # The rule the diagnosis explains, asserted independently of it: the badge
@@ -135,7 +143,10 @@ class TestControls:
         import re
 
         badge = re.search(r"tests-(\d+)-brightgreen", (ROOT / "README.md").read_text())
-        assert badge
+        if badge is None:
+            import pytest
+
+            pytest.skip("the README quotes no test count")
         shown = subprocess.run(
             ["git", "show", "HEAD:README.md"], cwd=ROOT, capture_output=True, text=True
         )

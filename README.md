@@ -2,14 +2,11 @@
 
 # 📉 slurmpast
 
-**How your finished Slurm jobs actually ran, and what the next one should ask for.**
+**Why your Slurm jobs failed, and what to ask for next time.**
 
+<a href="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 <a href="https://pypi.org/project/slurmpast/"><img src="https://img.shields.io/pypi/v/slurmpast.svg" alt="PyPI"></a>
 <a href="https://pypi.org/project/slurmpast/"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/PursuitOfDataScience/slurmpast/badges/downloads.json" alt="PyPI downloads per month"></a>
-<a href="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml"><img src="https://github.com/PursuitOfDataScience/slurmpast/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-<img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
-<img src="https://img.shields.io/badge/tests-2725-brightgreen.svg" alt="2725 tests">
-<img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License">
 
 <img src="assets/demo.gif" width="900" alt="The slurmpast dashboard: finished jobs grouped into workloads, filtered to failures, then one job's report showing it used all its time at 0% CPU, meaning it hung rather than ran out of time, then per-node failure rates.">
 
